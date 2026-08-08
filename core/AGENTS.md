@@ -13,7 +13,7 @@
 | `docs/WORKING-CONTEXT.md` | 当前主任务的短期上下文和交接摘要 |
 | `docs/WORKFLOW-ADOPTION.md` | dev-workflow 首次接入状态、既有文档映射和审计记录 |
 | `docs/PROJECT-SUMMARY.md` | 稳定项目事实、模块摘要、技术决策、命令和路径速查 |
-| `.dev-workflow/manifest.json` | 已安装版本、流程包和机器可读接入状态 |
+| `.dev-workflow/manifest.json` | 已安装版本、流程包、文件归属和机器可读接入状态 |
 | `docs/project-memory/` | 长期、可复用且已经验证的操作知识 |
 | `docs/architecture/`（如启用） | 系统、仓库、模块和运行时架构 |
 | `docs/design/` 或根 `DESIGN.md`（如启用） | 当前有效的产品/技术设计与验收口径 |

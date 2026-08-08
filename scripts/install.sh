@@ -35,6 +35,40 @@ json_string_field() {
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$path" | head -n 1
 }
 
+json_number_field() {
+  local field="$1"
+  local path="$2"
+  sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
+}
+
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | sed -E 's/^.*= //' | tr '[:upper:]' '[:lower:]'
+    return
+  fi
+  echo "缺少 SHA-256 工具（需要 sha256sum、shasum 或 openssl）。" >&2
+  exit 1
+}
+
 contains_item() {
   local needle="$1"
   shift
@@ -75,16 +109,113 @@ read_manifest_packs() {
     sed -n -E 's/^[[:space:]]*"([0-9A-Za-z._-]+)"[[:space:]]*$/\1/p'
 }
 
+read_manifest_file_objects() {
+  local path="$1"
+  awk '
+    /"files"[[:space:]]*:[[:space:]]*\[/ { in_files=1; next }
+    in_files {
+      if (!in_object && $0 ~ /^[[:space:]]*\]/) { exit }
+      if (!in_object && index($0, "{") > 0) {
+        in_object=1
+        object=$0
+      } else if (in_object) {
+        object=object " " $0
+      }
+      if (in_object && index($0, "}") > 0) {
+        gsub(/[[:space:]]+/, " ", object)
+        print object
+        in_object=0
+        object=""
+      }
+    }
+  ' "$path"
+}
+
+read_manifest_files() {
+  local path="$1"
+  local object
+  local entry_path
+  local source
+  local action
+  local hash
+  local count=0
+  while IFS= read -r object; do
+    [[ -n "$object" ]] || continue
+    entry_path="$(printf '%s' "$object" | sed -n -E 's/.*"path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    source="$(printf '%s' "$object" | sed -n -E 's/.*"source"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    action="$(printf '%s' "$object" | sed -n -E 's/.*"action"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    hash="$(printf '%s' "$object" | sed -n -E 's/.*"installedSha256"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]+)".*/\1/p' | tr '[:upper:]' '[:lower:]')"
+    [[ -n "$entry_path" && -n "$source" && -n "$action" ]] || return 1
+    case "$entry_path" in
+      /*|../*|*/../*|*/..|*'|'*|*$'\t'*|*$'\r'*|*$'\n'*) return 1 ;;
+    esac
+    case "$action" in
+      created|appended|managed-block|preserved|legacy) ;;
+      *) return 1 ;;
+    esac
+    if [[ "$action" == "created" && ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+    if [[ "$action" != "created" && -n "$hash" ]]; then
+      return 1
+    fi
+    printf '%s|%s|%s|%s\n' "$entry_path" "$source" "$action" "$hash"
+    count=$((count + 1))
+  done < <(read_manifest_file_objects "$path")
+  [[ "$count" -gt 0 ]]
+}
+
+inventory_index() {
+  local needle="$1"
+  local index
+  for index in "${!file_paths[@]}"; do
+    if [[ "${file_paths[$index]}" == "$needle" ]]; then
+      printf '%s' "$index"
+      return 0
+    fi
+  done
+  return 1
+}
+
+set_inventory() {
+  local path="$1"
+  local source="$2"
+  local action="$3"
+  local hash="$4"
+  local index
+  if index="$(inventory_index "$path")"; then
+    file_sources[$index]="$source"
+    file_actions[$index]="$action"
+    file_hashes[$index]="$hash"
+  else
+    file_paths+=("$path")
+    file_sources+=("$source")
+    file_actions+=("$action")
+    file_hashes+=("$hash")
+  fi
+}
+
+inventory_summary() {
+  local index
+  for index in "${!file_paths[@]}"; do
+    printf '%s|%s|%s|%s\n' \
+      "${file_paths[$index]}" \
+      "${file_sources[$index]}" \
+      "${file_actions[$index]}" \
+      "${file_hashes[$index]}"
+  done | LC_ALL=C sort
+}
+
 build_manifest() {
   local version="$1"
   local installed_at="$2"
   local updated_at="$3"
   local onboarding_status="$4"
   local last_audit_at="$5"
-  shift 5
   local pack
+  local index
   local packs_json=""
-  for pack in "$@"; do
+  for pack in "${installed_packs[@]}"; do
     if [[ -n "$packs_json" ]]; then
       packs_json+=","
     fi
@@ -94,10 +225,33 @@ build_manifest() {
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$last_audit_at\""
   cat <<EOF
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "managedBy": "dev-workflow",
   "workflowVersion": "$version",
   "installedPacks": [$packs_json
+  ],
+  "files": [
+EOF
+  local sorted_inventory
+  sorted_inventory="$(inventory_summary)"
+  local inventory_count=0
+  [[ -n "$sorted_inventory" ]] && inventory_count="$(printf '%s\n' "$sorted_inventory" | wc -l | tr -d '[:space:]')"
+  local current=0
+  while IFS='|' read -r entry_path source action hash; do
+    [[ -n "$entry_path" ]] || continue
+    current=$((current + 1))
+    local comma=","
+    [[ "$current" -eq "$inventory_count" ]] && comma=""
+    local hash_json="null"
+    [[ -n "$hash" ]] && hash_json="\"$(json_escape "$hash")\""
+    printf '    {"path":"%s","source":"%s","action":"%s","installedSha256":%s}%s\n' \
+      "$(json_escape "$entry_path")" \
+      "$(json_escape "$source")" \
+      "$(json_escape "$action")" \
+      "$hash_json" \
+      "$comma"
+  done <<< "$sorted_inventory"
+  cat <<EOF
   ],
   "installedAt": "$installed_at",
   "updatedAt": "$updated_at",
@@ -185,16 +339,25 @@ existing_manifest=0
 existing_installed_at=""
 existing_updated_at=""
 existing_onboarding_status="pending"
+existing_schema_version=""
 existing_packs=()
+file_paths=()
+file_sources=()
+file_actions=()
+file_hashes=()
 if [[ -f "$manifest_path" ]]; then
   grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" || {
     echo "manifest 已存在但不是由 dev-workflow 管理：$manifest_path" >&2
     exit 1
   }
-  grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*1' "$manifest_path" || {
+  existing_schema_version="$(json_number_field schemaVersion "$manifest_path")"
+  case "$existing_schema_version" in
+    1|2) ;;
+    *)
     echo "不支持的 dev-workflow manifest schema：$manifest_path" >&2
     exit 1
-  }
+      ;;
+  esac
   existing_manifest=1
   existing_installed_at="$(json_string_field installedAt "$manifest_path")"
   existing_updated_at="$(json_string_field updatedAt "$manifest_path")"
@@ -206,6 +369,20 @@ if [[ -f "$manifest_path" ]]; then
       exit 1
       ;;
   esac
+  if [[ "$existing_schema_version" == "2" ]]; then
+    manifest_file_output="$(read_manifest_files "$manifest_path")" || {
+      echo "manifest files 格式无效：$manifest_path" >&2
+      exit 1
+    }
+    while IFS='|' read -r entry_path source action hash; do
+      [[ -n "$entry_path" ]] || continue
+      if inventory_index "$entry_path" >/dev/null; then
+        echo "manifest files 包含重复路径：$entry_path" >&2
+        exit 1
+      fi
+      set_inventory "$entry_path" "$source" "$action" "$hash"
+    done <<< "$manifest_file_output"
+  fi
 fi
 
 available_packs=()
@@ -228,6 +405,31 @@ if [[ "$existing_manifest" -eq 1 ]]; then
     contains_item "$pack" "${existing_packs[@]}" || existing_packs+=("$pack")
   done <<< "$manifest_pack_output"
 fi
+
+for index in "${!file_paths[@]}"; do
+  source="${file_sources[$index]}"
+  if [[ "$source" != "core" ]] && ! contains_item "$source" "${existing_packs[@]}"; then
+    echo "manifest 将 ${file_paths[$index]} 归属于未安装流程包：$source" >&2
+    exit 1
+  fi
+  owner_root="$core_root"
+  [[ "$source" == "core" ]] || owner_root="$packs_root/$source"
+  if [[ ! -f "$owner_root/${file_paths[$index]}" ]]; then
+    echo "manifest 文件 ${file_paths[$index]} 不属于流程源 $source" >&2
+    exit 1
+  fi
+  if [[ "${file_actions[$index]}" == "created" ]]; then
+    source_hash="$(sha256_file "$owner_root/${file_paths[$index]}")"
+    if [[ "${file_hashes[$index]}" != "$source_hash" ]]; then
+      if [[ "$existing_schema_version" == "2" && "$(json_string_field workflowVersion "$manifest_path")" == "$workflow_version" ]]; then
+        echo "manifest created 文件哈希与流程源不一致：${file_paths[$index]}" >&2
+        exit 1
+      fi
+      file_actions[$index]="legacy"
+      file_hashes[$index]=""
+    fi
+  fi
+done
 
 selected_packs=()
 if [[ "$all_packs" -eq 1 ]]; then
@@ -256,6 +458,20 @@ for pack in "${available_packs[@]}"; do
   fi
 done
 
+if [[ "$existing_schema_version" == "1" ]]; then
+  for pack in "${existing_packs[@]}"; do
+    legacy_pack_root="$packs_root/$pack"
+    while IFS= read -r source_path; do
+      relative_path="${source_path#"$legacy_pack_root"/}"
+      if inventory_index "$relative_path" >/dev/null; then
+        echo "旧版流程包文件归属冲突：$relative_path" >&2
+        exit 1
+      fi
+      set_inventory "$relative_path" "$pack" "legacy" ""
+    done < <(find "$legacy_pack_root" -type f | LC_ALL=C sort)
+  done
+fi
+
 now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 installed_at="$existing_installed_at"
 [[ -n "$installed_at" ]] || installed_at="$now"
@@ -265,14 +481,7 @@ if [[ "$existing_manifest" -eq 1 ]]; then
 fi
 old_pack_summary="${existing_packs[*]-}"
 new_pack_summary="${installed_packs[*]-}"
-manifest_changed=0
-if [[ "$existing_manifest" -eq 0 || "$old_version" != "$workflow_version" || "$old_pack_summary" != "$new_pack_summary" ]]; then
-  manifest_changed=1
-fi
-updated_at="$existing_updated_at"
-if [[ "$manifest_changed" -eq 1 || -z "$updated_at" ]]; then
-  updated_at="$now"
-fi
+old_inventory_summary="$(inventory_summary)"
 manifest_action="[create] .dev-workflow/manifest.json"
 [[ "$existing_manifest" -eq 1 ]] && manifest_action="[update] .dev-workflow/manifest.json"
 
@@ -307,6 +516,14 @@ for index in "${!overlay_roots[@]}"; do
     fi
     seen_paths+=("$relative_path")
 
+    existing_index=""
+    if existing_index="$(inventory_index "$relative_path")"; then
+      if [[ "${file_sources[$existing_index]}" != "$overlay_name" ]]; then
+        echo "manifest 文件归属冲突：$relative_path（${file_sources[$existing_index]} / $overlay_name）" >&2
+        exit 1
+      fi
+    fi
+
     target_path="$target_root/$relative_path"
     if [[ -e "$target_path" && ! -f "$target_path" ]]; then
       echo "目标路径存在但不是文件：$target_path" >&2
@@ -324,11 +541,15 @@ for index in "${!overlay_roots[@]}"; do
           exit 1
         fi
         actions+=("[skip] $relative_path（已存在受管控核心区块）")
+        if [[ -z "$existing_index" ]]; then
+          set_inventory "$relative_path" "$overlay_name" "managed-block" ""
+        fi
       elif [[ "$start_count" -gt 0 || "$end_count" -gt 0 ]]; then
         echo "现有 AGENTS.md 包含不完整或重复的 AI-WORKFLOW 核心标记：$target_path" >&2
         exit 1
       elif [[ "$dry_run" -eq 1 ]]; then
         actions+=("[append] $relative_path（保留现有内容，追加通用核心区块）")
+        set_inventory "$relative_path" "$overlay_name" "appended" ""
       else
         temp_path="$(mktemp "${target_path}.dev-workflow.XXXXXX")"
         if ! {
@@ -340,25 +561,49 @@ for index in "${!overlay_roots[@]}"; do
         fi
         mv "$temp_path" "$target_path"
         actions+=("[append] $relative_path（保留现有内容，追加通用核心区块）")
+        set_inventory "$relative_path" "$overlay_name" "appended" ""
       fi
       continue
     fi
 
     if [[ -f "$target_path" ]]; then
       actions+=("[skip] $relative_path（目标项目已有文件，不覆盖）")
+      if [[ -z "$existing_index" ]]; then
+        ownership_action="preserved"
+        [[ "$existing_schema_version" == "1" ]] && ownership_action="legacy"
+        set_inventory "$relative_path" "$overlay_name" "$ownership_action" ""
+      fi
       continue
     fi
 
     if [[ "$dry_run" -eq 1 ]]; then
       actions+=("[create] $relative_path [$overlay_name]")
+      set_inventory "$relative_path" "$overlay_name" "created" "$(sha256_file "$source_path")"
       continue
     fi
 
     mkdir -p "$(dirname -- "$target_path")"
     cp "$source_path" "$target_path"
     actions+=("[create] $relative_path [$overlay_name]")
+    set_inventory "$relative_path" "$overlay_name" "created" "$(sha256_file "$target_path")"
   done < <(find "$overlay_root" -type f | LC_ALL=C sort)
 done
+
+new_inventory_summary="$(inventory_summary)"
+manifest_changed=0
+if [[
+  "$existing_manifest" -eq 0 ||
+  "$existing_schema_version" != "2" ||
+  "$old_version" != "$workflow_version" ||
+  "$old_pack_summary" != "$new_pack_summary" ||
+  "$old_inventory_summary" != "$new_inventory_summary"
+]]; then
+  manifest_changed=1
+fi
+updated_at="$existing_updated_at"
+if [[ "$manifest_changed" -eq 1 || -z "$updated_at" ]]; then
+  updated_at="$now"
+fi
 
 if [[ "$manifest_changed" -eq 1 ]]; then
   if [[ "$dry_run" -eq 1 ]]; then
@@ -370,7 +615,7 @@ if [[ "$manifest_changed" -eq 1 ]]; then
     if [[ "$existing_manifest" -eq 1 ]]; then
       last_audit_at="$(json_string_field lastAuditAt "$manifest_path")"
     fi
-    if ! build_manifest "$workflow_version" "$installed_at" "$updated_at" "$existing_onboarding_status" "$last_audit_at" "${installed_packs[@]}" > "$manifest_tmp"; then
+    if ! build_manifest "$workflow_version" "$installed_at" "$updated_at" "$existing_onboarding_status" "$last_audit_at" > "$manifest_tmp"; then
       rm -f -- "$manifest_tmp"
       exit 1
     fi

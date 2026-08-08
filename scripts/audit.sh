@@ -25,6 +25,45 @@ add_warning() {
   warnings+=("$1")
 }
 
+contains_item() {
+  local needle="$1"
+  shift
+  local item
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print tolower($1)}'
+    return
+  fi
+  if command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | sed -E 's/^.*= //' | tr '[:upper:]' '[:lower:]'
+    return
+  fi
+  return 1
+}
+
+inventory_source_for() {
+  local needle="$1"
+  local index
+  for index in "${!inventory_paths[@]}"; do
+    if [[ "${inventory_paths[$index]}" == "$needle" ]]; then
+      printf '%s' "${inventory_sources[$index]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 json_string_field() {
   local field="$1"
   local path="$2"
@@ -75,6 +114,62 @@ read_manifest_packs() {
   printf '%s' "$segment" |
     tr ',' '\n' |
     sed -n -E 's/^[[:space:]]*"([0-9A-Za-z._-]+)"[[:space:]]*$/\1/p'
+}
+
+read_manifest_file_objects() {
+  local path="$1"
+  awk '
+    /"files"[[:space:]]*:[[:space:]]*\[/ { in_files=1; next }
+    in_files {
+      if (!in_object && $0 ~ /^[[:space:]]*\]/) { exit }
+      if (!in_object && index($0, "{") > 0) {
+        in_object=1
+        object=$0
+      } else if (in_object) {
+        object=object " " $0
+      }
+      if (in_object && index($0, "}") > 0) {
+        gsub(/[[:space:]]+/, " ", object)
+        print object
+        in_object=0
+        object=""
+      }
+    }
+  ' "$path"
+}
+
+read_manifest_files() {
+  local path="$1"
+  local object
+  local entry_path
+  local source
+  local action
+  local hash
+  local count=0
+  while IFS= read -r object; do
+    [[ -n "$object" ]] || continue
+    entry_path="$(printf '%s' "$object" | sed -n -E 's/.*"path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    source="$(printf '%s' "$object" | sed -n -E 's/.*"source"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    action="$(printf '%s' "$object" | sed -n -E 's/.*"action"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p')"
+    hash="$(printf '%s' "$object" | sed -n -E 's/.*"installedSha256"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f]+)".*/\1/p' | tr '[:upper:]' '[:lower:]')"
+    [[ -n "$entry_path" && -n "$source" && -n "$action" ]] || return 1
+    case "$entry_path" in
+      /*|../*|*/../*|*/..|*'|'*|*$'\t'*|*$'\r'*|*$'\n'*) return 1 ;;
+    esac
+    case "$action" in
+      created|appended|managed-block|preserved|legacy) ;;
+      *) return 1 ;;
+    esac
+    if [[ "$action" == "created" && ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+      return 1
+    fi
+    if [[ "$action" != "created" && -n "$hash" ]]; then
+      return 1
+    fi
+    printf '%s|%s|%s|%s\n' "$entry_path" "$source" "$action" "$hash"
+    count=$((count + 1))
+  done < <(read_manifest_file_objects "$path")
+  [[ "$count" -gt 0 ]]
 }
 
 target=""
@@ -160,6 +255,10 @@ manifest_path="$target_root/.dev-workflow/manifest.json"
 manifest_status="missing"
 manifest_version=""
 installed_packs=()
+inventory_paths=()
+inventory_sources=()
+inventory_actions=()
+inventory_hashes=()
 
 if [[ ! -f "$manifest_path" ]]; then
   add_error "缺少 .dev-workflow/manifest.json；请重新运行安装器。"
@@ -178,9 +277,11 @@ else
   if [[ "$managed_by" != "dev-workflow" ]]; then
     add_error "manifest.json 不是由 dev-workflow 管理。"
   fi
-  if [[ "$schema_version" != "1" ]]; then
-    add_error "manifest.json 使用了不支持的 schemaVersion。"
-  fi
+  case "$schema_version" in
+    1) add_warning "manifest.json 仍使用 schemaVersion 1；请用当前版本安装器升级，以获得安全卸载所需的文件归属信息。" ;;
+    2) ;;
+    *) add_error "manifest.json 使用了不支持的 schemaVersion。" ;;
+  esac
   if [[ ! "$manifest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
     add_error "manifest workflowVersion 无效：${manifest_version:-missing}"
   fi
@@ -207,6 +308,35 @@ else
     fi
   fi
 
+  if [[ "$schema_version" == "2" ]]; then
+    manifest_file_output="$(read_manifest_files "$manifest_path")"
+    file_result=$?
+    if [[ "$file_result" -ne 0 ]]; then
+      add_error "manifest files 格式无效。"
+    else
+      while IFS='|' read -r entry_path source action hash; do
+        [[ -n "$entry_path" ]] || continue
+        if contains_item "$entry_path" "${inventory_paths[@]}"; then
+          add_error "manifest files 包含重复路径：$entry_path"
+        else
+          inventory_paths+=("$entry_path")
+          inventory_sources+=("$source")
+          inventory_actions+=("$action")
+          inventory_hashes+=("$hash")
+          if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]}"; then
+            add_error "manifest 文件 $entry_path 归属于未安装流程包：$source"
+          else
+            owner_root="$source_root/core"
+            [[ "$source" == "core" ]] || owner_root="$source_root/packs/$source"
+            if [[ ! -f "$owner_root/$entry_path" ]]; then
+              add_error "manifest 文件 $entry_path 不属于流程源 $source"
+            fi
+          fi
+        fi
+      done <<< "$manifest_file_output"
+    fi
+  fi
+
   source_version_path="$source_root/VERSION"
   if [[ ! -f "$source_version_path" ]]; then
     add_error "分发仓库缺少 VERSION 文件。"
@@ -217,6 +347,23 @@ else
     elif [[ -n "$manifest_version" && "$manifest_version" != "$source_version" ]]; then
       add_warning "manifest 版本 $manifest_version 不是当前分发版本 $source_version；可先执行安装器 dry-run 查看升级差异。"
     fi
+  fi
+
+  if [[ "$schema_version" == "2" && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
+    for index in "${!inventory_paths[@]}"; do
+      [[ "${inventory_actions[$index]}" == "created" ]] || continue
+      owner_root="$source_root/core"
+      [[ "${inventory_sources[$index]}" == "core" ]] || owner_root="$source_root/packs/${inventory_sources[$index]}"
+      if [[ -f "$owner_root/${inventory_paths[$index]}" ]]; then
+        source_hash="$(sha256_file "$owner_root/${inventory_paths[$index]}")" || {
+          add_error "缺少 SHA-256 工具，无法验证 created 文件归属。"
+          break
+        }
+        if [[ "${inventory_hashes[$index]}" != "$source_hash" ]]; then
+          add_error "manifest created 文件哈希与流程源不一致：${inventory_paths[$index]}"
+        fi
+      fi
+    done
   fi
 
   seen_packs=()
@@ -245,8 +392,28 @@ else
       if [[ ! -f "$target_root/$relative_path" ]]; then
         add_error "流程包 $pack 缺少文件：$relative_path"
       fi
+      if [[ "$schema_version" == "2" ]] && ! contains_item "$relative_path" "${inventory_paths[@]}"; then
+        add_error "manifest 文件归属清单缺少流程包文件：$relative_path"
+      elif [[ "$schema_version" == "2" ]]; then
+        inventory_source="$(inventory_source_for "$relative_path")"
+        if [[ "$inventory_source" != "$pack" ]]; then
+          add_error "manifest 将 $relative_path 归属于 $inventory_source，而不是 $pack"
+        fi
+      fi
     done < <(find "$pack_root" -type f | LC_ALL=C sort)
   done
+  if [[ "$schema_version" == "2" ]]; then
+    for relative_path in "${core_files[@]}"; do
+      if ! contains_item "$relative_path" "${inventory_paths[@]}"; then
+        add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"
+      else
+        inventory_source="$(inventory_source_for "$relative_path")"
+        if [[ "$inventory_source" != "core" ]]; then
+          add_error "manifest 将 Core 文件 $relative_path 归属于 $inventory_source"
+        fi
+      fi
+    done
+  fi
 fi
 
 adoption_path="$target_root/docs/WORKFLOW-ADOPTION.md"

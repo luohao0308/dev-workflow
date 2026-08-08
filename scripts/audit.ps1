@@ -86,8 +86,11 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         if ($manifest.managedBy -ne 'dev-workflow') {
             Add-Error $errors 'manifest.json is not managed by dev-workflow.'
         }
-        if (([string]$manifest.schemaVersion) -ne '1') {
+        $schemaVersion = [string]$manifest.schemaVersion
+        if ($schemaVersion -notin @('1', '2')) {
             Add-Error $errors 'manifest.json uses an unsupported schemaVersion.'
+        } elseif ($schemaVersion -eq '1') {
+            Add-Warning $warnings 'manifest.json uses legacy schemaVersion 1; reinstall with the current distribution to add safe uninstall ownership metadata.'
         }
         if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
             Add-Error $errors "Invalid manifest workflowVersion: $($manifest.workflowVersion)"
@@ -106,6 +109,51 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Warning $warnings "Manifest version $($manifest.workflowVersion) differs from distribution version $sourceVersion; run the installer in dry-run mode before upgrading."
         }
 
+        $inventoryPaths = @{}
+        $inventoryActions = @{}
+        $inventoryHashes = @{}
+        if ($schemaVersion -eq '2') {
+            $filesProperty = $manifest.PSObject.Properties['files']
+            if (
+                $null -eq $filesProperty -or
+                $null -eq $filesProperty.Value -or
+                $filesProperty.Value -is [string] -or
+                $filesProperty.Value -isnot [Collections.IEnumerable]
+            ) {
+                Add-Error $errors 'manifest schemaVersion 2 requires a files array.'
+            } else {
+                foreach ($entry in @($filesProperty.Value)) {
+                    $entryPath = ([string]$entry.path).Replace('\', '/')
+                    $entrySource = ([string]$entry.source).Trim().ToLowerInvariant()
+                    $action = ([string]$entry.action).Trim().ToLowerInvariant()
+                    $hash = ([string]$entry.installedSha256).Trim().ToLowerInvariant()
+                    if ([string]::IsNullOrWhiteSpace($entryPath) -or [IO.Path]::IsPathRooted($entryPath) -or $entryPath -match '(^|/)\.\.(/|$)') {
+                        Add-Error $errors 'manifest files contains an unsafe or empty path.'
+                        continue
+                    }
+                    if ($inventoryPaths.ContainsKey($entryPath)) {
+                        Add-Error $errors "manifest files contains a duplicate path: $entryPath"
+                        continue
+                    }
+                    if ([string]::IsNullOrWhiteSpace($entrySource)) {
+                        Add-Error $errors "manifest files contains an empty source for: $entryPath"
+                    }
+                    if ($action -notin @('created', 'appended', 'managed-block', 'preserved', 'legacy')) {
+                        Add-Error $errors "manifest files contains an invalid action for ${entryPath}: $action"
+                    }
+                    if ($action -eq 'created' -and $hash -notmatch '^[0-9a-f]{64}$') {
+                        Add-Error $errors "manifest files contains an invalid installedSha256 for: $entryPath"
+                    }
+                    if ($action -ne 'created' -and -not [string]::IsNullOrWhiteSpace($hash)) {
+                        Add-Error $errors "manifest files contains an unexpected installedSha256 for: $entryPath"
+                    }
+                    $inventoryPaths[$entryPath] = $entrySource
+                    $inventoryActions[$entryPath] = $action
+                    $inventoryHashes[$entryPath] = $hash
+                }
+            }
+        }
+
         $packNames = @()
         $installedPacksProperty = $manifest.PSObject.Properties['installedPacks']
         if ($null -eq $installedPacksProperty) {
@@ -122,6 +170,31 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         foreach ($pack in $duplicatePacks) {
             Add-Error $errors "manifest installedPacks contains a duplicate: $pack"
         }
+        if ($schemaVersion -eq '2') {
+            foreach ($entryPath in $inventoryPaths.Keys) {
+                $entrySource = $inventoryPaths[$entryPath]
+                if ($entrySource -ne 'core' -and $packNames -notcontains $entrySource) {
+                    Add-Error $errors "Manifest file '$entryPath' belongs to uninstalled workflow pack '$entrySource'."
+                    continue
+                }
+                $ownerRoot = if ($entrySource -eq 'core') {
+                    Join-Path $sourceRoot 'core'
+                } else {
+                    Join-Path $sourceRoot "packs/$entrySource"
+                }
+                if (-not (Test-Path -LiteralPath (Join-Path $ownerRoot $entryPath) -PathType Leaf)) {
+                    Add-Error $errors "Manifest file '$entryPath' does not belong to workflow source '$entrySource'."
+                } elseif (
+                    $inventoryActions[$entryPath] -eq 'created' -and
+                    $manifest.workflowVersion -eq $sourceVersion
+                ) {
+                    $sourceHash = (Get-FileHash -LiteralPath (Join-Path $ownerRoot $entryPath) -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($inventoryHashes[$entryPath] -ne $sourceHash) {
+                        Add-Error $errors "Manifest created-file hash does not match workflow source for '$entryPath'."
+                    }
+                }
+            }
+        }
         foreach ($pack in $packNames) {
             $packRoot = Join-Path $sourceRoot "packs/$pack"
             if (-not (Test-Path -LiteralPath $packRoot -PathType Container)) {
@@ -133,6 +206,21 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 $relativePath = $sourceFile.FullName.Substring($overlayPrefix.Length).Replace('\', '/')
                 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
                     Add-Error $errors "Workflow pack $pack is missing file: $relativePath"
+                }
+                if ($schemaVersion -eq '2' -and -not $inventoryPaths.ContainsKey($relativePath)) {
+                    Add-Error $errors "Manifest ownership inventory is missing workflow pack file: $relativePath"
+                } elseif ($schemaVersion -eq '2' -and $inventoryPaths[$relativePath] -ne $pack) {
+                    Add-Error $errors "Manifest ownership inventory assigns '$relativePath' to '$($inventoryPaths[$relativePath])' instead of '$pack'."
+                }
+            }
+        }
+
+        if ($schemaVersion -eq '2') {
+            foreach ($relativePath in $coreFiles) {
+                if (-not $inventoryPaths.ContainsKey($relativePath)) {
+                    Add-Error $errors "Manifest ownership inventory is missing Core file: $relativePath"
+                } elseif ($inventoryPaths[$relativePath] -ne 'core') {
+                    Add-Error $errors "Manifest ownership inventory assigns Core file '$relativePath' to '$($inventoryPaths[$relativePath])'."
                 }
             }
         }
