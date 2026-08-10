@@ -14,6 +14,10 @@ assert_not_file() {
   [[ ! -f "$1" ]] || fail "$2"
 }
 
+assert_no_installed_packs() {
+  tr -d '[:space:]' < "$1" | grep -Fq '"installedPacks":[]' || fail "$2"
+}
+
 sha256_file() {
   local path="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -106,6 +110,66 @@ grep -Fq '"source":"delivery"' "$fresh_manifest" && fail "partial uninstall remo
 bash "$uninstall_script" --target "$fresh_target" >/dev/null
 assert_not_file "$fresh_manifest" "full uninstall removes manifest"
 assert_file "$modified_delivery_file" "project-modified content remains after full uninstall"
+
+invalid_install_target="$temp_root/invalid-install-packs"
+mkdir -p "$invalid_install_target"
+set +e
+bash "$install_script" --target "$invalid_install_target" --packs "" >/dev/null 2>&1
+empty_install_packs_code=$?
+bash "$install_script" --target "$invalid_install_target" --packs "   " >/dev/null 2>&1
+blank_install_packs_code=$?
+bash "$install_script" --target "$invalid_install_target" --packs ",,," >/dev/null 2>&1
+comma_install_packs_code=$?
+set -e
+[[ "$empty_install_packs_code" -eq 2 ]] || fail "install rejects an empty explicit pack list"
+[[ "$blank_install_packs_code" -eq 2 ]] || fail "install rejects a whitespace-only pack list"
+[[ "$comma_install_packs_code" -eq 2 ]] || fail "install rejects a comma-only pack list"
+assert_not_file "$invalid_install_target/.dev-workflow/manifest.json" "rejected pack lists do not install Core"
+
+core_only_target="$temp_root/core-only"
+mkdir -p "$core_only_target"
+bash "$install_script" --target "$core_only_target" >/dev/null
+core_only_manifest="$core_only_target/.dev-workflow/manifest.json"
+assert_no_installed_packs "$core_only_manifest" "Core-only install records an empty pack list"
+core_only_manifest_hash="$(sha256_file "$core_only_manifest")"
+
+set +e
+bash "$audit_script" --target "$core_only_target" >/dev/null
+core_only_audit_code=$?
+bash "$uninstall_script" --target "$core_only_target" --packs architecture >/dev/null 2>&1
+core_only_pack_uninstall_code=$?
+bash "$uninstall_script" --target "$core_only_target" --packs "" >/dev/null 2>&1
+empty_uninstall_packs_code=$?
+bash "$uninstall_script" --target "$core_only_target" --packs "   " >/dev/null 2>&1
+blank_uninstall_packs_code=$?
+bash "$uninstall_script" --target "$core_only_target" --packs ",,," >/dev/null 2>&1
+comma_uninstall_packs_code=$?
+set -e
+[[ "$core_only_audit_code" -eq 2 ]] || fail "Core-only pending install returns audit exit code 2"
+[[ "$core_only_pack_uninstall_code" -eq 2 ]] || fail "Core-only uninstall reports an uninstalled requested pack"
+[[ "$empty_uninstall_packs_code" -eq 2 ]] || fail "uninstall rejects an empty explicit pack list"
+[[ "$blank_uninstall_packs_code" -eq 2 ]] || fail "uninstall rejects a whitespace-only pack list"
+[[ "$comma_uninstall_packs_code" -eq 2 ]] || fail "uninstall rejects a comma-only pack list"
+assert_file "$core_only_manifest" "rejected Core-only partial uninstall preserves manifest"
+[[ "$(sha256_file "$core_only_manifest")" == "$core_only_manifest_hash" ]] || fail "rejected pack lists leave the manifest unchanged"
+assert_file "$core_only_target/AGENTS.md" "rejected pack lists preserve Core files"
+bash "$uninstall_script" --target "$core_only_target" >/dev/null
+assert_not_file "$core_only_manifest" "Core-only full uninstall removes manifest"
+
+single_pack_target="$temp_root/single-pack"
+mkdir -p "$single_pack_target"
+bash "$install_script" --target "$single_pack_target" --packs architecture >/dev/null
+single_pack_manifest="$single_pack_target/.dev-workflow/manifest.json"
+bash "$uninstall_script" --target "$single_pack_target" --packs architecture >/dev/null
+assert_no_installed_packs "$single_pack_manifest" "removing the last pack records an empty pack list"
+
+set +e
+bash "$audit_script" --target "$single_pack_target" >/dev/null
+single_pack_audit_code=$?
+set -e
+[[ "$single_pack_audit_code" -eq 2 ]] || fail "Core remains valid after removing the last pack"
+bash "$uninstall_script" --target "$single_pack_target" >/dev/null
+assert_not_file "$single_pack_manifest" "full uninstall removes manifest after the last pack is removed"
 
 existing_target="$temp_root/existing"
 mkdir -p "$existing_target/docs"

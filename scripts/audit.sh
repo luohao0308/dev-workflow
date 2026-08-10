@@ -419,7 +419,7 @@ else
     done < <(find "$pack_root" -type f | LC_ALL=C sort)
   done
   if [[ "$schema_version" == "2" ]]; then
-    for relative_path in "${core_files[@]}"; do
+    for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
       if ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"
       else
