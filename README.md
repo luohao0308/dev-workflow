@@ -134,6 +134,14 @@ bash ./scripts/audit.sh --target /path/to/project
 
 审计退出码：`0` 表示结构正常且接入状态为 `ready`，`1` 表示安装损坏或缺少必要文件，`2` 表示安装存在但接入状态仍为 `pending` 或 `blocked`。可选的 `-Strict` / `--strict` 会把占位内容、版本落后等告警也视为退出码 `1`。
 
+### Bash 版本兼容
+
+`scripts/install.sh`、`scripts/audit.sh` 和 `scripts/uninstall.sh` 支持 macOS 自带的 Bash 3.2。脚本在 `set -u` 下对空流程包、空文件清单和空错误列表使用兼容展开，不要求安装新版 Bash。完整 Bash 端到端回归入口为：
+
+```bash
+bash tests/integration.sh
+```
+
 ## 卸载
 
 卸载器必须从 `dev-workflow` 分发仓库运行。schema 2 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash 3.2 treats an empty array expansion as unbound under `set -u`.
+# The `${items[@]+"${items[@]}"}` form expands all items, or nothing when empty.
+
 usage() {
   cat <<'EOF'
 用法：
   bash scripts/uninstall.sh --target /path/to/project [options]
 
 选项：
-  --packs delivery,operations  只卸载指定流程包；不提供时卸载 Core 和全部流程包
+  --packs delivery,operations  只卸载指定流程包（至少一个名称）；不提供时卸载 Core 和全部流程包
   --dry-run                    只显示动作，不写文件
   -h, --help                   显示帮助
 
@@ -189,7 +192,7 @@ build_manifest() {
   local last_audit_at="$5"
   local pack
   local packs_json=""
-  for pack in "${installed_packs[@]}"; do
+  for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
     [[ -n "$packs_json" ]] && packs_json+=","
     packs_json+=$'\n    '"\"$(json_escape "$pack")\""
   done
@@ -238,6 +241,7 @@ EOF
 target=""
 packs_csv=""
 dry_run=0
+packs_option_seen=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -248,6 +252,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --packs)
       [[ $# -ge 2 ]] || { echo "--packs 需要逗号分隔的流程包列表" >&2; exit 2; }
+      packs_option_seen=1
       if [[ -n "$packs_csv" ]]; then
         packs_csv="$packs_csv,$2"
       else
@@ -270,6 +275,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$packs_option_seen" -eq 1 ]] && [[ -z "$(printf '%s' "$packs_csv" | tr -d '[:space:],')" ]]; then
+  echo "--packs 需要至少一个流程包名称" >&2
+  exit 2
+fi
 
 [[ -n "$target" ]] || { echo "必须提供 --target" >&2; usage >&2; exit 2; }
 [[ -d "$target" ]] || { echo "目标目录不存在：$target" >&2; exit 1; }
@@ -320,20 +330,20 @@ while IFS= read -r pack; do
 done <<< "$pack_output"
 
 requested_packs=()
-if [[ -n "$packs_csv" ]]; then
+if [[ "$packs_option_seen" -eq 1 ]]; then
   IFS=',' read -r -a raw_packs <<< "$packs_csv"
-  for pack in "${raw_packs[@]}"; do
+  for pack in "${raw_packs[@]+"${raw_packs[@]}"}"; do
     pack="$(printf '%s' "$pack" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     [[ -n "$pack" ]] || continue
-    contains_item "$pack" "${installed_packs[@]}" || {
+    contains_item "$pack" "${installed_packs[@]+"${installed_packs[@]}"}" || {
       echo "流程包未安装：$pack。已安装：${installed_packs[*]-none}" >&2
       exit 2
     }
-    contains_item "$pack" "${requested_packs[@]}" || requested_packs+=("$pack")
+    contains_item "$pack" "${requested_packs[@]+"${requested_packs[@]}"}" || requested_packs+=("$pack")
   done
 fi
 full_uninstall=0
-[[ "${#requested_packs[@]}" -eq 0 ]] && full_uninstall=1
+[[ "$packs_option_seen" -eq 0 ]] && full_uninstall=1
 
 file_paths=()
 file_sources=()
@@ -350,7 +360,7 @@ if [[ "$schema_version" == "2" ]]; then
       echo "manifest files 包含重复路径：$entry_path" >&2
       exit 1
     fi
-    if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]}"; then
+    if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]+"${installed_packs[@]}"}"; then
       echo "manifest 将 $entry_path 归属于未安装流程包：$source" >&2
       exit 1
     fi
@@ -372,7 +382,7 @@ if [[ "$schema_version" == "2" ]]; then
 else
   overlay_names=("core")
   overlay_roots=("$source_root/core")
-  for pack in "${installed_packs[@]}"; do
+  for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
     [[ -d "$source_root/packs/$pack" ]] || { echo "旧 manifest 引用了不存在的流程包：$pack" >&2; exit 1; }
     overlay_names+=("$pack")
     overlay_roots+=("$source_root/packs/$pack")
@@ -405,7 +415,7 @@ for index in "${!file_paths[@]}"; do
   source="${file_sources[$index]}"
   action="${file_actions[$index]}"
   hash="${file_hashes[$index]}"
-  if [[ "$full_uninstall" -eq 0 ]] && ! contains_item "$source" "${requested_packs[@]}"; then
+  if [[ "$full_uninstall" -eq 0 ]] && ! contains_item "$source" "${requested_packs[@]+"${requested_packs[@]}"}"; then
     continue
   fi
   target_path="$target_root/$entry_path"
@@ -514,10 +524,10 @@ if [[ "$full_uninstall" -eq 1 ]]; then
   rmdir -- "$target_root/.dev-workflow" 2>/dev/null || true
 else
   remaining_packs=()
-  for pack in "${installed_packs[@]}"; do
-    contains_item "$pack" "${requested_packs[@]}" || remaining_packs+=("$pack")
+  for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
+    contains_item "$pack" "${requested_packs[@]+"${requested_packs[@]}"}" || remaining_packs+=("$pack")
   done
-  installed_packs=("${remaining_packs[@]}")
+  installed_packs=("${remaining_packs[@]+"${remaining_packs[@]}"}")
 
   remaining_paths=()
   remaining_sources=()
@@ -525,7 +535,7 @@ else
   remaining_hashes=()
   for index in "${!file_paths[@]}"; do
     source="${file_sources[$index]}"
-    if contains_item "$source" "${requested_packs[@]}"; then
+    if contains_item "$source" "${requested_packs[@]+"${requested_packs[@]}"}"; then
       continue
     fi
     remaining_paths+=("${file_paths[$index]}")
@@ -533,10 +543,10 @@ else
     remaining_actions+=("${file_actions[$index]}")
     remaining_hashes+=("${file_hashes[$index]}")
   done
-  file_paths=("${remaining_paths[@]}")
-  file_sources=("${remaining_sources[@]}")
-  file_actions=("${remaining_actions[@]}")
-  file_hashes=("${remaining_hashes[@]}")
+  file_paths=("${remaining_paths[@]+"${remaining_paths[@]}"}")
+  file_sources=("${remaining_sources[@]+"${remaining_sources[@]}"}")
+  file_actions=("${remaining_actions[@]+"${remaining_actions[@]}"}")
+  file_hashes=("${remaining_hashes[@]+"${remaining_hashes[@]}"}")
 
   manifest_tmp="$(mktemp "$manifest_path.XXXXXX")"
   now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -547,7 +557,7 @@ else
   mv -- "$manifest_tmp" "$manifest_path"
 fi
 
-for removed_path in "${removed_paths[@]}"; do
+for removed_path in "${removed_paths[@]+"${removed_paths[@]}"}"; do
   parent="$(dirname -- "$removed_path")"
   while [[ "$parent" == "$target_root"/* && "$parent" != "$target_root" ]]; do
     rmdir -- "$parent" 2>/dev/null || break

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash 3.2 treats an empty array expansion as unbound under `set -u`.
+# The `${items[@]+"${items[@]}"}` form expands all items, or nothing when empty.
+
 usage() {
   cat <<'EOF'
 用法：
   bash scripts/install.sh --target /path/to/project [options]
 
 选项：
-  --packs architecture,design,delivery  安装指定流程包
+  --packs architecture,design,delivery  安装指定流程包（至少一个名称）
   --all-packs                           安装全部流程包
   --dry-run                             只显示动作，不写文件
   -h, --help                            显示帮助
@@ -215,7 +218,7 @@ build_manifest() {
   local pack
   local index
   local packs_json=""
-  for pack in "${installed_packs[@]}"; do
+  for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
     if [[ -n "$packs_json" ]]; then
       packs_json+=","
     fi
@@ -267,6 +270,7 @@ dry_run=0
 all_packs=0
 target=""
 packs_csv=""
+packs_option_seen=0
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 core_root="$source_root/core"
@@ -282,6 +286,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --packs)
       [[ $# -ge 2 ]] || { echo "--packs 需要逗号分隔的流程包列表" >&2; exit 2; }
+      packs_option_seen=1
       if [[ -n "$packs_csv" ]]; then
         packs_csv="$packs_csv,$2"
       else
@@ -308,6 +313,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$packs_option_seen" -eq 1 ]] && [[ -z "$(printf '%s' "$packs_csv" | tr -d '[:space:],')" ]]; then
+  echo "--packs 需要至少一个流程包名称" >&2
+  exit 2
+fi
 
 [[ -n "$target" ]] || { echo "必须提供 --target" >&2; usage >&2; exit 2; }
 [[ -d "$target" ]] || { echo "目标目录不存在：$target" >&2; exit 1; }
@@ -398,17 +408,17 @@ if [[ "$existing_manifest" -eq 1 ]]; then
   while IFS= read -r pack; do
     [[ -n "$pack" ]] || continue
     pack="$(printf '%s' "$pack" | tr '[:upper:]' '[:lower:]')"
-    contains_item "$pack" "${available_packs[@]}" || {
+    contains_item "$pack" "${available_packs[@]+"${available_packs[@]}"}" || {
       echo "manifest 引用了不存在的流程包：$pack" >&2
       exit 1
     }
-    contains_item "$pack" "${existing_packs[@]}" || existing_packs+=("$pack")
+    contains_item "$pack" "${existing_packs[@]+"${existing_packs[@]}"}" || existing_packs+=("$pack")
   done <<< "$manifest_pack_output"
 fi
 
 for index in "${!file_paths[@]}"; do
   source="${file_sources[$index]}"
-  if [[ "$source" != "core" ]] && ! contains_item "$source" "${existing_packs[@]}"; then
+  if [[ "$source" != "core" ]] && ! contains_item "$source" "${existing_packs[@]+"${existing_packs[@]}"}"; then
     echo "manifest 将 ${file_paths[$index]} 归属于未安装流程包：$source" >&2
     exit 1
   fi
@@ -433,33 +443,33 @@ done
 
 selected_packs=()
 if [[ "$all_packs" -eq 1 ]]; then
-  selected_packs=("${available_packs[@]}")
-elif [[ -n "$packs_csv" ]]; then
+  selected_packs=("${available_packs[@]+"${available_packs[@]}"}")
+elif [[ "$packs_option_seen" -eq 1 ]]; then
   IFS=',' read -r -a requested_packs <<< "$packs_csv"
-  for pack in "${requested_packs[@]}"; do
+  for pack in "${requested_packs[@]+"${requested_packs[@]}"}"; do
     pack="$(printf '%s' "$pack" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     [[ -n "$pack" ]] || continue
     if [[ "$pack" == "all" ]]; then
-      selected_packs=("${available_packs[@]}")
+      selected_packs=("${available_packs[@]+"${available_packs[@]}"}")
       break
     fi
-    contains_item "$pack" "${available_packs[@]}" || {
-      echo "未知流程包：$pack。可用流程包：${available_packs[*]}" >&2
+    contains_item "$pack" "${available_packs[@]+"${available_packs[@]}"}" || {
+      echo "未知流程包：$pack。可用流程包：${available_packs[*]-none}" >&2
       exit 2
     }
-    contains_item "$pack" "${selected_packs[@]}" || selected_packs+=("$pack")
+    contains_item "$pack" "${selected_packs[@]+"${selected_packs[@]}"}" || selected_packs+=("$pack")
   done
 fi
 
 installed_packs=()
-for pack in "${available_packs[@]}"; do
-  if contains_item "$pack" "${existing_packs[@]}" || contains_item "$pack" "${selected_packs[@]}"; then
+for pack in "${available_packs[@]+"${available_packs[@]}"}"; do
+  if contains_item "$pack" "${existing_packs[@]+"${existing_packs[@]}"}" || contains_item "$pack" "${selected_packs[@]+"${selected_packs[@]}"}"; then
     installed_packs+=("$pack")
   fi
 done
 
 if [[ "$existing_schema_version" == "1" ]]; then
-  for pack in "${existing_packs[@]}"; do
+  for pack in "${existing_packs[@]+"${existing_packs[@]}"}"; do
     legacy_pack_root="$packs_root/$pack"
     while IFS= read -r source_path; do
       relative_path="${source_path#"$legacy_pack_root"/}"
@@ -494,7 +504,7 @@ core_block="$(awk '
 
 overlay_names=("core")
 overlay_roots=("$core_root")
-for pack in "${selected_packs[@]}"; do
+for pack in "${selected_packs[@]+"${selected_packs[@]}"}"; do
   overlay_names+=("$pack")
   overlay_roots+=("$packs_root/$pack")
 done
@@ -510,7 +520,7 @@ for index in "${!overlay_roots[@]}"; do
     [[ -n "$source_path" ]] || continue
     relative_path="${source_path#"$overlay_root"/}"
 
-    if contains_item "$relative_path" "${seen_paths[@]}"; then
+    if contains_item "$relative_path" "${seen_paths[@]+"${seen_paths[@]}"}"; then
       echo "Overlay 路径冲突：$relative_path" >&2
       exit 1
     fi
@@ -637,4 +647,4 @@ if [[ "$dry_run" -eq 1 ]]; then
 else
   echo "dev-workflow 安装完成（packs: $pack_summary）"
 fi
-printf '%s\n' "${actions[@]}"
+printf '%s\n' "${actions[@]+"${actions[@]}"}"
