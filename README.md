@@ -58,6 +58,7 @@ dev-workflow/
 Core 提供：
 
 - `AGENTS.md`：自动协作规则、首次项目扫描、规则分层、任务推进、安全和完成标准；
+- 大型计划拆分确认门：在跨模块或高风险计划实施前，先列出 `2-6` 个切片并等待用户确认；
 - `docs/README.md`：文档导航与权威边界；
 - `docs/TASKS.md`：唯一任务状态源；
 - `docs/WORKING-CONTEXT.md`：当前主任务短期记忆；
@@ -73,11 +74,13 @@ Core 提供：
 |---|---|---|
 | `architecture` | 系统架构、模块边界、ADR 模板 | 多模块、Monorepo、多仓库、长期维护项目 |
 | `design` | 根 `DESIGN.md`、设计索引与完整设计模板 | 新功能、产品/UI、复杂技术方案 |
-| `delivery` | 开发命令、Worktree、测试、计划、并行上下文、工作日志 | 需要可重复的开发、验证和 Git 交付流程 |
+| `delivery` | 开发命令、Worktree、测试、计划、并行上下文、工作日志，以及大型计划拆分确认门 | 需要可重复的开发、验证和 Git 交付流程 |
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 
 流程包只包含普通 Markdown 文件，不会安装新的运行时或后台进程。
+
+Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
 
 ## 安装
 
@@ -133,6 +136,14 @@ bash ./scripts/audit.sh --target /path/to/project
 ```
 
 审计退出码：`0` 表示结构正常且接入状态为 `ready`，`1` 表示安装损坏或缺少必要文件，`2` 表示安装存在但接入状态仍为 `pending` 或 `blocked`。可选的 `-Strict` / `--strict` 会把占位内容、版本落后等告警也视为退出码 `1`。
+
+### Bash 版本兼容
+
+`scripts/install.sh`、`scripts/audit.sh` 和 `scripts/uninstall.sh` 支持 macOS 自带的 Bash 3.2。脚本在 `set -u` 下对空流程包、空文件清单和空错误列表使用兼容展开，不要求安装新版 Bash。完整 Bash 端到端回归入口为：
+
+```bash
+bash tests/integration.sh
+```
 
 ## 卸载
 

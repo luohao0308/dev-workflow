@@ -51,6 +51,10 @@ fresh_manifest="$fresh_target/.dev-workflow/manifest.json"
 assert_file "$fresh_manifest" "new install creates manifest"
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*2' "$fresh_manifest" || fail "new installs use schema 2"
 grep -Eq '"path":"AGENTS.md","source":"core","action":"created"' "$fresh_manifest" || fail "new installs record created ownership"
+grep -Fq '## 大型计划拆分与确认门' "$fresh_target/AGENTS.md" || fail "Core install includes the large-plan approval gate"
+grep -Fq 'awaiting_user_confirmation' "$fresh_target/docs/plans/README.md" || fail "delivery plans expose the approval state"
+grep -Fq '## 7. 偏移控制' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template includes drift control"
+grep -Fq 'codex/*' "$fresh_target/docs/development/GIT-WORKTREE-WORKFLOW.md" || fail "delivery workflow protects local Codex branches"
 
 first_updated_at="$(grep -E '"updatedAt"' "$fresh_manifest")"
 bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
@@ -111,6 +115,7 @@ bash "$install_script" --target "$existing_target" >/dev/null
 existing_manifest="$existing_target/.dev-workflow/manifest.json"
 grep -Eq '"path":"AGENTS.md","source":"core","action":"appended"' "$existing_manifest" || fail "existing AGENTS records appended ownership"
 grep -Eq '"path":"docs/TASKS.md","source":"core","action":"preserved"' "$existing_manifest" || fail "pre-existing files record preserved ownership"
+grep -Fq '## 大型计划拆分与确认门' "$existing_target/AGENTS.md" || fail "existing AGENTS receives the large-plan approval gate"
 
 bash "$uninstall_script" --target "$existing_target" >/dev/null
 grep -Fq '# Existing project rules' "$existing_target/AGENTS.md" || fail "existing AGENTS content is preserved"
