@@ -49,6 +49,28 @@ $coreFiles = @(
     'docs/project-memory/README.md'
 )
 
+$coreSourcePath = Join-Path $sourceRoot 'core/AGENTS.md'
+$coreSourceContent = if (Test-Path -LiteralPath $coreSourcePath -PathType Leaf) {
+    Get-Content -LiteralPath $coreSourcePath -Raw -Encoding UTF8
+} else { '' }
+if ($coreSourceContent -notmatch '## 大型计划拆分与确认门' -or $coreSourceContent -notmatch 'awaiting_user_confirmation') {
+    Add-Error $errors 'Distribution Core is missing the large-plan decomposition approval contract.'
+}
+$deliveryReadmeSource = Join-Path $sourceRoot 'packs/delivery/docs/plans/README.md'
+$deliveryTemplateSource = Join-Path $sourceRoot 'packs/delivery/docs/plans/TEMPLATE.md'
+$deliveryReadmeContent = if (Test-Path -LiteralPath $deliveryReadmeSource -PathType Leaf) {
+    Get-Content -LiteralPath $deliveryReadmeSource -Raw -Encoding UTF8
+} else { '' }
+if ($deliveryReadmeContent -notmatch '大型计划确认门') {
+    Add-Error $errors 'Distribution delivery plan index is missing the large-plan approval contract.'
+}
+$deliveryTemplateContent = if (Test-Path -LiteralPath $deliveryTemplateSource -PathType Leaf) {
+    Get-Content -LiteralPath $deliveryTemplateSource -Raw -Encoding UTF8
+} else { '' }
+if ($deliveryTemplateContent -notmatch 'awaiting_user_confirmation' -or $deliveryTemplateContent -notmatch '## 7\. 偏移控制') {
+    Add-Error $errors 'Distribution delivery plan template is missing confirmation or drift-control fields.'
+}
+
 foreach ($relativePath in $coreFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
         Add-Error $errors "Missing Core file: $relativePath"

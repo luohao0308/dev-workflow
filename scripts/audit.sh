@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# Bash 3.2 treats an empty array expansion as unbound under `set -u`.
+# The `${items[@]+"${items[@]}"}` form expands all items, or nothing when empty.
+
 usage() {
   cat <<'EOF'
 用法：
@@ -234,7 +237,20 @@ core_files=(
   "docs/project-memory/README.md"
 )
 
-for relative_path in "${core_files[@]}"; do
+core_source_path="$source_root/core/AGENTS.md"
+if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## 大型计划拆分与确认门' "$core_source_path" || ! grep -Fq 'awaiting_user_confirmation' "$core_source_path"; then
+  add_error "分发 Core 缺少大型计划拆分确认门契约。"
+fi
+delivery_readme_source="$source_root/packs/delivery/docs/plans/README.md"
+delivery_template_source="$source_root/packs/delivery/docs/plans/TEMPLATE.md"
+if [[ ! -f "$delivery_readme_source" ]] || ! grep -Fq '大型计划确认门' "$delivery_readme_source"; then
+  add_error "分发 delivery 计划导航缺少大型计划确认门契约。"
+fi
+if [[ ! -f "$delivery_template_source" ]] || ! grep -Fq 'awaiting_user_confirmation' "$delivery_template_source" || ! grep -Fq '## 7. 偏移控制' "$delivery_template_source"; then
+  add_error "分发 delivery 计划模板缺少确认状态或偏移控制契约。"
+fi
+
+for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
   if [[ ! -f "$target_root/$relative_path" ]]; then
     add_error "缺少 Core 文件：$relative_path"
   fi
@@ -316,14 +332,14 @@ else
     else
       while IFS='|' read -r entry_path source action hash; do
         [[ -n "$entry_path" ]] || continue
-        if contains_item "$entry_path" "${inventory_paths[@]}"; then
+        if contains_item "$entry_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
           add_error "manifest files 包含重复路径：$entry_path"
         else
           inventory_paths+=("$entry_path")
           inventory_sources+=("$source")
           inventory_actions+=("$action")
           inventory_hashes+=("$hash")
-          if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]}"; then
+          if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]+"${installed_packs[@]}"}"; then
             add_error "manifest 文件 $entry_path 归属于未安装流程包：$source"
           else
             owner_root="$source_root/core"
@@ -367,9 +383,9 @@ else
   fi
 
   seen_packs=()
-  for pack in "${installed_packs[@]}"; do
+  for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
     duplicate=0
-    for seen_pack in "${seen_packs[@]}"; do
+    for seen_pack in "${seen_packs[@]+"${seen_packs[@]}"}"; do
       if [[ "$seen_pack" == "$pack" ]]; then
         duplicate=1
         break
@@ -392,7 +408,7 @@ else
       if [[ ! -f "$target_root/$relative_path" ]]; then
         add_error "流程包 $pack 缺少文件：$relative_path"
       fi
-      if [[ "$schema_version" == "2" ]] && ! contains_item "$relative_path" "${inventory_paths[@]}"; then
+      if [[ "$schema_version" == "2" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少流程包文件：$relative_path"
       elif [[ "$schema_version" == "2" ]]; then
         inventory_source="$(inventory_source_for "$relative_path")"
@@ -404,7 +420,7 @@ else
   done
   if [[ "$schema_version" == "2" ]]; then
     for relative_path in "${core_files[@]}"; do
-      if ! contains_item "$relative_path" "${inventory_paths[@]}"; then
+      if ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"
       else
         inventory_source="$(inventory_source_for "$relative_path")"
@@ -444,7 +460,7 @@ if [[ -f "$context_path" ]]; then
 fi
 
 initialization_files=("docs/PROJECT-SUMMARY.md" "docs/WORKFLOW-ADOPTION.md")
-for relative_path in "${initialization_files[@]}"; do
+for relative_path in "${initialization_files[@]+"${initialization_files[@]}"}"; do
   path="$target_root/$relative_path"
   if [[ -f "$path" ]] && grep -Eq 'YYYY-MM-DD|待初始化|<!--[[:space:]]*(填写|path|command|repo/path)' "$path"; then
     add_warning "仍包含接入占位内容：$relative_path"
@@ -462,10 +478,10 @@ if [[ -f "$manifest_path" ]]; then
   fi
   echo "onboarding: $manifest_status"
 fi
-for message in "${errors[@]}"; do
+for message in "${errors[@]+"${errors[@]}"}"; do
   echo "[error] $message"
 done
-for message in "${warnings[@]}"; do
+for message in "${warnings[@]+"${warnings[@]}"}"; do
   echo "[warn] $message"
 done
 

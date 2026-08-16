@@ -34,6 +34,10 @@ try {
     Assert-True ([string]$manifest.schemaVersion -eq '2') 'new installs use manifest schema 2'
     Assert-True (@($manifest.files).Count -gt 20) 'new installs record a file ownership inventory'
     Assert-True (@($manifest.files | Where-Object action -eq 'created').Count -gt 20) 'new files record created ownership'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 大型计划拆分与确认门') 'Core install includes the large-plan approval gate'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/README.md') -Raw -Encoding UTF8) -match 'awaiting_user_confirmation') 'delivery plans expose the approval state'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match '## 7\. 偏移控制') 'delivery plan template includes drift control'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/GIT-WORKTREE-WORKFLOW.md') -Raw -Encoding UTF8) -match 'codex/\*') 'delivery workflow protects local Codex branches'
 
     $firstUpdatedAt = [string]$manifest.updatedAt
     & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
@@ -81,6 +85,7 @@ try {
     $existingManifest = Get-Content -LiteralPath (Join-Path $existingTarget '.dev-workflow/manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True (($existingManifest.files | Where-Object path -eq 'AGENTS.md').action -eq 'appended') 'existing AGENTS.md records appended ownership'
     Assert-True (($existingManifest.files | Where-Object path -eq 'docs/TASKS.md').action -eq 'preserved') 'pre-existing files record preserved ownership'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $existingTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 大型计划拆分与确认门') 'existing AGENTS.md receives the large-plan approval gate'
 
     & $uninstallScript -TargetPath $existingTarget | Out-Null
     $remainingAgents = Get-Content -LiteralPath (Join-Path $existingTarget 'AGENTS.md') -Raw -Encoding UTF8
