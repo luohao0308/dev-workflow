@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dev-workflow.local/schemas/feature-catalog.schema.json",
+  "title": "Project Feature Catalog",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "catalog_version", "updated_at", "title", "items"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "catalog_version": {"type": "integer", "minimum": 1},
+    "updated_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "title": {"type": "string", "minLength": 1},
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/item"}
+    }
+  },
+  "$defs": {
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "parent_id", "level", "name", "summary", "keywords", "platforms",
+        "implementation_status", "maturity", "acceptance_criteria", "code_paths",
+        "spec_paths", "test_paths", "evidence", "known_gaps", "task_ids"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+        "parent_id": {"type": ["string", "null"]},
+        "level": {"type": "string", "enum": ["domain", "capability", "feature"]},
+        "name": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "minLength": 1},
+        "keywords": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "platforms": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"},
+          "uniqueItems": true
+        },
+        "implementation_status": {
+          "type": "string",
+          "enum": ["not_started", "in_progress", "implemented", "verified"]
+        },
+        "maturity": {
+          "type": "string",
+          "enum": ["prototype", "beta", "production_candidate", "production_ready", "production_proven"]
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "code_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "spec_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "test_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "evidence": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/evidence"}
+        },
+        "known_gaps": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "task_ids": {
+          "type": "array",
+          "items": {"type": "string", "pattern": "^\\S+$"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "command", "result", "verified_at", "commit", "ref"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["unit", "integration", "e2e", "smoke", "release", "live", "docs"]
+        },
+        "command": {"type": "string", "minLength": 1},
+        "result": {"type": "string", "enum": ["passed", "blocked", "partial"]},
+        "verified_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        "commit": {"type": ["string", "null"]},
+        "ref": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

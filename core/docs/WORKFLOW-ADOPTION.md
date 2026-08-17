@@ -24,8 +24,9 @@ updated: YYYY-MM-DD
 4. 识别受保护路径、凭据边界、需要人工授权的操作和无法验证的 Unknown。
 5. 将已验证稳定事实填入 `PROJECT-SUMMARY.md`，将项目专属规则填入根 `AGENTS.md` 的项目扩展区或现有等价入口。
 6. 按实际启用的流程包补充导航、命令矩阵、契约索引、Runbook 和验证入口。
-7. 保持 `pending` 状态运行接入审计；预期退出码为 `2`，但不应有结构错误，告警应逐项处理或解释。
-8. 完成检查清单后，同步将本文件与 manifest 的 `onboarding.status` 改为 `ready`，在 manifest 写入 UTC `lastAuditAt`，再运行审计并确认退出码为 `0`。
+7. 如果安装了 `feature-catalog`，运行 `python3 scripts/feature_catalog.py --init`，用项目事实替换脚手架，生成矩阵，并把 `--check` 接入适用的 CI。
+8. 保持 `pending` 状态运行接入审计；预期退出码为 `2`，但不应有结构错误，告警应逐项处理或解释。
+9. 完成检查清单后，同步将本文件与 manifest 的 `onboarding.status` 改为 `ready`，在 manifest 写入 UTC `lastAuditAt`，再运行审计并确认退出码为 `0`。
 
 ## 接入检查清单
 
@@ -36,6 +37,7 @@ updated: YYYY-MM-DD
 - [ ] 契约、迁移、发布、健康检查和回滚入口按项目适用性登记。
 - [ ] 敏感信息和不可逆操作边界已明确。
 - [ ] Unknown、阻塞和需要人工确认的事项已记录。
+- [ ] 如安装 `feature-catalog`：活动清单已按项目事实初始化，矩阵已生成，`python3 scripts/feature_catalog.py --check` 通过。
 - [ ] 已从 dev-workflow 分发仓库运行 `audit.ps1` 或 `audit.sh`；最终 `ready` 状态审计退出码为 `0`，剩余告警已有解释。
 
 ## 既有文档映射
@@ -48,6 +50,7 @@ updated: YYYY-MM-DD
 | 架构/模块 | <!-- path --> | <!-- yes/no --> |  |
 | 设计/计划 | <!-- path --> | <!-- yes/no --> |  |
 | 契约/生成物 | <!-- path --> | <!-- yes/no --> |  |
+| 功能清单/成熟度（如启用） | <!-- path --> | <!-- yes/no --> |  |
 | 测试/验证 | <!-- path --> | <!-- yes/no --> |  |
 | 运维/Runbook | <!-- path --> | <!-- yes/no --> |  |
 | 历史证据 | <!-- path --> | <!-- yes/no --> |  |

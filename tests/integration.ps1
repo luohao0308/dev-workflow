@@ -38,6 +38,23 @@ try {
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/README.md') -Raw -Encoding UTF8) -match 'awaiting_user_confirmation') 'delivery plans expose the approval state'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match '## 7\. 偏移控制') 'delivery plan template includes drift control'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/GIT-WORKTREE-WORKFLOW.md') -Raw -Encoding UTF8) -match 'codex/\*') 'delivery workflow protects local Codex branches'
+    Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/feature_catalog.py' -and $_.source -eq 'feature-catalog' }).Count -eq 1) 'all-packs installs feature-catalog ownership'
+
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($null -eq $pythonCommand) { $pythonCommand = Get-Command python -ErrorAction SilentlyContinue }
+    Assert-True ($null -ne $pythonCommand) 'feature-catalog integration requires Python 3'
+    $featureCatalogTool = Join-Path $freshTarget 'scripts/feature_catalog.py'
+    & $pythonCommand.Name $featureCatalogTool --root $freshTarget --init | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog initializes project data'
+    & $pythonCommand.Name $featureCatalogTool --root $freshTarget --generate | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog generates the matrix'
+    & $pythonCommand.Name $featureCatalogTool --root $freshTarget --check | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog generated matrix is current'
+    $activeCatalogPath = Join-Path $freshTarget 'docs/development/ai/feature-catalog.json'
+    $catalogHashBeforeReinstall = (Get-FileHash -LiteralPath $activeCatalogPath -Algorithm SHA256).Hash
+    & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
+    $catalogHashAfterReinstall = (Get-FileHash -LiteralPath $activeCatalogPath -Algorithm SHA256).Hash
+    Assert-True ($catalogHashBeforeReinstall -eq $catalogHashAfterReinstall) 'reinstall does not overwrite active feature catalog'
 
     $firstUpdatedAt = [string]$manifest.updatedAt
     & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
@@ -57,6 +74,11 @@ try {
     Write-Utf8NoBom -Path $freshManifestPath -Content (($manifest | ConvertTo-Json -Depth 8) + "`n")
     Write-Utf8NoBom -Path (Join-Path $freshTarget 'docs/PROJECT-SUMMARY.md') -Content "# Project summary`n`nVerified project facts.`n"
     Write-Utf8NoBom -Path (Join-Path $freshTarget 'docs/WORKFLOW-ADOPTION.md') -Content "---`nworkflow: dev-workflow`nstatus: ready`nupdated: 2026-01-01`n---`n`n# Adoption`n`nVerified.`n"
+    [IO.File]::AppendAllText((Join-Path $freshTarget 'docs/FEATURE-MATRIX.md'), "`nmanual matrix drift`n", [Text.UTF8Encoding]::new($false))
+    & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget -Strict *> $null
+    Assert-True ($LASTEXITCODE -eq 1) 'strict audit rejects feature matrix drift'
+    & $pythonCommand.Name $featureCatalogTool --root $freshTarget --generate | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog regeneration repairs matrix drift'
     & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget -Strict *> $null
     Assert-True ($LASTEXITCODE -eq 0) 'a completed schema 2 install passes strict audit'
 
@@ -75,6 +97,25 @@ try {
     & $uninstallScript -TargetPath $freshTarget | Out-Null
     Assert-True (-not (Test-Path -LiteralPath $freshManifestPath)) 'full uninstall removes the manifest'
     Assert-True (Test-Path -LiteralPath $modifiedDeliveryFile -PathType Leaf) 'project-modified content remains after full uninstall'
+    Assert-True (Test-Path -LiteralPath $activeCatalogPath -PathType Leaf) 'full uninstall preserves active feature catalog'
+    Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'docs/FEATURE-MATRIX.md') -PathType Leaf) 'full uninstall preserves generated feature matrix'
+
+    $featurePackTarget = Join-Path $tempRoot 'feature-pack'
+    New-Item -ItemType Directory -Path $featurePackTarget | Out-Null
+    & $installScript -TargetPath $featurePackTarget -Packs feature-catalog | Out-Null
+    $featurePackManifestPath = Join-Path $featurePackTarget '.dev-workflow/manifest.json'
+    $featurePackTool = Join-Path $featurePackTarget 'scripts/feature_catalog.py'
+    & $pythonCommand.Name $featurePackTool --root $featurePackTarget --init | Out-Null
+    & $pythonCommand.Name $featurePackTool --root $featurePackTarget --generate | Out-Null
+    & $uninstallScript -TargetPath $featurePackTarget -Packs feature-catalog | Out-Null
+    $featurePackManifest = Get-Content -LiteralPath $featurePackManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (@($featurePackManifest.installedPacks).Count -eq 0) 'removing feature-catalog leaves a Core-only manifest'
+    Assert-True (-not (Test-Path -LiteralPath $featurePackTool)) 'partial uninstall removes unchanged feature-catalog tool'
+    Assert-True (Test-Path -LiteralPath (Join-Path $featurePackTarget 'docs/development/ai/feature-catalog.json') -PathType Leaf) 'partial uninstall preserves active feature catalog'
+    Assert-True (Test-Path -LiteralPath (Join-Path $featurePackTarget 'docs/FEATURE-MATRIX.md') -PathType Leaf) 'partial uninstall preserves generated feature matrix'
+    & $uninstallScript -TargetPath $featurePackTarget | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath $featurePackManifestPath)) 'full uninstall removes Core manifest after feature pack removal'
+    Assert-True (Test-Path -LiteralPath (Join-Path $featurePackTarget 'docs/development/ai/feature-catalog.json') -PathType Leaf) 'Core uninstall still preserves active feature catalog'
 
     $existingTarget = Join-Path $tempRoot 'existing'
     New-Item -ItemType Directory -Path $existingTarget | Out-Null

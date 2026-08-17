@@ -1,6 +1,6 @@
 # dev-workflow
 
-`dev-workflow` 是一套可放在 GitHub 分发、安装到任意代码仓库或多仓库工作区的通用 AI 协作开发流程。它不依赖 Skill、Plugin、常驻 CLI、特定模型、前后端框架或业务领域。
+`dev-workflow` 是一套可放在 GitHub 分发、安装到任意代码仓库或多仓库工作区的通用 AI 协作开发流程。Core 不依赖 Skill、Plugin、常驻 CLI、特定模型、前后端框架或业务领域；可选 `feature-catalog` 自动化只使用 Python 3 标准库。
 
 安装完成后，AI 日常只需自动读取目标项目中的 `AGENTS.md`；其他 Markdown 文件由 `AGENTS.md` 按任务引导读取。
 
@@ -32,12 +32,13 @@
 ```text
 dev-workflow/
 ├── core/                  # 每个项目都适用的协作与知识治理核心
-├── packs/                 # 按项目选择安装的普通 Markdown 流程包
+├── packs/                 # 按项目选择安装的流程包
 │   ├── architecture/
 │   ├── design/
 │   ├── delivery/
 │   ├── contracts/
-│   └── operations/
+│   ├── operations/
+│   └── feature-catalog/   # 功能清单 Schema、模板、说明和标准库工具
 ├── VERSION                # 分发仓库版本
 ├── scripts/               # 安装、卸载和接入审计工具，不进入目标项目
 │   ├── install.ps1
@@ -46,7 +47,8 @@ dev-workflow/
 │   ├── uninstall.sh
 │   ├── audit.ps1
 │   └── audit.sh
-└── tests/                 # PowerShell/Bash 端到端脚本测试
+└── tests/                 # 单元测试与 PowerShell/Bash 端到端脚本测试
+    ├── test_feature_catalog.py
     ├── integration.ps1
     └── integration.sh
 ```
@@ -77,8 +79,9 @@ Core 提供：
 | `delivery` | 开发命令、Worktree、测试、计划、并行上下文、工作日志，以及大型计划拆分确认门 | 需要可重复的开发、验证和 Git 交付流程 |
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
+| `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
 
-流程包只包含普通 Markdown 文件，不会安装新的运行时或后台进程。
+多数流程包只包含普通 Markdown 文件。`feature-catalog` 额外安装一个零第三方依赖的 Python 3 脚本；它不会安装解释器、依赖包、后台进程或常驻服务。不启用该包时，Core 和其他流程包的行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
 
@@ -98,7 +101,7 @@ Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁
 ```powershell
 .\scripts\install.ps1 `
   -TargetPath "D:\Projects\another-project" `
-  -Packs architecture,design,delivery
+  -Packs architecture,design,delivery,feature-catalog
 ```
 
 安装全部流程包：
@@ -117,15 +120,40 @@ bash ./scripts/install.sh --target /path/to/project
 # 安装选定流程包
 bash ./scripts/install.sh \
   --target /path/to/project \
-  --packs architecture,design,delivery
+  --packs architecture,design,delivery,feature-catalog
 
 # 安装全部流程包
 bash ./scripts/install.sh --target /path/to/project --all-packs
 ```
 
+### 功能清单初始化与使用
+
+只有选择了 `feature-catalog` 流程包的项目才需要这些命令。安装完成后，在目标项目根目录运行：
+
+```bash
+# 首次创建活动清单；文件已经存在时会拒绝覆盖
+python3 scripts/feature_catalog.py --init
+
+# 只读校验 JSON 结构、层级、成熟度规则、证据和仓库内路径
+python3 scripts/feature_catalog.py --validate
+
+# 校验后写入/更新面向人的 docs/FEATURE-MATRIX.md
+python3 scripts/feature_catalog.py --generate
+
+# 只读校验清单，并确认生成矩阵没有漂移；适合 CI 和接入审计
+python3 scripts/feature_catalog.py --check
+
+# 只读返回匹配功能及其必要祖先；适合 AI 按当前任务加载最小上下文
+python3 scripts/feature_catalog.py --query "login release evidence"
+```
+
+这些命令主要服务 AI 协作和 CI 门禁，但人也可以直接使用。`--init` 和 `--generate` 会写项目文件，其余命令只读；查询还支持项目自定义的 `--platform` 标签，以及 `--status`、`--maturity`、`--limit` 和 `--json`。初始化后必须用当前项目事实替换模板示例，不能把模板状态当成产品完成情况。
+
+项目维护的活动清单 `docs/development/ai/feature-catalog.json` 和生成矩阵 `docs/FEATURE-MATRIX.md` 不属于安装器的文件清单；它们是项目数据，不会在重装或卸载流程包时被覆盖或删除。完整字段、成熟度门和 CI 接入方式见安装后的 `docs/development/ai/FEATURE-CATALOG.md`。
+
 ### 接入审计
 
-审计只检查安装结构、流程包文件、核心标记、manifest 和初始化状态；它不会修改项目代码，也不会读取凭据。
+审计检查安装结构、流程包文件、核心标记、manifest 和初始化状态；安装了 `feature-catalog` 时还会只读运行目录校验与矩阵漂移检查。它不会修改项目代码，也不会读取凭据。
 
 ```powershell
 .\scripts\audit.ps1 -TargetPath "D:\Projects\another-project"
@@ -136,6 +164,8 @@ bash ./scripts/audit.sh --target /path/to/project
 ```
 
 审计退出码：`0` 表示结构正常且接入状态为 `ready`，`1` 表示安装损坏或缺少必要文件，`2` 表示安装存在但接入状态仍为 `pending` 或 `blocked`。可选的 `-Strict` / `--strict` 会把占位内容、版本落后等告警也视为退出码 `1`。
+
+安装了 `feature-catalog` 时，审计会调用目标项目自己的 `scripts/feature_catalog.py --check`。接入状态为 `pending` 或 `blocked` 时，活动清单缺失、矩阵缺失或检查失败记为告警；状态为 `ready` 时记为错误并返回 `1`。因此项目可以先完成画像和清单初始化，再把 onboarding 切换为 `ready`。
 
 ### Bash 版本兼容
 
@@ -184,6 +214,7 @@ bash ./scripts/uninstall.sh \
 - `AGENTS.md` 只移除带稳定标记的 AI-WORKFLOW 核心区块；安装后新增的项目专属规则会保留。
 - 只有 manifest 标记为安装器创建、且当前哈希仍等于安装时哈希的文件才会自动删除。
 - 安装前已存在、安装后被修改或旧版来源不明的文件始终保留，并在输出中标记为 `[keep]`。
+- `feature-catalog` 的活动清单和生成矩阵是项目数据，不进入 manifest 文件所有权；部分或完整卸载都会保留它们。
 - 部分卸载会更新 manifest 中的流程包和文件清单；完整卸载最后删除 manifest，并且只清理已经为空的目录。
 - `schemaVersion: 1` 的旧安装会先保守迁移：核心标记可移除，普通文件标记为 `legacy`，不会因无法证明所有权而被删除。
 
@@ -209,6 +240,7 @@ bash ./scripts/uninstall.sh \
 - 自动删除还要求 `created` 文件的安装哈希等于同版本分发文件哈希；卸载器版本不匹配时会停止，避免用新版模板推断旧版所有权。
 - 目标项目已有非 dev-workflow 管理的 `.dev-workflow/manifest.json` 时安装会停止，不覆盖未知元数据。
 - 安装脚本和 `core/`、`packs/` 分发目录不会复制到目标项目。
+- `feature-catalog` 的 Schema、模板、说明和工具由 manifest 管理；活动清单和生成矩阵由项目管理，不记录为安装器拥有的文件。
 - `audit` 不会自动把项目标记为已接入；必须先完成 `WORKFLOW-ADOPTION.md` 中的项目画像和文档映射，再同步更新文档状态、manifest 的 `onboarding.status` 与 `lastAuditAt`。
 - 自动升级不会静默改写已有规则；升级先比较 GitHub 版本差异，再用 dry-run 查看安装计划，审核合并后运行审计。
 
@@ -231,7 +263,20 @@ bash ./scripts/uninstall.sh \
         └── README.md
 ```
 
-安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/`、`工作日志/` 和 Runbook 模板；设计包还会增加根 `DESIGN.md`。
+安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/`、`工作日志/` 和 Runbook 模板；设计包还会增加根 `DESIGN.md`。`feature-catalog` 包还会增加：
+
+```text
+.
+├── scripts/
+│   └── feature_catalog.py
+└── docs/
+    ├── FEATURE-MATRIX.md                         # --generate 后创建的项目数据
+    └── development/ai/
+        ├── FEATURE-CATALOG.md
+        ├── feature-catalog.schema.json
+        ├── feature-catalog.template.json
+        └── feature-catalog.json                  # --init 后创建的项目数据
+```
 
 ## 首次使用
 
@@ -245,11 +290,15 @@ bash ./scripts/uninstall.sh \
 
 完成项目画像后，先在 `pending` 状态运行审计并处理结构错误和告警，再同步将 `WORKFLOW-ADOPTION.md` 与 manifest 标记为 `ready`，记录审计时间，最后重跑审计确认退出码为 `0`。此后正常对话即可自动沿用这套开发风格，不需要每次调用 Skill 或运行 CLI。安装和审计脚本只在首次接入或升级时使用。
 
+如果选择了 `feature-catalog`，在切换到 `ready` 前还要运行 `--init`，用项目事实维护活动清单，再运行 `--generate` 和 `--check`。后续对话无需重复安装；AI 按任务查询清单，维护者在功能、证据或成熟度变化时更新清单并重新生成矩阵。
+
 ## 版本与升级
 
 分发仓库的版本写在 `VERSION`。目标项目的 manifest 应随项目文档一起提交到 Git，这样其他电脑克隆项目后无需重新安装即可获得同一套规则。
 
-升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。项目已经存在的规则和文档需要人工或由 AI 审核合并；确认后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。schema 1 manifest 会在升级时保守迁移到 schema 2；无法证明由旧安装器创建的普通文件，以及新版中模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
+升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
+
+从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1 manifest 会在升级时保守迁移到 schema 2；无法证明由旧安装器创建的普通文件，以及新版中模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
 
 ## 不包含的内容
 

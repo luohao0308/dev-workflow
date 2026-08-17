@@ -28,6 +28,45 @@ add_warning() {
   warnings+=("$1")
 }
 
+feature_catalog_issue() {
+  local message="$1"
+  if [[ "$manifest_status" == "ready" && "$adoption_status" == "ready" ]]; then
+    add_error "$message"
+  else
+    add_warning "$message"
+  fi
+}
+
+check_feature_catalog_pack() {
+  contains_item "feature-catalog" "${installed_packs[@]+"${installed_packs[@]}"}" || return 0
+
+  local tool="$target_root/scripts/feature_catalog.py"
+  local catalog="$target_root/docs/development/ai/feature-catalog.json"
+  local matrix="$target_root/docs/FEATURE-MATRIX.md"
+  local interpreter=""
+  if command -v python3 >/dev/null 2>&1; then
+    interpreter="$(command -v python3)"
+  elif command -v python >/dev/null 2>&1; then
+    interpreter="$(command -v python)"
+  fi
+
+  if [[ ! -f "$catalog" ]]; then
+    feature_catalog_issue "feature-catalog active catalog is missing; run python3 scripts/feature_catalog.py --init."
+    return 0
+  fi
+  if [[ ! -f "$matrix" ]]; then
+    feature_catalog_issue "feature-catalog generated matrix is missing; run python3 scripts/feature_catalog.py --generate."
+    return 0
+  fi
+  if [[ -z "$interpreter" ]]; then
+    feature_catalog_issue "feature-catalog requires Python 3 for validation and drift checks."
+    return 0
+  fi
+  if [[ ! -f "$tool" ]] || ! "$interpreter" "$tool" --check >/dev/null 2>&1; then
+    feature_catalog_issue "feature-catalog validation or generated-matrix drift check failed."
+  fi
+}
+
 contains_item() {
   local needle="$1"
   shift
@@ -450,6 +489,8 @@ fi
 if [[ "$manifest_status" != "missing" && "$adoption_status" != "missing" && "$manifest_status" != "$adoption_status" ]]; then
   add_error "manifest 与 WORKFLOW-ADOPTION 状态不一致：$manifest_status / $adoption_status"
 fi
+
+check_feature_catalog_pack
 
 context_path="$target_root/docs/WORKING-CONTEXT.md"
 if [[ -f "$context_path" ]]; then

@@ -270,6 +270,42 @@ if ($manifestStatus -ne 'missing' -and $adoptionStatus -ne 'missing' -and $manif
     Add-Error $errors "Manifest and WORKFLOW-ADOPTION status differ: $manifestStatus / $adoptionStatus"
 }
 
+function Add-FeatureCatalogIssue([string]$Message) {
+    if ($manifestStatus -eq 'ready' -and $adoptionStatus -eq 'ready') {
+        Add-Error $errors $Message
+    } else {
+        Add-Warning $warnings $Message
+    }
+}
+
+$featureCatalogInstalled = $false
+if ($null -ne $manifest) {
+    $featureCatalogInstalled = @($manifest.installedPacks) -contains 'feature-catalog'
+}
+if ($featureCatalogInstalled) {
+    $featureCatalogTool = Join-Path $targetRoot 'scripts/feature_catalog.py'
+    $featureCatalogPath = Join-Path $targetRoot 'docs/development/ai/feature-catalog.json'
+    $featureMatrixPath = Join-Path $targetRoot 'docs/FEATURE-MATRIX.md'
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+    if ($null -eq $pythonCommand) {
+        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $featureCatalogPath -PathType Leaf)) {
+        Add-FeatureCatalogIssue 'feature-catalog active catalog is missing; run python3 scripts/feature_catalog.py --init.'
+    } elseif (-not (Test-Path -LiteralPath $featureMatrixPath -PathType Leaf)) {
+        Add-FeatureCatalogIssue 'feature-catalog generated matrix is missing; run python3 scripts/feature_catalog.py --generate.'
+    } elseif ($null -eq $pythonCommand) {
+        Add-FeatureCatalogIssue 'feature-catalog requires Python 3 for validation and drift checks.'
+    } elseif (-not (Test-Path -LiteralPath $featureCatalogTool -PathType Leaf)) {
+        Add-FeatureCatalogIssue 'feature-catalog validator script is missing from the target project.'
+    } else {
+        & $pythonCommand.Name $featureCatalogTool --check *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Add-FeatureCatalogIssue 'feature-catalog validation or generated-matrix drift check failed.'
+        }
+    }
+}
+
 $contextPath = Join-Path $targetRoot 'docs/WORKING-CONTEXT.md'
 if (Test-Path -LiteralPath $contextPath -PathType Leaf) {
     $context = Get-Content -LiteralPath $contextPath -Raw -Encoding UTF8

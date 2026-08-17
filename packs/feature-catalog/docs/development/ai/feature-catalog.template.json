@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "catalog_version": 1,
+  "updated_at": "2026-08-17",
+  "title": "Project Feature Catalog",
+  "items": [
+    {
+      "id": "project-capabilities",
+      "parent_id": null,
+      "level": "domain",
+      "name": "Project capabilities",
+      "summary": "Replace this scaffold with the project's product or system domains.",
+      "keywords": ["project", "capability"],
+      "platforms": ["application"],
+      "implementation_status": "implemented",
+      "maturity": "prototype",
+      "acceptance_criteria": [],
+      "code_paths": ["AGENTS.md"],
+      "spec_paths": ["docs/README.md"],
+      "test_paths": [],
+      "evidence": [],
+      "known_gaps": ["Replace this scaffold with verified project facts."],
+      "task_ids": []
+    },
+    {
+      "id": "feature-catalog",
+      "parent_id": "project-capabilities",
+      "level": "capability",
+      "name": "Feature catalog",
+      "summary": "Use this catalog to connect features, implementation, evidence and maturity.",
+      "keywords": ["feature catalog", "feature matrix", "maturity", "功能清单"],
+      "platforms": ["application"],
+      "implementation_status": "implemented",
+      "maturity": "prototype",
+      "acceptance_criteria": [],
+      "code_paths": ["scripts/feature_catalog.py"],
+      "spec_paths": ["docs/development/ai/FEATURE-CATALOG.md"],
+      "test_paths": [],
+      "evidence": [],
+      "known_gaps": ["Add project-specific feature leaves before using this as a product status source."],
+      "task_ids": []
+    }
+  ]
+}

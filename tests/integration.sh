@@ -59,6 +59,15 @@ grep -Fq '## 大型计划拆分与确认门' "$fresh_target/AGENTS.md" || fail "
 grep -Fq 'awaiting_user_confirmation' "$fresh_target/docs/plans/README.md" || fail "delivery plans expose the approval state"
 grep -Fq '## 7. 偏移控制' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template includes drift control"
 grep -Fq 'codex/*' "$fresh_target/docs/development/GIT-WORKTREE-WORKFLOW.md" || fail "delivery workflow protects local Codex branches"
+grep -Eq '"path":"scripts/feature_catalog.py","source":"feature-catalog"' "$fresh_manifest" || fail "all-packs installs feature-catalog ownership"
+
+python3 "$fresh_target/scripts/feature_catalog.py" --root "$fresh_target" --init >/dev/null
+python3 "$fresh_target/scripts/feature_catalog.py" --root "$fresh_target" --generate >/dev/null
+python3 "$fresh_target/scripts/feature_catalog.py" --root "$fresh_target" --check >/dev/null
+catalog_hash_before_reinstall="$(sha256_file "$fresh_target/docs/development/ai/feature-catalog.json")"
+bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
+catalog_hash_after_reinstall="$(sha256_file "$fresh_target/docs/development/ai/feature-catalog.json")"
+[[ "$catalog_hash_before_reinstall" == "$catalog_hash_after_reinstall" ]] || fail "reinstall does not overwrite active feature catalog"
 
 first_updated_at="$(grep -E '"updatedAt"' "$fresh_manifest")"
 bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
@@ -88,6 +97,13 @@ printf '%s\n' \
   '# Adoption' \
   '' \
   'Verified.' > "$fresh_target/docs/WORKFLOW-ADOPTION.md"
+printf '\nmanual matrix drift\n' >> "$fresh_target/docs/FEATURE-MATRIX.md"
+set +e
+bash "$audit_script" --target "$fresh_target" --strict >/dev/null
+feature_matrix_drift_code=$?
+set -e
+[[ "$feature_matrix_drift_code" -eq 1 ]] || fail "strict audit rejects feature matrix drift"
+python3 "$fresh_target/scripts/feature_catalog.py" --root "$fresh_target" --generate >/dev/null
 set +e
 bash "$audit_script" --target "$fresh_target" --strict >/dev/null
 strict_audit_code=$?
@@ -110,6 +126,8 @@ grep -Fq '"source":"delivery"' "$fresh_manifest" && fail "partial uninstall remo
 bash "$uninstall_script" --target "$fresh_target" >/dev/null
 assert_not_file "$fresh_manifest" "full uninstall removes manifest"
 assert_file "$modified_delivery_file" "project-modified content remains after full uninstall"
+assert_file "$fresh_target/docs/development/ai/feature-catalog.json" "full uninstall preserves active feature catalog"
+assert_file "$fresh_target/docs/FEATURE-MATRIX.md" "full uninstall preserves generated feature matrix"
 
 invalid_install_target="$temp_root/invalid-install-packs"
 mkdir -p "$invalid_install_target"
@@ -170,6 +188,21 @@ set -e
 [[ "$single_pack_audit_code" -eq 2 ]] || fail "Core remains valid after removing the last pack"
 bash "$uninstall_script" --target "$single_pack_target" >/dev/null
 assert_not_file "$single_pack_manifest" "full uninstall removes manifest after the last pack is removed"
+
+feature_pack_target="$temp_root/feature-pack"
+mkdir -p "$feature_pack_target"
+bash "$install_script" --target "$feature_pack_target" --packs feature-catalog >/dev/null
+feature_pack_manifest="$feature_pack_target/.dev-workflow/manifest.json"
+python3 "$feature_pack_target/scripts/feature_catalog.py" --root "$feature_pack_target" --init >/dev/null
+python3 "$feature_pack_target/scripts/feature_catalog.py" --root "$feature_pack_target" --generate >/dev/null
+bash "$uninstall_script" --target "$feature_pack_target" --packs feature-catalog >/dev/null
+assert_no_installed_packs "$feature_pack_manifest" "removing feature-catalog leaves a Core-only manifest"
+assert_not_file "$feature_pack_target/scripts/feature_catalog.py" "partial uninstall removes unchanged feature-catalog tool"
+assert_file "$feature_pack_target/docs/development/ai/feature-catalog.json" "partial uninstall preserves active feature catalog"
+assert_file "$feature_pack_target/docs/FEATURE-MATRIX.md" "partial uninstall preserves generated feature matrix"
+bash "$uninstall_script" --target "$feature_pack_target" >/dev/null
+assert_not_file "$feature_pack_manifest" "full uninstall removes Core manifest after feature pack removal"
+assert_file "$feature_pack_target/docs/development/ai/feature-catalog.json" "Core uninstall still preserves active feature catalog"
 
 existing_target="$temp_root/existing"
 mkdir -p "$existing_target/docs"

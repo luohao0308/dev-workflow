@@ -6,11 +6,12 @@
 
 1. 每次任务先读根目录 `AGENTS.md` 和 [TASKS.md](TASKS.md)。
 2. 如果 [WORKING-CONTEXT.md](WORKING-CONTEXT.md) 处于 active 状态且未过期，再读取它；并行任务按 `working-context/` 的规则读取对应文件。
-3. 根据任务打开一个领域入口；禁止无差别加载整个 `docs/`。
-4. 自动生成文档、完整 Runbook 和历史工作日志按标题或关键词检索，不整份预载。
-5. 按内容类型区分权威来源：当前任务上下文 → `WORKING-CONTEXT.md`；任务状态 → `TASKS.md`；稳定事实 → `PROJECT-SUMMARY.md` 与 `architecture/`；当前设计 → `design/`；计划 → `plans/`；契约 → `contracts/`；可重复操作 → `project-memory/` 与 `operations/`；历史证据 → `工作日志/`。
-6. 线上动态值、外部服务状态和环境信息必须重新验证，不能直接复用历史记录。
-7. 被 Git 忽略的敏感配置和本机运行资料不属于知识库，不读取、不索引、不提交。
+3. 如果安装了 `feature-catalog`，功能状态、规划、缺陷定位和发布就绪任务先通过 `python3 scripts/feature_catalog.py --query "<task>"` 检索相关能力。
+4. 根据任务打开一个领域入口；禁止无差别加载整个 `docs/`。
+5. 自动生成文档、完整 Runbook 和历史工作日志按标题或关键词检索，不整份预载。
+6. 按内容类型区分权威来源：当前任务上下文 → `WORKING-CONTEXT.md`；任务状态 → `TASKS.md`；全量功能/成熟度 → `development/ai/feature-catalog.json`（如启用）；稳定事实 → `PROJECT-SUMMARY.md` 与 `architecture/`；当前设计 → `design/`；计划 → `plans/`；契约 → `contracts/`；可重复操作 → `project-memory/` 与 `operations/`；历史证据 → `工作日志/`。
+7. 线上动态值、外部服务状态和环境信息必须重新验证，不能直接复用历史记录。
+8. 被 Git 忽略的敏感配置和本机运行资料不属于知识库，不读取、不索引、不提交。
 
 ## 核心文件
 
@@ -33,6 +34,7 @@
 | `contracts/` | contracts | API、事件、Schema、CLI 等机器契约 |
 | `operations/` | operations | 发布、Preflight、观测、健康检查和回滚 |
 | `工作日志/` | delivery | 历史过程、验证证据和交付记录 |
+| `development/ai/feature-catalog.json`、`FEATURE-MATRIX.md` | feature-catalog | 全量功能层级、实现/成熟度、验证证据和生成矩阵 |
 
 未安装某个流程包时，不假定其目录或模板存在；应按项目现有文档和规则继续，并在项目扩展区说明替代入口。
 
@@ -41,6 +43,7 @@
 - 新增目录或领域文档时，先在本索引登记用途和读取时机。
 - 稳定事实只保留一个权威来源，其他文档使用链接引用。
 - 任务状态、短期上下文、长期经验、设计、契约和历史证据不能混写。
+- 功能清单负责全量能力与成熟度，`TASKS.md` 只负责当前工作；生成矩阵不能替代机器清单。
 - 文档内容与代码或运行中接口冲突时，保留冲突说明并重新验证事实。
 - 模板完成后删除占位示例，保留状态、权威范围和更新时间。
 - 首次接入完成后将 `WORKFLOW-ADOPTION.md` 标记为 `ready`，并保留最近一次审计的简短证据。
