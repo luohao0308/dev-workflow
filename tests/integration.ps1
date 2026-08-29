@@ -35,8 +35,10 @@ try {
     Assert-True (@($manifest.files).Count -gt 20) 'new installs record a file ownership inventory'
     Assert-True (@($manifest.files | Where-Object action -eq 'created').Count -gt 20) 'new files record created ownership'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 大型计划拆分与确认门') 'Core install includes the large-plan approval gate'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 默认开发闭环（轻量核心 \+ 风险插件）') 'Core install includes the lightweight development loop'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/README.md') -Raw -Encoding UTF8) -match 'awaiting_user_confirmation') 'delivery plans expose the approval state'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match '## 7\. 偏移控制') 'delivery plan template includes drift control'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match 'Test/Eval/Check') 'delivery plan template maps claims to executable checks'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/GIT-WORKTREE-WORKFLOW.md') -Raw -Encoding UTF8) -match 'codex/\*') 'delivery workflow protects local Codex branches'
     Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/feature_catalog.py' -and $_.source -eq 'feature-catalog' }).Count -eq 1) 'all-packs installs feature-catalog ownership'
 
