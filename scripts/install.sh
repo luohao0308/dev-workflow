@@ -12,11 +12,17 @@ usage() {
 选项：
   --packs architecture,design,delivery  安装指定流程包（至少一个名称）
   --all-packs                           安装全部流程包
+  --push-mode manual|auto              push 审批模式（默认 manual）
+  --push-actor user|ai                 push 执行角色（默认 user）
+  --merge-mode manual|auto             merge 审批模式（默认 manual）
+  --merge-actor user|ai                merge 执行角色（默认 user）
+  --non-interactive                    不询问 Git 策略，使用参数、已有值或安全默认值
   --dry-run                             只显示动作，不写文件
   -h, --help                            显示帮助
 
 说明：
   Core 始终安装。已存在的普通文件不会覆盖；已有 AGENTS.md 会保留原内容并追加核心区块。
+  新安装会确认 push/merge 策略；非交互环境默认 manual + user。
 EOF
 }
 
@@ -42,6 +48,200 @@ json_number_field() {
   local field="$1"
   local path="$2"
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
+}
+
+json_boolean_field() {
+  local field="$1"
+  local path="$2"
+  sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
+}
+
+git_exclude_begin='# BEGIN dev-workflow managed excludes'
+git_exclude_end='# END dev-workflow managed excludes'
+
+escape_git_exclude_path() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) echo "Git exclude 路径不能包含换行符。" >&2; return 1 ;;
+  esac
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/[][?*#! ]/\\&/g'
+}
+
+detect_git_exclude() {
+  git_repo_root=""
+  git_exclude_path=""
+  git_target_prefix=""
+  git_exclude_available=0
+  git_repo_root="$(git -C "$target_root" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$git_repo_root" ]] || return 0
+  git_path="$(git -C "$target_root" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  [[ -n "$git_path" ]] || return 0
+  case "$git_path" in
+    /*) git_exclude_path="$git_path" ;;
+    *) git_exclude_path="$(CDPATH= cd -- "$target_root/$(dirname -- "$git_path")" && pwd)/$(basename -- "$git_path")" ;;
+  esac
+  git_target_prefix="$(git -C "$target_root" rev-parse --show-prefix 2>/dev/null || true)"
+  git_target_prefix="${git_target_prefix%/}"
+  git_exclude_available=1
+}
+
+git_exclude_pattern_for() {
+  local relative_path="$1"
+  local escaped_relative_path
+  local escaped_target_prefix
+  escaped_relative_path="$(escape_git_exclude_path "$relative_path")"
+  if [[ -n "$git_target_prefix" ]]; then
+    escaped_target_prefix="$(escape_git_exclude_path "$git_target_prefix")"
+    printf '/%s/%s' "$escaped_target_prefix" "$escaped_relative_path"
+  else
+    printf '/%s' "$escaped_relative_path"
+  fi
+}
+
+validate_git_exclude_block_for_write() {
+  local exclude_path="$1"
+  local begin_count
+  local end_count
+  local begin_line
+  local end_line
+  [[ -f "$exclude_path" ]] || return 0
+  begin_count="$(grep -cF "$git_exclude_begin" "$exclude_path" || true)"
+  end_count="$(grep -cF "$git_exclude_end" "$exclude_path" || true)"
+  if [[ "$begin_count" -gt 1 || "$end_count" -gt 1 || "$begin_count" -ne "$end_count" ]]; then
+    echo "Git exclude 中的 dev-workflow managed block 不完整或重复：$exclude_path" >&2
+    return 1
+  fi
+  if [[ "$begin_count" -eq 1 ]]; then
+    begin_line="$(grep -nF "$git_exclude_begin" "$exclude_path" | cut -d: -f1)"
+    end_line="$(grep -nF "$git_exclude_end" "$exclude_path" | cut -d: -f1)"
+    if [[ "$begin_line" -ge "$end_line" ]]; then
+      echo "Git exclude 中的 dev-workflow managed block 标记顺序无效：$exclude_path" >&2
+      return 1
+    fi
+  fi
+}
+
+contains_git_exclude_pattern() {
+  local needle="$1"
+  local item
+  for item in "${git_exclude_patterns[@]+"${git_exclude_patterns[@]}"}"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+build_git_exclude_patterns() {
+  local relative_path
+  local source
+  local action
+  local hash
+  local pattern
+  git_exclude_patterns=()
+  pattern="$(git_exclude_pattern_for '.dev-workflow/')"
+  git_exclude_patterns+=("$pattern")
+  while IFS='|' read -r relative_path source action hash; do
+    [[ -n "$relative_path" && "$action" == "created" ]] || continue
+    pattern="$(git_exclude_pattern_for "$relative_path")"
+    contains_git_exclude_pattern "$pattern" || git_exclude_patterns+=("$pattern")
+  done <<< "$(inventory_summary)"
+}
+
+write_git_exclude_block() {
+  local exclude_path="$1"
+  local temp_path
+  mkdir -p "$(dirname -- "$exclude_path")"
+  validate_git_exclude_block_for_write "$exclude_path" || return 1
+  temp_path="$(mktemp "${exclude_path}.dev-workflow.XXXXXX")"
+  if [[ -f "$exclude_path" ]]; then
+    awk -v begin="$git_exclude_begin" -v end="$git_exclude_end" '
+      $0 == begin { skipping=1; next }
+      $0 == end { skipping=0; next }
+      !skipping { print }
+    ' "$exclude_path" > "$temp_path"
+  fi
+  if [[ "${#git_exclude_patterns[@]}" -gt 0 ]]; then
+    if [[ -s "$temp_path" ]] && [[ -n "$(tail -n 1 "$temp_path")" ]]; then
+      printf '\n' >> "$temp_path"
+    fi
+    printf '%s\n' "$git_exclude_begin" >> "$temp_path"
+    printf '%s\n' "${git_exclude_patterns[@]}" >> "$temp_path"
+    printf '%s\n' "$git_exclude_end" >> "$temp_path"
+  fi
+  if [[ -f "$exclude_path" ]] && cmp -s "$temp_path" "$exclude_path"; then
+    rm -f -- "$temp_path"
+  else
+    mv -- "$temp_path" "$exclude_path"
+  fi
+}
+
+warn_tracked_git_excludes() {
+  local index
+  local repo_relative
+  repo_relative="${git_target_prefix:+$git_target_prefix/}.dev-workflow/"
+  if [[ -n "$(git -C "$git_repo_root" ls-files -- ":(literal)$repo_relative" 2>/dev/null)" ]]; then
+    echo "警告：Git 已跟踪 dev-workflow 元数据，info/exclude 不会阻止上传：.dev-workflow/" >&2
+  fi
+  for index in "${!file_paths[@]}"; do
+    case "${file_actions[$index]}" in
+      created|appended|managed-block) ;;
+      *) continue ;;
+    esac
+    repo_relative="${git_target_prefix:+$git_target_prefix/}${file_paths[$index]}"
+    if git -C "$git_repo_root" ls-files --error-unmatch -- ":(literal)$repo_relative" >/dev/null 2>&1; then
+      echo "警告：Git 已跟踪包含 dev-workflow 内容的文件，info/exclude 不会阻止上传：${file_paths[$index]}" >&2
+    fi
+  done
+}
+
+warn_ineffective_git_excludes() {
+  local index
+  if ! git -C "$target_root" check-ignore --no-index -q -- '.dev-workflow/manifest.json'; then
+    echo "警告：Git 的最终 ignore 规则未排除 dev-workflow 元数据：.dev-workflow/manifest.json" >&2
+  fi
+  for index in "${!file_paths[@]}"; do
+    [[ "${file_actions[$index]}" == "created" ]] || continue
+    if ! git -C "$target_root" check-ignore --no-index -q -- "${file_paths[$index]}"; then
+      echo "警告：Git 的最终 ignore 规则未排除 dev-workflow 文件：${file_paths[$index]}" >&2
+    fi
+  done
+}
+
+prompt_choice() {
+  local label="$1"
+  local default_value="$2"
+  local first_value="$3"
+  local second_value="$4"
+  local answer
+  while true; do
+    printf '%s [%s]: ' "$label" "$default_value" >&2
+    IFS= read -r answer
+    answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+    [[ -n "$answer" ]] || answer="$default_value"
+    case "$answer" in
+      "$first_value"|"$second_value")
+        prompt_result="$answer"
+        return
+        ;;
+      *) echo "请输入 ${first_value} 或 ${second_value}。" >&2 ;;
+    esac
+  done
+}
+
+validate_git_policy() {
+  local operation="$1"
+  local mode="$2"
+  local actor="$3"
+  case "$mode" in
+    manual|auto) ;;
+    *) echo "${operation} 模式无效：${mode}（仅支持 manual/auto）" >&2; return 1 ;;
+  esac
+  case "$actor" in
+    user|ai) ;;
+    *) echo "${operation} 执行角色无效：${actor}（仅支持 user/ai）" >&2; return 1 ;;
+  esac
+  if [[ "$mode" == "auto" && "$actor" != "ai" ]]; then
+    echo "$operation 使用 auto 模式时执行角色必须是 ai。" >&2
+    return 1
+  fi
 }
 
 json_escape() {
@@ -228,11 +428,18 @@ build_manifest() {
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$last_audit_at\""
   cat <<EOF
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "managedBy": "dev-workflow",
   "workflowVersion": "$version",
   "installedPacks": [$packs_json
   ],
+  "gitPolicy": {
+    "pushMode": "$push_mode",
+    "pushActor": "$push_actor",
+    "mergeMode": "$merge_mode",
+    "mergeActor": "$merge_actor",
+    "deleteAllowed": false
+  },
   "files": [
 EOF
   local sorted_inventory
@@ -271,6 +478,14 @@ all_packs=0
 target=""
 packs_csv=""
 packs_option_seen=0
+push_mode_option=""
+push_actor_option=""
+merge_mode_option=""
+merge_actor_option=""
+non_interactive=0
+case "${DEV_WORKFLOW_NON_INTERACTIVE:-}" in
+  1|true|TRUE|yes|YES) non_interactive=1 ;;
+esac
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source_root="$(CDPATH= cd -- "$script_dir/.." && pwd)"
 core_root="$source_root/core"
@@ -296,6 +511,30 @@ while [[ $# -gt 0 ]]; do
       ;;
     --all-packs)
       all_packs=1
+      shift
+      ;;
+    --push-mode)
+      [[ $# -ge 2 ]] || { echo "--push-mode 需要 manual 或 auto" >&2; exit 2; }
+      push_mode_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --push-actor)
+      [[ $# -ge 2 ]] || { echo "--push-actor 需要 user 或 ai" >&2; exit 2; }
+      push_actor_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --merge-mode)
+      [[ $# -ge 2 ]] || { echo "--merge-mode 需要 manual 或 auto" >&2; exit 2; }
+      merge_mode_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --merge-actor)
+      [[ $# -ge 2 ]] || { echo "--merge-actor 需要 user 或 ai" >&2; exit 2; }
+      merge_actor_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --non-interactive)
+      non_interactive=1
       shift
       ;;
     --dry-run)
@@ -332,6 +571,11 @@ case "$target_root/" in
     ;;
 esac
 
+detect_git_exclude
+if [[ "$git_exclude_available" -eq 1 ]]; then
+  validate_git_exclude_block_for_write "$git_exclude_path"
+fi
+
 metadata_root="$target_root/.dev-workflow"
 manifest_path="$metadata_root/manifest.json"
 if [[ -e "$metadata_root" && ! -d "$metadata_root" ]]; then
@@ -350,6 +594,11 @@ existing_installed_at=""
 existing_updated_at=""
 existing_onboarding_status="pending"
 existing_schema_version=""
+existing_git_policy=0
+existing_push_mode=""
+existing_push_actor=""
+existing_merge_mode=""
+existing_merge_actor=""
 existing_packs=()
 file_paths=()
 file_sources=()
@@ -362,7 +611,7 @@ if [[ -f "$manifest_path" ]]; then
   }
   existing_schema_version="$(json_number_field schemaVersion "$manifest_path")"
   case "$existing_schema_version" in
-    1|2) ;;
+    1|2|3) ;;
     *)
     echo "不支持的 dev-workflow manifest schema：$manifest_path" >&2
     exit 1
@@ -379,7 +628,25 @@ if [[ -f "$manifest_path" ]]; then
       exit 1
       ;;
   esac
-  if [[ "$existing_schema_version" == "2" ]]; then
+  if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
+    existing_git_policy=1
+    push_mode="$(json_string_field pushMode "$manifest_path")"
+    push_actor="$(json_string_field pushActor "$manifest_path")"
+    merge_mode="$(json_string_field mergeMode "$manifest_path")"
+    merge_actor="$(json_string_field mergeActor "$manifest_path")"
+    delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+    validate_git_policy push "$push_mode" "$push_actor" || exit 1
+    validate_git_policy merge "$merge_mode" "$merge_actor" || exit 1
+    [[ "$delete_allowed" == "false" ]] || {
+      echo "manifest gitPolicy.deleteAllowed 必须为 false。" >&2
+      exit 1
+    }
+    existing_push_mode="$push_mode"
+    existing_push_actor="$push_actor"
+    existing_merge_mode="$merge_mode"
+    existing_merge_actor="$merge_actor"
+  fi
+  if [[ "$existing_schema_version" == "2" || "$existing_schema_version" == "3" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")" || {
       echo "manifest files 格式无效：$manifest_path" >&2
       exit 1
@@ -394,6 +661,38 @@ if [[ -f "$manifest_path" ]]; then
     done <<< "$manifest_file_output"
   fi
 fi
+
+push_mode="${push_mode:-manual}"
+push_actor="${push_actor:-user}"
+merge_mode="${merge_mode:-manual}"
+merge_actor="${merge_actor:-user}"
+[[ -n "$push_mode_option" ]] && push_mode="$push_mode_option"
+[[ -n "$push_actor_option" ]] && push_actor="$push_actor_option"
+[[ -n "$merge_mode_option" ]] && merge_mode="$merge_mode_option"
+[[ -n "$merge_actor_option" ]] && merge_actor="$merge_actor_option"
+
+if [[ "$existing_git_policy" -eq 0 && "$non_interactive" -eq 0 && "$dry_run" -eq 0 && -t 0 ]]; then
+  echo "配置 Git 交付策略。" >&2
+  if [[ -z "$push_actor_option" ]]; then
+    prompt_choice "push 执行角色 user/ai" "$push_actor" user ai
+    push_actor="$prompt_result"
+  fi
+  if [[ -z "$push_mode_option" ]]; then
+    prompt_choice "push 模式 manual（需人工确认）/auto（AI 自动执行）" "$push_mode" manual auto
+    push_mode="$prompt_result"
+  fi
+  if [[ -z "$merge_actor_option" ]]; then
+    prompt_choice "merge 执行角色 user/ai" "$merge_actor" user ai
+    merge_actor="$prompt_result"
+  fi
+  if [[ -z "$merge_mode_option" ]]; then
+    prompt_choice "merge 模式 manual（需人工确认）/auto（AI 自动执行）" "$merge_mode" manual auto
+    merge_mode="$prompt_result"
+  fi
+fi
+
+validate_git_policy push "$push_mode" "$push_actor" || exit 2
+validate_git_policy merge "$merge_mode" "$merge_actor" || exit 2
 
 available_packs=()
 for pack_dir in "$packs_root"/*; do
@@ -431,7 +730,7 @@ for index in "${!file_paths[@]}"; do
   if [[ "${file_actions[$index]}" == "created" ]]; then
     source_hash="$(sha256_file "$owner_root/${file_paths[$index]}")"
     if [[ "${file_hashes[$index]}" != "$source_hash" ]]; then
-      if [[ "$existing_schema_version" == "2" && "$(json_string_field workflowVersion "$manifest_path")" == "$workflow_version" ]]; then
+      if [[ "$existing_schema_version" != "1" && "$(json_string_field workflowVersion "$manifest_path")" == "$workflow_version" ]]; then
         echo "manifest created 文件哈希与流程源不一致：${file_paths[$index]}" >&2
         exit 1
       fi
@@ -454,7 +753,7 @@ elif [[ "$packs_option_seen" -eq 1 ]]; then
       break
     fi
     contains_item "$pack" "${available_packs[@]+"${available_packs[@]}"}" || {
-      echo "未知流程包：$pack。可用流程包：${available_packs[*]-none}" >&2
+      echo "未知流程包：${pack}。可用流程包：${available_packs[*]-none}" >&2
       exit 2
     }
     contains_item "$pack" "${selected_packs[@]+"${selected_packs[@]}"}" || selected_packs+=("$pack")
@@ -492,6 +791,11 @@ fi
 old_pack_summary="${existing_packs[*]-}"
 new_pack_summary="${installed_packs[*]-}"
 old_inventory_summary="$(inventory_summary)"
+old_policy_summary=""
+if [[ "$existing_git_policy" -eq 1 ]]; then
+  old_policy_summary="$existing_push_mode|$existing_push_actor|$existing_merge_mode|$existing_merge_actor|false"
+fi
+new_policy_summary="$push_mode|$push_actor|$merge_mode|$merge_actor|false"
 manifest_action="[create] .dev-workflow/manifest.json"
 [[ "$existing_manifest" -eq 1 ]] && manifest_action="[update] .dev-workflow/manifest.json"
 
@@ -529,7 +833,7 @@ for index in "${!overlay_roots[@]}"; do
     existing_index=""
     if existing_index="$(inventory_index "$relative_path")"; then
       if [[ "${file_sources[$existing_index]}" != "$overlay_name" ]]; then
-        echo "manifest 文件归属冲突：$relative_path（${file_sources[$existing_index]} / $overlay_name）" >&2
+        echo "manifest 文件归属冲突：${relative_path}（${file_sources[$existing_index]} / ${overlay_name}）" >&2
         exit 1
       fi
     fi
@@ -550,7 +854,7 @@ for index in "${!overlay_roots[@]}"; do
           echo "现有 AGENTS.md 的 AI-WORKFLOW 核心标记顺序无效：$target_path" >&2
           exit 1
         fi
-        actions+=("[skip] $relative_path（已存在受管控核心区块）")
+        actions+=("[skip] ${relative_path}（已存在受管控核心区块）")
         if [[ -z "$existing_index" ]]; then
           set_inventory "$relative_path" "$overlay_name" "managed-block" ""
         fi
@@ -558,7 +862,7 @@ for index in "${!overlay_roots[@]}"; do
         echo "现有 AGENTS.md 包含不完整或重复的 AI-WORKFLOW 核心标记：$target_path" >&2
         exit 1
       elif [[ "$dry_run" -eq 1 ]]; then
-        actions+=("[append] $relative_path（保留现有内容，追加通用核心区块）")
+        actions+=("[append] ${relative_path}（保留现有内容，追加通用核心区块）")
         set_inventory "$relative_path" "$overlay_name" "appended" ""
       else
         temp_path="$(mktemp "${target_path}.dev-workflow.XXXXXX")"
@@ -570,14 +874,14 @@ for index in "${!overlay_roots[@]}"; do
           exit 1
         fi
         mv "$temp_path" "$target_path"
-        actions+=("[append] $relative_path（保留现有内容，追加通用核心区块）")
+        actions+=("[append] ${relative_path}（保留现有内容，追加通用核心区块）")
         set_inventory "$relative_path" "$overlay_name" "appended" ""
       fi
       continue
     fi
 
     if [[ -f "$target_path" ]]; then
-      actions+=("[skip] $relative_path（目标项目已有文件，不覆盖）")
+      actions+=("[skip] ${relative_path}（目标项目已有文件，不覆盖）")
       if [[ -z "$existing_index" ]]; then
         ownership_action="preserved"
         [[ "$existing_schema_version" == "1" ]] && ownership_action="legacy"
@@ -603,10 +907,11 @@ new_inventory_summary="$(inventory_summary)"
 manifest_changed=0
 if [[
   "$existing_manifest" -eq 0 ||
-  "$existing_schema_version" != "2" ||
+  "$existing_schema_version" != "3" ||
   "$old_version" != "$workflow_version" ||
   "$old_pack_summary" != "$new_pack_summary" ||
-  "$old_inventory_summary" != "$new_inventory_summary"
+  "$old_inventory_summary" != "$new_inventory_summary" ||
+  "$old_policy_summary" != "$new_policy_summary"
 ]]; then
   manifest_changed=1
 fi
@@ -617,7 +922,7 @@ fi
 
 if [[ "$manifest_changed" -eq 1 ]]; then
   if [[ "$dry_run" -eq 1 ]]; then
-    actions+=("$manifest_action（dry-run；version $workflow_version）")
+    actions+=("${manifest_action}（dry-run；version ${workflow_version}）")
   else
     mkdir -p "$metadata_root"
     manifest_tmp="$(mktemp "$manifest_path.XXXXXX")"
@@ -630,10 +935,25 @@ if [[ "$manifest_changed" -eq 1 ]]; then
       exit 1
     fi
     mv -- "$manifest_tmp" "$manifest_path"
-    actions+=("$manifest_action（version $workflow_version）")
+    actions+=("${manifest_action}（version ${workflow_version}）")
   fi
 else
   actions+=("[skip] .dev-workflow/manifest.json（已是当前版本）")
+fi
+
+if [[ "$git_exclude_available" -eq 1 ]]; then
+  build_git_exclude_patterns
+  warn_tracked_git_excludes
+  if [[ "$dry_run" -eq 1 ]]; then
+    actions+=("[git-exclude] ${git_exclude_path}（dry-run；保留用户内容并更新 dev-workflow managed block）")
+  else
+    write_git_exclude_block "$git_exclude_path"
+    warn_ineffective_git_excludes
+    actions+=("[git-exclude] ${git_exclude_path}（已更新 dev-workflow managed block）")
+  fi
+else
+  actions+=("[git-exclude] 跳过（目标目录不在 Git 仓库中）")
+  echo "警告：目标目录不在 Git 仓库中，未配置本地 info/exclude；安装仍继续。" >&2
 fi
 
 if [[ "${#selected_packs[@]}" -eq 0 ]]; then
@@ -643,8 +963,8 @@ else
 fi
 
 if [[ "$dry_run" -eq 1 ]]; then
-  echo "dev-workflow dry-run（未写入文件；packs: $pack_summary）"
+  echo "dev-workflow dry-run（未写入文件；packs: ${pack_summary}）"
 else
-  echo "dev-workflow 安装完成（packs: $pack_summary）"
+  echo "dev-workflow 安装完成（packs: ${pack_summary}）"
 fi
 printf '%s\n' "${actions[@]+"${actions[@]}"}"

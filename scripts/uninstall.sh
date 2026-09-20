@@ -32,6 +32,138 @@ json_number_field() {
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
 }
 
+json_boolean_field() {
+  local field="$1"
+  local path="$2"
+  sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
+}
+
+git_exclude_begin='# BEGIN dev-workflow managed excludes'
+git_exclude_end='# END dev-workflow managed excludes'
+
+escape_git_exclude_path() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) echo "Git exclude 路径不能包含换行符。" >&2; return 1 ;;
+  esac
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/[][?*#! ]/\\&/g'
+}
+
+detect_git_exclude() {
+  git_repo_root=""
+  git_exclude_path=""
+  git_target_prefix=""
+  git_exclude_available=0
+  git_repo_root="$(git -C "$target_root" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$git_repo_root" ]] || return 0
+  git_path="$(git -C "$target_root" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  [[ -n "$git_path" ]] || return 0
+  case "$git_path" in
+    /*) git_exclude_path="$git_path" ;;
+    *) git_exclude_path="$(CDPATH= cd -- "$target_root/$(dirname -- "$git_path")" && pwd)/$(basename -- "$git_path")" ;;
+  esac
+  git_target_prefix="$(git -C "$target_root" rev-parse --show-prefix 2>/dev/null || true)"
+  git_target_prefix="${git_target_prefix%/}"
+  git_exclude_available=1
+}
+
+git_exclude_pattern_for() {
+  local relative_path="$1"
+  local escaped_relative_path
+  local escaped_target_prefix
+  escaped_relative_path="$(escape_git_exclude_path "$relative_path")"
+  if [[ -n "$git_target_prefix" ]]; then
+    escaped_target_prefix="$(escape_git_exclude_path "$git_target_prefix")"
+    printf '/%s/%s' "$escaped_target_prefix" "$escaped_relative_path"
+  else
+    printf '/%s' "$escaped_relative_path"
+  fi
+}
+
+validate_git_exclude_block_for_write() {
+  local exclude_path="$1"
+  local begin_count
+  local end_count
+  local begin_line
+  local end_line
+  [[ -f "$exclude_path" ]] || return 0
+  begin_count="$(grep -cF "$git_exclude_begin" "$exclude_path" || true)"
+  end_count="$(grep -cF "$git_exclude_end" "$exclude_path" || true)"
+  if [[ "$begin_count" -gt 1 || "$end_count" -gt 1 || "$begin_count" -ne "$end_count" ]]; then
+    echo "Git exclude 中的 dev-workflow managed block 不完整或重复：$exclude_path" >&2
+    return 1
+  fi
+  if [[ "$begin_count" -eq 1 ]]; then
+    begin_line="$(grep -nF "$git_exclude_begin" "$exclude_path" | cut -d: -f1)"
+    end_line="$(grep -nF "$git_exclude_end" "$exclude_path" | cut -d: -f1)"
+    if [[ "$begin_line" -ge "$end_line" ]]; then
+      echo "Git exclude 中的 dev-workflow managed block 标记顺序无效：$exclude_path" >&2
+      return 1
+    fi
+  fi
+}
+
+contains_git_exclude_pattern() {
+  local needle="$1"
+  local item
+  for item in "${git_exclude_patterns[@]+"${git_exclude_patterns[@]}"}"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+build_remaining_git_exclude_patterns() {
+  local relative_path
+  local source
+  local action
+  local hash
+  local pattern
+  git_exclude_patterns=()
+  if [[ "$full_uninstall" -eq 0 ]]; then
+    pattern="$(git_exclude_pattern_for '.dev-workflow/')"
+    git_exclude_patterns+=("$pattern")
+  fi
+  while IFS='|' read -r relative_path source action hash; do
+    [[ -n "$relative_path" && "$action" == "created" ]] || continue
+    [[ "$full_uninstall" -eq 0 ]] || continue
+    if contains_item "$source" "${requested_packs[@]+"${requested_packs[@]}"}"; then
+      continue
+    fi
+    pattern="$(git_exclude_pattern_for "$relative_path")"
+    contains_git_exclude_pattern "$pattern" || git_exclude_patterns+=("$pattern")
+  done <<< "$(inventory_summary)"
+}
+
+write_git_exclude_block() {
+  local exclude_path="$1"
+  local temp_path
+  if [[ "${#git_exclude_patterns[@]}" -eq 0 && ! -f "$exclude_path" ]]; then
+    return 0
+  fi
+  mkdir -p "$(dirname -- "$exclude_path")"
+  validate_git_exclude_block_for_write "$exclude_path" || return 1
+  temp_path="$(mktemp "${exclude_path}.dev-workflow.XXXXXX")"
+  if [[ -f "$exclude_path" ]]; then
+    awk -v begin="$git_exclude_begin" -v end="$git_exclude_end" '
+      $0 == begin { skipping=1; next }
+      $0 == end { skipping=0; next }
+      !skipping { print }
+    ' "$exclude_path" > "$temp_path"
+  fi
+  if [[ "${#git_exclude_patterns[@]}" -gt 0 ]]; then
+    if [[ -s "$temp_path" ]] && [[ -n "$(tail -n 1 "$temp_path")" ]]; then
+      printf '\n' >> "$temp_path"
+    fi
+    printf '%s\n' "$git_exclude_begin" >> "$temp_path"
+    printf '%s\n' "${git_exclude_patterns[@]}" >> "$temp_path"
+    printf '%s\n' "$git_exclude_end" >> "$temp_path"
+  fi
+  if [[ -f "$exclude_path" ]] && cmp -s "$temp_path" "$exclude_path"; then
+    rm -f -- "$temp_path"
+  else
+    mv -- "$temp_path" "$exclude_path"
+  fi
+}
+
 json_escape() {
   local value="$1"
   value="${value//\\/\\\\}"
@@ -200,11 +332,18 @@ build_manifest() {
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$(json_escape "$last_audit_at")\""
   cat <<EOF
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "managedBy": "dev-workflow",
   "workflowVersion": "$(json_escape "$version")",
   "installedPacks": [$packs_json
   ],
+  "gitPolicy": {
+    "pushMode": "$(json_escape "$push_mode")",
+    "pushActor": "$(json_escape "$push_actor")",
+    "mergeMode": "$(json_escape "$merge_mode")",
+    "mergeActor": "$(json_escape "$merge_actor")",
+    "deleteAllowed": false
+  },
   "files": [
 EOF
   local sorted_inventory
@@ -302,7 +441,7 @@ grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" |
 }
 schema_version="$(json_number_field schemaVersion "$manifest_path")"
 case "$schema_version" in
-  1|2) ;;
+  1|2|3) ;;
   *) echo "不支持的 dev-workflow manifest schema：${schema_version:-missing}" >&2; exit 1 ;;
 esac
 
@@ -314,9 +453,23 @@ case "$onboarding_status" in
   pending|ready|blocked) ;;
   *) echo "manifest onboarding.status 无效：${onboarding_status:-missing}" >&2; exit 1 ;;
 esac
+push_mode="manual"
+push_actor="user"
+merge_mode="manual"
+merge_actor="user"
+if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
+  push_mode="$(json_string_field pushMode "$manifest_path")"
+  push_actor="$(json_string_field pushActor "$manifest_path")"
+  merge_mode="$(json_string_field mergeMode "$manifest_path")"
+  merge_actor="$(json_string_field mergeActor "$manifest_path")"
+  delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+  case "$push_mode:$push_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest push Git 策略无效。" >&2; exit 1 ;; esac
+  case "$merge_mode:$merge_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest merge Git 策略无效。" >&2; exit 1 ;; esac
+  [[ "$delete_allowed" == "false" ]] || { echo "manifest gitPolicy.deleteAllowed 必须为 false。" >&2; exit 1; }
+fi
 distribution_version="$(tr -d '[:space:]' < "$source_root/VERSION")"
-if [[ "$schema_version" == "2" && "$distribution_version" != "$manifest_version" ]]; then
-  echo "卸载需要 dev-workflow $manifest_version，但当前分发版本是 $distribution_version。" >&2
+if [[ "$schema_version" != "1" && "$distribution_version" != "$manifest_version" ]]; then
+  echo "卸载需要 dev-workflow ${manifest_version}，但当前分发版本是 ${distribution_version}。" >&2
   exit 1
 fi
 
@@ -336,7 +489,7 @@ if [[ "$packs_option_seen" -eq 1 ]]; then
     pack="$(printf '%s' "$pack" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
     [[ -n "$pack" ]] || continue
     contains_item "$pack" "${installed_packs[@]+"${installed_packs[@]}"}" || {
-      echo "流程包未安装：$pack。已安装：${installed_packs[*]-none}" >&2
+      echo "流程包未安装：${pack}。已安装：${installed_packs[*]-none}" >&2
       exit 2
     }
     contains_item "$pack" "${requested_packs[@]+"${requested_packs[@]}"}" || requested_packs+=("$pack")
@@ -349,7 +502,7 @@ file_paths=()
 file_sources=()
 file_actions=()
 file_hashes=()
-if [[ "$schema_version" == "2" ]]; then
+if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
   manifest_file_output="$(read_manifest_files "$manifest_path")" || {
     echo "manifest files 格式无效：$manifest_path" >&2
     exit 1
@@ -468,6 +621,12 @@ for index in "${!file_paths[@]}"; do
   plan_reasons+=("$reason")
 done
 
+detect_git_exclude
+if [[ "$git_exclude_available" -eq 1 ]]; then
+  validate_git_exclude_block_for_write "$git_exclude_path"
+  build_remaining_git_exclude_patterns
+fi
+
 if [[ "$dry_run" -eq 1 ]]; then
   echo "dev-workflow 卸载 dry-run（未写入文件）"
 else
@@ -493,6 +652,15 @@ if [[ "$dry_run" -eq 1 ]]; then
     echo "[delete] .dev-workflow/manifest.json"
   else
     echo "[update] .dev-workflow/manifest.json"
+  fi
+  if [[ "$git_exclude_available" -eq 1 ]]; then
+    if [[ "$full_uninstall" -eq 1 ]]; then
+      echo "[git-exclude] ${git_exclude_path}（dry-run；移除 dev-workflow managed block）"
+    else
+      echo "[git-exclude] ${git_exclude_path}（dry-run；按剩余安装内容重建 managed block）"
+    fi
+  else
+    echo "[git-exclude] 跳过（目标目录不在 Git 仓库中）"
   fi
   exit 0
 fi
@@ -555,6 +723,13 @@ else
     exit 1
   fi
   mv -- "$manifest_tmp" "$manifest_path"
+fi
+
+if [[ "$git_exclude_available" -eq 1 ]]; then
+  write_git_exclude_block "$git_exclude_path"
+else
+  echo "[git-exclude] 跳过（目标目录不在 Git 仓库中）"
+  echo "警告：目标目录不在 Git 仓库中，未清理本地 info/exclude；卸载仍继续。" >&2
 fi
 
 for removed_path in "${removed_paths[@]+"${removed_paths[@]}"}"; do

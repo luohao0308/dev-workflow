@@ -28,6 +28,96 @@ function Add-Warning([Collections.Generic.List[string]]$Items, [string]$Message)
     $Items.Add($Message)
 }
 
+function ConvertTo-GitExcludeLiteral([string]$Value) {
+    if ($Value.IndexOf("`r") -ge 0 -or $Value.IndexOf("`n") -ge 0) {
+        throw 'Git exclude paths cannot contain line breaks.'
+    }
+    $builder = [Text.StringBuilder]::new()
+    foreach ($character in $Value.ToCharArray()) {
+        if ('\ #![]*?'.IndexOf([string]$character) -ge 0) {
+            [void]$builder.Append('\')
+        }
+        [void]$builder.Append($character)
+    }
+    return $builder.ToString()
+}
+
+function Check-GitExcludeBlock(
+    [string]$TargetRoot,
+    [hashtable]$InventoryActions,
+    [string[]]$InventoryPaths,
+    [Collections.Generic.List[string]]$Warnings
+) {
+    if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) { return }
+    $repoRootOutput = @(& git -C $TargetRoot rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $repoRootOutput.Count -eq 0) { return }
+    $gitPathOutput = @(& git -C $TargetRoot rev-parse --git-path info/exclude 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $gitPathOutput.Count -eq 0) { return }
+    $gitPath = ($gitPathOutput -join "`n").Trim()
+    $excludePath = if ([IO.Path]::IsPathRooted($gitPath)) { $gitPath } else { [IO.Path]::GetFullPath((Join-Path $TargetRoot $gitPath)) }
+    if (-not (Test-Path -LiteralPath $excludePath -PathType Leaf)) {
+        Add-Warning $Warnings "Git info/exclude is missing the dev-workflow managed block: $excludePath"
+        return
+    }
+    $lines = @(Get-Content -LiteralPath $excludePath -Encoding UTF8)
+    $begin = '# BEGIN dev-workflow managed excludes'
+    $end = '# END dev-workflow managed excludes'
+    $beginIndexes = @()
+    $endIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -eq $begin) { $beginIndexes += $index }
+        if ($lines[$index] -eq $end) { $endIndexes += $index }
+    }
+    if ($beginIndexes.Count -ne 1 -or $endIndexes.Count -ne 1 -or $beginIndexes[0] -ge $endIndexes[0]) {
+        Add-Warning $Warnings "Git info/exclude contains an incomplete, duplicate, or misordered dev-workflow managed block: $excludePath"
+        return
+    }
+    $inside = $false
+    $managed = [Collections.Generic.HashSet[string]]::new()
+    foreach ($line in $lines) {
+        if ($line -eq $begin) { $inside = $true; continue }
+        if ($line -eq $end) { $inside = $false; continue }
+        if ($inside) { [void]$managed.Add([string]$line) }
+    }
+    $prefixOutput = @(& git -C $TargetRoot rev-parse --show-prefix 2>$null)
+    if ($LASTEXITCODE -ne 0) { return }
+    $prefix = ($prefixOutput -join "`n").Trim().TrimEnd('/')
+    $prefixValue = if ($prefix) { "/$(ConvertTo-GitExcludeLiteral $prefix)" } else { '' }
+    $expected = [Collections.Generic.List[string]]::new()
+    $expected.Add("$prefixValue/.dev-workflow/")
+    & git -C $TargetRoot check-ignore --no-index -q -- '.dev-workflow/manifest.json'
+    if ($LASTEXITCODE -ne 0) {
+        Add-Warning $Warnings 'Git final ignore rules do not exclude dev-workflow metadata: .dev-workflow/manifest.json'
+    }
+    $metadataPrefix = if ($prefix) { "$prefix/.dev-workflow/" } else { '.dev-workflow/' }
+    $trackedMetadata = @(& git -C (($repoRootOutput -join "`n").Trim()) ls-files -- ":(literal)$metadataPrefix" 2>$null)
+    if ($trackedMetadata.Count -gt 0) {
+        Add-Warning $Warnings 'Git already tracks dev-workflow metadata; info/exclude cannot prevent upload: .dev-workflow/'
+    }
+    foreach ($path in $InventoryPaths) {
+        $action = [string]$InventoryActions[$path]
+        if ($action -eq 'created') {
+            $expected.Add("$prefixValue/$(ConvertTo-GitExcludeLiteral $path)")
+            & git -C $TargetRoot check-ignore --no-index -q -- $path
+            if ($LASTEXITCODE -ne 0) {
+                Add-Warning $Warnings "Git final ignore rules do not exclude a dev-workflow file: $path"
+            }
+        }
+        if ($action -in @('created', 'appended', 'managed-block')) {
+            $repoRelative = if ($prefix) { "$prefix/$path" } else { $path }
+            & git -C (($repoRootOutput -join "`n").Trim()) ls-files --error-unmatch -- ":(literal)$repoRelative" *> $null
+            if ($LASTEXITCODE -eq 0) {
+                Add-Warning $Warnings "Git already tracks a file containing dev-workflow content; info/exclude cannot prevent upload: $path"
+            }
+        }
+    }
+    foreach ($pattern in $expected) {
+        if (-not $managed.Contains($pattern)) {
+            Add-Warning $Warnings "Git info/exclude is missing a dev-workflow exclusion: $pattern"
+        }
+    }
+}
+
 $sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $targetRoot = Resolve-FullPath $TargetPath
 if (
@@ -55,6 +145,9 @@ $coreSourceContent = if (Test-Path -LiteralPath $coreSourcePath -PathType Leaf) 
 } else { '' }
 if ($coreSourceContent -notmatch '## 大型计划拆分与确认门' -or $coreSourceContent -notmatch 'awaiting_user_confirmation') {
     Add-Error $errors 'Distribution Core is missing the large-plan decomposition approval contract.'
+}
+if ($coreSourceContent -notmatch '## Git 交付权限策略' -or $coreSourceContent -notmatch 'gitPolicy') {
+    Add-Error $errors 'Distribution Core is missing the Git delivery permission policy contract.'
 }
 $deliveryReadmeSource = Join-Path $sourceRoot 'packs/delivery/docs/plans/README.md'
 $deliveryTemplateSource = Join-Path $sourceRoot 'packs/delivery/docs/plans/TEMPLATE.md'
@@ -90,11 +183,18 @@ if (Test-Path -LiteralPath $agentsPath -PathType Leaf) {
     if (-not $hasValidCoreBlock) {
         Add-Error $errors 'AGENTS.md must contain exactly one complete AI-WORKFLOW core marker pair.'
     }
+    if ($agents -notmatch '## Git 交付权限策略') {
+        Add-Warning $warnings 'AGENTS.md has not merged the Git delivery permission policy; upgraded projects must merge the current Core block.'
+    }
 }
 
 $manifestPath = Join-Path $targetRoot '.dev-workflow/manifest.json'
 $manifest = $null
 $manifestStatus = 'missing'
+$schemaVersion = ''
+$inventoryPaths = @{}
+$inventoryActions = @{}
+$inventoryHashes = @{}
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     Add-Error $errors 'Missing .dev-workflow/manifest.json; run the installer again.'
 } else {
@@ -109,10 +209,12 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Error $errors 'manifest.json is not managed by dev-workflow.'
         }
         $schemaVersion = [string]$manifest.schemaVersion
-        if ($schemaVersion -notin @('1', '2')) {
+        if ($schemaVersion -notin @('1', '2', '3')) {
             Add-Error $errors 'manifest.json uses an unsupported schemaVersion.'
         } elseif ($schemaVersion -eq '1') {
             Add-Warning $warnings 'manifest.json uses legacy schemaVersion 1; reinstall with the current distribution to add safe uninstall ownership metadata.'
+        } elseif ($schemaVersion -eq '2') {
+            Add-Warning $warnings 'manifest.json uses legacy schemaVersion 2; reinstall with the current distribution and confirm Git delivery permissions.'
         }
         if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
             Add-Error $errors "Invalid manifest workflowVersion: $($manifest.workflowVersion)"
@@ -124,6 +226,25 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         if ($manifestStatus -eq 'ready' -and [string]::IsNullOrWhiteSpace([string]$manifest.onboarding.lastAuditAt)) {
             Add-Warning $warnings 'Ready onboarding state has no recorded onboarding.lastAuditAt timestamp.'
         }
+        if ($null -eq $manifest.gitPolicy) {
+            if ($schemaVersion -eq '3') {
+                Add-Error $errors 'schemaVersion 3 manifest is missing gitPolicy.'
+            } else {
+                Add-Warning $warnings 'manifest.json is missing gitPolicy; rerun the current installer to confirm push/merge policy.'
+            }
+        } else {
+            $pushMode = ([string]$manifest.gitPolicy.pushMode).Trim().ToLowerInvariant()
+            $pushActor = ([string]$manifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
+            $mergeMode = ([string]$manifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
+            $mergeActor = ([string]$manifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
+            if ($pushMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.pushMode: $pushMode" }
+            if ($pushActor -notin @('user', 'ai')) { Add-Error $errors "Invalid manifest gitPolicy.pushActor: $pushActor" }
+            if ($mergeMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.mergeMode: $mergeMode" }
+            if ($mergeActor -notin @('user', 'ai')) { Add-Error $errors "Invalid manifest gitPolicy.mergeActor: $mergeActor" }
+            if ($pushMode -eq 'auto' -and $pushActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy push auto mode requires actor ai.' }
+            if ($mergeMode -eq 'auto' -and $mergeActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy merge auto mode requires actor ai.' }
+            if ($manifest.gitPolicy.deleteAllowed -ne $false) { Add-Error $errors 'manifest gitPolicy.deleteAllowed must be false.' }
+        }
 
         $sourceVersionPath = Join-Path $sourceRoot 'VERSION'
         $sourceVersion = (Get-Content -LiteralPath $sourceVersionPath -Raw -Encoding UTF8).Trim()
@@ -131,10 +252,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Warning $warnings "Manifest version $($manifest.workflowVersion) differs from distribution version $sourceVersion; run the installer in dry-run mode before upgrading."
         }
 
-        $inventoryPaths = @{}
-        $inventoryActions = @{}
-        $inventoryHashes = @{}
-        if ($schemaVersion -eq '2') {
+        if ($schemaVersion -in @('2', '3')) {
             $filesProperty = $manifest.PSObject.Properties['files']
             if (
                 $null -eq $filesProperty -or
@@ -142,7 +260,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 $filesProperty.Value -is [string] -or
                 $filesProperty.Value -isnot [Collections.IEnumerable]
             ) {
-                Add-Error $errors 'manifest schemaVersion 2 requires a files array.'
+                Add-Error $errors "manifest schemaVersion $schemaVersion requires a files array."
             } else {
                 foreach ($entry in @($filesProperty.Value)) {
                     $entryPath = ([string]$entry.path).Replace('\', '/')
@@ -192,7 +310,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         foreach ($pack in $duplicatePacks) {
             Add-Error $errors "manifest installedPacks contains a duplicate: $pack"
         }
-        if ($schemaVersion -eq '2') {
+        if ($schemaVersion -in @('2', '3')) {
             foreach ($entryPath in $inventoryPaths.Keys) {
                 $entrySource = $inventoryPaths[$entryPath]
                 if ($entrySource -ne 'core' -and $packNames -notcontains $entrySource) {
@@ -229,15 +347,15 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
                     Add-Error $errors "Workflow pack $pack is missing file: $relativePath"
                 }
-                if ($schemaVersion -eq '2' -and -not $inventoryPaths.ContainsKey($relativePath)) {
+                if ($schemaVersion -in @('2', '3') -and -not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing workflow pack file: $relativePath"
-                } elseif ($schemaVersion -eq '2' -and $inventoryPaths[$relativePath] -ne $pack) {
+                } elseif ($schemaVersion -in @('2', '3') -and $inventoryPaths[$relativePath] -ne $pack) {
                     Add-Error $errors "Manifest ownership inventory assigns '$relativePath' to '$($inventoryPaths[$relativePath])' instead of '$pack'."
                 }
             }
         }
 
-        if ($schemaVersion -eq '2') {
+        if ($schemaVersion -in @('2', '3')) {
             foreach ($relativePath in $coreFiles) {
                 if (-not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing Core file: $relativePath"
@@ -248,6 +366,17 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         }
     }
 }
+
+$auditInventoryPaths = if ($null -ne $manifest -and $schemaVersion -in @('2', '3')) {
+    @($inventoryPaths.Keys)
+} else {
+    @()
+}
+Check-GitExcludeBlock `
+    -TargetRoot $targetRoot `
+    -InventoryActions $inventoryActions `
+    -InventoryPaths $auditInventoryPaths `
+    -Warnings $warnings
 
 $adoptionPath = Join-Path $targetRoot 'docs/WORKFLOW-ADOPTION.md'
 $adoptionStatus = 'missing'

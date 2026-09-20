@@ -124,6 +124,20 @@
 2. 在 `WORKING-CONTEXT.md` 或任务专属上下文中记录已完成步骤、当前决策、阻塞、下一步和验证摘要；
 3. 通知接手者按 `TASKS.md` → 上下文 → 领域文档 → 验证证据的顺序继续。
 
+## Git 交付权限策略
+
+开始涉及远端 Git 状态的操作前，读取 `.dev-workflow/manifest.json` 中的 `gitPolicy`：
+
+- `pushMode` / `mergeMode` 为 `manual` 时，执行前必须获得本次操作的人工确认；为 `auto` 时只表示该操作可以无需再次确认。
+- `pushActor` / `mergeActor` 为 `user` 时，AI 只准备命令和验证证据，由用户执行；为 `ai` 时，AI 才可以在对应 mode 允许后执行。
+- `auto` 只允许与 `ai` 组合；`manual + ai` 表示 AI 在获得确认后执行。
+- 缺少 `gitPolicy` 或字段无法验证时，按 `manual + user` 处理，不得从历史对话、仓库可写性或已有凭据推断授权。
+- `deleteAllowed` 固定为 `false`，表示安装初始化不授予任何删除权限。删除远端分支、标签、Release、仓库内容、数据或其他难以恢复的对象，必须由用户针对明确目标另行授权，且仍需执行删除前安全检查。
+
+本策略只约束谁可以执行以及是否需要确认，不替代分支保护、PR 审查、CI、发布或生产环境门禁。push 和 merge 是两个独立权限，授权其中一个不自动授权另一个。
+
+安装器在 Git 仓库中只维护 Git 解析出的 `info/exclude` 的 `dev-workflow managed` 区块，不修改项目 `.gitignore`。`.dev-workflow/` 和安装器实际创建的本地流程文件会按字面路径排除，并验证 Git 的最终 ignore 结果；已经被 Git 跟踪或被更高优先级规则重新放行的文件不受该 exclude 保护，遇到这种情况应告警并由用户决定是否调整 Git 索引或项目规则。受管区块标记不完整、重复或倒序时，安装和卸载必须在修改项目文件前停止。非 Git 目录跳过本地排除配置。
+
 ## 安全与变更边界
 
 - 不读取、提交或传播密码、Token、Cookie、私钥、完整签名 URL 或其他凭据；

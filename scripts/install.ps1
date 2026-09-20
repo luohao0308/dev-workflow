@@ -7,6 +7,20 @@ param(
 
     [switch]$AllPacks,
 
+    [ValidateSet('manual', 'auto')]
+    [string]$PushMode,
+
+    [ValidateSet('user', 'ai')]
+    [string]$PushActor,
+
+    [ValidateSet('manual', 'auto')]
+    [string]$MergeMode,
+
+    [ValidateSet('user', 'ai')]
+    [string]$MergeActor,
+
+    [switch]$NonInteractiveInstall,
+
     [switch]$DryRun
 )
 
@@ -26,6 +40,162 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
 
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+$script:GitExcludeBegin = '# BEGIN dev-workflow managed excludes'
+$script:GitExcludeEnd = '# END dev-workflow managed excludes'
+
+function ConvertTo-GitExcludeLiteral([string]$Value) {
+    if ($Value.IndexOf("`r") -ge 0 -or $Value.IndexOf("`n") -ge 0) {
+        throw 'Git exclude paths cannot contain line breaks.'
+    }
+    $builder = [Text.StringBuilder]::new()
+    foreach ($character in $Value.ToCharArray()) {
+        if ('\ #![]*?'.IndexOf([string]$character) -ge 0) {
+            [void]$builder.Append('\')
+        }
+        [void]$builder.Append($character)
+    }
+    return $builder.ToString()
+}
+
+function Get-GitExcludeContext([string]$TargetRoot) {
+    if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    $repoRootOutput = @(& git -C $TargetRoot rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $repoRootOutput.Count -eq 0) { return $null }
+    $repoRoot = ($repoRootOutput -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($repoRoot)) { return $null }
+
+    $gitPathOutput = @(& git -C $TargetRoot rev-parse --git-path info/exclude 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $gitPathOutput.Count -eq 0) { return $null }
+    $gitPath = ($gitPathOutput -join "`n").Trim()
+    $excludePath = if ([IO.Path]::IsPathRooted($gitPath)) {
+        $gitPath
+    } else {
+        [IO.Path]::GetFullPath((Join-Path $TargetRoot $gitPath))
+    }
+
+    $prefixOutput = @(& git -C $TargetRoot rev-parse --show-prefix 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $prefix = ($prefixOutput -join "`n").Trim().TrimEnd('/')
+    [pscustomobject]@{
+        RepoRoot = $repoRoot
+        TargetPrefix = $prefix
+        ExcludePath = $excludePath
+    }
+}
+
+function Get-GitExcludePattern([object]$Context, [string]$RelativePath) {
+    $escapedRelativePath = ConvertTo-GitExcludeLiteral $RelativePath
+    if ([string]::IsNullOrWhiteSpace([string]$Context.TargetPrefix)) {
+        return "/$escapedRelativePath"
+    }
+    $escapedPrefix = ConvertTo-GitExcludeLiteral ([string]$Context.TargetPrefix)
+    return "/$escapedPrefix/$escapedRelativePath"
+}
+
+function Assert-GitExcludeBlockValid([string]$ExcludePath) {
+    if (-not (Test-Path -LiteralPath $ExcludePath -PathType Leaf)) { return }
+    $existingLines = @(Get-Content -LiteralPath $ExcludePath -Encoding UTF8)
+    $beginIndexes = @()
+    $endIndexes = @()
+    for ($index = 0; $index -lt $existingLines.Count; $index++) {
+        if ($existingLines[$index] -eq $script:GitExcludeBegin) { $beginIndexes += $index }
+        if ($existingLines[$index] -eq $script:GitExcludeEnd) { $endIndexes += $index }
+    }
+    $valid = (
+        ($beginIndexes.Count -eq 0 -and $endIndexes.Count -eq 0) -or
+        ($beginIndexes.Count -eq 1 -and $endIndexes.Count -eq 1 -and $beginIndexes[0] -lt $endIndexes[0])
+    )
+    if (-not $valid) {
+        throw "Git exclude contains an incomplete, duplicate, or misordered dev-workflow managed block: $ExcludePath"
+    }
+}
+
+function Get-GitExcludePatterns([object]$Context, [object[]]$Inventory) {
+    $patterns = [Collections.Generic.List[string]]::new()
+    $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/'))
+    foreach ($entry in @($Inventory | Sort-Object { ([string]$_.path).ToLowerInvariant() })) {
+        if ([string]$entry.action -ne 'created') { continue }
+        $pattern = Get-GitExcludePattern -Context $Context -RelativePath ([string]$entry.path)
+        if (-not $patterns.Contains($pattern)) { $patterns.Add($pattern) }
+    }
+    return @($patterns)
+}
+
+function Update-GitExclude([object]$Context, [string[]]$Patterns) {
+    $excludePath = [string]$Context.ExcludePath
+    if ($Patterns.Count -eq 0 -and -not (Test-Path -LiteralPath $excludePath -PathType Leaf)) { return }
+    $parent = Split-Path -Parent $excludePath
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+
+    $lines = [Collections.Generic.List[string]]::new()
+    if (Test-Path -LiteralPath $excludePath -PathType Leaf) {
+        $existingLines = @(Get-Content -LiteralPath $excludePath -Encoding UTF8)
+        Assert-GitExcludeBlockValid -ExcludePath $excludePath
+        $skipping = $false
+        foreach ($line in $existingLines) {
+            if ($line -eq $script:GitExcludeBegin) { $skipping = $true; continue }
+            if ($line -eq $script:GitExcludeEnd) { $skipping = $false; continue }
+            if (-not $skipping) { $lines.Add([string]$line) }
+        }
+    }
+    if ($Patterns.Count -gt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -ne '') { $lines.Add('') }
+        $lines.Add($script:GitExcludeBegin)
+        foreach ($pattern in $Patterns) { $lines.Add($pattern) }
+        $lines.Add($script:GitExcludeEnd)
+    }
+    $temporaryPath = Join-Path $parent ('.' + [IO.Path]::GetFileName($excludePath) + '.dev-workflow.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        Write-Utf8NoBom -Path $temporaryPath -Content (($lines -join "`r`n") + "`r`n")
+        if (Test-Path -LiteralPath $excludePath -PathType Leaf) {
+            [IO.File]::Replace($temporaryPath, $excludePath, $null)
+        } else {
+            [IO.File]::Move($temporaryPath, $excludePath)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
+}
+
+function Warn-TrackedGitExcludePaths([object]$Context, [object[]]$Inventory) {
+    $metadataPrefix = if ([string]::IsNullOrWhiteSpace([string]$Context.TargetPrefix)) {
+        '.dev-workflow/'
+    } else {
+        "$($Context.TargetPrefix)/.dev-workflow/"
+    }
+    $trackedMetadata = @(& git -C $Context.RepoRoot ls-files -- ":(literal)$metadataPrefix" 2>$null)
+    if ($trackedMetadata.Count -gt 0) {
+        Write-Warning 'Git already tracks dev-workflow metadata; info/exclude cannot prevent upload: .dev-workflow/'
+    }
+    foreach ($entry in @($Inventory | Sort-Object { ([string]$_.path).ToLowerInvariant() })) {
+        if ([string]$entry.action -notin @('created', 'appended', 'managed-block')) { continue }
+        $repoRelative = if ([string]::IsNullOrWhiteSpace([string]$Context.TargetPrefix)) {
+            [string]$entry.path
+        } else {
+            "$($Context.TargetPrefix)/$($entry.path)"
+        }
+        & git -C $Context.RepoRoot ls-files --error-unmatch -- ":(literal)$repoRelative" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Warning "Git already tracks a file containing dev-workflow content; info/exclude cannot prevent upload: $($entry.path)"
+        }
+    }
+}
+
+function Warn-IneffectiveGitExcludes([object]$Context, [object[]]$Inventory, [string]$TargetRoot) {
+    & git -C $TargetRoot check-ignore --no-index -q -- '.dev-workflow/manifest.json'
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'Git final ignore rules do not exclude dev-workflow metadata: .dev-workflow/manifest.json'
+    }
+    foreach ($entry in @($Inventory | Where-Object { [string]$_.action -eq 'created' })) {
+        & git -C $TargetRoot check-ignore --no-index -q -- ([string]$entry.path)
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Git final ignore rules do not exclude a dev-workflow file: $($entry.path)"
+        }
+    }
 }
 
 function Get-CoreBlock([string]$Path) {
@@ -51,6 +221,27 @@ function Get-WorkflowVersion([string]$Path) {
     return $version
 }
 
+function Assert-GitPolicy([string]$Operation, [string]$Mode, [string]$Actor) {
+    if ($Mode -notin @('manual', 'auto')) {
+        throw "Invalid $Operation mode '$Mode'; expected manual or auto."
+    }
+    if ($Actor -notin @('user', 'ai')) {
+        throw "Invalid $Operation actor '$Actor'; expected user or ai."
+    }
+    if ($Mode -eq 'auto' -and $Actor -ne 'ai') {
+        throw "$Operation auto mode requires the ai actor."
+    }
+}
+
+function Read-PolicyChoice([string]$Prompt, [string]$Default, [string[]]$Allowed) {
+    while ($true) {
+        $answer = (Read-Host "$Prompt [$Default]").Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $Default }
+        if ($Allowed -contains $answer) { return $answer }
+        Write-Warning "Enter one of: $($Allowed -join ', ')."
+    }
+}
+
 function Read-ManagedManifest([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         return $null
@@ -68,7 +259,7 @@ function Read-ManagedManifest([string]$Path) {
         throw "Manifest exists but is not managed by dev-workflow: $Path"
     }
     $schemaVersion = [string]$manifest.schemaVersion
-    if ($schemaVersion -notin @('1', '2')) {
+    if ($schemaVersion -notin @('1', '2', '3')) {
         throw "Unsupported dev-workflow manifest schema in $Path"
     }
     if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
@@ -88,7 +279,18 @@ function Read-ManagedManifest([string]$Path) {
     if ($null -eq $manifest.onboarding -or ([string]$manifest.onboarding.status) -notin @('pending', 'ready', 'blocked')) {
         throw "Manifest has an invalid onboarding.status: $Path"
     }
-    if ($schemaVersion -eq '2') {
+    if ($null -ne $manifest.gitPolicy) {
+        $pushMode = ([string]$manifest.gitPolicy.pushMode).Trim().ToLowerInvariant()
+        $pushActor = ([string]$manifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
+        $mergeMode = ([string]$manifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
+        $mergeActor = ([string]$manifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
+        Assert-GitPolicy -Operation 'push' -Mode $pushMode -Actor $pushActor
+        Assert-GitPolicy -Operation 'merge' -Mode $mergeMode -Actor $mergeActor
+        if ($manifest.gitPolicy.deleteAllowed -ne $false) {
+            throw "Manifest gitPolicy.deleteAllowed must be false: $Path"
+        }
+    }
+    if ($schemaVersion -in @('2', '3')) {
         $filesProperty = $manifest.PSObject.Properties['files']
         if (
             $null -eq $filesProperty -or
@@ -130,7 +332,8 @@ function New-ManifestPlan(
     [string]$Version,
     [string[]]$InstalledPacks,
     [object[]]$Files,
-    [object]$Existing
+    [object]$Existing,
+    [object]$GitPolicy
 ) {
     $now = [DateTime]::UtcNow.ToString('o')
     $installedAt = $now
@@ -164,7 +367,7 @@ function New-ManifestPlan(
     )
     $oldPackSummary = if ($null -eq $Existing) { '' } else { @($Existing.installedPacks) -join ',' }
     $newPackSummary = @($InstalledPacks) -join ','
-    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -ne '2') {
+    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -notin @('2', '3')) {
         ''
     } else {
         @($Existing.files | ForEach-Object {
@@ -174,20 +377,34 @@ function New-ManifestPlan(
     $newFileSummary = @($normalizedFiles | ForEach-Object {
         "$($_.path)|$($_.source)|$($_.action)|$($_.installedSha256)"
     } | Sort-Object) -join "`n"
+    $oldPolicySummary = if ($null -eq $Existing -or $null -eq $Existing.gitPolicy) {
+        ''
+    } else {
+        "$([string]$Existing.gitPolicy.pushMode)|$([string]$Existing.gitPolicy.pushActor)|$([string]$Existing.gitPolicy.mergeMode)|$([string]$Existing.gitPolicy.mergeActor)|$([string]$Existing.gitPolicy.deleteAllowed)"
+    }
+    $newPolicySummary = "$($GitPolicy.pushMode)|$($GitPolicy.pushActor)|$($GitPolicy.mergeMode)|$($GitPolicy.mergeActor)|False"
     $changed = (
         ($null -eq $Existing) -or
-        ([string]$Existing.schemaVersion -ne '2') -or
+        ([string]$Existing.schemaVersion -ne '3') -or
         ($oldVersion -ne $Version) -or
         ($oldPackSummary -ne $newPackSummary) -or
-        ($oldFileSummary -ne $newFileSummary)
+        ($oldFileSummary -ne $newFileSummary) -or
+        ($oldPolicySummary -ne $newPolicySummary)
     )
     $updatedAt = if ($changed -or [string]::IsNullOrWhiteSpace($oldUpdatedAt)) { $now } else { $oldUpdatedAt }
 
     $manifest = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         managedBy = 'dev-workflow'
         workflowVersion = $Version
         installedPacks = @($InstalledPacks)
+        gitPolicy = [ordered]@{
+            pushMode = [string]$GitPolicy.pushMode
+            pushActor = [string]$GitPolicy.pushActor
+            mergeMode = [string]$GitPolicy.mergeMode
+            mergeActor = [string]$GitPolicy.mergeActor
+            deleteAllowed = $false
+        }
         files = $normalizedFiles
         installedAt = $installedAt
         updatedAt = $updatedAt
@@ -268,6 +485,10 @@ if (
 ) {
     throw 'The target directory cannot be the dev-workflow distribution repository or one of its subdirectories.'
 }
+$gitExcludeContext = Get-GitExcludeContext -TargetRoot $targetRoot
+if ($null -ne $gitExcludeContext) {
+    Assert-GitExcludeBlockValid -ExcludePath ([string]$gitExcludeContext.ExcludePath)
+}
 if (-not (Test-Path -LiteralPath $coreRoot -PathType Container)) {
     throw "Core overlay does not exist: $coreRoot"
 }
@@ -287,6 +508,56 @@ if (Test-Path -LiteralPath $metadataRoot -PathType Container) {
     }
 }
 $existingManifest = Read-ManagedManifest $manifestPath
+
+$pushModeValue = 'manual'
+$pushActorValue = 'user'
+$mergeModeValue = 'manual'
+$mergeActorValue = 'user'
+$hasExistingGitPolicy = $null -ne $existingManifest -and $null -ne $existingManifest.gitPolicy
+if ($hasExistingGitPolicy) {
+    $pushModeValue = ([string]$existingManifest.gitPolicy.pushMode).Trim().ToLowerInvariant()
+    $pushActorValue = ([string]$existingManifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
+    $mergeModeValue = ([string]$existingManifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
+    $mergeActorValue = ([string]$existingManifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
+}
+if ($PSBoundParameters.ContainsKey('PushMode')) { $pushModeValue = $PushMode.Trim().ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('PushActor')) { $pushActorValue = $PushActor.Trim().ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('MergeMode')) { $mergeModeValue = $MergeMode.Trim().ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('MergeActor')) { $mergeActorValue = $MergeActor.Trim().ToLowerInvariant() }
+
+$nonInteractiveEnvironment = [string]$env:DEV_WORKFLOW_NON_INTERACTIVE -match '^(?i:1|true|yes)$'
+$canPromptForGitPolicy = (
+    -not $hasExistingGitPolicy -and
+    -not $DryRun.IsPresent -and
+    -not $NonInteractiveInstall.IsPresent -and
+    -not $nonInteractiveEnvironment -and
+    -not [Console]::IsInputRedirected
+)
+if ($canPromptForGitPolicy) {
+    Write-Host 'Configure Git delivery policy.'
+    if (-not $PSBoundParameters.ContainsKey('PushActor')) {
+        $pushActorValue = Read-PolicyChoice -Prompt 'push actor user/ai' -Default $pushActorValue -Allowed @('user', 'ai')
+    }
+    if (-not $PSBoundParameters.ContainsKey('PushMode')) {
+        $pushModeValue = Read-PolicyChoice -Prompt 'push mode manual/auto' -Default $pushModeValue -Allowed @('manual', 'auto')
+    }
+    if (-not $PSBoundParameters.ContainsKey('MergeActor')) {
+        $mergeActorValue = Read-PolicyChoice -Prompt 'merge actor user/ai' -Default $mergeActorValue -Allowed @('user', 'ai')
+    }
+    if (-not $PSBoundParameters.ContainsKey('MergeMode')) {
+        $mergeModeValue = Read-PolicyChoice -Prompt 'merge mode manual/auto' -Default $mergeModeValue -Allowed @('manual', 'auto')
+    }
+}
+
+Assert-GitPolicy -Operation 'push' -Mode $pushModeValue -Actor $pushActorValue
+Assert-GitPolicy -Operation 'merge' -Mode $mergeModeValue -Actor $mergeActorValue
+$gitPolicy = [pscustomobject]@{
+    pushMode = $pushModeValue
+    pushActor = $pushActorValue
+    mergeMode = $mergeModeValue
+    mergeActor = $mergeActorValue
+    deleteAllowed = $false
+}
 
 $availablePacks = @(
     Get-ChildItem -LiteralPath $packsRoot -Directory |
@@ -316,7 +587,7 @@ foreach ($pack in $availablePacks) {
 }
 
 $inventoryByPath = @{}
-if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -eq '2') {
+if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -in @('2', '3')) {
     foreach ($entry in @($existingManifest.files)) {
         Set-InventoryEntry `
             -Map $inventoryByPath `
@@ -447,7 +718,8 @@ $manifestPlan = New-ManifestPlan `
     -Version $workflowVersion `
     -InstalledPacks @($installedPacks) `
     -Files @($inventoryByPath.Values) `
-    -Existing $existingManifest
+    -Existing $existingManifest `
+    -GitPolicy $gitPolicy
 
 if ($manifestPlan.Changed) {
     if ($DryRun) {
@@ -459,6 +731,22 @@ if ($manifestPlan.Changed) {
     }
 } else {
     $actions.Add('[skip] .dev-workflow/manifest.json (already current)')
+}
+
+if ($null -ne $gitExcludeContext) {
+    $inventoryEntries = @($inventoryByPath.Values)
+    $gitExcludePatterns = @(Get-GitExcludePatterns -Context $gitExcludeContext -Inventory $inventoryEntries)
+    Warn-TrackedGitExcludePaths -Context $gitExcludeContext -Inventory $inventoryEntries
+    if ($DryRun) {
+        $actions.Add("[git-exclude] $($gitExcludeContext.ExcludePath) (dry-run; update dev-workflow managed block)")
+    } else {
+        Update-GitExclude -Context $gitExcludeContext -Patterns $gitExcludePatterns
+        Warn-IneffectiveGitExcludes -Context $gitExcludeContext -Inventory $inventoryEntries -TargetRoot $targetRoot
+        $actions.Add("[git-exclude] $($gitExcludeContext.ExcludePath) (updated dev-workflow managed block)")
+    }
+} else {
+    Write-Warning 'Target directory is not inside a Git repository; local info/exclude was not configured.'
+    $actions.Add('[git-exclude] skipped (target is not inside a Git repository)')
 }
 
 $packSummary = if ($selectedPacks.Count -eq 0) { 'none' } else { $selectedPacks -join ', ' }

@@ -30,8 +30,11 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 - 分支命名：
 - 提交格式：
 - 集成策略：<!-- ff-only/rebase/merge/PR -->
-- 自动允许：<!-- 本地可逆操作 -->
-- 需要确认：<!-- merge/push/生产/发布 -->
+- Git 交付策略：以 `.dev-workflow/manifest.json` 的 `gitPolicy` 为机器权威；此处只记录项目补充说明。
+- 本地流程文件：以 `info/exclude` 的实际 `git check-ignore` 结果为准；已跟踪或被项目规则重新放行的路径必须在交付前处理。
+- 自动允许：<!-- 本地可逆操作；push/merge 仅在对应 mode=auto 且 actor=ai 时由 AI 自动执行 -->
+- 需要确认：<!-- mode=manual 的 push/merge、生产/发布 -->
+- 删除：安装初始化不授予删除权限；具体删除必须针对明确目标另行授权。
 
 若 Worktree 模式为 `required` 或 `recommended`，按 [GIT-WORKTREE-WORKFLOW.md](GIT-WORKTREE-WORKFLOW.md) 执行。
 

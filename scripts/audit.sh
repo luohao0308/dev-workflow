@@ -77,6 +77,101 @@ contains_item() {
   return 1
 }
 
+escape_git_exclude_path() {
+  case "$1" in
+    *$'\r'*|*$'\n'*) return 1 ;;
+  esac
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/[][?*#! ]/\\&/g'
+}
+
+check_git_exclude_block() {
+  local repo_root
+  local git_path
+  local exclude_path
+  local target_prefix
+  local begin_count
+  local end_count
+  local begin_line
+  local end_line
+  local pattern
+  local escaped_target_prefix
+  local repo_relative
+  local index
+  repo_root="$(git -C "$target_root" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$repo_root" ]] || return 0
+  git_path="$(git -C "$target_root" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  [[ -n "$git_path" ]] || return 0
+  case "$git_path" in
+    /*) exclude_path="$git_path" ;;
+    *) exclude_path="$(CDPATH= cd -- "$target_root/$(dirname -- "$git_path")" && pwd)/$(basename -- "$git_path")" ;;
+  esac
+  target_prefix="$(git -C "$target_root" rev-parse --show-prefix 2>/dev/null || true)"
+  target_prefix="${target_prefix%/}"
+  if [[ ! -f "$exclude_path" ]]; then
+    add_warning "Git info/exclude 缺少 dev-workflow managed block：$exclude_path"
+    return 0
+  fi
+  begin_count="$(grep -cF '# BEGIN dev-workflow managed excludes' "$exclude_path" || true)"
+  end_count="$(grep -cF '# END dev-workflow managed excludes' "$exclude_path" || true)"
+  if [[ "$begin_count" -ne 1 || "$end_count" -ne 1 ]]; then
+    add_warning "Git info/exclude 中的 dev-workflow managed block 不完整或重复：$exclude_path"
+    return 0
+  fi
+  begin_line="$(grep -nF '# BEGIN dev-workflow managed excludes' "$exclude_path" | cut -d: -f1)"
+  end_line="$(grep -nF '# END dev-workflow managed excludes' "$exclude_path" | cut -d: -f1)"
+  if [[ "$begin_line" -ge "$end_line" ]]; then
+    add_warning "Git info/exclude 中的 dev-workflow managed block 标记顺序无效：$exclude_path"
+    return 0
+  fi
+  git_exclude_has_line() {
+    local needle="$1"
+    awk -v begin='# BEGIN dev-workflow managed excludes' -v end='# END dev-workflow managed excludes' -v needle="$needle" '
+      $0 == begin { inside=1; next }
+      $0 == end { inside=0; next }
+      inside && $0 == needle { found=1 }
+      END { exit(found ? 0 : 1) }
+    ' "$exclude_path"
+  }
+  pattern=""
+  if [[ -n "$target_prefix" ]]; then
+    if ! escaped_target_prefix="$(escape_git_exclude_path "$target_prefix")"; then
+      add_warning "Git 目标路径包含无法写入 info/exclude 的换行符。"
+      return 0
+    fi
+    pattern="/$escaped_target_prefix"
+  fi
+  expected_pattern="${pattern}/.dev-workflow/"
+  if ! git_exclude_has_line "$expected_pattern"; then
+    add_warning "Git info/exclude 缺少 .dev-workflow 排除项：$exclude_path"
+  fi
+  if ! git -C "$target_root" check-ignore --no-index -q -- '.dev-workflow/manifest.json'; then
+    add_warning "Git 的最终 ignore 规则未排除 dev-workflow 元数据：.dev-workflow/manifest.json"
+  fi
+  repo_relative="${target_prefix:+$target_prefix/}.dev-workflow/"
+  if [[ -n "$(git -C "$repo_root" ls-files -- ":(literal)$repo_relative" 2>/dev/null)" ]]; then
+    add_warning "Git 已跟踪 dev-workflow 元数据，info/exclude 无法阻止上传：.dev-workflow/"
+  fi
+  for index in "${!inventory_paths[@]}"; do
+    case "${inventory_actions[$index]}" in
+      created)
+        expected_pattern="${pattern}/$(escape_git_exclude_path "${inventory_paths[$index]}")"
+        if ! git_exclude_has_line "$expected_pattern"; then
+          add_warning "Git info/exclude 缺少 dev-workflow 文件排除项：${inventory_paths[$index]}"
+        fi
+        if ! git -C "$target_root" check-ignore --no-index -q -- "${inventory_paths[$index]}"; then
+          add_warning "Git 的最终 ignore 规则未排除 dev-workflow 文件：${inventory_paths[$index]}"
+        fi
+        ;;
+      appended|managed-block) ;;
+      *) continue ;;
+    esac
+    repo_relative="${target_prefix:+$target_prefix/}${inventory_paths[$index]}"
+    if git -C "$repo_root" ls-files --error-unmatch -- ":(literal)$repo_relative" >/dev/null 2>&1; then
+      add_warning "Git 已跟踪包含 dev-workflow 内容的文件，info/exclude 无法阻止上传：${inventory_paths[$index]}"
+    fi
+  done
+}
+
 sha256_file() {
   local path="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -116,6 +211,12 @@ json_number_field() {
   local field="$1"
   local path="$2"
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
+}
+
+json_boolean_field() {
+  local field="$1"
+  local path="$2"
+  sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
 validate_json_when_available() {
@@ -280,6 +381,9 @@ core_source_path="$source_root/core/AGENTS.md"
 if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## 大型计划拆分与确认门' "$core_source_path" || ! grep -Fq 'awaiting_user_confirmation' "$core_source_path"; then
   add_error "分发 Core 缺少大型计划拆分确认门契约。"
 fi
+if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## Git 交付权限策略' "$core_source_path" || ! grep -Fq 'gitPolicy' "$core_source_path"; then
+  add_error "分发 Core 缺少 Git 交付权限策略契约。"
+fi
 delivery_readme_source="$source_root/packs/delivery/docs/plans/README.md"
 delivery_template_source="$source_root/packs/delivery/docs/plans/TEMPLATE.md"
 if [[ ! -f "$delivery_readme_source" ]] || ! grep -Fq '大型计划确认门' "$delivery_readme_source"; then
@@ -303,6 +407,9 @@ if [[ -f "$agents_path" ]]; then
   end_line="$(grep -n '<!-- AI-WORKFLOW:CORE:END -->' "$agents_path" | head -n 1 | cut -d: -f1 || true)"
   if [[ "$start_count" -ne 1 || "$end_count" -ne 1 || "$start_line" -ge "$end_line" ]]; then
     add_error "AGENTS.md 必须包含且只包含一组完整的 AI-WORKFLOW 核心标记。"
+  fi
+  if ! grep -Fq '## Git 交付权限策略' "$agents_path"; then
+    add_warning "AGENTS.md 尚未合并 Git 交付权限策略；升级项目需人工合并当前 Core 区块。"
   fi
 fi
 
@@ -334,7 +441,8 @@ else
   fi
   case "$schema_version" in
     1) add_warning "manifest.json 仍使用 schemaVersion 1；请用当前版本安装器升级，以获得安全卸载所需的文件归属信息。" ;;
-    2) ;;
+    2) add_warning "manifest.json 仍使用 schemaVersion 2；请用当前版本安装器升级并确认 Git 交付权限。" ;;
+    3) ;;
     *) add_error "manifest.json 使用了不支持的 schemaVersion。" ;;
   esac
   if [[ ! "$manifest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
@@ -347,6 +455,33 @@ else
   last_audit_at="$(json_string_field lastAuditAt "$manifest_path")"
   if [[ "$manifest_status" == "ready" && -z "$last_audit_at" ]]; then
     add_warning "ready 接入状态尚未记录 onboarding.lastAuditAt。"
+  fi
+
+  if ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
+    if [[ "$schema_version" == "3" ]]; then
+      add_error "schemaVersion 3 manifest 缺少 gitPolicy。"
+    else
+      add_warning "manifest.json 缺少 gitPolicy；请用当前安装器确认 push/merge 策略。"
+    fi
+  else
+    push_mode="$(json_string_field pushMode "$manifest_path")"
+    push_actor="$(json_string_field pushActor "$manifest_path")"
+    merge_mode="$(json_string_field mergeMode "$manifest_path")"
+    merge_actor="$(json_string_field mergeActor "$manifest_path")"
+    delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+    case "$push_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.pushMode 无效：${push_mode:-missing}" ;; esac
+    case "$push_actor" in user|ai) ;; *) add_error "manifest gitPolicy.pushActor 无效：${push_actor:-missing}" ;; esac
+    case "$merge_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.mergeMode 无效：${merge_mode:-missing}" ;; esac
+    case "$merge_actor" in user|ai) ;; *) add_error "manifest gitPolicy.mergeActor 无效：${merge_actor:-missing}" ;; esac
+    if [[ "$push_mode" == "auto" && "$push_actor" != "ai" ]]; then
+      add_error "manifest gitPolicy 的 push auto 模式要求 actor 为 ai。"
+    fi
+    if [[ "$merge_mode" == "auto" && "$merge_actor" != "ai" ]]; then
+      add_error "manifest gitPolicy 的 merge auto 模式要求 actor 为 ai。"
+    fi
+    if [[ "$delete_allowed" != "false" ]]; then
+      add_error "manifest gitPolicy.deleteAllowed 必须为 false。"
+    fi
   fi
 
   if ! grep -Eq '"installedPacks"[[:space:]]*:' "$manifest_path"; then
@@ -363,7 +498,7 @@ else
     fi
   fi
 
-  if [[ "$schema_version" == "2" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")"
     file_result=$?
     if [[ "$file_result" -ne 0 ]]; then
@@ -400,11 +535,11 @@ else
     if [[ ! "$source_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
       add_error "分发仓库 VERSION 格式无效：${source_version:-missing}"
     elif [[ -n "$manifest_version" && "$manifest_version" != "$source_version" ]]; then
-      add_warning "manifest 版本 $manifest_version 不是当前分发版本 $source_version；可先执行安装器 dry-run 查看升级差异。"
+      add_warning "manifest 版本 ${manifest_version} 不是当前分发版本 ${source_version}；可先执行安装器 dry-run 查看升级差异。"
     fi
   fi
 
-  if [[ "$schema_version" == "2" && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
+  if [[ ( "$schema_version" == "2" || "$schema_version" == "3" ) && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
     for index in "${!inventory_paths[@]}"; do
       [[ "${inventory_actions[$index]}" == "created" ]] || continue
       owner_root="$source_root/core"
@@ -447,17 +582,17 @@ else
       if [[ ! -f "$target_root/$relative_path" ]]; then
         add_error "流程包 $pack 缺少文件：$relative_path"
       fi
-      if [[ "$schema_version" == "2" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
+      if [[ "$schema_version" == "2" || "$schema_version" == "3" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少流程包文件：$relative_path"
-      elif [[ "$schema_version" == "2" ]]; then
+      elif [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
         inventory_source="$(inventory_source_for "$relative_path")"
         if [[ "$inventory_source" != "$pack" ]]; then
-          add_error "manifest 将 $relative_path 归属于 $inventory_source，而不是 $pack"
+          add_error "manifest 将 ${relative_path} 归属于 ${inventory_source}，而不是 $pack"
         fi
       fi
     done < <(find "$pack_root" -type f | LC_ALL=C sort)
   done
-  if [[ "$schema_version" == "2" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
     for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
       if ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"
@@ -470,6 +605,8 @@ else
     done
   fi
 fi
+
+check_git_exclude_block
 
 adoption_path="$target_root/docs/WORKFLOW-ADOPTION.md"
 adoption_status="missing"

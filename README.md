@@ -82,6 +82,8 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 
 安装器还会在目标项目生成 `.dev-workflow/manifest.json`，记录流程版本、已安装流程包、逐文件来源、安装动作、原始哈希和接入状态。它是安装、升级与安全卸载的元数据，不是日常运行时依赖。
 
+如果目标目录位于 Git 仓库，安装器还会通过 `git rev-parse --git-path` 定位该仓库（包括 worktree）的本地 `info/exclude`，维护一个 `dev-workflow managed` 排除区块。`.dev-workflow/` 和安装器实际创建的文件会加入其中；项目原有文件、被保留的文件和只追加核心区块的 `AGENTS.md` 不会被整文件忽略。嵌套目标路径会按 Git ignore 字面量规则转义，写入后再用 Git 验证最终忽略结果。安装器不会修改项目 `.gitignore`。非 Git 目录会跳过这一步并给出告警。已经被 Git 跟踪的文件，或被更高优先级 `.gitignore` 规则重新放行的文件，不会因为新增 exclude 而停止上传；安装器只告警，不会自动执行 `git rm --cached` 或改写 `.gitignore`。
+
 ## 可选流程包
 
 | 包 | 安装内容 | 适用场景 |
@@ -122,6 +124,15 @@ Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁
 .\scripts\install.ps1 -TargetPath "D:\Projects\another-project" -AllPacks
 ```
 
+交互安装会确认 push/merge 的审批模式与执行角色。默认均为 `manual + user`；自动执行必须显式使用 `auto + ai`：
+
+```powershell
+.\scripts\install.ps1 `
+  -TargetPath "D:\Projects\another-project" `
+  -PushMode auto -PushActor ai `
+  -MergeMode manual -MergeActor ai
+```
+
 ### Linux、macOS 或 WSL Bash
 
 ```bash
@@ -137,6 +148,17 @@ bash ./scripts/install.sh \
 # 安装全部流程包
 bash ./scripts/install.sh --target /path/to/project --all-packs
 ```
+
+交互安装会确认 push/merge 的审批模式与执行角色。默认均为 `manual + user`；自动执行必须显式使用 `auto + ai`：
+
+```bash
+bash ./scripts/install.sh \
+  --target /path/to/project \
+  --push-mode auto --push-actor ai \
+  --merge-mode manual --merge-actor ai
+```
+
+CI 或其他非交互环境可使用 `--non-interactive`、PowerShell 的 `-NonInteractiveInstall`，或设置 `DEV_WORKFLOW_NON_INTERACTIVE=1`；未提供策略参数时仍使用安全默认值。删除权限固定为拒绝，不提供安装参数或初始化问题。
 
 ### 功能清单初始化与使用
 
@@ -165,7 +187,7 @@ python3 scripts/feature_catalog.py --query "login release evidence"
 
 ### 接入审计
 
-审计检查安装结构、流程包文件、核心标记、manifest 和初始化状态；安装了 `feature-catalog` 时还会只读运行目录校验与矩阵漂移检查。它不会修改项目代码，也不会读取凭据。
+审计检查安装结构、流程包文件、核心标记、manifest、初始化状态和本地 Git exclude；安装了 `feature-catalog` 时还会只读运行目录校验与矩阵漂移检查。受管排除区块缺失、重复、标记倒序、最终 Git ignore 未生效，或包含 dev-workflow 内容的文件已经被 Git 跟踪时都会告警，strict 模式会失败。审计不会修改项目代码，也不会读取凭据。
 
 ```powershell
 .\scripts\audit.ps1 -TargetPath "D:\Projects\another-project"
@@ -189,7 +211,7 @@ bash tests/integration.sh
 
 ## 卸载
 
-卸载器必须从 `dev-workflow` 分发仓库运行。schema 2 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
+卸载器必须从 `dev-workflow` 分发仓库运行。schema 2/3 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
 
 ### Windows PowerShell
 
@@ -247,7 +269,10 @@ bash ./scripts/uninstall.sh \
 - 已经存在通用核心标记时保持不变，重复安装具有幂等性。
 - `-DryRun` / `--dry-run` 只输出将创建、追加或跳过的文件，不写入目标项目。
 - 首次安装会创建 `.dev-workflow/manifest.json`；重复安装会保留安装时间，合并已安装流程包并更新版本信息。
-- manifest schema 2 会记录安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
+- manifest 的 `gitPolicy` 分别记录 push/merge 的 `manual|auto` 模式和 `user|ai` 执行角色；缺失时按 `manual + user`。`auto` 只允许与 `ai` 组合。
+- `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
+- manifest schema 3 会记录 Git 交付权限，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
+- 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。
 - 安装、审计和卸载都会验证 manifest 中的每个路径确实属于其声明的 Core 或流程包；未知路径会停止处理，不会据此删除项目文件。
 - 自动删除还要求 `created` 文件的安装哈希等于同版本分发文件哈希；卸载器版本不匹配时会停止，避免用新版模板推断旧版所有权。
 - 目标项目已有非 dev-workflow 管理的 `.dev-workflow/manifest.json` 时安装会停止，不覆盖未知元数据。
@@ -310,7 +335,7 @@ bash ./scripts/uninstall.sh \
 
 升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
 
-从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1 manifest 会在升级时保守迁移到 schema 2；无法证明由旧安装器创建的普通文件，以及新版中模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
+从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1/2 manifest 会升级到 schema 3；schema 1 中无法证明由旧安装器创建的普通文件，以及升级时模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
 
 ## 不包含的内容
 
