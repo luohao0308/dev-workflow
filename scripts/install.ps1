@@ -19,6 +19,12 @@ param(
     [ValidateSet('user', 'ai')]
     [string]$MergeActor,
 
+    [ValidateSet('manual', 'auto')]
+    [string]$PullRequestMode,
+
+    [ValidateSet('user', 'ai')]
+    [string]$PullRequestActor,
+
     [switch]$NonInteractiveInstall,
 
     [switch]$DryRun
@@ -242,6 +248,29 @@ function Read-PolicyChoice([string]$Prompt, [string]$Default, [string[]]$Allowed
     }
 }
 
+function Confirm-GitPolicyMutation(
+    [string]$Operation,
+    [string]$OldMode,
+    [string]$OldActor,
+    [string]$NewMode,
+    [string]$NewActor,
+    [bool]$CanPrompt,
+    [bool]$IsDryRun
+) {
+    if ($OldMode -eq $NewMode -and $OldActor -eq $NewActor) { return }
+    if ($IsDryRun) {
+        Write-Output "[policy] ${Operation}: ${OldMode}/${OldActor} -> ${NewMode}/${NewActor} (dry-run; independent confirmation required when applied)"
+        return
+    }
+    if (-not $CanPrompt) {
+        throw "Cannot change $Operation policy from ${OldMode}/${OldActor} to ${NewMode}/${NewActor} without independent interactive confirmation."
+    }
+    $answer = (Read-Host "Change $Operation policy from ${OldMode}/${OldActor} to ${NewMode}/${NewActor}? Type yes to confirm").Trim().ToLowerInvariant()
+    if ($answer -ne 'yes') {
+        throw "$Operation policy change was not confirmed."
+    }
+}
+
 function Read-ManagedManifest([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) {
         return $null
@@ -259,7 +288,7 @@ function Read-ManagedManifest([string]$Path) {
         throw "Manifest exists but is not managed by dev-workflow: $Path"
     }
     $schemaVersion = [string]$manifest.schemaVersion
-    if ($schemaVersion -notin @('1', '2', '3')) {
+    if ($schemaVersion -notin @('1', '2', '3', '4')) {
         throw "Unsupported dev-workflow manifest schema in $Path"
     }
     if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
@@ -289,8 +318,24 @@ function Read-ManagedManifest([string]$Path) {
         if ($manifest.gitPolicy.deleteAllowed -ne $false) {
             throw "Manifest gitPolicy.deleteAllowed must be false: $Path"
         }
+        if ($schemaVersion -eq '4') {
+            $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
+            $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
+            Assert-GitPolicy -Operation 'pull request' -Mode $pullRequestMode -Actor $pullRequestActor
+            foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+                if ($manifest.gitPolicy.$requiredField -ne $true) { throw "Manifest gitPolicy.$requiredField must be true: $Path" }
+            }
+            foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+                if ($manifest.gitPolicy.$deniedField -ne $false) { throw "Manifest gitPolicy.$deniedField must be false: $Path" }
+            }
+            if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
+            if ([string]::IsNullOrWhiteSpace([string]$manifest.gitPolicy.policyChangedAt)) { throw "Manifest gitPolicy.policyChangedAt is required: $Path" }
+            if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { throw "Manifest gitPolicy.policyChangedBy is invalid: $Path" }
+        }
+    } elseif ($schemaVersion -eq '4') {
+        throw "Schema 4 manifest is missing gitPolicy: $Path"
     }
-    if ($schemaVersion -in @('2', '3')) {
+    if ($schemaVersion -in @('2', '3', '4')) {
         $filesProperty = $manifest.PSObject.Properties['files']
         if (
             $null -eq $filesProperty -or
@@ -333,7 +378,8 @@ function New-ManifestPlan(
     [string[]]$InstalledPacks,
     [object[]]$Files,
     [object]$Existing,
-    [object]$GitPolicy
+    [object]$GitPolicy,
+    [string]$PolicyChangedBy
 ) {
     $now = [DateTime]::UtcNow.ToString('o')
     $installedAt = $now
@@ -367,7 +413,7 @@ function New-ManifestPlan(
     )
     $oldPackSummary = if ($null -eq $Existing) { '' } else { @($Existing.installedPacks) -join ',' }
     $newPackSummary = @($InstalledPacks) -join ','
-    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -notin @('2', '3')) {
+    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -notin @('2', '3', '4')) {
         ''
     } else {
         @($Existing.files | ForEach-Object {
@@ -380,12 +426,13 @@ function New-ManifestPlan(
     $oldPolicySummary = if ($null -eq $Existing -or $null -eq $Existing.gitPolicy) {
         ''
     } else {
-        "$([string]$Existing.gitPolicy.pushMode)|$([string]$Existing.gitPolicy.pushActor)|$([string]$Existing.gitPolicy.mergeMode)|$([string]$Existing.gitPolicy.mergeActor)|$([string]$Existing.gitPolicy.deleteAllowed)"
+        "$([string]$Existing.gitPolicy.pushMode)|$([string]$Existing.gitPolicy.pushActor)|$([string]$Existing.gitPolicy.mergeMode)|$([string]$Existing.gitPolicy.mergeActor)|$([string]$Existing.gitPolicy.pullRequestMode)|$([string]$Existing.gitPolicy.pullRequestActor)|$([string]$Existing.gitPolicy.deleteAllowed)"
     }
-    $newPolicySummary = "$($GitPolicy.pushMode)|$($GitPolicy.pushActor)|$($GitPolicy.mergeMode)|$($GitPolicy.mergeActor)|False"
+    $newPolicySummary = "$($GitPolicy.pushMode)|$($GitPolicy.pushActor)|$($GitPolicy.mergeMode)|$($GitPolicy.mergeActor)|$($GitPolicy.pullRequestMode)|$($GitPolicy.pullRequestActor)|False"
+    $policyChanged = $oldPolicySummary -ne $newPolicySummary -or $null -eq $Existing -or [string]$Existing.schemaVersion -ne '4'
     $changed = (
         ($null -eq $Existing) -or
-        ([string]$Existing.schemaVersion -ne '3') -or
+        ([string]$Existing.schemaVersion -ne '4') -or
         ($oldVersion -ne $Version) -or
         ($oldPackSummary -ne $newPackSummary) -or
         ($oldFileSummary -ne $newFileSummary) -or
@@ -394,7 +441,7 @@ function New-ManifestPlan(
     $updatedAt = if ($changed -or [string]::IsNullOrWhiteSpace($oldUpdatedAt)) { $now } else { $oldUpdatedAt }
 
     $manifest = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         managedBy = 'dev-workflow'
         workflowVersion = $Version
         installedPacks = @($InstalledPacks)
@@ -403,7 +450,17 @@ function New-ManifestPlan(
             pushActor = [string]$GitPolicy.pushActor
             mergeMode = [string]$GitPolicy.mergeMode
             mergeActor = [string]$GitPolicy.mergeActor
+            pullRequestMode = [string]$GitPolicy.pullRequestMode
+            pullRequestActor = [string]$GitPolicy.pullRequestActor
+            pullRequestRequired = $true
+            ciRequired = $true
+            independentReviewRequired = $true
+            forcePushAllowed = $false
+            directProtectedBranchPushAllowed = $false
+            privilegedOperationsDefault = 'deny'
             deleteAllowed = $false
+            policyChangedAt = if ($policyChanged) { $now } else { [string]$Existing.gitPolicy.policyChangedAt }
+            policyChangedBy = if ($policyChanged) { $PolicyChangedBy } else { [string]$Existing.gitPolicy.policyChangedBy }
         }
         files = $normalizedFiles
         installedAt = $installedAt
@@ -513,17 +570,31 @@ $pushModeValue = 'manual'
 $pushActorValue = 'user'
 $mergeModeValue = 'manual'
 $mergeActorValue = 'user'
+$pullRequestModeValue = 'manual'
+$pullRequestActorValue = 'user'
 $hasExistingGitPolicy = $null -ne $existingManifest -and $null -ne $existingManifest.gitPolicy
 if ($hasExistingGitPolicy) {
     $pushModeValue = ([string]$existingManifest.gitPolicy.pushMode).Trim().ToLowerInvariant()
     $pushActorValue = ([string]$existingManifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
     $mergeModeValue = ([string]$existingManifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
     $mergeActorValue = ([string]$existingManifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
+    if ([string]$existingManifest.schemaVersion -eq '4') {
+        $pullRequestModeValue = ([string]$existingManifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
+        $pullRequestActorValue = ([string]$existingManifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
+    }
 }
+$oldPushMode = $pushModeValue
+$oldPushActor = $pushActorValue
+$oldMergeMode = $mergeModeValue
+$oldMergeActor = $mergeActorValue
+$oldPullRequestMode = $pullRequestModeValue
+$oldPullRequestActor = $pullRequestActorValue
 if ($PSBoundParameters.ContainsKey('PushMode')) { $pushModeValue = $PushMode.Trim().ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('PushActor')) { $pushActorValue = $PushActor.Trim().ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('MergeMode')) { $mergeModeValue = $MergeMode.Trim().ToLowerInvariant() }
 if ($PSBoundParameters.ContainsKey('MergeActor')) { $mergeActorValue = $MergeActor.Trim().ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('PullRequestMode')) { $pullRequestModeValue = $PullRequestMode.Trim().ToLowerInvariant() }
+if ($PSBoundParameters.ContainsKey('PullRequestActor')) { $pullRequestActorValue = $PullRequestActor.Trim().ToLowerInvariant() }
 
 $nonInteractiveEnvironment = [string]$env:DEV_WORKFLOW_NON_INTERACTIVE -match '^(?i:1|true|yes)$'
 $canPromptForGitPolicy = (
@@ -533,6 +604,9 @@ $canPromptForGitPolicy = (
     -not $nonInteractiveEnvironment -and
     -not [Console]::IsInputRedirected
 )
+if (-not $hasExistingGitPolicy -and -not $DryRun.IsPresent -and -not $NonInteractiveInstall.IsPresent -and -not $nonInteractiveEnvironment -and [Console]::IsInputRedirected) {
+    throw 'First installation requires interactive confirmation of push, pull request, and merge policy. Run in an interactive terminal or explicitly use -NonInteractiveInstall for safe defaults.'
+}
 if ($canPromptForGitPolicy) {
     Write-Host 'Configure Git delivery policy.'
     if (-not $PSBoundParameters.ContainsKey('PushActor')) {
@@ -547,15 +621,46 @@ if ($canPromptForGitPolicy) {
     if (-not $PSBoundParameters.ContainsKey('MergeMode')) {
         $mergeModeValue = Read-PolicyChoice -Prompt 'merge mode manual/auto' -Default $mergeModeValue -Allowed @('manual', 'auto')
     }
+    if (-not $PSBoundParameters.ContainsKey('PullRequestActor')) {
+        $pullRequestActorValue = Read-PolicyChoice -Prompt 'pull request actor user/ai' -Default $pullRequestActorValue -Allowed @('user', 'ai')
+    }
+    if (-not $PSBoundParameters.ContainsKey('PullRequestMode')) {
+        $pullRequestModeValue = Read-PolicyChoice -Prompt 'pull request mode manual/auto' -Default $pullRequestModeValue -Allowed @('manual', 'auto')
+    }
 }
 
 Assert-GitPolicy -Operation 'push' -Mode $pushModeValue -Actor $pushActorValue
 Assert-GitPolicy -Operation 'merge' -Mode $mergeModeValue -Actor $mergeActorValue
+Assert-GitPolicy -Operation 'pull request' -Mode $pullRequestModeValue -Actor $pullRequestActorValue
+$canConfirmPolicyMutation = (
+    -not $NonInteractiveInstall.IsPresent -and
+    -not $nonInteractiveEnvironment -and
+    -not [Console]::IsInputRedirected
+)
+Confirm-GitPolicyMutation -Operation 'push' -OldMode $oldPushMode -OldActor $oldPushActor -NewMode $pushModeValue -NewActor $pushActorValue -CanPrompt $canConfirmPolicyMutation -IsDryRun $DryRun.IsPresent
+Confirm-GitPolicyMutation -Operation 'merge' -OldMode $oldMergeMode -OldActor $oldMergeActor -NewMode $mergeModeValue -NewActor $mergeActorValue -CanPrompt $canConfirmPolicyMutation -IsDryRun $DryRun.IsPresent
+Confirm-GitPolicyMutation -Operation 'pull request' -OldMode $oldPullRequestMode -OldActor $oldPullRequestActor -NewMode $pullRequestModeValue -NewActor $pullRequestActorValue -CanPrompt $canConfirmPolicyMutation -IsDryRun $DryRun.IsPresent
+$policyExplicitlyChanged = (
+    $pushModeValue -ne $oldPushMode -or $pushActorValue -ne $oldPushActor -or
+    $mergeModeValue -ne $oldMergeMode -or $mergeActorValue -ne $oldMergeActor -or
+    $pullRequestModeValue -ne $oldPullRequestMode -or $pullRequestActorValue -ne $oldPullRequestActor
+)
+$policyChangedBy = if ($policyExplicitlyChanged) {
+    'user'
+} elseif ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -ne '4') {
+    'migration'
+} elseif ($null -eq $existingManifest) {
+    'default'
+} else {
+    [string]$existingManifest.gitPolicy.policyChangedBy
+}
 $gitPolicy = [pscustomobject]@{
     pushMode = $pushModeValue
     pushActor = $pushActorValue
     mergeMode = $mergeModeValue
     mergeActor = $mergeActorValue
+    pullRequestMode = $pullRequestModeValue
+    pullRequestActor = $pullRequestActorValue
     deleteAllowed = $false
 }
 
@@ -587,7 +692,7 @@ foreach ($pack in $availablePacks) {
 }
 
 $inventoryByPath = @{}
-if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -in @('2', '3')) {
+if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -in @('2', '3', '4')) {
     foreach ($entry in @($existingManifest.files)) {
         Set-InventoryEntry `
             -Map $inventoryByPath `
@@ -611,8 +716,10 @@ foreach ($entry in $inventoryByPath.Values) {
             if ([string]$existingManifest.workflowVersion -eq $workflowVersion) {
                 throw "Manifest created-file hash does not match workflow source for '$($entry.path)'."
             }
-            $entry.action = 'legacy'
-            $entry.installedSha256 = $null
+            if ($entry.path -ne 'scripts/delivery_guard.py') {
+                $entry.action = 'legacy'
+                $entry.installedSha256 = $null
+            }
         }
     }
 }
@@ -690,6 +797,31 @@ foreach ($overlay in $overlays) {
             continue
         }
 
+        if ($relativePath -eq 'scripts/delivery_guard.py' -and (Test-Path -LiteralPath $targetPathResolved -PathType Leaf)) {
+            $guardSourceHash = Get-Sha256 $file.FullName
+            $guardTargetHash = Get-Sha256 $targetPathResolved
+            if (-not $inventoryByPath.ContainsKey($relativePath)) {
+                if ($guardTargetHash -ne $guardSourceHash) {
+                    throw "Security-critical file already exists with unverifiable ownership: $relativePath"
+                }
+            } else {
+                $guardEntry = $inventoryByPath[$relativePath]
+                if ($guardEntry.action -ne 'created' -or $guardTargetHash -ne $guardEntry.installedSha256) {
+                    throw "Security-critical file was modified or has unverifiable ownership: $relativePath"
+                }
+            }
+            if ($guardTargetHash -eq $guardSourceHash) {
+                $actions.Add("[skip] $relativePath (security-critical file is current)")
+            } elseif ($DryRun) {
+                $actions.Add("[update] $relativePath (security-critical file upgrade)")
+            } else {
+                Copy-Item -LiteralPath $file.FullName -Destination $targetPathResolved -Force
+                $actions.Add("[update] $relativePath (security-critical file upgrade)")
+            }
+            Set-InventoryEntry -Map $inventoryByPath -RelativePath $relativePath -Source $overlay.Name -Action 'created' -InstalledSha256 $guardSourceHash
+            continue
+        }
+
         if (Test-Path -LiteralPath $targetPathResolved -PathType Leaf) {
             $actions.Add("[skip] $relativePath (existing file was not overwritten)")
             if (-not $inventoryByPath.ContainsKey($relativePath)) {
@@ -719,7 +851,8 @@ $manifestPlan = New-ManifestPlan `
     -InstalledPacks @($installedPacks) `
     -Files @($inventoryByPath.Values) `
     -Existing $existingManifest `
-    -GitPolicy $gitPolicy
+    -GitPolicy $gitPolicy `
+    -PolicyChangedBy $policyChangedBy
 
 if ($manifestPlan.Changed) {
     if ($DryRun) {

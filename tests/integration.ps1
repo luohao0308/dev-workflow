@@ -28,6 +28,8 @@ $powerShellExe = if ($PSVersionTable.PSEdition -eq 'Core') {
     Join-Path $PSHOME 'powershell.exe'
 }
 Assert-True (@($installParameters | Where-Object { $_ -match 'delete' }).Count -eq 0) 'installer does not expose a delete permission option'
+Assert-True ($installParameters -contains 'PullRequestMode') 'installer exposes pull-request mode configuration'
+Assert-True ($installParameters -contains 'PullRequestActor') 'installer exposes pull-request actor configuration'
 $tempBase = [IO.Path]::GetTempPath()
 $tempRoot = Join-Path $tempBase ("dev-workflow-integration-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -43,23 +45,57 @@ try {
     & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
     $freshManifestPath = Join-Path $freshTarget '.dev-workflow/manifest.json'
     $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$manifest.schemaVersion -eq '3') 'new installs use manifest schema 3'
+    Assert-True ([string]$manifest.schemaVersion -eq '4') 'new installs use manifest schema 4'
     Assert-True ([string]$manifest.gitPolicy.pushMode -eq 'manual') 'push defaults to manual approval'
     Assert-True ([string]$manifest.gitPolicy.pushActor -eq 'user') 'push defaults to user execution'
+    Assert-True ([string]$manifest.gitPolicy.pullRequestMode -eq 'manual') 'pull requests default to manual approval'
+    Assert-True ([string]$manifest.gitPolicy.pullRequestActor -eq 'user') 'pull requests default to user execution'
     Assert-True ([string]$manifest.gitPolicy.mergeMode -eq 'manual') 'merge defaults to manual approval'
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'merge defaults to user execution'
+    Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'pull requests are required by default'
+    Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'CI is required by default'
+    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'independent review is required by default'
+    Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'force push is denied by default'
+    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'direct protected-branch push is denied by default'
+    Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'privileged operations default to deny'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'delete is always denied'
+    Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq 'default') 'safe defaults record their policy origin'
+    $policyChangedAt = [DateTime]::MinValue
+    Assert-True ([DateTime]::TryParse([string]$manifest.gitPolicy.policyChangedAt, [ref]$policyChangedAt)) 'safe defaults record a valid policy timestamp'
     Assert-True (@($manifest.files).Count -gt 20) 'new installs record a file ownership inventory'
     Assert-True (@($manifest.files | Where-Object action -eq 'created').Count -gt 20) 'new files record created ownership'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 大型计划拆分与确认门') 'Core install includes the large-plan approval gate'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 默认开发闭环（轻量核心 \+ 风险插件）') 'Core install includes the lightweight development loop'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## Git 交付权限策略') 'Core install includes the Git delivery permission policy'
-    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '一次性人工授权') 'Core install permits explicit one-time AI push or merge authorization'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 交付治理与权限策略') 'Core install includes the delivery governance and permission policy'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '一次性授权必须绑定') 'Core install scopes one-time delivery authorization'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/README.md') -Raw -Encoding UTF8) -match 'awaiting_user_confirmation') 'delivery plans expose the approval state'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match '## 7\. 偏移控制') 'delivery plan template includes drift control'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -Raw -Encoding UTF8) -match 'Test/Eval/Check') 'delivery plan template maps claims to executable checks'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/GIT-WORKTREE-WORKFLOW.md') -Raw -Encoding UTF8) -match 'codex/\*') 'delivery workflow protects local Codex branches'
+    Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'scripts/delivery_guard.py') -PathType Leaf) 'Core installs the delivery preflight guard'
+    Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/delivery_guard.py' -and $_.source -eq 'core' }).Count -eq 1) 'manifest records delivery guard ownership'
     Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/feature_catalog.py' -and $_.source -eq 'feature-catalog' }).Count -eq 1) 'all-packs installs feature-catalog ownership'
+
+    $guardCollisionTarget = Join-Path $tempRoot 'guard-collision'
+    New-Item -ItemType Directory -Path (Join-Path $guardCollisionTarget 'scripts') -Force | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $guardCollisionTarget 'scripts/delivery_guard.py') -Content "untrusted guard`n"
+    $guardCollisionFailed = $false
+    try { & $installScript -TargetPath $guardCollisionTarget -NonInteractiveInstall | Out-Null } catch { $guardCollisionFailed = $true }
+    Assert-True $guardCollisionFailed 'install rejects an untrusted pre-existing delivery guard'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $guardCollisionTarget '.dev-workflow/manifest.json'))) 'guard collision fails before manifest creation'
+
+    $guardTamperTarget = Join-Path $tempRoot 'guard-tamper'
+    New-Item -ItemType Directory -Path $guardTamperTarget | Out-Null
+    & $installScript -TargetPath $guardTamperTarget -NonInteractiveInstall | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $guardTamperTarget 'scripts/delivery_guard.py') -Content "tampered guard`n"
+    $guardTamperManifestPath = Join-Path $guardTamperTarget '.dev-workflow/manifest.json'
+    $guardTamperManifestHash = (Get-FileHash -LiteralPath $guardTamperManifestPath -Algorithm SHA256).Hash
+    & $powerShellExe -NoProfile -File $auditScript -TargetPath $guardTamperTarget *> $null
+    Assert-True ($LASTEXITCODE -eq 1) 'audit rejects a modified managed delivery guard'
+    $guardTamperFailed = $false
+    try { & $installScript -TargetPath $guardTamperTarget -NonInteractiveInstall | Out-Null } catch { $guardTamperFailed = $true }
+    Assert-True $guardTamperFailed 'reinstall rejects a modified managed delivery guard'
+    Assert-True ($guardTamperManifestHash -eq (Get-FileHash -LiteralPath $guardTamperManifestPath -Algorithm SHA256).Hash) 'rejected guard tamper leaves manifest unchanged'
     $freshExcludePath = Join-Path $freshTarget '.git/info/exclude'
     $freshExclude = Get-Content -LiteralPath $freshExcludePath -Raw -Encoding UTF8
     Assert-True ($freshExclude -match '# BEGIN dev-workflow managed excludes') 'install adds a managed Git exclude block'
@@ -76,24 +112,52 @@ try {
     }
     Assert-True ($gitignoreHashBeforeInstall -eq (Get-FileHash -LiteralPath (Join-Path $freshTarget '.gitignore') -Algorithm SHA256).Hash) 'install does not modify project .gitignore'
 
-    $automatedGitTarget = Join-Path $tempRoot 'automated-git'
-    New-Item -ItemType Directory -Path $automatedGitTarget | Out-Null
-    & $installScript `
-        -TargetPath $automatedGitTarget `
-        -PushMode auto `
-        -PushActor ai `
-        -MergeMode auto `
-        -MergeActor ai | Out-Null
-    $automatedGitManifest = Get-Content -LiteralPath (Join-Path $automatedGitTarget '.dev-workflow/manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$automatedGitManifest.gitPolicy.pushMode -eq 'auto') 'explicit push automation is recorded'
-    Assert-True ([string]$automatedGitManifest.gitPolicy.pushActor -eq 'ai') 'explicit AI push actor is recorded'
-    Assert-True ([string]$automatedGitManifest.gitPolicy.mergeMode -eq 'auto') 'explicit merge automation is recorded'
-    Assert-True ([string]$automatedGitManifest.gitPolicy.mergeActor -eq 'ai') 'explicit AI merge actor is recorded'
-    Assert-True ($automatedGitManifest.gitPolicy.deleteAllowed -eq $false) 'delete remains denied when Git automation is enabled'
-    & $installScript -TargetPath $automatedGitTarget | Out-Null
-    $automatedGitManifest = Get-Content -LiteralPath (Join-Path $automatedGitTarget '.dev-workflow/manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$automatedGitManifest.gitPolicy.pushMode -eq 'auto') 'reinstall preserves explicit push automation'
-    Assert-True ([string]$automatedGitManifest.gitPolicy.mergeMode -eq 'auto') 'reinstall preserves explicit merge automation'
+    foreach ($nonInteractiveAuthorization in @(
+        @{ Name = 'push'; Arguments = @('-PushMode', 'auto', '-PushActor', 'ai') },
+        @{ Name = 'pull-request'; Arguments = @('-PullRequestMode', 'auto', '-PullRequestActor', 'ai') },
+        @{ Name = 'merge'; Arguments = @('-MergeMode', 'auto', '-MergeActor', 'ai') }
+    )) {
+        $authorizationTarget = Join-Path $tempRoot ("non-interactive-$($nonInteractiveAuthorization.Name)")
+        New-Item -ItemType Directory -Path $authorizationTarget | Out-Null
+        $authorizationFailed = $false
+        try {
+            $authorizationArguments = @('-TargetPath', $authorizationTarget) + @($nonInteractiveAuthorization.Arguments)
+            & $installScript @authorizationArguments | Out-Null
+        } catch {
+            $authorizationFailed = $true
+        }
+        Assert-True $authorizationFailed "non-interactive install cannot self-authorize $($nonInteractiveAuthorization.Name) auto/ai"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $authorizationTarget '.dev-workflow/manifest.json'))) "rejected $($nonInteractiveAuthorization.Name) self-authorization does not write a manifest"
+    }
+
+    foreach ($existingPolicyChange in @(
+        @{ Name = 'push-mode'; ModeField = 'pushMode'; ActorField = 'pushActor'; InitialMode = 'auto'; Parameter = '-PushMode'; Value = 'manual' },
+        @{ Name = 'push-actor'; ModeField = 'pushMode'; ActorField = 'pushActor'; InitialMode = 'manual'; Parameter = '-PushActor'; Value = 'user' },
+        @{ Name = 'pull-request-mode'; ModeField = 'pullRequestMode'; ActorField = 'pullRequestActor'; InitialMode = 'auto'; Parameter = '-PullRequestMode'; Value = 'manual' },
+        @{ Name = 'pull-request-actor'; ModeField = 'pullRequestMode'; ActorField = 'pullRequestActor'; InitialMode = 'manual'; Parameter = '-PullRequestActor'; Value = 'user' },
+        @{ Name = 'merge-mode'; ModeField = 'mergeMode'; ActorField = 'mergeActor'; InitialMode = 'auto'; Parameter = '-MergeMode'; Value = 'manual' },
+        @{ Name = 'merge-actor'; ModeField = 'mergeMode'; ActorField = 'mergeActor'; InitialMode = 'manual'; Parameter = '-MergeActor'; Value = 'user' }
+    )) {
+        $existingPolicyTarget = Join-Path $tempRoot ("existing-policy-$($existingPolicyChange.Name)")
+        New-Item -ItemType Directory -Path $existingPolicyTarget | Out-Null
+        & $installScript -TargetPath $existingPolicyTarget | Out-Null
+        $existingPolicyManifestPath = Join-Path $existingPolicyTarget '.dev-workflow/manifest.json'
+        $existingPolicyManifest = Get-Content -LiteralPath $existingPolicyManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $existingPolicyManifest.gitPolicy.($existingPolicyChange.ModeField) = $existingPolicyChange.InitialMode
+        $existingPolicyManifest.gitPolicy.($existingPolicyChange.ActorField) = 'ai'
+        $existingPolicyManifest.gitPolicy.policyChangedBy = 'user'
+        Write-Utf8NoBom -Path $existingPolicyManifestPath -Content (($existingPolicyManifest | ConvertTo-Json -Depth 8) + "`n")
+        $existingPolicyHash = (Get-FileHash -LiteralPath $existingPolicyManifestPath -Algorithm SHA256).Hash
+        $existingPolicyChangeFailed = $false
+        try {
+            $existingPolicyArguments = @('-TargetPath', $existingPolicyTarget, $existingPolicyChange.Parameter, $existingPolicyChange.Value)
+            & $installScript @existingPolicyArguments | Out-Null
+        } catch {
+            $existingPolicyChangeFailed = $true
+        }
+        Assert-True $existingPolicyChangeFailed "non-interactive install cannot narrow existing $($existingPolicyChange.Name) policy"
+        Assert-True ($existingPolicyHash -eq (Get-FileHash -LiteralPath $existingPolicyManifestPath -Algorithm SHA256).Hash) "rejected $($existingPolicyChange.Name) policy change preserves the manifest"
+    }
 
     $invalidGitTarget = Join-Path $tempRoot 'invalid-git'
     New-Item -ItemType Directory -Path $invalidGitTarget | Out-Null
@@ -105,6 +169,17 @@ try {
     }
     Assert-True $invalidGitFailed 'automatic push with a user actor is rejected'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $invalidGitTarget '.dev-workflow/manifest.json'))) 'invalid Git policy does not write a manifest'
+
+    $invalidMergeTarget = Join-Path $tempRoot 'invalid-merge'
+    New-Item -ItemType Directory -Path $invalidMergeTarget | Out-Null
+    $invalidMergeFailed = $false
+    try {
+        & $installScript -TargetPath $invalidMergeTarget -MergeMode auto -MergeActor user | Out-Null
+    } catch {
+        $invalidMergeFailed = $true
+    }
+    Assert-True $invalidMergeFailed 'automatic merge with a user actor is rejected'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $invalidMergeTarget '.dev-workflow/manifest.json'))) 'invalid merge policy does not write a manifest'
 
     $dryRunGitTarget = Join-Path $tempRoot 'dry-run-git'
     New-Item -ItemType Directory -Path $dryRunGitTarget | Out-Null
@@ -243,10 +318,36 @@ try {
     $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ([string]$manifest.updatedAt -eq $firstUpdatedAt) 'idempotent reinstall preserves updatedAt'
 
-    $automatedGitManifest.gitPolicy.deleteAllowed = $true
-    Write-Utf8NoBom -Path (Join-Path $automatedGitTarget '.dev-workflow/manifest.json') -Content (($automatedGitManifest | ConvertTo-Json -Depth 8) + "`n")
-    & $powerShellExe -NoProfile -File $auditScript -TargetPath $automatedGitTarget *> $null
-    Assert-True ($LASTEXITCODE -eq 1) 'audit rejects granted delete permission'
+    $auditPolicyTarget = Join-Path $tempRoot 'audit-policy'
+    New-Item -ItemType Directory -Path $auditPolicyTarget | Out-Null
+    & $installScript -TargetPath $auditPolicyTarget | Out-Null
+    $auditPolicyManifestPath = Join-Path $auditPolicyTarget '.dev-workflow/manifest.json'
+    $auditPolicyBaseline = Get-Content -LiteralPath $auditPolicyManifestPath -Raw -Encoding UTF8
+    foreach ($auditPolicyCase in @(
+        @{ Message = 'audit rejects an invalid pull-request mode'; Changes = @{ pullRequestMode = 'sometimes' }; Remove = @() },
+        @{ Message = 'audit rejects automatic pull requests with a user actor'; Changes = @{ pullRequestMode = 'auto'; pullRequestActor = 'user' }; Remove = @() },
+        @{ Message = 'audit rejects a missing pull-request actor'; Changes = @{}; Remove = @('pullRequestActor') },
+        @{ Message = 'audit rejects a missing required safety gate'; Changes = @{}; Remove = @('ciRequired') },
+        @{ Message = 'audit rejects automatic merge with a user actor'; Changes = @{ mergeMode = 'auto'; mergeActor = 'user' }; Remove = @() },
+        @{ Message = 'audit rejects a disabled pull-request requirement'; Changes = @{ pullRequestRequired = $false }; Remove = @() },
+        @{ Message = 'audit rejects a disabled CI requirement'; Changes = @{ ciRequired = $false }; Remove = @() },
+        @{ Message = 'audit rejects a disabled independent-review requirement'; Changes = @{ independentReviewRequired = $false }; Remove = @() },
+        @{ Message = 'audit rejects allowed force push'; Changes = @{ forcePushAllowed = $true }; Remove = @() },
+        @{ Message = 'audit rejects direct protected-branch push'; Changes = @{ directProtectedBranchPushAllowed = $true }; Remove = @() },
+        @{ Message = 'audit rejects privileged operations enabled by default'; Changes = @{ privilegedOperationsDefault = 'allow' }; Remove = @() },
+        @{ Message = 'audit rejects granted delete permission'; Changes = @{ deleteAllowed = $true }; Remove = @() }
+    )) {
+        $auditPolicyManifest = $auditPolicyBaseline | ConvertFrom-Json
+        foreach ($field in $auditPolicyCase.Changes.Keys) {
+            $auditPolicyManifest.gitPolicy.$field = $auditPolicyCase.Changes[$field]
+        }
+        foreach ($field in $auditPolicyCase.Remove) {
+            $auditPolicyManifest.gitPolicy.PSObject.Properties.Remove($field)
+        }
+        Write-Utf8NoBom -Path $auditPolicyManifestPath -Content (($auditPolicyManifest | ConvertTo-Json -Depth 8) + "`n")
+        & $powerShellExe -NoProfile -File $auditScript -TargetPath $auditPolicyTarget *> $null
+        Assert-True ($LASTEXITCODE -eq 1) $auditPolicyCase.Message
+    }
     & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget *> $null
     Assert-True ($LASTEXITCODE -eq 2) 'a structurally valid pending install returns audit exit code 2'
 
@@ -261,7 +362,7 @@ try {
     & $pythonCommand.Name $featureCatalogTool --root $freshTarget --generate | Out-Null
     Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog regeneration repairs matrix drift'
     & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget -Strict *> $null
-    Assert-True ($LASTEXITCODE -eq 0) 'a completed schema 3 install passes strict audit'
+    Assert-True ($LASTEXITCODE -eq 0) 'a completed schema 4 install passes strict audit'
 
     $excludeWithoutCore = @(
         Get-Content -LiteralPath $freshExcludePath -Encoding UTF8 |
@@ -274,18 +375,34 @@ try {
 
     $modifiedDeliveryFile = Join-Path $freshTarget 'docs/development/README.md'
     [IO.File]::AppendAllText($modifiedDeliveryFile, "`n项目自定义内容。`n", [Text.UTF8Encoding]::new($false))
+    $policyManifestBeforeUninstall = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $policyChangedAtBeforeUninstall = [string]$policyManifestBeforeUninstall.gitPolicy.policyChangedAt
+    $policyChangedByBeforeUninstall = [string]$policyManifestBeforeUninstall.gitPolicy.policyChangedBy
     & $uninstallScript -TargetPath $freshTarget -Packs delivery -DryRun | Out-Null
     Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md') -PathType Leaf) 'dry-run does not delete files'
 
     & $uninstallScript -TargetPath $freshTarget -Packs delivery | Out-Null
     Assert-True (Test-Path -LiteralPath $modifiedDeliveryFile -PathType Leaf) 'modified managed files are preserved'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $freshTarget 'docs/plans/TEMPLATE.md'))) 'unchanged pack files are deleted'
+    Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'scripts/delivery_guard.py') -PathType Leaf) 'partial delivery uninstall preserves the Core guard'
     $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True (@($manifest.installedPacks) -notcontains 'delivery') 'partial uninstall removes the pack from manifest'
     Assert-True (@($manifest.files | Where-Object source -eq 'delivery').Count -eq 0) 'partial uninstall removes pack inventory entries'
     Assert-True ([string]$manifest.gitPolicy.pushMode -eq 'manual') 'partial uninstall preserves push policy'
+    Assert-True ([string]$manifest.gitPolicy.pushActor -eq 'user') 'partial uninstall preserves push actor'
+    Assert-True ([string]$manifest.gitPolicy.pullRequestMode -eq 'manual') 'partial uninstall preserves pull-request policy'
+    Assert-True ([string]$manifest.gitPolicy.pullRequestActor -eq 'user') 'partial uninstall preserves pull-request actor'
+    Assert-True ([string]$manifest.gitPolicy.mergeMode -eq 'manual') 'partial uninstall preserves merge policy'
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'partial uninstall preserves merge policy'
+    Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'partial uninstall preserves the pull-request requirement'
+    Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'partial uninstall preserves the CI requirement'
+    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'partial uninstall preserves the independent-review requirement'
+    Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'partial uninstall preserves denied force push'
+    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'partial uninstall preserves denied direct protected-branch push'
+    Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'partial uninstall preserves denied privileged operations'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'partial uninstall preserves denied delete permission'
+    Assert-True ([string]$manifest.gitPolicy.policyChangedAt -eq $policyChangedAtBeforeUninstall) 'partial uninstall preserves the policy timestamp'
+    Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq $policyChangedByBeforeUninstall) 'partial uninstall preserves the policy origin'
     $partialExclude = Get-Content -LiteralPath $freshExcludePath -Raw -Encoding UTF8
     Assert-True ($partialExclude -match '/docs/README\.md') 'partial uninstall preserves Core Git excludes'
     Assert-True ($partialExclude -notmatch '/docs/plans/TEMPLATE\.md') 'partial uninstall removes pack Git excludes'
@@ -416,6 +533,46 @@ try {
     Assert-True (Test-Path -LiteralPath $forgedCorePath -PathType Leaf) 'forged Core ownership cannot delete a pre-existing user file'
     Assert-True (Test-Path -LiteralPath $forgedPackPath -PathType Leaf) 'forged pack ownership cannot delete a pre-existing user file'
 
+    $schema3UpgradeTarget = Join-Path $tempRoot 'schema3-upgrade'
+    New-Item -ItemType Directory -Path $schema3UpgradeTarget | Out-Null
+    & $installScript -TargetPath $schema3UpgradeTarget | Out-Null
+    $schema3UpgradeManifestPath = Join-Path $schema3UpgradeTarget '.dev-workflow/manifest.json'
+    $schema3UpgradeManifest = Get-Content -LiteralPath $schema3UpgradeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $schema3UpgradeManifest.schemaVersion = 3
+    $schema3UpgradeManifest.gitPolicy.pushMode = 'manual'
+    $schema3UpgradeManifest.gitPolicy.pushActor = 'ai'
+    $schema3UpgradeManifest.gitPolicy.mergeMode = 'auto'
+    $schema3UpgradeManifest.gitPolicy.mergeActor = 'ai'
+    foreach ($field in @(
+        'pullRequestMode',
+        'pullRequestActor',
+        'pullRequestRequired',
+        'ciRequired',
+        'independentReviewRequired',
+        'forcePushAllowed',
+        'directProtectedBranchPushAllowed',
+        'privilegedOperationsDefault'
+    )) {
+        $schema3UpgradeManifest.gitPolicy.PSObject.Properties.Remove($field)
+    }
+    Write-Utf8NoBom -Path $schema3UpgradeManifestPath -Content (($schema3UpgradeManifest | ConvertTo-Json -Depth 8) + "`n")
+    & $installScript -TargetPath $schema3UpgradeTarget | Out-Null
+    $schema3UpgradeManifest = Get-Content -LiteralPath $schema3UpgradeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True ([string]$schema3UpgradeManifest.schemaVersion -eq '4') 'schema 3 manifests upgrade to schema 4'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pushMode -eq 'manual') 'schema 3 upgrade preserves push mode'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pushActor -eq 'ai') 'schema 3 upgrade preserves push actor'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.mergeMode -eq 'auto') 'schema 3 upgrade preserves merge mode'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.mergeActor -eq 'ai') 'schema 3 upgrade preserves merge actor'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pullRequestMode -eq 'manual') 'schema 3 upgrade adds safe pull-request mode'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pullRequestActor -eq 'user') 'schema 3 upgrade adds safe pull-request actor'
+    Assert-True ($schema3UpgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 3 upgrade requires pull requests'
+    Assert-True ($schema3UpgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 3 upgrade requires CI'
+    Assert-True ($schema3UpgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 3 upgrade requires independent review'
+    Assert-True ($schema3UpgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 3 upgrade denies force push'
+    Assert-True ($schema3UpgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 3 upgrade denies direct protected-branch push'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 3 upgrade denies privileged operations by default'
+    Assert-True ([string]$schema3UpgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 3 upgrade records migration as the policy origin'
+
     $upgradeTarget = Join-Path $tempRoot 'schema2-upgrade'
     New-Item -ItemType Directory -Path $upgradeTarget | Out-Null
     & $installScript -TargetPath $upgradeTarget | Out-Null
@@ -431,10 +588,21 @@ try {
     $upgradedEntry = $upgradeManifest.files | Where-Object path -eq 'docs/TASKS.md'
     Assert-True ($upgradedEntry.action -eq 'legacy') 'changed created ownership becomes legacy during a version upgrade'
     Assert-True ($null -eq $upgradedEntry.installedSha256) 'legacy upgrade ownership clears the deletion hash'
-    Assert-True ([string]$upgradeManifest.schemaVersion -eq '3') 'schema 2 manifests upgrade to schema 3'
+    Assert-True ([string]$upgradeManifest.schemaVersion -eq '4') 'schema 2 manifests upgrade to schema 4'
     Assert-True ($upgradeManifest.workflowVersion -eq $workflowVersion) 'schema 2 upgrade records the current workflow version'
     Assert-True ([string]$upgradeManifest.gitPolicy.pushMode -eq 'manual') 'upgrade adds safe push policy when missing'
+    Assert-True ([string]$upgradeManifest.gitPolicy.pushActor -eq 'user') 'upgrade adds safe push actor when missing'
+    Assert-True ([string]$upgradeManifest.gitPolicy.pullRequestMode -eq 'manual') 'upgrade adds safe pull-request policy when missing'
+    Assert-True ([string]$upgradeManifest.gitPolicy.pullRequestActor -eq 'user') 'upgrade adds safe pull-request actor when missing'
+    Assert-True ([string]$upgradeManifest.gitPolicy.mergeMode -eq 'manual') 'upgrade adds safe merge policy when missing'
     Assert-True ([string]$upgradeManifest.gitPolicy.mergeActor -eq 'user') 'upgrade adds safe merge actor when missing'
+    Assert-True ($upgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 2 upgrade requires pull requests'
+    Assert-True ($upgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 2 upgrade requires CI'
+    Assert-True ($upgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 2 upgrade requires independent review'
+    Assert-True ($upgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 2 upgrade denies force push'
+    Assert-True ($upgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 2 upgrade denies direct protected-branch push'
+    Assert-True ([string]$upgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 2 upgrade denies privileged operations by default'
+    Assert-True ([string]$upgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 2 upgrade records migration as the policy origin'
 
     $legacyTarget = Join-Path $tempRoot 'legacy'
     New-Item -ItemType Directory -Path $legacyTarget | Out-Null
@@ -448,8 +616,21 @@ try {
 
     & $installScript -TargetPath $legacyTarget | Out-Null
     $migratedManifest = Get-Content -LiteralPath $legacyManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$migratedManifest.schemaVersion -eq '3') 'legacy manifests migrate to schema 3'
+    Assert-True ([string]$migratedManifest.schemaVersion -eq '4') 'legacy manifests migrate to schema 4'
     Assert-True (($migratedManifest.files | Where-Object path -eq 'docs/architecture/SYSTEM.md').action -eq 'legacy') 'legacy pack files remain conservatively owned'
+    Assert-True ([string]$migratedManifest.gitPolicy.pushMode -eq 'manual') 'schema 1 upgrade adds safe push policy'
+    Assert-True ([string]$migratedManifest.gitPolicy.pushActor -eq 'user') 'schema 1 upgrade adds safe push actor'
+    Assert-True ([string]$migratedManifest.gitPolicy.pullRequestMode -eq 'manual') 'schema 1 upgrade adds safe pull-request policy'
+    Assert-True ([string]$migratedManifest.gitPolicy.pullRequestActor -eq 'user') 'schema 1 upgrade adds safe pull-request actor'
+    Assert-True ([string]$migratedManifest.gitPolicy.mergeMode -eq 'manual') 'schema 1 upgrade adds safe merge policy'
+    Assert-True ([string]$migratedManifest.gitPolicy.mergeActor -eq 'user') 'schema 1 upgrade adds safe merge actor'
+    Assert-True ($migratedManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 1 upgrade requires pull requests'
+    Assert-True ($migratedManifest.gitPolicy.ciRequired -eq $true) 'schema 1 upgrade requires CI'
+    Assert-True ($migratedManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 1 upgrade requires independent review'
+    Assert-True ($migratedManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 1 upgrade denies force push'
+    Assert-True ($migratedManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 1 upgrade denies direct protected-branch push'
+    Assert-True ([string]$migratedManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 1 upgrade denies privileged operations by default'
+    Assert-True ([string]$migratedManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 1 upgrade records migration as the policy origin'
 
     Write-Output 'PowerShell integration tests passed.'
 } finally {

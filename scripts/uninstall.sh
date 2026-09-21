@@ -38,6 +38,43 @@ json_boolean_field() {
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
+git_policy_field() {
+  local field="$1"
+  local path="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
+if not isinstance(p, dict) or sys.argv[2] not in p or isinstance(p[sys.argv[2]], (dict, list)) or p[sys.argv[2]] is None: raise SystemExit(1)
+v=p[sys.argv[2]]
+print(str(v).lower() if isinstance(v, bool) else v)' "$path" "$field"
+    return $?
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg field "$field" '
+      .gitPolicy as $p |
+      if ($p | type) != "object" or ($p | has($field) | not) then error("missing gitPolicy field")
+      elif ($p[$field] | type) == "boolean" then ($p[$field] | if . then "true" else "false" end)
+      elif (($p[$field] | type) == "string" or ($p[$field] | type) == "number") then ($p[$field] | tostring)
+      else error("invalid gitPolicy field") end
+    ' "$path"
+    return $?
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const p=d.gitPolicy; const f=process.argv[2]; if (!p || typeof p !== "object" || !(f in p) || p[f] === null || typeof p[f] === "object") process.exit(1); process.stdout.write(String(p[f]));' "$path" "$field"
+    return $?
+  fi
+  echo "读取 manifest gitPolicy 需要 python3、jq 或 node；未找到可用的结构化 JSON 解析器。" >&2
+  return 2
+}
+
+git_policy_string_field() {
+  git_policy_field "$1" "$2"
+}
+
+git_policy_boolean_field() {
+  git_policy_field "$1" "$2"
+}
+
 git_exclude_begin='# BEGIN dev-workflow managed excludes'
 git_exclude_end='# END dev-workflow managed excludes'
 
@@ -332,7 +369,7 @@ build_manifest() {
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$(json_escape "$last_audit_at")\""
   cat <<EOF
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "managedBy": "dev-workflow",
   "workflowVersion": "$(json_escape "$version")",
   "installedPacks": [$packs_json
@@ -342,7 +379,17 @@ build_manifest() {
     "pushActor": "$(json_escape "$push_actor")",
     "mergeMode": "$(json_escape "$merge_mode")",
     "mergeActor": "$(json_escape "$merge_actor")",
-    "deleteAllowed": false
+    "pullRequestMode": "$(json_escape "$pull_request_mode")",
+    "pullRequestActor": "$(json_escape "$pull_request_actor")",
+    "pullRequestRequired": true,
+    "ciRequired": true,
+    "independentReviewRequired": true,
+    "forcePushAllowed": false,
+    "directProtectedBranchPushAllowed": false,
+    "privilegedOperationsDefault": "deny",
+    "deleteAllowed": false,
+    "policyChangedAt": "$(json_escape "$policy_changed_at")",
+    "policyChangedBy": "$(json_escape "$policy_changed_by")"
   },
   "files": [
 EOF
@@ -441,7 +488,7 @@ grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" |
 }
 schema_version="$(json_number_field schemaVersion "$manifest_path")"
 case "$schema_version" in
-  1|2|3) ;;
+  1|2|3|4) ;;
   *) echo "不支持的 dev-workflow manifest schema：${schema_version:-missing}" >&2; exit 1 ;;
 esac
 
@@ -457,15 +504,38 @@ push_mode="manual"
 push_actor="user"
 merge_mode="manual"
 merge_actor="user"
+pull_request_mode="manual"
+pull_request_actor="user"
+policy_changed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+policy_changed_by="migration"
 if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
-  push_mode="$(json_string_field pushMode "$manifest_path")"
-  push_actor="$(json_string_field pushActor "$manifest_path")"
-  merge_mode="$(json_string_field mergeMode "$manifest_path")"
-  merge_actor="$(json_string_field mergeActor "$manifest_path")"
-  delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+  push_mode="$(git_policy_string_field pushMode "$manifest_path")"
+  push_actor="$(git_policy_string_field pushActor "$manifest_path")"
+  merge_mode="$(git_policy_string_field mergeMode "$manifest_path")"
+  merge_actor="$(git_policy_string_field mergeActor "$manifest_path")"
+  delete_allowed="$(git_policy_boolean_field deleteAllowed "$manifest_path")"
   case "$push_mode:$push_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest push Git 策略无效。" >&2; exit 1 ;; esac
   case "$merge_mode:$merge_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest merge Git 策略无效。" >&2; exit 1 ;; esac
   [[ "$delete_allowed" == "false" ]] || { echo "manifest gitPolicy.deleteAllowed 必须为 false。" >&2; exit 1; }
+  if [[ "$schema_version" == "4" ]]; then
+    pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
+    pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
+    policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
+    policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"
+    case "$pull_request_mode:$pull_request_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest pull request Git 策略无效。" >&2; exit 1 ;; esac
+    [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.pullRequestRequired 必须为 true。" >&2; exit 1; }
+    [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.ciRequired 必须为 true。" >&2; exit 1; }
+    [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.independentReviewRequired 必须为 true。" >&2; exit 1; }
+    [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.forcePushAllowed 必须为 false。" >&2; exit 1; }
+    [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。" >&2; exit 1; }
+    [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || { echo "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。" >&2; exit 1; }
+    [[ -n "$policy_changed_at" ]] || { echo "manifest gitPolicy.policyChangedAt 缺失。" >&2; exit 1; }
+    case "$policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
+  fi
+fi
+if [[ "$schema_version" == "4" ]] && ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
+  echo "schemaVersion 4 manifest 缺少 gitPolicy。" >&2
+  exit 1
 fi
 distribution_version="$(tr -d '[:space:]' < "$source_root/VERSION")"
 if [[ "$schema_version" != "1" && "$distribution_version" != "$manifest_version" ]]; then
@@ -502,7 +572,7 @@ file_paths=()
 file_sources=()
 file_actions=()
 file_hashes=()
-if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
+if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
   manifest_file_output="$(read_manifest_files "$manifest_path")" || {
     echo "manifest files 格式无效：$manifest_path" >&2
     exit 1

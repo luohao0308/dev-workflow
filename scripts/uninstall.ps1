@@ -188,7 +188,7 @@ function Read-ManagedManifest([string]$Path) {
     if ($manifest.managedBy -ne 'dev-workflow') {
         throw "Manifest is not managed by dev-workflow: $Path"
     }
-    if ([string]$manifest.schemaVersion -notin @('1', '2', '3')) {
+    if ([string]$manifest.schemaVersion -notin @('1', '2', '3', '4')) {
         throw "Unsupported dev-workflow manifest schema: $Path"
     }
     if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
@@ -220,6 +220,24 @@ function Read-ManagedManifest([string]$Path) {
         if ($manifest.gitPolicy.deleteAllowed -ne $false) {
             throw "Manifest gitPolicy.deleteAllowed must be false: $Path"
         }
+        if ([string]$manifest.schemaVersion -eq '4') {
+            $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
+            $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
+            if ("${pullRequestMode}:${pullRequestActor}" -notin @('manual:user', 'manual:ai', 'auto:ai')) {
+                throw "Manifest has an invalid pull request Git policy: $Path"
+            }
+            foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+                if ($manifest.gitPolicy.$requiredField -ne $true) { throw "Manifest gitPolicy.$requiredField must be true: $Path" }
+            }
+            foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+                if ($manifest.gitPolicy.$deniedField -ne $false) { throw "Manifest gitPolicy.$deniedField must be false: $Path" }
+            }
+            if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
+            if ([string]::IsNullOrWhiteSpace([string]$manifest.gitPolicy.policyChangedAt)) { throw "Manifest gitPolicy.policyChangedAt is required: $Path" }
+            if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { throw "Manifest gitPolicy.policyChangedBy is invalid: $Path" }
+        }
+    } elseif ([string]$manifest.schemaVersion -eq '4') {
+        throw "Schema 4 manifest is missing gitPolicy: $Path"
     }
     return $manifest
 }
@@ -236,7 +254,7 @@ function New-InventoryEntry([string]$Path, [string]$Source, [string]$Action, [Al
 function Get-Inventory([object]$Manifest, [string]$SourceRoot, [string]$TargetRoot) {
     $entries = [Collections.Generic.List[object]]::new()
     $seen = @{}
-    if ([string]$Manifest.schemaVersion -in @('2', '3')) {
+    if ([string]$Manifest.schemaVersion -in @('2', '3', '4')) {
         $filesProperty = $Manifest.PSObject.Properties['files']
         if (
             $null -eq $filesProperty -or
@@ -332,7 +350,17 @@ $gitPolicy = if ($null -ne $manifest.gitPolicy) {
         pushActor = ([string]$manifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
         mergeMode = ([string]$manifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
         mergeActor = ([string]$manifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
+        pullRequestMode = if ([string]$manifest.schemaVersion -eq '4') { ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant() } else { 'manual' }
+        pullRequestActor = if ([string]$manifest.schemaVersion -eq '4') { ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant() } else { 'user' }
+        pullRequestRequired = $true
+        ciRequired = $true
+        independentReviewRequired = $true
+        forcePushAllowed = $false
+        directProtectedBranchPushAllowed = $false
+        privilegedOperationsDefault = 'deny'
         deleteAllowed = $false
+        policyChangedAt = if ([string]$manifest.schemaVersion -eq '4') { [string]$manifest.gitPolicy.policyChangedAt } else { [DateTime]::UtcNow.ToString('o') }
+        policyChangedBy = if ([string]$manifest.schemaVersion -eq '4') { [string]$manifest.gitPolicy.policyChangedBy } else { 'migration' }
     }
 } else {
     [ordered]@{
@@ -340,7 +368,17 @@ $gitPolicy = if ($null -ne $manifest.gitPolicy) {
         pushActor = 'user'
         mergeMode = 'manual'
         mergeActor = 'user'
+        pullRequestMode = 'manual'
+        pullRequestActor = 'user'
+        pullRequestRequired = $true
+        ciRequired = $true
+        independentReviewRequired = $true
+        forcePushAllowed = $false
+        directProtectedBranchPushAllowed = $false
+        privilegedOperationsDefault = 'deny'
         deleteAllowed = $false
+        policyChangedAt = [DateTime]::UtcNow.ToString('o')
+        policyChangedBy = 'migration'
     }
 }
 $distributionVersion = (Get-Content -LiteralPath (Join-Path $sourceRoot 'VERSION') -Raw -Encoding UTF8).Trim()
@@ -500,7 +538,7 @@ if ($fullUninstall) {
     $remainingFiles = @($inventory | Where-Object { $requestedPacks -notcontains $_.source } | Sort-Object path)
     $now = [DateTime]::UtcNow.ToString('o')
     $updatedManifest = [ordered]@{
-        schemaVersion = 3
+        schemaVersion = 4
         managedBy = 'dev-workflow'
         workflowVersion = [string]$manifest.workflowVersion
         installedPacks = $remainingPacks

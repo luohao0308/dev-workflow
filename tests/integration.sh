@@ -20,6 +20,36 @@ assert_no_installed_packs() {
   tr -d '[:space:]' < "$1" | grep -Fq '"installedPacks":[]' || fail "$2"
 }
 
+assert_json_string() {
+  local path="$1"
+  local field="$2"
+  local expected="$3"
+  local message="$4"
+  grep -Eq "\"$field\"[[:space:]]*:[[:space:]]*\"$expected\"" "$path" || fail "$message"
+}
+
+assert_json_boolean() {
+  local path="$1"
+  local field="$2"
+  local expected="$3"
+  local message="$4"
+  grep -Eq "\"$field\"[[:space:]]*:[[:space:]]*$expected" "$path" || fail "$message"
+}
+
+assert_v4_safety_defaults() {
+  local path="$1"
+  local context="$2"
+  assert_json_string "$path" pullRequestMode manual "$context adds safe pull request mode"
+  assert_json_string "$path" pullRequestActor user "$context adds safe pull request actor"
+  assert_json_boolean "$path" pullRequestRequired true "$context requires pull requests"
+  assert_json_boolean "$path" ciRequired true "$context requires CI"
+  assert_json_boolean "$path" independentReviewRequired true "$context requires independent review"
+  assert_json_boolean "$path" forcePushAllowed false "$context denies force push"
+  assert_json_boolean "$path" directProtectedBranchPushAllowed false "$context denies direct protected branch push"
+  assert_json_boolean "$path" deleteAllowed false "$context denies delete"
+  assert_json_string "$path" privilegedOperationsDefault deny "$context denies privileged operations by default"
+}
+
 sha256_file() {
   local path="$1"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -39,6 +69,18 @@ install_script="$repo_root/scripts/install.sh"
 uninstall_script="$repo_root/scripts/uninstall.sh"
 audit_script="$repo_root/scripts/audit.sh"
 workflow_version="$(tr -d '[:space:]' < "$repo_root/VERSION")"
+
+assert_audit_rejects() {
+  local target="$1"
+  local message="$2"
+  local audit_code
+  set +e
+  bash "$audit_script" --target "$target" >/dev/null
+  audit_code=$?
+  set -e
+  [[ "$audit_code" -eq 1 ]] || fail "$message"
+}
+
 if bash "$install_script" --help | grep -Eq -- '--delete'; then
   fail "installer does not expose a delete permission option"
 fi
@@ -62,22 +104,63 @@ gitignore_hash_before_install="$(sha256_file "$fresh_target/.gitignore")"
 bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
 fresh_manifest="$fresh_target/.dev-workflow/manifest.json"
 assert_file "$fresh_manifest" "new install creates manifest"
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*3' "$fresh_manifest" || fail "new installs use schema 3"
-grep -Eq '"pushMode"[[:space:]]*:[[:space:]]*"manual"' "$fresh_manifest" || fail "push defaults to manual approval"
-grep -Eq '"pushActor"[[:space:]]*:[[:space:]]*"user"' "$fresh_manifest" || fail "push defaults to user execution"
-grep -Eq '"mergeMode"[[:space:]]*:[[:space:]]*"manual"' "$fresh_manifest" || fail "merge defaults to manual approval"
-grep -Eq '"mergeActor"[[:space:]]*:[[:space:]]*"user"' "$fresh_manifest" || fail "merge defaults to user execution"
-grep -Eq '"deleteAllowed"[[:space:]]*:[[:space:]]*false' "$fresh_manifest" || fail "delete is always denied"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$fresh_manifest" || fail "new installs use schema 4"
+assert_json_string "$fresh_manifest" pushMode manual "push defaults to manual approval"
+assert_json_string "$fresh_manifest" pushActor user "push defaults to user execution"
+assert_json_string "$fresh_manifest" pullRequestMode manual "pull request defaults to manual approval"
+assert_json_string "$fresh_manifest" pullRequestActor user "pull request defaults to user execution"
+assert_json_string "$fresh_manifest" mergeMode manual "merge defaults to manual approval"
+assert_json_string "$fresh_manifest" mergeActor user "merge defaults to user execution"
+assert_json_boolean "$fresh_manifest" pullRequestRequired true "pull requests are required by default"
+assert_json_boolean "$fresh_manifest" ciRequired true "CI is required by default"
+assert_json_boolean "$fresh_manifest" independentReviewRequired true "independent review is required by default"
+assert_json_boolean "$fresh_manifest" forcePushAllowed false "force push is denied by default"
+assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "direct protected branch push is denied by default"
+assert_json_boolean "$fresh_manifest" deleteAllowed false "delete is always denied"
+assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "privileged operations default to deny"
+assert_json_string "$fresh_manifest" policyChangedBy default "safe defaults record their policy origin"
+grep -Eq '"policyChangedAt"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"' "$fresh_manifest" || fail "new installs timestamp the initial policy"
 grep -Eq '"path":"AGENTS.md","source":"core","action":"created"' "$fresh_manifest" || fail "new installs record created ownership"
 grep -Fq '## 大型计划拆分与确认门' "$fresh_target/AGENTS.md" || fail "Core install includes the large-plan approval gate"
 grep -Fq '## 默认开发闭环（轻量核心 + 风险插件）' "$fresh_target/AGENTS.md" || fail "Core install includes the lightweight development loop"
-grep -Fq '## Git 交付权限策略' "$fresh_target/AGENTS.md" || fail "Core install includes the Git delivery permission policy"
-grep -Fq '一次性人工授权' "$fresh_target/AGENTS.md" || fail "Core install permits explicit one-time AI push or merge authorization"
+grep -Fq '## 交付治理与权限策略' "$fresh_target/AGENTS.md" || fail "Core install includes the delivery governance policy"
+grep -Fq '一次性授权必须绑定' "$fresh_target/AGENTS.md" || fail "Core install scopes one-time authorization to an exact operation"
 grep -Fq 'awaiting_user_confirmation' "$fresh_target/docs/plans/README.md" || fail "delivery plans expose the approval state"
 grep -Fq '## 7. 偏移控制' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template includes drift control"
 grep -Fq 'Test/Eval/Check' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template maps claims to executable checks"
 grep -Fq 'codex/*' "$fresh_target/docs/development/GIT-WORKTREE-WORKFLOW.md" || fail "delivery workflow protects local Codex branches"
+assert_file "$fresh_target/scripts/delivery_guard.py" "Core installs the delivery preflight guard"
+grep -Eq '"path":"scripts/delivery_guard.py","source":"core"' "$fresh_manifest" || fail "manifest records delivery guard ownership"
 grep -Eq '"path":"scripts/feature_catalog.py","source":"feature-catalog"' "$fresh_manifest" || fail "all-packs installs feature-catalog ownership"
+
+guard_collision_target="$temp_root/guard-collision"
+mkdir -p "$guard_collision_target/scripts"
+printf 'untrusted guard\n' > "$guard_collision_target/scripts/delivery_guard.py"
+set +e
+bash "$install_script" --target "$guard_collision_target" --non-interactive >/dev/null 2>&1
+guard_collision_code=$?
+set -e
+[[ "$guard_collision_code" -ne 0 ]] || fail "install rejects an untrusted pre-existing delivery guard"
+grep -Fq 'untrusted guard' "$guard_collision_target/scripts/delivery_guard.py" || fail "rejected guard collision is not overwritten"
+assert_not_file "$guard_collision_target/.dev-workflow/manifest.json" "guard collision fails before manifest creation"
+
+guard_tamper_target="$temp_root/guard-tamper"
+mkdir -p "$guard_tamper_target"
+bash "$install_script" --target "$guard_tamper_target" --non-interactive >/dev/null
+printf 'tampered guard\n' > "$guard_tamper_target/scripts/delivery_guard.py"
+guard_tamper_manifest="$guard_tamper_target/.dev-workflow/manifest.json"
+guard_tamper_manifest_hash="$(sha256_file "$guard_tamper_manifest")"
+set +e
+bash "$audit_script" --target "$guard_tamper_target" >/dev/null 2>&1
+guard_tamper_audit_code=$?
+set -e
+[[ "$guard_tamper_audit_code" -eq 1 ]] || fail "audit rejects a modified managed delivery guard"
+set +e
+bash "$install_script" --target "$guard_tamper_target" --non-interactive >/dev/null 2>&1
+guard_tamper_code=$?
+set -e
+[[ "$guard_tamper_code" -ne 0 ]] || fail "reinstall rejects a modified managed delivery guard"
+[[ "$(sha256_file "$guard_tamper_manifest")" == "$guard_tamper_manifest_hash" ]] || fail "rejected guard tamper leaves manifest unchanged"
 grep -Fq '# BEGIN dev-workflow managed excludes' "$fresh_target/.git/info/exclude" || fail "install adds a managed Git exclude block"
 grep -Fq '/.dev-workflow/' "$fresh_target/.git/info/exclude" || fail "Git exclude hides dev-workflow metadata"
 grep -Fq '/docs/README.md' "$fresh_target/.git/info/exclude" || fail "Git exclude hides a created Core file"
@@ -92,30 +175,63 @@ done < <(sed -n -E 's/.*"path":"([^"]+)".*"action":"created".*/\1/p' "$fresh_man
 
 automated_git_target="$temp_root/automated-git"
 mkdir -p "$automated_git_target"
+set +e
 bash "$install_script" \
   --target "$automated_git_target" \
   --push-mode auto \
   --push-actor ai \
+  --pull-request-mode auto \
+  --pull-request-actor ai \
   --merge-mode auto \
-  --merge-actor ai >/dev/null
-automated_git_manifest="$automated_git_target/.dev-workflow/manifest.json"
-grep -Eq '"pushMode"[[:space:]]*:[[:space:]]*"auto"' "$automated_git_manifest" || fail "explicit push automation is recorded"
-grep -Eq '"pushActor"[[:space:]]*:[[:space:]]*"ai"' "$automated_git_manifest" || fail "explicit AI push actor is recorded"
-grep -Eq '"mergeMode"[[:space:]]*:[[:space:]]*"auto"' "$automated_git_manifest" || fail "explicit merge automation is recorded"
-grep -Eq '"mergeActor"[[:space:]]*:[[:space:]]*"ai"' "$automated_git_manifest" || fail "explicit AI merge actor is recorded"
-grep -Eq '"deleteAllowed"[[:space:]]*:[[:space:]]*false' "$automated_git_manifest" || fail "delete remains denied when Git automation is enabled"
-bash "$install_script" --target "$automated_git_target" >/dev/null
-grep -Eq '"pushMode"[[:space:]]*:[[:space:]]*"auto"' "$automated_git_manifest" || fail "reinstall preserves explicit push automation"
-grep -Eq '"mergeMode"[[:space:]]*:[[:space:]]*"auto"' "$automated_git_manifest" || fail "reinstall preserves explicit merge automation"
-
-tampered_delete_manifest="$automated_git_manifest.tampered"
-sed -E 's/"deleteAllowed"[[:space:]]*:[[:space:]]*false/"deleteAllowed": true/' "$automated_git_manifest" > "$tampered_delete_manifest"
-mv -- "$tampered_delete_manifest" "$automated_git_manifest"
-set +e
-bash "$audit_script" --target "$automated_git_target" >/dev/null
-tampered_delete_code=$?
+  --merge-actor ai \
+  --non-interactive >/dev/null 2>&1
+non_interactive_automation_code=$?
 set -e
-[[ "$tampered_delete_code" -eq 1 ]] || fail "audit rejects granted delete permission"
+[[ "$non_interactive_automation_code" -ne 0 ]] || fail "non-interactive install cannot self-authorize AI automation"
+assert_not_file "$automated_git_target/.dev-workflow/manifest.json" "rejected non-interactive automation does not write a manifest"
+
+redirected_git_target="$temp_root/redirected-git"
+mkdir -p "$redirected_git_target"
+set +e
+printf 'YES\n' | DEV_WORKFLOW_NON_INTERACTIVE= bash "$install_script" \
+  --target "$redirected_git_target" \
+  --push-mode auto \
+  --push-actor ai >/dev/null 2>&1
+redirected_automation_code=$?
+set -e
+[[ "$redirected_automation_code" -ne 0 ]] || fail "redirected stdin cannot authorize AI automation"
+assert_not_file "$redirected_git_target/.dev-workflow/manifest.json" "rejected redirected automation does not write a manifest"
+
+existing_policy_target="$temp_root/existing-policy-change"
+mkdir -p "$existing_policy_target"
+bash "$install_script" --target "$existing_policy_target" >/dev/null
+existing_policy_manifest="$existing_policy_target/.dev-workflow/manifest.json"
+existing_policy_hash="$(sha256_file "$existing_policy_manifest")"
+set +e
+bash "$install_script" --target "$existing_policy_target" --push-actor ai --non-interactive >/dev/null 2>&1
+existing_policy_change_code=$?
+set -e
+[[ "$existing_policy_change_code" -ne 0 ]] || fail "non-interactive install cannot change an existing actor"
+[[ "$(sha256_file "$existing_policy_manifest")" == "$existing_policy_hash" ]] || fail "rejected existing policy change leaves the manifest unchanged"
+
+policy_narrowing_tmp="$existing_policy_manifest.auto"
+sed -E \
+  -e 's/"pushMode"[[:space:]]*:[[:space:]]*"manual"/"pushMode": "auto"/' \
+  -e 's/"pushActor"[[:space:]]*:[[:space:]]*"user"/"pushActor": "ai"/' \
+  -e 's/"policyChangedBy"[[:space:]]*:[[:space:]]*"default"/"policyChangedBy": "user"/' \
+  "$existing_policy_manifest" > "$policy_narrowing_tmp"
+mv -- "$policy_narrowing_tmp" "$existing_policy_manifest"
+automated_policy_hash="$(sha256_file "$existing_policy_manifest")"
+set +e
+bash "$install_script" \
+  --target "$existing_policy_target" \
+  --push-mode manual \
+  --push-actor user \
+  --non-interactive >/dev/null 2>&1
+policy_narrowing_code=$?
+set -e
+[[ "$policy_narrowing_code" -ne 0 ]] || fail "non-interactive install cannot narrow an existing policy"
+[[ "$(sha256_file "$existing_policy_manifest")" == "$automated_policy_hash" ]] || fail "rejected policy narrowing leaves the manifest unchanged"
 
 invalid_git_target="$temp_root/invalid-git"
 mkdir -p "$invalid_git_target"
@@ -125,6 +241,102 @@ invalid_git_code=$?
 set -e
 [[ "$invalid_git_code" -ne 0 ]] || fail "automatic push with a user actor is rejected"
 assert_not_file "$invalid_git_target/.dev-workflow/manifest.json" "invalid Git policy does not write a manifest"
+
+invalid_merge_target="$temp_root/invalid-merge"
+mkdir -p "$invalid_merge_target"
+set +e
+bash "$install_script" --target "$invalid_merge_target" --merge-mode auto --merge-actor user >/dev/null 2>&1
+invalid_merge_code=$?
+set -e
+[[ "$invalid_merge_code" -ne 0 ]] || fail "automatic merge with a user actor is rejected"
+assert_not_file "$invalid_merge_target/.dev-workflow/manifest.json" "invalid merge policy does not write a manifest"
+
+audit_policy_target="$temp_root/audit-policy"
+mkdir -p "$audit_policy_target"
+bash "$install_script" --target "$audit_policy_target" >/dev/null
+audit_policy_manifest="$audit_policy_target/.dev-workflow/manifest.json"
+audit_policy_baseline="$audit_policy_target/manifest.baseline.json"
+cp -- "$audit_policy_manifest" "$audit_policy_baseline"
+
+sed -E 's/"pullRequestMode"[[:space:]]*:[[:space:]]*"manual"/"pullRequestMode": "sometimes"/' \
+  "$audit_policy_baseline" > "$audit_policy_manifest"
+assert_audit_rejects "$audit_policy_target" "audit rejects an invalid pull request mode"
+
+sed -E \
+  -e 's/"pullRequestMode"[[:space:]]*:[[:space:]]*"manual"/"pullRequestMode": "auto"/' \
+  -e 's/"pullRequestActor"[[:space:]]*:[[:space:]]*"user"/"pullRequestActor": "user"/' \
+  "$audit_policy_baseline" > "$audit_policy_manifest"
+assert_audit_rejects "$audit_policy_target" "audit rejects automatic pull requests executed by a user actor"
+
+while IFS='|' read -r safety_field secure_value relaxed_value; do
+  sed -E "s/\"$safety_field\"[[:space:]]*:[[:space:]]*$secure_value/\"$safety_field\": $relaxed_value/" \
+    "$audit_policy_baseline" > "$audit_policy_manifest"
+  assert_audit_rejects "$audit_policy_target" "audit rejects relaxed $safety_field"
+done <<'EOF'
+pullRequestRequired|true|false
+ciRequired|true|false
+independentReviewRequired|true|false
+forcePushAllowed|false|true
+directProtectedBranchPushAllowed|false|true
+deleteAllowed|false|true
+EOF
+
+sed -E 's/"privilegedOperationsDefault"[[:space:]]*:[[:space:]]*"deny"/"privilegedOperationsDefault": "allow"/' \
+  "$audit_policy_baseline" > "$audit_policy_manifest"
+assert_audit_rejects "$audit_policy_target" "audit rejects privileged operations that do not default to deny"
+
+sed -E '/"pullRequestActor"[[:space:]]*:/d' "$audit_policy_baseline" > "$audit_policy_manifest"
+assert_audit_rejects "$audit_policy_target" "audit rejects a missing pull request actor"
+
+sed -E '/"ciRequired"[[:space:]]*:/d' "$audit_policy_baseline" > "$audit_policy_manifest"
+assert_audit_rejects "$audit_policy_target" "audit rejects a missing required safety gate"
+
+python3 - "$audit_policy_baseline" "$audit_policy_manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+manifest["gitPolicy"]["forcePushAllowed"] = True
+manifest["gitPolicy"]["directProtectedBranchPushAllowed"] = True
+manifest["gitPolicy"]["privilegedOperationsDefault"] = "allow"
+manifest["shadow"] = {
+    "forcePushAllowed": False,
+    "directProtectedBranchPushAllowed": False,
+    "privilegedOperationsDefault": "deny",
+}
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, separators=(",", ":"))
+PY
+assert_audit_rejects "$audit_policy_target" "structured policy parsing ignores safe-looking sibling fields"
+
+sed -E 's/("policyChangedAt"[[:space:]]*:[[:space:]]*"[0-9T:-]+)Z"/\1.1234567Z"/' \
+  "$audit_policy_baseline" > "$audit_policy_manifest"
+set +e
+bash "$audit_script" --target "$audit_policy_target" >/dev/null
+fractional_timestamp_code=$?
+set -e
+[[ "$fractional_timestamp_code" -eq 2 ]] || fail "audit accepts PowerShell-style fractional policy timestamps"
+
+python3 - "$audit_policy_baseline" "$audit_policy_manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+del manifest["gitPolicy"]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle, indent=2)
+PY
+missing_policy_hash="$(sha256_file "$audit_policy_manifest")"
+set +e
+bash "$uninstall_script" --target "$audit_policy_target" --dry-run >/dev/null 2>&1
+missing_policy_uninstall_code=$?
+set -e
+[[ "$missing_policy_uninstall_code" -ne 0 ]] || fail "uninstall rejects a schema 4 manifest without gitPolicy"
+[[ "$(sha256_file "$audit_policy_manifest")" == "$missing_policy_hash" ]] || fail "rejected missing-policy uninstall leaves the manifest unchanged"
+
+cp -- "$audit_policy_baseline" "$audit_policy_manifest"
 
 dry_run_git_target="$temp_root/dry-run-git"
 mkdir -p "$dry_run_git_target"
@@ -288,7 +500,7 @@ set +e
 bash "$audit_script" --target "$fresh_target" --strict >/dev/null
 strict_audit_code=$?
 set -e
-[[ "$strict_audit_code" -eq 0 ]] || fail "completed schema 3 install passes strict audit"
+[[ "$strict_audit_code" -eq 0 ]] || fail "completed schema 4 install passes strict audit"
 
 exclude_without_core="$fresh_target/.git/info/exclude.without-core"
 sed '\|^/docs/README\.md$|d' "$fresh_target/.git/info/exclude" > "$exclude_without_core"
@@ -302,19 +514,34 @@ bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
 
 modified_delivery_file="$fresh_target/docs/development/README.md"
 printf '\n项目自定义内容。\n' >> "$modified_delivery_file"
+policy_changed_at_before_uninstall="$(grep -E '"policyChangedAt"' "$fresh_manifest")"
+policy_changed_by_before_uninstall="$(grep -E '"policyChangedBy"' "$fresh_manifest")"
 bash "$uninstall_script" --target "$fresh_target" --packs delivery --dry-run >/dev/null
 assert_file "$fresh_target/docs/plans/TEMPLATE.md" "dry-run does not delete files"
 
 bash "$uninstall_script" --target "$fresh_target" --packs delivery >/dev/null
 assert_file "$modified_delivery_file" "modified managed files are preserved"
 assert_not_file "$fresh_target/docs/plans/TEMPLATE.md" "unchanged pack files are deleted"
+assert_file "$fresh_target/scripts/delivery_guard.py" "partial delivery uninstall preserves the Core guard"
 if tr -d '\r\n' < "$fresh_manifest" | grep -Eq '"installedPacks"[[:space:]]*:[[:space:]]*\[[^]]*"delivery"'; then
   fail "partial uninstall removes pack from manifest"
 fi
 grep -Fq '"source":"delivery"' "$fresh_manifest" && fail "partial uninstall removes pack inventory entries"
-grep -Eq '"pushMode"[[:space:]]*:[[:space:]]*"manual"' "$fresh_manifest" || fail "partial uninstall preserves push policy"
-grep -Eq '"mergeActor"[[:space:]]*:[[:space:]]*"user"' "$fresh_manifest" || fail "partial uninstall preserves merge policy"
-grep -Eq '"deleteAllowed"[[:space:]]*:[[:space:]]*false' "$fresh_manifest" || fail "partial uninstall preserves denied delete permission"
+assert_json_string "$fresh_manifest" pushMode manual "partial uninstall preserves push mode"
+assert_json_string "$fresh_manifest" pushActor user "partial uninstall preserves push actor"
+assert_json_string "$fresh_manifest" pullRequestMode manual "partial uninstall preserves pull request mode"
+assert_json_string "$fresh_manifest" pullRequestActor user "partial uninstall preserves pull request actor"
+assert_json_string "$fresh_manifest" mergeMode manual "partial uninstall preserves merge mode"
+assert_json_string "$fresh_manifest" mergeActor user "partial uninstall preserves merge actor"
+assert_json_boolean "$fresh_manifest" pullRequestRequired true "partial uninstall preserves the pull request gate"
+assert_json_boolean "$fresh_manifest" ciRequired true "partial uninstall preserves the CI gate"
+assert_json_boolean "$fresh_manifest" independentReviewRequired true "partial uninstall preserves the independent review gate"
+assert_json_boolean "$fresh_manifest" forcePushAllowed false "partial uninstall preserves denied force push"
+assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "partial uninstall preserves denied direct protected branch push"
+assert_json_boolean "$fresh_manifest" deleteAllowed false "partial uninstall preserves denied delete permission"
+assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "partial uninstall preserves denied privileged operations"
+[[ "$(grep -E '"policyChangedAt"' "$fresh_manifest")" == "$policy_changed_at_before_uninstall" ]] || fail "partial uninstall preserves the policy timestamp"
+[[ "$(grep -E '"policyChangedBy"' "$fresh_manifest")" == "$policy_changed_by_before_uninstall" ]] || fail "partial uninstall preserves the policy origin"
 grep -Fq '/docs/README.md' "$fresh_target/.git/info/exclude" || fail "partial uninstall preserves Core Git excludes"
 if grep -Fq '/docs/plans/TEMPLATE.md' "$fresh_target/.git/info/exclude"; then
   fail "partial uninstall removes pack Git excludes"
@@ -416,6 +643,7 @@ existing_manifest="$existing_target/.dev-workflow/manifest.json"
 grep -Eq '"path":"AGENTS.md","source":"core","action":"appended"' "$existing_manifest" || fail "existing AGENTS records appended ownership"
 grep -Eq '"path":"docs/TASKS.md","source":"core","action":"preserved"' "$existing_manifest" || fail "pre-existing files record preserved ownership"
 grep -Fq '## 大型计划拆分与确认门' "$existing_target/AGENTS.md" || fail "existing AGENTS receives the large-plan approval gate"
+grep -Fq '## 交付治理与权限策略' "$existing_target/AGENTS.md" || fail "existing AGENTS receives the delivery governance policy"
 
 bash "$uninstall_script" --target "$existing_target" >/dev/null
 grep -Fq '# Existing project rules' "$existing_target/AGENTS.md" || fail "existing AGENTS content is preserved"
@@ -524,47 +752,79 @@ set -e
 assert_file "$forged_core_path" "forged Core ownership cannot delete a pre-existing user file"
 assert_file "$forged_pack_path" "forged pack ownership cannot delete a pre-existing user file"
 
-upgrade_target="$temp_root/schema2-upgrade"
-mkdir -p "$upgrade_target"
-bash "$install_script" --target "$upgrade_target" >/dev/null
-upgrade_manifest="$upgrade_target/.dev-workflow/manifest.json"
-upgrade_manifest_without_policy="$upgrade_manifest.without-policy"
+schema3_target="$temp_root/schema3-upgrade"
+mkdir -p "$schema3_target"
+bash "$install_script" --target "$schema3_target" >/dev/null
+schema3_manifest="$schema3_target/.dev-workflow/manifest.json"
+schema3_tmp="$schema3_manifest.old"
 awk '
-  /"gitPolicy"[[:space:]]*:[[:space:]]*\{/ { skipping_policy=1; next }
-  skipping_policy && /^[[:space:]]*\},[[:space:]]*$/ { skipping_policy=0; next }
-  !skipping_policy { print }
-' "$upgrade_manifest" > "$upgrade_manifest_without_policy"
-upgrade_manifest_tmp="$upgrade_manifest.old"
-sed -E \
-  -e 's/"schemaVersion"[[:space:]]*:[[:space:]]*3/"schemaVersion": 2/' \
-  -e 's/"workflowVersion"[[:space:]]*:[[:space:]]*"[^"]+"/"workflowVersion": "0.1.9"/' \
-  -e '/"path":"docs\/TASKS.md"/ s/"installedSha256":"[0-9a-f]{64}"/"installedSha256":"0000000000000000000000000000000000000000000000000000000000000000"/' \
-  "$upgrade_manifest_without_policy" > "$upgrade_manifest_tmp"
-mv -- "$upgrade_manifest_tmp" "$upgrade_manifest"
-bash "$install_script" --target "$upgrade_target" >/dev/null
-grep -Eq '"path":"docs/TASKS.md","source":"core","action":"legacy","installedSha256":null' "$upgrade_manifest" || fail "changed created ownership becomes legacy during a version upgrade"
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*3' "$upgrade_manifest" || fail "schema 2 manifests upgrade to schema 3"
-grep -Eq "\"workflowVersion\"[[:space:]]*:[[:space:]]*\"$workflow_version\"" "$upgrade_manifest" || fail "schema 2 upgrade records current workflow version"
-grep -Eq '"pushMode"[[:space:]]*:[[:space:]]*"manual"' "$upgrade_manifest" || fail "upgrade adds safe push policy when missing"
-grep -Eq '"mergeActor"[[:space:]]*:[[:space:]]*"user"' "$upgrade_manifest" || fail "upgrade adds safe merge actor when missing"
+  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "3") }
+  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
+  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
+  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
+  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
+  { print }
+' "$schema3_manifest" > "$schema3_tmp"
+mv -- "$schema3_tmp" "$schema3_manifest"
+bash "$install_script" --target "$schema3_target" >/dev/null
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$schema3_manifest" || fail "schema 3 manifests upgrade to schema 4"
+assert_json_string "$schema3_manifest" pushMode manual "schema 3 upgrade preserves push mode"
+assert_json_string "$schema3_manifest" pushActor ai "schema 3 upgrade preserves push actor"
+assert_json_string "$schema3_manifest" mergeMode manual "schema 3 upgrade preserves merge mode"
+assert_json_string "$schema3_manifest" mergeActor ai "schema 3 upgrade preserves merge actor"
+assert_v4_safety_defaults "$schema3_manifest" "schema 3 upgrade"
+assert_json_string "$schema3_manifest" policyChangedBy migration "schema 3 upgrade records migration as the policy origin"
 
-legacy_target="$temp_root/legacy"
+schema2_target="$temp_root/schema2-upgrade"
+mkdir -p "$schema2_target"
+bash "$install_script" --target "$schema2_target" >/dev/null
+schema2_manifest="$schema2_target/.dev-workflow/manifest.json"
+schema2_tmp="$schema2_manifest.old"
+awk '
+  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "2") }
+  /"workflowVersion"[[:space:]]*:/ { sub(/"[^"]+"[[:space:]]*,[[:space:]]*$/, "\"0.1.9\",") }
+  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
+  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
+  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
+  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
+  /"path":"docs\/TASKS.md"/ { sub(/"installedSha256":"[0-9a-f]{64}"/, "\"installedSha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"") }
+  { print }
+' "$schema2_manifest" > "$schema2_tmp"
+mv -- "$schema2_tmp" "$schema2_manifest"
+bash "$install_script" --target "$schema2_target" >/dev/null
+grep -Eq '"path":"docs/TASKS.md","source":"core","action":"legacy","installedSha256":null' "$schema2_manifest" || fail "changed created ownership becomes legacy during a version upgrade"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$schema2_manifest" || fail "schema 2 manifests upgrade to schema 4"
+grep -Eq "\"workflowVersion\"[[:space:]]*:[[:space:]]*\"$workflow_version\"" "$schema2_manifest" || fail "schema 2 upgrade records current workflow version"
+assert_json_string "$schema2_manifest" pushMode manual "schema 2 upgrade preserves push mode"
+assert_json_string "$schema2_manifest" pushActor ai "schema 2 upgrade preserves push actor"
+assert_json_string "$schema2_manifest" mergeMode manual "schema 2 upgrade preserves merge mode"
+assert_json_string "$schema2_manifest" mergeActor ai "schema 2 upgrade preserves merge actor"
+assert_v4_safety_defaults "$schema2_manifest" "schema 2 upgrade"
+assert_json_string "$schema2_manifest" policyChangedBy migration "schema 2 upgrade records migration as the policy origin"
+
+legacy_target="$temp_root/schema1-upgrade"
 mkdir -p "$legacy_target"
 bash "$install_script" --target "$legacy_target" --packs architecture >/dev/null
 legacy_manifest="$legacy_target/.dev-workflow/manifest.json"
 legacy_tmp="$legacy_manifest.legacy"
 awk '
-  /"schemaVersion"[[:space:]]*:[[:space:]]*3/ { sub(/3/, "1") }
+  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "1") }
   /"gitPolicy"[[:space:]]*:[[:space:]]*\{/ { skipping_policy=1; next }
   skipping_policy && /^[[:space:]]*\},[[:space:]]*$/ { skipping_policy=0; next }
-  /"files"[[:space:]]*:[[:space:]]*\[/ { skipping=1; next }
-  skipping && /^[[:space:]]*\],[[:space:]]*$/ { skipping=0; next }
-  !skipping && !skipping_policy { print }
+  /"files"[[:space:]]*:[[:space:]]*\[/ { skipping_files=1; next }
+  skipping_files && /^[[:space:]]*\],[[:space:]]*$/ { skipping_files=0; next }
+  !skipping_policy && !skipping_files { print }
 ' "$legacy_manifest" > "$legacy_tmp"
 mv -- "$legacy_tmp" "$legacy_manifest"
 
 bash "$install_script" --target "$legacy_target" >/dev/null
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*3' "$legacy_manifest" || fail "legacy manifests migrate to schema 3"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$legacy_manifest" || fail "schema 1 manifests upgrade to schema 4"
+assert_json_string "$legacy_manifest" pushMode manual "schema 1 upgrade adds safe push mode"
+assert_json_string "$legacy_manifest" pushActor user "schema 1 upgrade adds safe push actor"
+assert_json_string "$legacy_manifest" mergeMode manual "schema 1 upgrade adds safe merge mode"
+assert_json_string "$legacy_manifest" mergeActor user "schema 1 upgrade adds safe merge actor"
+assert_v4_safety_defaults "$legacy_manifest" "schema 1 upgrade"
+assert_json_string "$legacy_manifest" policyChangedBy migration "schema 1 upgrade records migration as the policy origin"
 grep -Eq '"path":"docs/architecture/SYSTEM.md","source":"architecture","action":"legacy"' "$legacy_manifest" || fail "legacy pack files remain conservatively owned"
 
 echo 'Bash integration tests passed.'

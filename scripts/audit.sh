@@ -219,6 +219,43 @@ json_boolean_field() {
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
+git_policy_field() {
+  local field="$1"
+  local path="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
+if not isinstance(p, dict) or sys.argv[2] not in p or isinstance(p[sys.argv[2]], (dict, list)) or p[sys.argv[2]] is None: raise SystemExit(1)
+v=p[sys.argv[2]]
+print(str(v).lower() if isinstance(v, bool) else v)' "$path" "$field"
+    return $?
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg field "$field" '
+      .gitPolicy as $p |
+      if ($p | type) != "object" or ($p | has($field) | not) then error("missing gitPolicy field")
+      elif ($p[$field] | type) == "boolean" then ($p[$field] | if . then "true" else "false" end)
+      elif (($p[$field] | type) == "string" or ($p[$field] | type) == "number") then ($p[$field] | tostring)
+      else error("invalid gitPolicy field") end
+    ' "$path"
+    return $?
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const p=d.gitPolicy; const f=process.argv[2]; if (!p || typeof p !== "object" || !(f in p) || p[f] === null || typeof p[f] === "object") process.exit(1); process.stdout.write(String(p[f]));' "$path" "$field"
+    return $?
+  fi
+  echo "读取 manifest gitPolicy 需要 python3、jq 或 node；未找到可用的结构化 JSON 解析器。" >&2
+  return 2
+}
+
+git_policy_string_field() {
+  git_policy_field "$1" "$2"
+}
+
+git_policy_boolean_field() {
+  git_policy_field "$1" "$2"
+}
+
 validate_json_when_available() {
   local path="$1"
   if command -v jq >/dev/null 2>&1; then
@@ -381,7 +418,7 @@ core_source_path="$source_root/core/AGENTS.md"
 if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## 大型计划拆分与确认门' "$core_source_path" || ! grep -Fq 'awaiting_user_confirmation' "$core_source_path"; then
   add_error "分发 Core 缺少大型计划拆分确认门契约。"
 fi
-if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## Git 交付权限策略' "$core_source_path" || ! grep -Fq 'gitPolicy' "$core_source_path"; then
+if [[ ! -f "$core_source_path" ]] || ! grep -Fq '## 交付治理与权限策略' "$core_source_path" || ! grep -Fq 'gitPolicy' "$core_source_path"; then
   add_error "分发 Core 缺少 Git 交付权限策略契约。"
 fi
 delivery_readme_source="$source_root/packs/delivery/docs/plans/README.md"
@@ -408,7 +445,7 @@ if [[ -f "$agents_path" ]]; then
   if [[ "$start_count" -ne 1 || "$end_count" -ne 1 || "$start_line" -ge "$end_line" ]]; then
     add_error "AGENTS.md 必须包含且只包含一组完整的 AI-WORKFLOW 核心标记。"
   fi
-  if ! grep -Fq '## Git 交付权限策略' "$agents_path"; then
+  if ! grep -Fq '## 交付治理与权限策略' "$agents_path"; then
     add_warning "AGENTS.md 尚未合并 Git 交付权限策略；升级项目需人工合并当前 Core 区块。"
   fi
 fi
@@ -442,7 +479,8 @@ else
   case "$schema_version" in
     1) add_warning "manifest.json 仍使用 schemaVersion 1；请用当前版本安装器升级，以获得安全卸载所需的文件归属信息。" ;;
     2) add_warning "manifest.json 仍使用 schemaVersion 2；请用当前版本安装器升级并确认 Git 交付权限。" ;;
-    3) ;;
+    3) add_warning "manifest.json 仍使用 schemaVersion 3；请用当前版本安装器升级 Git 交付治理策略。" ;;
+    4) ;;
     *) add_error "manifest.json 使用了不支持的 schemaVersion。" ;;
   esac
   if [[ ! "$manifest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
@@ -458,17 +496,17 @@ else
   fi
 
   if ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
-    if [[ "$schema_version" == "3" ]]; then
-      add_error "schemaVersion 3 manifest 缺少 gitPolicy。"
+    if [[ "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+      add_error "schemaVersion ${schema_version} manifest 缺少 gitPolicy。"
     else
       add_warning "manifest.json 缺少 gitPolicy；请用当前安装器确认 push/merge 策略。"
     fi
   else
-    push_mode="$(json_string_field pushMode "$manifest_path")"
-    push_actor="$(json_string_field pushActor "$manifest_path")"
-    merge_mode="$(json_string_field mergeMode "$manifest_path")"
-    merge_actor="$(json_string_field mergeActor "$manifest_path")"
-    delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+    push_mode="$(git_policy_string_field pushMode "$manifest_path")"
+    push_actor="$(git_policy_string_field pushActor "$manifest_path")"
+    merge_mode="$(git_policy_string_field mergeMode "$manifest_path")"
+    merge_actor="$(git_policy_string_field mergeActor "$manifest_path")"
+    delete_allowed="$(git_policy_boolean_field deleteAllowed "$manifest_path")"
     case "$push_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.pushMode 无效：${push_mode:-missing}" ;; esac
     case "$push_actor" in user|ai) ;; *) add_error "manifest gitPolicy.pushActor 无效：${push_actor:-missing}" ;; esac
     case "$merge_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.mergeMode 无效：${merge_mode:-missing}" ;; esac
@@ -481,6 +519,25 @@ else
     fi
     if [[ "$delete_allowed" != "false" ]]; then
       add_error "manifest gitPolicy.deleteAllowed 必须为 false。"
+    fi
+    if [[ "$schema_version" == "4" ]]; then
+      pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
+      pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
+      case "$pull_request_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.pullRequestMode 无效：${pull_request_mode:-missing}" ;; esac
+      case "$pull_request_actor" in user|ai) ;; *) add_error "manifest gitPolicy.pullRequestActor 无效：${pull_request_actor:-missing}" ;; esac
+      if [[ "$pull_request_mode" == "auto" && "$pull_request_actor" != "ai" ]]; then
+        add_error "manifest gitPolicy 的 pull request auto 模式要求 actor 为 ai。"
+      fi
+      [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.pullRequestRequired 必须为 true。"
+      [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.ciRequired 必须为 true。"
+      [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.independentReviewRequired 必须为 true。"
+      [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.forcePushAllowed 必须为 false。"
+      [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。"
+      [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || add_error "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。"
+      policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
+      policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"
+      [[ "$policy_changed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]] || add_error "manifest gitPolicy.policyChangedAt 无效：${policy_changed_at:-missing}"
+      case "$policy_changed_by" in default|user|migration) ;; *) add_error "manifest gitPolicy.policyChangedBy 无效：${policy_changed_by:-missing}" ;; esac
     fi
   fi
 
@@ -498,7 +555,7 @@ else
     fi
   fi
 
-  if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")"
     file_result=$?
     if [[ "$file_result" -ne 0 ]]; then
@@ -539,7 +596,7 @@ else
     fi
   fi
 
-  if [[ ( "$schema_version" == "2" || "$schema_version" == "3" ) && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
+  if [[ ( "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ) && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
     for index in "${!inventory_paths[@]}"; do
       [[ "${inventory_actions[$index]}" == "created" ]] || continue
       owner_root="$source_root/core"
@@ -554,6 +611,24 @@ else
         fi
       fi
     done
+  fi
+
+  guard_inventory_index=""
+  for index in "${!inventory_paths[@]}"; do
+    if [[ "${inventory_paths[$index]}" == "scripts/delivery_guard.py" ]]; then
+      guard_inventory_index="$index"
+      break
+    fi
+  done
+  if [[ -z "$guard_inventory_index" || "${inventory_sources[$guard_inventory_index]}" != "core" || "${inventory_actions[$guard_inventory_index]}" != "created" ]]; then
+    add_error "Core delivery guard 缺少可信的 created 文件归属。"
+  elif [[ ! -f "$target_root/scripts/delivery_guard.py" ]]; then
+    add_error "Core delivery guard 缺失：scripts/delivery_guard.py"
+  else
+    guard_target_hash="$(sha256_file "$target_root/scripts/delivery_guard.py")" || add_error "缺少 SHA-256 工具，无法验证 Core delivery guard。"
+    if [[ -n "${guard_target_hash:-}" && "$guard_target_hash" != "${inventory_hashes[$guard_inventory_index]}" ]]; then
+      add_error "Core delivery guard 当前内容与安装哈希不一致。"
+    fi
   fi
 
   seen_packs=()
@@ -582,9 +657,9 @@ else
       if [[ ! -f "$target_root/$relative_path" ]]; then
         add_error "流程包 $pack 缺少文件：$relative_path"
       fi
-      if [[ "$schema_version" == "2" || "$schema_version" == "3" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
+      if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少流程包文件：$relative_path"
-      elif [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
+      elif [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
         inventory_source="$(inventory_source_for "$relative_path")"
         if [[ "$inventory_source" != "$pack" ]]; then
           add_error "manifest 将 ${relative_path} 归属于 ${inventory_source}，而不是 $pack"
@@ -592,7 +667,7 @@ else
       fi
     done < <(find "$pack_root" -type f | LC_ALL=C sort)
   done
-  if [[ "$schema_version" == "2" || "$schema_version" == "3" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
     for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
       if ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"

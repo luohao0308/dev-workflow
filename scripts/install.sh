@@ -16,13 +16,15 @@ usage() {
   --push-actor user|ai                 push 执行角色（默认 user）
   --merge-mode manual|auto             merge 审批模式（默认 manual）
   --merge-actor user|ai                merge 执行角色（默认 user）
+  --pull-request-mode manual|auto      pull request 审批模式（默认 manual）
+  --pull-request-actor user|ai         pull request 执行角色（默认 user）
   --non-interactive                    不询问 Git 策略，使用参数、已有值或安全默认值
   --dry-run                             只显示动作，不写文件
   -h, --help                            显示帮助
 
 说明：
   Core 始终安装。已存在的普通文件不会覆盖；已有 AGENTS.md 会保留原内容并追加核心区块。
-  新安装会确认 push/merge 策略；非交互环境默认 manual + user。
+  新安装会确认 push/pull request/merge 策略；非交互环境默认 manual + user。
 EOF
 }
 
@@ -54,6 +56,43 @@ json_boolean_field() {
   local field="$1"
   local path="$2"
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
+}
+
+git_policy_field() {
+  local field="$1"
+  local path="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
+if not isinstance(p, dict) or sys.argv[2] not in p or isinstance(p[sys.argv[2]], (dict, list)) or p[sys.argv[2]] is None: raise SystemExit(1)
+v=p[sys.argv[2]]
+print(str(v).lower() if isinstance(v, bool) else v)' "$path" "$field"
+    return $?
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -r --arg field "$field" '
+      .gitPolicy as $p |
+      if ($p | type) != "object" or ($p | has($field) | not) then error("missing gitPolicy field")
+      elif ($p[$field] | type) == "boolean" then ($p[$field] | if . then "true" else "false" end)
+      elif (($p[$field] | type) == "string" or ($p[$field] | type) == "number") then ($p[$field] | tostring)
+      else error("invalid gitPolicy field") end
+    ' "$path"
+    return $?
+  fi
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const fs=require("fs"); const d=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); const p=d.gitPolicy; const f=process.argv[2]; if (!p || typeof p !== "object" || !(f in p) || p[f] === null || typeof p[f] === "object") process.exit(1); process.stdout.write(String(p[f]));' "$path" "$field"
+    return $?
+  fi
+  echo "读取 manifest gitPolicy 需要 python3、jq 或 node；未找到可用的结构化 JSON 解析器。" >&2
+  return 2
+}
+
+git_policy_string_field() {
+  git_policy_field "$1" "$2"
+}
+
+git_policy_boolean_field() {
+  git_policy_field "$1" "$2"
 }
 
 git_exclude_begin='# BEGIN dev-workflow managed excludes'
@@ -224,6 +263,16 @@ prompt_choice() {
       *) echo "请输入 ${first_value} 或 ${second_value}。" >&2 ;;
     esac
   done
+}
+
+confirm_policy_mutation() {
+  local answer
+  printf '即将变更 Git 权限策略。请输入 YES 确认：' >&2
+  IFS= read -r answer
+  [[ "$answer" == "YES" ]] || {
+    echo "未确认 Git 权限策略变更，安装已取消。" >&2
+    return 1
+  }
 }
 
 validate_git_policy() {
@@ -428,7 +477,7 @@ build_manifest() {
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$last_audit_at\""
   cat <<EOF
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "managedBy": "dev-workflow",
   "workflowVersion": "$version",
   "installedPacks": [$packs_json
@@ -438,7 +487,17 @@ build_manifest() {
     "pushActor": "$push_actor",
     "mergeMode": "$merge_mode",
     "mergeActor": "$merge_actor",
-    "deleteAllowed": false
+    "pullRequestMode": "$pull_request_mode",
+    "pullRequestActor": "$pull_request_actor",
+    "pullRequestRequired": true,
+    "ciRequired": true,
+    "independentReviewRequired": true,
+    "forcePushAllowed": false,
+    "directProtectedBranchPushAllowed": false,
+    "privilegedOperationsDefault": "deny",
+    "deleteAllowed": false,
+    "policyChangedAt": "$policy_changed_at",
+    "policyChangedBy": "$policy_changed_by"
   },
   "files": [
 EOF
@@ -482,6 +541,8 @@ push_mode_option=""
 push_actor_option=""
 merge_mode_option=""
 merge_actor_option=""
+pull_request_mode_option=""
+pull_request_actor_option=""
 non_interactive=0
 case "${DEV_WORKFLOW_NON_INTERACTIVE:-}" in
   1|true|TRUE|yes|YES) non_interactive=1 ;;
@@ -531,6 +592,16 @@ while [[ $# -gt 0 ]]; do
     --merge-actor)
       [[ $# -ge 2 ]] || { echo "--merge-actor 需要 user 或 ai" >&2; exit 2; }
       merge_actor_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --pull-request-mode)
+      [[ $# -ge 2 ]] || { echo "--pull-request-mode 需要 manual 或 auto" >&2; exit 2; }
+      pull_request_mode_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
+      shift 2
+      ;;
+    --pull-request-actor)
+      [[ $# -ge 2 ]] || { echo "--pull-request-actor 需要 user 或 ai" >&2; exit 2; }
+      pull_request_actor_option="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
       shift 2
       ;;
     --non-interactive)
@@ -599,6 +670,10 @@ existing_push_mode=""
 existing_push_actor=""
 existing_merge_mode=""
 existing_merge_actor=""
+existing_pull_request_mode=""
+existing_pull_request_actor=""
+existing_policy_changed_at=""
+existing_policy_changed_by=""
 existing_packs=()
 file_paths=()
 file_sources=()
@@ -611,7 +686,7 @@ if [[ -f "$manifest_path" ]]; then
   }
   existing_schema_version="$(json_number_field schemaVersion "$manifest_path")"
   case "$existing_schema_version" in
-    1|2|3) ;;
+    1|2|3|4) ;;
     *)
     echo "不支持的 dev-workflow manifest schema：$manifest_path" >&2
     exit 1
@@ -630,11 +705,11 @@ if [[ -f "$manifest_path" ]]; then
   esac
   if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
     existing_git_policy=1
-    push_mode="$(json_string_field pushMode "$manifest_path")"
-    push_actor="$(json_string_field pushActor "$manifest_path")"
-    merge_mode="$(json_string_field mergeMode "$manifest_path")"
-    merge_actor="$(json_string_field mergeActor "$manifest_path")"
-    delete_allowed="$(json_boolean_field deleteAllowed "$manifest_path")"
+    push_mode="$(git_policy_string_field pushMode "$manifest_path")"
+    push_actor="$(git_policy_string_field pushActor "$manifest_path")"
+    merge_mode="$(git_policy_string_field mergeMode "$manifest_path")"
+    merge_actor="$(git_policy_string_field mergeActor "$manifest_path")"
+    delete_allowed="$(git_policy_boolean_field deleteAllowed "$manifest_path")"
     validate_git_policy push "$push_mode" "$push_actor" || exit 1
     validate_git_policy merge "$merge_mode" "$merge_actor" || exit 1
     [[ "$delete_allowed" == "false" ]] || {
@@ -645,8 +720,27 @@ if [[ -f "$manifest_path" ]]; then
     existing_push_actor="$push_actor"
     existing_merge_mode="$merge_mode"
     existing_merge_actor="$merge_actor"
+    if [[ "$existing_schema_version" == "4" ]]; then
+      existing_pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
+      existing_pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
+      existing_policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
+      existing_policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"
+      validate_git_policy "pull request" "$existing_pull_request_mode" "$existing_pull_request_actor" || exit 1
+      [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.pullRequestRequired 必须为 true。" >&2; exit 1; }
+      [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.ciRequired 必须为 true。" >&2; exit 1; }
+      [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.independentReviewRequired 必须为 true。" >&2; exit 1; }
+      [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.forcePushAllowed 必须为 false。" >&2; exit 1; }
+      [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。" >&2; exit 1; }
+      [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || { echo "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。" >&2; exit 1; }
+      [[ -n "$existing_policy_changed_at" ]] || { echo "manifest gitPolicy.policyChangedAt 缺失。" >&2; exit 1; }
+      case "$existing_policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
+    fi
   fi
-  if [[ "$existing_schema_version" == "2" || "$existing_schema_version" == "3" ]]; then
+  if [[ "$existing_schema_version" == "4" && "$existing_git_policy" -eq 0 ]]; then
+    echo "schemaVersion 4 manifest 缺少 gitPolicy。" >&2
+    exit 1
+  fi
+  if [[ "$existing_schema_version" == "2" || "$existing_schema_version" == "3" || "$existing_schema_version" == "4" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")" || {
       echo "manifest files 格式无效：$manifest_path" >&2
       exit 1
@@ -666,12 +760,20 @@ push_mode="${push_mode:-manual}"
 push_actor="${push_actor:-user}"
 merge_mode="${merge_mode:-manual}"
 merge_actor="${merge_actor:-user}"
+pull_request_mode="${existing_pull_request_mode:-manual}"
+pull_request_actor="${existing_pull_request_actor:-user}"
 [[ -n "$push_mode_option" ]] && push_mode="$push_mode_option"
 [[ -n "$push_actor_option" ]] && push_actor="$push_actor_option"
 [[ -n "$merge_mode_option" ]] && merge_mode="$merge_mode_option"
 [[ -n "$merge_actor_option" ]] && merge_actor="$merge_actor_option"
+[[ -n "$pull_request_mode_option" ]] && pull_request_mode="$pull_request_mode_option"
+[[ -n "$pull_request_actor_option" ]] && pull_request_actor="$pull_request_actor_option"
 
-if [[ "$existing_git_policy" -eq 0 && "$non_interactive" -eq 0 && "$dry_run" -eq 0 && -t 0 ]]; then
+if [[ "$existing_git_policy" -eq 0 && "$non_interactive" -eq 0 && "$dry_run" -eq 0 ]]; then
+  if [[ ! -t 0 ]]; then
+    echo "首次安装需要交互式确认 push、pull request 和 merge 策略；当前 stdin 不是终端。请在交互式终端运行，或明确使用 --non-interactive 采用安全默认值。" >&2
+    exit 2
+  fi
   echo "配置 Git 交付策略。" >&2
   if [[ -z "$push_actor_option" ]]; then
     prompt_choice "push 执行角色 user/ai" "$push_actor" user ai
@@ -689,10 +791,33 @@ if [[ "$existing_git_policy" -eq 0 && "$non_interactive" -eq 0 && "$dry_run" -eq
     prompt_choice "merge 模式 manual（需人工确认）/auto（AI 自动执行）" "$merge_mode" manual auto
     merge_mode="$prompt_result"
   fi
+  if [[ -z "$pull_request_actor_option" ]]; then
+    prompt_choice "pull request 执行角色 user/ai" "$pull_request_actor" user ai
+    pull_request_actor="$prompt_result"
+  fi
+  if [[ -z "$pull_request_mode_option" ]]; then
+    prompt_choice "pull request 模式 manual（需人工确认）/auto（AI 自动执行）" "$pull_request_mode" manual auto
+    pull_request_mode="$prompt_result"
+  fi
 fi
 
 validate_git_policy push "$push_mode" "$push_actor" || exit 2
 validate_git_policy merge "$merge_mode" "$merge_actor" || exit 2
+validate_git_policy "pull request" "$pull_request_mode" "$pull_request_actor" || exit 2
+
+policy_mutation=0
+if [[ "$existing_git_policy" -eq 0 ]]; then
+  [[ "$push_mode:$push_actor:$merge_mode:$merge_actor:$pull_request_mode:$pull_request_actor" == "manual:user:manual:user:manual:user" ]] || policy_mutation=1
+else
+  [[ "$existing_push_mode:$existing_push_actor:$existing_merge_mode:$existing_merge_actor:${existing_pull_request_mode:-manual}:${existing_pull_request_actor:-user}" == "$push_mode:$push_actor:$merge_mode:$merge_actor:$pull_request_mode:$pull_request_actor" ]] || policy_mutation=1
+fi
+if [[ "$policy_mutation" -eq 1 && "$dry_run" -eq 0 ]]; then
+  if [[ "$non_interactive" -eq 1 || ! -t 0 ]]; then
+    echo "已有持久 Git 策略的 mode/actor 变更或新安装的非默认策略必须由交互式人工确认。" >&2
+    exit 2
+  fi
+  confirm_policy_mutation || exit 2
+fi
 
 available_packs=()
 for pack_dir in "$packs_root"/*; do
@@ -734,8 +859,10 @@ for index in "${!file_paths[@]}"; do
         echo "manifest created 文件哈希与流程源不一致：${file_paths[$index]}" >&2
         exit 1
       fi
-      file_actions[$index]="legacy"
-      file_hashes[$index]=""
+      if [[ "${file_paths[$index]}" != "scripts/delivery_guard.py" ]]; then
+        file_actions[$index]="legacy"
+        file_hashes[$index]=""
+      fi
     fi
   fi
 done
@@ -793,9 +920,22 @@ new_pack_summary="${installed_packs[*]-}"
 old_inventory_summary="$(inventory_summary)"
 old_policy_summary=""
 if [[ "$existing_git_policy" -eq 1 ]]; then
-  old_policy_summary="$existing_push_mode|$existing_push_actor|$existing_merge_mode|$existing_merge_actor|false"
+  old_policy_summary="$existing_push_mode|$existing_push_actor|$existing_merge_mode|$existing_merge_actor|${existing_pull_request_mode:-manual}|${existing_pull_request_actor:-user}|true|true|true|false|false|deny|false"
 fi
-new_policy_summary="$push_mode|$push_actor|$merge_mode|$merge_actor|false"
+new_policy_summary="$push_mode|$push_actor|$merge_mode|$merge_actor|$pull_request_mode|$pull_request_actor|true|true|true|false|false|deny|false"
+policy_changed_at="$existing_policy_changed_at"
+policy_changed_by="$existing_policy_changed_by"
+if [[ "$existing_manifest" -eq 0 ]]; then
+  policy_changed_at="$now"
+  policy_changed_by="default"
+  [[ "$new_policy_summary" == "manual|user|manual|user|manual|user|true|true|true|false|false|deny|false" ]] || policy_changed_by="user"
+elif [[ "$policy_mutation" -eq 1 ]]; then
+  policy_changed_at="$now"
+  policy_changed_by="user"
+elif [[ "$existing_schema_version" != "4" ]]; then
+  policy_changed_at="$now"
+  policy_changed_by="migration"
+fi
 manifest_action="[create] .dev-workflow/manifest.json"
 [[ "$existing_manifest" -eq 1 ]] && manifest_action="[update] .dev-workflow/manifest.json"
 
@@ -880,6 +1020,30 @@ for index in "${!overlay_roots[@]}"; do
       continue
     fi
 
+    if [[ "$relative_path" == "scripts/delivery_guard.py" && -f "$target_path" ]]; then
+      guard_source_hash="$(sha256_file "$source_path")"
+      guard_target_hash="$(sha256_file "$target_path")"
+      if [[ -z "$existing_index" ]]; then
+        if [[ "$guard_target_hash" != "$guard_source_hash" ]]; then
+          echo "安全关键文件已存在且来源无法验证：$relative_path" >&2
+          exit 1
+        fi
+      elif [[ "${file_actions[$existing_index]}" != "created" || "$guard_target_hash" != "${file_hashes[$existing_index]}" ]]; then
+        echo "安全关键文件已被修改或所有权无法验证：$relative_path" >&2
+        exit 1
+      fi
+      if [[ "$guard_target_hash" == "$guard_source_hash" ]]; then
+        actions+=("[skip] ${relative_path}（安全关键文件已是当前版本）")
+      elif [[ "$dry_run" -eq 1 ]]; then
+        actions+=("[update] ${relative_path}（安全关键文件升级）")
+      else
+        cp "$source_path" "$target_path"
+        actions+=("[update] ${relative_path}（安全关键文件升级）")
+      fi
+      set_inventory "$relative_path" "$overlay_name" "created" "$guard_source_hash"
+      continue
+    fi
+
     if [[ -f "$target_path" ]]; then
       actions+=("[skip] ${relative_path}（目标项目已有文件，不覆盖）")
       if [[ -z "$existing_index" ]]; then
@@ -907,7 +1071,7 @@ new_inventory_summary="$(inventory_summary)"
 manifest_changed=0
 if [[
   "$existing_manifest" -eq 0 ||
-  "$existing_schema_version" != "3" ||
+  "$existing_schema_version" != "4" ||
   "$old_version" != "$workflow_version" ||
   "$old_pack_summary" != "$new_pack_summary" ||
   "$old_inventory_summary" != "$new_inventory_summary" ||

@@ -30,13 +30,18 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 - 分支命名：
 - 提交格式：
 - 集成策略：<!-- ff-only/rebase/merge/PR -->
-- Git 交付策略：以 `.dev-workflow/manifest.json` 的 `gitPolicy` 为机器权威；此处只记录项目补充说明。
+- Git 交付策略：以 `.dev-workflow/manifest.json` 的 `gitPolicy` 为当前机器的执行权限权威；此处记录远端门禁和项目补充说明。
 - 本地流程文件：以 `info/exclude` 的实际 `git check-ignore` 结果为准；已跟踪或被项目规则重新放行的路径必须在交付前处理。
-- 自动允许：<!-- 本地可逆操作；push/merge 仅在对应 mode=auto 且 actor=ai 时由 AI 自动执行；单次明确人工授权只覆盖指定目标 -->
-- 需要确认：<!-- mode=manual 的 push/merge、生产/发布 -->
-- 删除：安装初始化不授予删除权限；具体删除必须针对明确目标另行授权。
+- 流程要求：feature/bug/security/跨模块工作关联 Issue；交付默认经过 PR、required CI 和独立 Review。
+- 自动允许：<!-- 本地可逆操作；远端操作仅在对应 mode=auto、actor=ai、一次性授权和质量门都通过时执行 -->
+- 需要确认：<!-- mode=manual 的 push、PR 创建/更新、远端 PR merge；持久权限策略修改固定需人工确认 -->
+- 一次性授权：<!-- repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses；文件放在 .dev-workflow/authorizations/ -->
+- 远端强制门：<!-- branch protection / required checks / CODEOWNERS / environment approval -->
+- 高权限操作：`privilegedOperationsDefault=deny`；发布、部署、迁移、回滚、流量、仓库设置、凭据和删除按明确目标另行授权。
 
 若 Worktree 模式为 `required` 或 `recommended`，按 [GIT-WORKTREE-WORKFLOW.md](GIT-WORKTREE-WORKFLOW.md) 执行。
+
+AI 执行远端操作前先运行 Core 自带、零第三方依赖的 `python3 scripts/delivery_guard.py check ...`。`actor=user` 时 guard 固定拒绝为 AI 放行；`actor=ai` 时必须提供 `.dev-workflow/authorizations/` 下、权限不宽于 `0600` 的一次性授权 JSON。真正执行前使用 `--consume` 原子记录消耗次数。每类操作都必须提供五分钟内从托管平台读取、并绑定当前仓库/remote/ref/SHA 的 provider 证据；push 证据还要证明非删除、非 force、fast-forward 且目标分支未受保护，merge 证据还要覆盖 PR、CI、独立人工 Review 和分支保护。guard 不读取 Token，也拒绝带凭据、query 或 fragment 的 remote URL。
 
 ## 本地服务登记
 
@@ -63,3 +68,4 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 - 运行时变更完成任务自有服务重启和冒烟。
 - 契约、迁移、架构、任务和长期知识已按影响同步。
 - 交付摘要包含文件、命令、结果、风险和后续动作。
+- 交付状态和证据包含 `committed → pushed → pr_open → ci_passed → review_approved → merged` 中实际到达的阶段、准确 SHA、PR head/base、CI 和独立 Review。

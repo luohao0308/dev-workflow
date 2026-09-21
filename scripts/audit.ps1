@@ -146,7 +146,7 @@ $coreSourceContent = if (Test-Path -LiteralPath $coreSourcePath -PathType Leaf) 
 if ($coreSourceContent -notmatch '## 大型计划拆分与确认门' -or $coreSourceContent -notmatch 'awaiting_user_confirmation') {
     Add-Error $errors 'Distribution Core is missing the large-plan decomposition approval contract.'
 }
-if ($coreSourceContent -notmatch '## Git 交付权限策略' -or $coreSourceContent -notmatch 'gitPolicy') {
+if ($coreSourceContent -notmatch '## 交付治理与权限策略' -or $coreSourceContent -notmatch 'gitPolicy') {
     Add-Error $errors 'Distribution Core is missing the Git delivery permission policy contract.'
 }
 $deliveryReadmeSource = Join-Path $sourceRoot 'packs/delivery/docs/plans/README.md'
@@ -183,7 +183,7 @@ if (Test-Path -LiteralPath $agentsPath -PathType Leaf) {
     if (-not $hasValidCoreBlock) {
         Add-Error $errors 'AGENTS.md must contain exactly one complete AI-WORKFLOW core marker pair.'
     }
-    if ($agents -notmatch '## Git 交付权限策略') {
+    if ($agents -notmatch '## 交付治理与权限策略') {
         Add-Warning $warnings 'AGENTS.md has not merged the Git delivery permission policy; upgraded projects must merge the current Core block.'
     }
 }
@@ -209,12 +209,14 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Error $errors 'manifest.json is not managed by dev-workflow.'
         }
         $schemaVersion = [string]$manifest.schemaVersion
-        if ($schemaVersion -notin @('1', '2', '3')) {
+        if ($schemaVersion -notin @('1', '2', '3', '4')) {
             Add-Error $errors 'manifest.json uses an unsupported schemaVersion.'
         } elseif ($schemaVersion -eq '1') {
             Add-Warning $warnings 'manifest.json uses legacy schemaVersion 1; reinstall with the current distribution to add safe uninstall ownership metadata.'
         } elseif ($schemaVersion -eq '2') {
             Add-Warning $warnings 'manifest.json uses legacy schemaVersion 2; reinstall with the current distribution and confirm Git delivery permissions.'
+        } elseif ($schemaVersion -eq '3') {
+            Add-Warning $warnings 'manifest.json uses legacy schemaVersion 3; reinstall with the current distribution to add pull request and protected-branch safeguards.'
         }
         if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
             Add-Error $errors "Invalid manifest workflowVersion: $($manifest.workflowVersion)"
@@ -227,8 +229,8 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Warning $warnings 'Ready onboarding state has no recorded onboarding.lastAuditAt timestamp.'
         }
         if ($null -eq $manifest.gitPolicy) {
-            if ($schemaVersion -eq '3') {
-                Add-Error $errors 'schemaVersion 3 manifest is missing gitPolicy.'
+            if ($schemaVersion -in @('3', '4')) {
+                Add-Error $errors "schemaVersion $schemaVersion manifest is missing gitPolicy."
             } else {
                 Add-Warning $warnings 'manifest.json is missing gitPolicy; rerun the current installer to confirm push/merge policy.'
             }
@@ -244,6 +246,29 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             if ($pushMode -eq 'auto' -and $pushActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy push auto mode requires actor ai.' }
             if ($mergeMode -eq 'auto' -and $mergeActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy merge auto mode requires actor ai.' }
             if ($manifest.gitPolicy.deleteAllowed -ne $false) { Add-Error $errors 'manifest gitPolicy.deleteAllowed must be false.' }
+            if ($schemaVersion -eq '4') {
+                $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
+                $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
+                if ($pullRequestMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestMode: $pullRequestMode" }
+                if ($pullRequestActor -notin @('user', 'ai')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestActor: $pullRequestActor" }
+                if ($pullRequestMode -eq 'auto' -and $pullRequestActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy pull request auto mode requires actor ai.' }
+                foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+                    if ($manifest.gitPolicy.$requiredField -ne $true) { Add-Error $errors "manifest gitPolicy.$requiredField must be true." }
+                }
+                foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+                    if ($manifest.gitPolicy.$deniedField -ne $false) { Add-Error $errors "manifest gitPolicy.$deniedField must be false." }
+                }
+                if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { Add-Error $errors 'manifest gitPolicy.privilegedOperationsDefault must be deny.' }
+                if ([string]::IsNullOrWhiteSpace([string]$manifest.gitPolicy.policyChangedAt)) {
+                    Add-Error $errors 'manifest gitPolicy.policyChangedAt is required.'
+                } else {
+                    $parsedPolicyChangedAt = [DateTimeOffset]::MinValue
+                    if (-not [DateTimeOffset]::TryParse([string]$manifest.gitPolicy.policyChangedAt, [ref]$parsedPolicyChangedAt)) {
+                        Add-Error $errors 'manifest gitPolicy.policyChangedAt must be a valid timestamp.'
+                    }
+                }
+                if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { Add-Error $errors 'manifest gitPolicy.policyChangedBy is invalid.' }
+            }
         }
 
         $sourceVersionPath = Join-Path $sourceRoot 'VERSION'
@@ -252,7 +277,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Warning $warnings "Manifest version $($manifest.workflowVersion) differs from distribution version $sourceVersion; run the installer in dry-run mode before upgrading."
         }
 
-        if ($schemaVersion -in @('2', '3')) {
+        if ($schemaVersion -in @('2', '3', '4')) {
             $filesProperty = $manifest.PSObject.Properties['files']
             if (
                 $null -eq $filesProperty -or
@@ -310,7 +335,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         foreach ($pack in $duplicatePacks) {
             Add-Error $errors "manifest installedPacks contains a duplicate: $pack"
         }
-        if ($schemaVersion -in @('2', '3')) {
+        if ($schemaVersion -in @('2', '3', '4')) {
             foreach ($entryPath in $inventoryPaths.Keys) {
                 $entrySource = $inventoryPaths[$entryPath]
                 if ($entrySource -ne 'core' -and $packNames -notcontains $entrySource) {
@@ -335,6 +360,24 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 }
             }
         }
+        $guardPath = 'scripts/delivery_guard.py'
+        if (
+            -not $inventoryPaths.ContainsKey($guardPath) -or
+            $inventoryPaths[$guardPath] -ne 'core' -or
+            $inventoryActions[$guardPath] -ne 'created'
+        ) {
+            Add-Error $errors 'Core delivery guard is missing trusted created-file ownership.'
+        } else {
+            $targetGuardPath = Join-Path $targetRoot $guardPath
+            if (-not (Test-Path -LiteralPath $targetGuardPath -PathType Leaf)) {
+                Add-Error $errors 'Core delivery guard is missing: scripts/delivery_guard.py'
+            } else {
+                $targetGuardHash = (Get-FileHash -LiteralPath $targetGuardPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($targetGuardHash -ne $inventoryHashes[$guardPath]) {
+                    Add-Error $errors 'Core delivery guard content does not match its installed hash.'
+                }
+            }
+        }
         foreach ($pack in $packNames) {
             $packRoot = Join-Path $sourceRoot "packs/$pack"
             if (-not (Test-Path -LiteralPath $packRoot -PathType Container)) {
@@ -347,15 +390,15 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
                     Add-Error $errors "Workflow pack $pack is missing file: $relativePath"
                 }
-                if ($schemaVersion -in @('2', '3') -and -not $inventoryPaths.ContainsKey($relativePath)) {
+                if ($schemaVersion -in @('2', '3', '4') -and -not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing workflow pack file: $relativePath"
-                } elseif ($schemaVersion -in @('2', '3') -and $inventoryPaths[$relativePath] -ne $pack) {
+                } elseif ($schemaVersion -in @('2', '3', '4') -and $inventoryPaths[$relativePath] -ne $pack) {
                     Add-Error $errors "Manifest ownership inventory assigns '$relativePath' to '$($inventoryPaths[$relativePath])' instead of '$pack'."
                 }
             }
         }
 
-        if ($schemaVersion -in @('2', '3')) {
+        if ($schemaVersion -in @('2', '3', '4')) {
             foreach ($relativePath in $coreFiles) {
                 if (-not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing Core file: $relativePath"
@@ -367,7 +410,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     }
 }
 
-$auditInventoryPaths = if ($null -ne $manifest -and $schemaVersion -in @('2', '3')) {
+$auditInventoryPaths = if ($null -ne $manifest -and $schemaVersion -in @('2', '3', '4')) {
     @($inventoryPaths.Keys)
 } else {
     @()
