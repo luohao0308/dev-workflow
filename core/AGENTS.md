@@ -129,7 +129,8 @@
 开始涉及远端 Git 状态的操作前，读取 `.dev-workflow/manifest.json` 中的 `gitPolicy`：
 
 - `pushMode` / `mergeMode` 为 `manual` 时，执行前必须获得本次操作的人工确认；为 `auto` 时只表示该操作可以无需再次确认。
-- `pushActor` / `mergeActor` 为 `user` 时，AI 只准备命令和验证证据，由用户执行；为 `ai` 时，AI 才可以在对应 mode 允许后执行。
+- `pushActor` / `mergeActor` 为 `user` 时，默认由用户执行，AI 只准备命令和验证证据；为 `ai` 时，AI 可以在对应 mode 允许后执行。
+- 用户可以针对当前对话中明确指定的单个 push 或 merge 目标，明确要求 AI 执行一次操作；这属于一次性人工授权，不改变 manifest 的默认 actor，也不延伸到其他目标或后续操作。
 - `auto` 只允许与 `ai` 组合；`manual + ai` 表示 AI 在获得确认后执行。
 - 缺少 `gitPolicy` 或字段无法验证时，按 `manual + user` 处理，不得从历史对话、仓库可写性或已有凭据推断授权。
 - `deleteAllowed` 固定为 `false`，表示安装初始化不授予任何删除权限。删除远端分支、标签、Release、仓库内容、数据或其他难以恢复的对象，必须由用户针对明确目标另行授权，且仍需执行删除前安全检查。

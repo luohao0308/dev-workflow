@@ -72,6 +72,7 @@ grep -Eq '"path":"AGENTS.md","source":"core","action":"created"' "$fresh_manifes
 grep -Fq '## 大型计划拆分与确认门' "$fresh_target/AGENTS.md" || fail "Core install includes the large-plan approval gate"
 grep -Fq '## 默认开发闭环（轻量核心 + 风险插件）' "$fresh_target/AGENTS.md" || fail "Core install includes the lightweight development loop"
 grep -Fq '## Git 交付权限策略' "$fresh_target/AGENTS.md" || fail "Core install includes the Git delivery permission policy"
+grep -Fq '一次性人工授权' "$fresh_target/AGENTS.md" || fail "Core install permits explicit one-time AI push or merge authorization"
 grep -Fq 'awaiting_user_confirmation' "$fresh_target/docs/plans/README.md" || fail "delivery plans expose the approval state"
 grep -Fq '## 7. 偏移控制' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template includes drift control"
 grep -Fq 'Test/Eval/Check' "$fresh_target/docs/plans/TEMPLATE.md" || fail "delivery plan template maps claims to executable checks"

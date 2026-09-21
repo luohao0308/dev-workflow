@@ -270,6 +270,7 @@ bash ./scripts/uninstall.sh \
 - `-DryRun` / `--dry-run` 只输出将创建、追加或跳过的文件，不写入目标项目。
 - 首次安装会创建 `.dev-workflow/manifest.json`；重复安装会保留安装时间，合并已安装流程包并更新版本信息。
 - manifest 的 `gitPolicy` 分别记录 push/merge 的 `manual|auto` 模式和 `user|ai` 执行角色；缺失时按 `manual + user`。`auto` 只允许与 `ai` 组合。
+- 用户可在当前对话中明确指定单个 push 或 merge 目标并要求 AI 执行一次；该授权只覆盖当前目标，不改变 manifest 默认 actor，也不授权其他目标或后续操作。
 - `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
 - manifest schema 3 会记录 Git 交付权限，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
 - 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。

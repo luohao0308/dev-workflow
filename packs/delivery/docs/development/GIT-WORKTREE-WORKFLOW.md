@@ -76,6 +76,7 @@ git commit -m "<project commit format>"
 - 禁止使用 `git add .` 和 `git add -A` 暂存范围不明的文件。
 - 提交后确认任务工作树干净并记录已验证 SHA。
 - push/merge 是否自动执行以及由谁执行，以 `.dev-workflow/manifest.json` 的 `gitPolicy` 为准；缺失时按 `manual + user`。
+- 用户可在当前对话中明确指定单个目标并要求 AI 执行一次 push/merge；该授权只覆盖当前目标，不改变 manifest 默认 actor，也不扩展到后续操作。
 - dev-workflow 本地文件以 Git 解析出的 `info/exclude` 为保护边界；交付前若审计报告文件已被跟踪或最终 ignore 规则未生效，必须先解决告警，不能仅凭 managed block 文本判定安全。
 - 不使用 `git push --force`、`git reset --hard` 或语义不明的 ours/theirs。
 
@@ -97,7 +98,7 @@ git rebase <current-target-head>
 - push 前核验 `git branch --show-current`，发现分支以 `codex/` 开头时停止交付，先切换或创建合规的线上分支，再重新检查提交和验证结果。
 - 项目要求线性历史时，先验证目标 HEAD 是任务 HEAD 的祖先，再使用 `git merge --ff-only <task-head>`。
 - 需要 PR、人工审查或明确确认的项目，不绕过对应门禁。
-- `mode=manual` 时必须获得本次操作确认；`actor=user` 时 AI 不执行对应 push/merge，只提供命令与证据。
+- `mode=manual` 时必须获得本次操作确认；`actor=user` 时默认由用户执行，除非用户已对当前明确目标授予 AI 一次性执行权限。
 - `mode=auto` 仅可与 `actor=ai` 组合；push 与 merge 相互独立，不可互相推断授权。
 - `deleteAllowed=false` 不授予任何删除权限；删除远端分支、标签、Release 或其他难恢复对象需针对明确目标另行授权。
 - 发布、生产变更或不可逆操作仍只在项目规则明确授权后执行。
