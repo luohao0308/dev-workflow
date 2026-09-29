@@ -76,6 +76,9 @@ try {
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/GIT-WORKTREE-WORKFLOW.md') -Raw -Encoding UTF8) -match 'DELIVERY-DECISION-MATRIX\.md') 'worktree workflow references the single decision authority'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/development/README.md') -Raw -Encoding UTF8) -match 'DELIVERY-DECISION-MATRIX\.md') 'development README references the single decision authority'
     Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'scripts/delivery_guard.py') -PathType Leaf) 'Core installs the delivery preflight guard'
+    Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'scripts/check-git-boundaries.py') -PathType Leaf) 'delivery installs the Git boundary check'
+    Assert-True (Test-Path -LiteralPath (Join-Path $freshTarget 'docs/development/CI-BOUNDARY-CHECK.md') -PathType Leaf) 'delivery documents CI enforcement for Git boundaries'
+    Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/check-git-boundaries.py' -and $_.source -eq 'delivery' }).Count -eq 1) 'manifest records Git boundary check ownership'
     Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/delivery_guard.py' -and $_.source -eq 'core' }).Count -eq 1) 'manifest records delivery guard ownership'
     Assert-True (@($manifest.files | Where-Object { $_.path -eq 'scripts/feature_catalog.py' -and $_.source -eq 'feature-catalog' }).Count -eq 1) 'all-packs installs feature-catalog ownership'
 

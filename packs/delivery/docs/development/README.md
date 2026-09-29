@@ -47,6 +47,14 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 
 AI 执行远端操作前先运行 Core 自带、零第三方依赖的 `python3 scripts/delivery_guard.py check ...`。`actor=user` 时 guard 固定拒绝为 AI 放行；`actor=ai` 时必须提供 `.dev-workflow/authorizations/` 下、权限不宽于 `0600` 的一次性授权 JSON。真正执行前使用 `--consume` 原子记录消耗次数。每类操作都必须提供五分钟内从托管平台读取、并绑定当前仓库/remote/ref/SHA 的 provider 证据；push 证据还要证明非删除、非 force、fast-forward 且目标分支未受保护，merge 证据还要覆盖 PR、CI、独立人工 Review 和分支保护。guard 不读取 Token，也拒绝带凭据、query 或 fragment 的 remote URL。
 
+团队级 Git 内容门禁见 [CI Git 边界检查](CI-BOUNDARY-CHECK.md)，在 CI 与本地均可运行：
+
+```bash
+python3 scripts/check-git-boundaries.py --repo .
+```
+
+它直接检查 Git 已跟踪内容，不依赖本机 `info/exclude`。默认拒绝本机流程状态目录、任务上下文、工作日志、常见环境秘密文件和私钥/证书；项目确需共享例外时只能逐个使用 `--allow-path`，并应在项目 CI 配置中留下理由。
+
 ## 本地服务登记
 
 | 服务 | 启动入口 | 健康/冒烟入口 | 端口策略 | 安全停止方式 |
