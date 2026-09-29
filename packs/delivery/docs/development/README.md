@@ -26,8 +26,11 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 
 ## Git 与隔离策略
 
-- Worktree 模式：`required` / `recommended` / `disabled`（只描述隔离偏好，不代表每个任务都要建分支）
-- 分支决策：仅为有意进入 Git 的共享交付创建；本机记忆、临时上下文、部署流水和只读任务不建分支。
+分支、worktree 和共享交付的唯一权威规则见
+[交付与隔离决策矩阵](DELIVERY-DECISION-MATRIX.md)。本页只登记项目实际配置，不重复定义决策逻辑。
+
+- Worktree 模式：`required` / `recommended` / `disabled`（只描述隔离偏好）
+- 分支决策：按 [交付与隔离决策矩阵](DELIVERY-DECISION-MATRIX.md) 判断。
 - 分支命名：
 - 提交格式：
 - 集成策略：<!-- ff-only/rebase/merge/PR -->

@@ -5,6 +5,9 @@ _更新：YYYY-MM-DD_
 
 ## 1. 目标
 
+分支、worktree 和是否进入 Git 的决策以
+[交付与隔离决策矩阵](DELIVERY-DECISION-MATRIX.md) 为唯一权威；本文件负责详细执行、权限和清理步骤。
+
 先判断任务是否产生需要共享的 Git 交付，再决定是否创建分支；worktree 只在需要并行或目录隔离时使用。集成时只移动已经验证的提交，不覆盖项目工作树中的其他改动。
 
 ```text
@@ -52,7 +55,7 @@ git worktree add <task-worktree-path> -b <task-branch> <base-ref>
 
 ### 分支与 Worktree 决策
 
-分支隔离准备进入 Git 的提交；worktree 是同一仓库额外的工作目录，通常绑定一个分支。二者不决定文件是否应该提交，也不要求每个任务都创建。
+分支隔离准备进入 Git 的提交；worktree 是同一仓库额外的工作目录，通常绑定一个分支。具体任务分类和选择顺序见 [交付与隔离决策矩阵](DELIVERY-DECISION-MATRIX.md)。
 
 | 任务/产物 | Git 处理 | 分支 | Worktree |
 |---|---|---|---|
