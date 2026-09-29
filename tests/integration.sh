@@ -144,6 +144,10 @@ grep -Fq 'DELIVERY-DECISION-MATRIX.md' "$fresh_target/docs/development/README.md
 assert_file "$fresh_target/scripts/delivery_guard.py" "Core installs the delivery preflight guard"
 assert_file "$fresh_target/scripts/check-git-boundaries.py" "delivery installs the Git boundary check"
 assert_file "$fresh_target/scripts/report-worktrees.py" "delivery installs the read-only worktree report"
+assert_file "$fresh_target/docs/contracts/API-GOVERNANCE.md" "all-packs installs API governance"
+assert_file "$fresh_target/docs/operations/CONTAINER-GOVERNANCE.md" "all-packs installs container governance"
+assert_file "$fresh_target/docs/development/CI-CD-GOVERNANCE.md" "all-packs installs CI/CD governance"
+assert_file "$fresh_target/docs/operations/DEPLOYMENT-GOVERNANCE.md" "all-packs installs deployment governance"
 grep -Eq '"path":"scripts/report-worktrees.py","source":"delivery"' "$fresh_manifest" || fail "manifest records worktree report ownership"
 assert_file "$fresh_target/docs/development/CI-BOUNDARY-CHECK.md" "delivery documents CI enforcement for Git boundaries"
 grep -Eq '"path":"scripts/check-git-boundaries.py","source":"delivery"' "$fresh_manifest" || fail "manifest records Git boundary check ownership"
@@ -630,6 +634,15 @@ mkdir -p "$core_only_target"
 bash "$install_script" --target "$core_only_target" >/dev/null
 core_only_manifest="$core_only_target/.dev-workflow/manifest.json"
 assert_no_installed_packs "$core_only_manifest" "Core-only install records an empty pack list"
+
+for pack in api-governance containers delivery-cicd deployment; do
+    pack_target="$temp_root/$pack-only"
+    mkdir -p "$pack_target"
+    git -C "$pack_target" init -q
+    bash "$install_script" --target "$pack_target" --packs "$pack" >/dev/null
+    pack_manifest="$pack_target/.dev-workflow/manifest.json"
+    grep -Fq "\"$pack\"" "$pack_manifest" || fail "$pack install records its own manifest ownership"
+done
 core_only_manifest_hash="$(sha256_file "$core_only_manifest")"
 
 set +e
