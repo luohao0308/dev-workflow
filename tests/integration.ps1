@@ -66,6 +66,10 @@ try {
     Assert-True (@($manifest.files | Where-Object action -eq 'created').Count -gt 20) 'new files record created ownership'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 大型计划拆分与确认门') 'Core install includes the large-plan approval gate'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 默认开发闭环（轻量核心 \+ 风险插件）') 'Core install includes the lightweight development loop'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 自适应技术决策门') 'Core install includes the adaptive technical decision gate'
+    $installedCore = Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8
+    Assert-True (($installedCore -match 'L0') -and ($installedCore -match 'L1') -and ($installedCore -match 'L2')) 'Core install includes all decision levels'
+    Assert-True ($installedCore -match '技术分析本身不构成授权门') 'decision levels do not add redundant approval gates'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '## 交付治理与权限策略') 'Core install includes the delivery governance and permission policy'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'AGENTS.md') -Raw -Encoding UTF8) -match '一次性授权必须绑定') 'Core install scopes one-time delivery authorization'
     Assert-True ((Get-Content -LiteralPath (Join-Path $freshTarget 'docs/plans/README.md') -Raw -Encoding UTF8) -match 'awaiting_user_confirmation') 'delivery plans expose the approval state'
