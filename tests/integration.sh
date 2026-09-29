@@ -164,13 +164,28 @@ set -e
 grep -Fq '# BEGIN dev-workflow managed excludes' "$fresh_target/.git/info/exclude" || fail "install adds a managed Git exclude block"
 grep -Fq '/.dev-workflow/' "$fresh_target/.git/info/exclude" || fail "Git exclude hides dev-workflow metadata"
 grep -Fq '/docs/README.md' "$fresh_target/.git/info/exclude" || fail "Git exclude hides a created Core file"
+grep -Fq '/docs/project-memory/' "$fresh_target/.git/info/exclude" || fail "Git exclude hides the complete long-term memory directory"
+grep -Fq '/docs/working-context/' "$fresh_target/.git/info/exclude" || fail "Git exclude hides the complete working-context directory"
+grep -Fq '/docs/工作日志/' "$fresh_target/.git/info/exclude" || fail "Git exclude hides the complete workflow journal directory"
 grep -Fq '# user exclude' "$fresh_target/.git/info/exclude" || fail "install preserves user Git excludes"
 git -C "$fresh_target" check-ignore -q -- .dev-workflow/manifest.json || fail "Git check-ignore matches dev-workflow metadata"
 git -C "$fresh_target" check-ignore -q -- docs/README.md || fail "Git check-ignore matches created workflow files"
+mkdir -p "$fresh_target/docs/project-memory/runbooks" "$fresh_target/docs/working-context" "$fresh_target/docs/工作日志"
+touch "$fresh_target/docs/project-memory/runbooks/future-memory.md" "$fresh_target/docs/working-context/future-task.md" "$fresh_target/docs/工作日志/future-session.md"
+git -C "$fresh_target" check-ignore -q -- docs/project-memory/runbooks/future-memory.md || fail "Git ignores future long-term memory files"
+git -C "$fresh_target" check-ignore -q -- docs/working-context/future-task.md || fail "Git ignores future working-context files"
+git -C "$fresh_target" check-ignore -q -- 'docs/工作日志/future-session.md' || fail "Git ignores future workflow journal files"
 while IFS= read -r installed_path; do
   [[ -n "$installed_path" ]] || continue
+  case "$installed_path" in
+    docs/operations/runbooks/*)
+      git -C "$fresh_target" check-ignore -q -- "$installed_path" && fail "Git must keep shared runbooks visible: $installed_path"
+      continue
+      ;;
+  esac
   git -C "$fresh_target" check-ignore -q -- "$installed_path" || fail "Git excludes every installer-created path: $installed_path"
 done < <(sed -n -E 's/.*"path":"([^"]+)".*"action":"created".*/\1/p' "$fresh_manifest")
+git -C "$fresh_target" check-ignore -q -- docs/operations/runbooks/RUNBOOK-TEMPLATE.md && fail "Git must not ignore the shared runbook template"
 [[ "$(sha256_file "$fresh_target/.gitignore")" == "$gitignore_hash_before_install" ]] || fail "install does not modify project .gitignore"
 
 automated_git_target="$temp_root/automated-git"
@@ -460,6 +475,7 @@ catalog_hash_after_reinstall="$(sha256_file "$fresh_target/docs/development/ai/f
 [[ "$catalog_hash_before_reinstall" == "$catalog_hash_after_reinstall" ]] || fail "reinstall does not overwrite active feature catalog"
 [[ "$(grep -cF '# BEGIN dev-workflow managed excludes' "$fresh_target/.git/info/exclude")" -eq 1 ]] || fail "reinstall does not duplicate the managed Git exclude block"
 [[ "$(sha256_file "$fresh_target/.git/info/exclude")" == "$exclude_hash_before_reinstall" ]] || fail "reinstall leaves the Git exclude file byte-stable"
+git -C "$fresh_target" check-ignore -q -- docs/project-memory/runbooks/future-memory.md || fail "reinstall keeps future long-term memory ignored"
 
 first_updated_at="$(grep -E '"updatedAt"' "$fresh_manifest")"
 bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
@@ -543,6 +559,10 @@ assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "partial u
 [[ "$(grep -E '"policyChangedAt"' "$fresh_manifest")" == "$policy_changed_at_before_uninstall" ]] || fail "partial uninstall preserves the policy timestamp"
 [[ "$(grep -E '"policyChangedBy"' "$fresh_manifest")" == "$policy_changed_by_before_uninstall" ]] || fail "partial uninstall preserves the policy origin"
 grep -Fq '/docs/README.md' "$fresh_target/.git/info/exclude" || fail "partial uninstall preserves Core Git excludes"
+grep -Fq '/docs/project-memory/' "$fresh_target/.git/info/exclude" || fail "partial uninstall preserves local memory exclusion"
+if grep -Fq '/docs/working-context/' "$fresh_target/.git/info/exclude" || grep -Fq '/docs/工作日志/' "$fresh_target/.git/info/exclude"; then
+  fail "partial uninstall removes Delivery-only directory excludes"
+fi
 if grep -Fq '/docs/plans/TEMPLATE.md' "$fresh_target/.git/info/exclude"; then
   fail "partial uninstall removes pack Git excludes"
 fi

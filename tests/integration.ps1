@@ -101,15 +101,34 @@ try {
     Assert-True ($freshExclude -match '# BEGIN dev-workflow managed excludes') 'install adds a managed Git exclude block'
     Assert-True ($freshExclude -match '/\.dev-workflow/') 'Git exclude hides dev-workflow metadata'
     Assert-True ($freshExclude -match '/docs/README\.md') 'Git exclude hides a created Core file'
+    Assert-True ($freshExclude -match '/docs/project-memory/') 'Git exclude hides the complete long-term memory directory'
+    Assert-True ($freshExclude -match '/docs/working-context/') 'Git exclude hides the complete working-context directory'
+    Assert-True ($freshExclude -match '/docs/工作日志/') 'Git exclude hides the complete workflow journal directory'
     Assert-True ($freshExclude -match '# user exclude') 'install preserves user Git excludes'
     & git -C $freshTarget check-ignore -q -- .dev-workflow/manifest.json
     Assert-True ($LASTEXITCODE -eq 0) 'Git check-ignore matches dev-workflow metadata'
     & git -C $freshTarget check-ignore -q -- docs/README.md
     Assert-True ($LASTEXITCODE -eq 0) 'Git check-ignore matches created workflow files'
+    New-Item -ItemType Directory -Path (Join-Path $freshTarget 'docs/project-memory/runbooks'), (Join-Path $freshTarget 'docs/working-context'), (Join-Path $freshTarget 'docs/工作日志') -Force | Out-Null
+    Write-Utf8NoBom -Path (Join-Path $freshTarget 'docs/project-memory/runbooks/future-memory.md') -Content "local memory`n"
+    Write-Utf8NoBom -Path (Join-Path $freshTarget 'docs/working-context/future-task.md') -Content "local context`n"
+    Write-Utf8NoBom -Path (Join-Path $freshTarget 'docs/工作日志/future-session.md') -Content "local journal`n"
+    & git -C $freshTarget check-ignore -q -- docs/project-memory/runbooks/future-memory.md
+    Assert-True ($LASTEXITCODE -eq 0) 'Git ignores future long-term memory files'
+    & git -C $freshTarget check-ignore -q -- docs/working-context/future-task.md
+    Assert-True ($LASTEXITCODE -eq 0) 'Git ignores future working-context files'
+    & git -C $freshTarget check-ignore -q -- 'docs/工作日志/future-session.md'
+    Assert-True ($LASTEXITCODE -eq 0) 'Git ignores future workflow journal files'
     foreach ($entry in @($manifest.files | Where-Object action -eq 'created')) {
         & git -C $freshTarget check-ignore -q -- ([string]$entry.path)
-        Assert-True ($LASTEXITCODE -eq 0) "Git excludes installer-created path: $($entry.path)"
+        if ([string]$entry.path -like 'docs/operations/runbooks/*') {
+            Assert-True ($LASTEXITCODE -ne 0) "Git keeps shared runbook visible: $($entry.path)"
+        } else {
+            Assert-True ($LASTEXITCODE -eq 0) "Git excludes installer-created path: $($entry.path)"
+        }
     }
+    & git -C $freshTarget check-ignore -q -- docs/operations/runbooks/RUNBOOK-TEMPLATE.md
+    Assert-True ($LASTEXITCODE -ne 0) 'Git does not ignore the shared runbook template'
     Assert-True ($gitignoreHashBeforeInstall -eq (Get-FileHash -LiteralPath (Join-Path $freshTarget '.gitignore') -Algorithm SHA256).Hash) 'install does not modify project .gitignore'
 
     foreach ($nonInteractiveAuthorization in @(
@@ -312,6 +331,8 @@ try {
     Assert-True ($catalogHashBeforeReinstall -eq $catalogHashAfterReinstall) 'reinstall does not overwrite active feature catalog'
     Assert-True (([regex]::Matches((Get-Content -LiteralPath $freshExcludePath -Raw -Encoding UTF8), '# BEGIN dev-workflow managed excludes')).Count -eq 1) 'reinstall does not duplicate the managed Git exclude block'
     Assert-True ($excludeHashBeforeReinstall -eq (Get-FileHash -LiteralPath $freshExcludePath -Algorithm SHA256).Hash) 'reinstall leaves the Git exclude file byte-stable'
+    & git -C $freshTarget check-ignore -q -- docs/project-memory/runbooks/future-memory.md
+    Assert-True ($LASTEXITCODE -eq 0) 'reinstall keeps future long-term memory ignored'
 
     $firstUpdatedAt = [string]$manifest.updatedAt
     & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
@@ -405,6 +426,8 @@ try {
     Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq $policyChangedByBeforeUninstall) 'partial uninstall preserves the policy origin'
     $partialExclude = Get-Content -LiteralPath $freshExcludePath -Raw -Encoding UTF8
     Assert-True ($partialExclude -match '/docs/README\.md') 'partial uninstall preserves Core Git excludes'
+    Assert-True ($partialExclude -match '/docs/project-memory/') 'partial uninstall preserves local memory exclusion'
+    Assert-True ($partialExclude -notmatch '/docs/working-context/' -and $partialExclude -notmatch '/docs/工作日志/') 'partial uninstall removes Delivery-only directory excludes'
     Assert-True ($partialExclude -notmatch '/docs/plans/TEMPLATE\.md') 'partial uninstall removes pack Git excludes'
     Assert-True (([regex]::Matches($partialExclude, '# BEGIN dev-workflow managed excludes')).Count -eq 1) 'partial uninstall keeps one managed Git exclude block'
 

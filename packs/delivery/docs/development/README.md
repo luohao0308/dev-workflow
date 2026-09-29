@@ -26,7 +26,8 @@ _状态：待初始化 | 更新：YYYY-MM-DD_
 
 ## Git 与隔离策略
 
-- Worktree 模式：`required` / `recommended` / `disabled`（选择一项）
+- Worktree 模式：`required` / `recommended` / `disabled`（只描述隔离偏好，不代表每个任务都要建分支）
+- 分支决策：仅为有意进入 Git 的共享交付创建；本机记忆、临时上下文、部署流水和只读任务不建分支。
 - 分支命名：
 - 提交格式：
 - 集成策略：<!-- ff-only/rebase/merge/PR -->
@@ -58,7 +59,7 @@ AI 执行远端操作前先运行 Core 自带、零第三方依赖的 `python3 s
 | 数据模型/迁移 | 迁移演练 + 数据断言 | 迁移模板、备份/恢复入口、架构数据说明 |
 | 运行时代码/配置/依赖 | 定向测试 + 重启 + 冒烟 | 本页命令、Runbook、配置说明 |
 | 部署/基础设施 | 配置校验 + Preflight + 回滚演练 | `operations/`、Runbook、观测入口 |
-| 重复性故障经验 | 修复回归测试 | `project-memory/` |
+| 团队可复用的重复性故障经验 | 修复回归测试 | `operations/runbooks/` |
 | 纯文档 | 链接、格式、事实来源检查 | 对应索引 |
 
 ## 完成定义

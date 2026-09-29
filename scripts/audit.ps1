@@ -85,6 +85,24 @@ function Check-GitExcludeBlock(
     $prefixValue = if ($prefix) { "/$(ConvertTo-GitExcludeLiteral $prefix)" } else { '' }
     $expected = [Collections.Generic.List[string]]::new()
     $expected.Add("$prefixValue/.dev-workflow/")
+    $expected.Add("$prefixValue/$(ConvertTo-GitExcludeLiteral 'docs/project-memory/')")
+    $installedPacks = @()
+    try {
+        $auditManifest = Get-Content -LiteralPath (Join-Path $TargetRoot '.dev-workflow/manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+        $installedPacks = @($auditManifest.installedPacks | ForEach-Object { [string]$_ })
+    } catch {
+        $installedPacks = @()
+    }
+    $expectedDirectories = @('docs/project-memory/')
+    if ($installedPacks -contains 'delivery') {
+        $expectedDirectories += @('docs/working-context/', 'docs/工作日志/')
+    }
+    foreach ($directory in $expectedDirectories) {
+        & git -C $TargetRoot check-ignore --no-index -q -- $directory
+        if ($LASTEXITCODE -ne 0) {
+            Add-Warning $Warnings "Git final ignore rules do not exclude the local workflow directory: $directory"
+        }
+    }
     & git -C $TargetRoot check-ignore --no-index -q -- '.dev-workflow/manifest.json'
     if ($LASTEXITCODE -ne 0) {
         Add-Warning $Warnings 'Git final ignore rules do not exclude dev-workflow metadata: .dev-workflow/manifest.json'
@@ -97,12 +115,19 @@ function Check-GitExcludeBlock(
     foreach ($path in $InventoryPaths) {
         $action = [string]$InventoryActions[$path]
         if ($action -eq 'created') {
-            $expected.Add("$prefixValue/$(ConvertTo-GitExcludeLiteral $path)")
             & git -C $TargetRoot check-ignore --no-index -q -- $path
-            if ($LASTEXITCODE -ne 0) {
-                Add-Warning $Warnings "Git final ignore rules do not exclude a dev-workflow file: $path"
+            if ($path -like 'docs/operations/runbooks/*') {
+                if ($LASTEXITCODE -eq 0) {
+                    Add-Warning $Warnings "Git final ignore rules hide a shared operations runbook: $path"
+                }
+            } else {
+                $expected.Add("$prefixValue/$(ConvertTo-GitExcludeLiteral $path)")
+                if ($LASTEXITCODE -ne 0) {
+                    Add-Warning $Warnings "Git final ignore rules do not exclude a dev-workflow file: $path"
+                }
             }
         }
+        if ($path -like 'docs/operations/runbooks/*') { continue }
         if ($action -in @('created', 'appended', 'managed-block')) {
             $repoRelative = if ($prefix) { "$prefix/$path" } else { $path }
             & git -C (($repoRootOutput -join "`n").Trim()) ls-files --error-unmatch -- ":(literal)$repoRelative" *> $null

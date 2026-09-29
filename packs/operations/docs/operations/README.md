@@ -16,7 +16,8 @@ _状态：待初始化 | 权威范围：环境、发布、健康、观测和恢�
 
 - [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)：发布前检查、迁移、切换、验证和回滚。
 - [OBSERVABILITY.md](OBSERVABILITY.md)：日志、指标、追踪、健康信号和排障入口。
-- `docs/project-memory/`：具体环境和能力的可重复 Runbook。
+- [`runbooks/`](runbooks/)：团队共享、可重复验证的操作与部署 Runbook；安装模板默认进入 Git 跟踪范围。
+- 部署流水、发布日志、动态环境快照和完整命令输出：保存在 CI/部署平台或受控日志系统，不提交到源码仓库。
 
 ## 发布原则
 

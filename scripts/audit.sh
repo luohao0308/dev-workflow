@@ -147,6 +147,26 @@ check_git_exclude_block() {
   if ! git -C "$target_root" check-ignore --no-index -q -- '.dev-workflow/manifest.json'; then
     add_warning "Git 的最终 ignore 规则未排除 dev-workflow 元数据：.dev-workflow/manifest.json"
   fi
+  for expected_directory in "docs/project-memory/"; do
+    expected_pattern="${pattern}/$(escape_git_exclude_path "$expected_directory")"
+    if ! git_exclude_has_line "$expected_pattern"; then
+      add_warning "Git info/exclude 缺少 dev-workflow 长期记忆目录排除项：$expected_directory"
+    fi
+    if ! git -C "$target_root" check-ignore --no-index -q -- "$expected_directory"; then
+      add_warning "Git 的最终 ignore 规则未排除 dev-workflow 长期记忆目录：$expected_directory"
+    fi
+  done
+  if contains_item "delivery" "${installed_packs[@]+"${installed_packs[@]}"}"; then
+    for expected_directory in "docs/working-context/" "docs/工作日志/"; do
+      expected_pattern="${pattern}/$(escape_git_exclude_path "$expected_directory")"
+      if ! git_exclude_has_line "$expected_pattern"; then
+        add_warning "Git info/exclude 缺少 dev-workflow 本地上下文目录排除项：$expected_directory"
+      fi
+      if ! git -C "$target_root" check-ignore --no-index -q -- "$expected_directory"; then
+        add_warning "Git 的最终 ignore 规则未排除 dev-workflow 本地上下文目录：$expected_directory"
+      fi
+    done
+  fi
   repo_relative="${target_prefix:+$target_prefix/}.dev-workflow/"
   if [[ -n "$(git -C "$repo_root" ls-files -- ":(literal)$repo_relative" 2>/dev/null)" ]]; then
     add_warning "Git 已跟踪 dev-workflow 元数据，info/exclude 无法阻止上传：.dev-workflow/"
@@ -154,6 +174,13 @@ check_git_exclude_block() {
   for index in "${!inventory_paths[@]}"; do
     case "${inventory_actions[$index]}" in
       created)
+        case "${inventory_paths[$index]}" in
+          docs/operations/runbooks/*)
+            if git -C "$target_root" check-ignore --no-index -q -- "${inventory_paths[$index]}"; then
+              add_warning "Git 最终 ignore 规则错误地隐藏团队共享 Runbook：${inventory_paths[$index]}"
+            fi
+            ;;
+          *)
         expected_pattern="${pattern}/$(escape_git_exclude_path "${inventory_paths[$index]}")"
         if ! git_exclude_has_line "$expected_pattern"; then
           add_warning "Git info/exclude 缺少 dev-workflow 文件排除项：${inventory_paths[$index]}"
@@ -161,11 +188,14 @@ check_git_exclude_block() {
         if ! git -C "$target_root" check-ignore --no-index -q -- "${inventory_paths[$index]}"; then
           add_warning "Git 的最终 ignore 规则未排除 dev-workflow 文件：${inventory_paths[$index]}"
         fi
+            ;;
+        esac
         ;;
       appended|managed-block) ;;
       *) continue ;;
     esac
     repo_relative="${target_prefix:+$target_prefix/}${inventory_paths[$index]}"
+    case "${inventory_paths[$index]}" in docs/operations/runbooks/*) continue ;; esac
     if git -C "$repo_root" ls-files --error-unmatch -- ":(literal)$repo_relative" >/dev/null 2>&1; then
       add_warning "Git 已跟踪包含 dev-workflow 内容的文件，info/exclude 无法阻止上传：${inventory_paths[$index]}"
     fi

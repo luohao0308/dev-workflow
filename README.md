@@ -66,7 +66,7 @@ Core 提供：
 - `docs/WORKING-CONTEXT.md`：当前主任务短期记忆；
 - `docs/WORKFLOW-ADOPTION.md`：首次接入状态、既有文档映射和审计记录；
 - `docs/PROJECT-SUMMARY.md`：仓库拓扑、模块、命令、契约、交付和风险画像；
-- `docs/project-memory/README.md`：长期、已验证经验库。
+- `docs/project-memory/README.md`：本机/Agent 长期记忆说明（本机忽略，不是团队事实源）。
 
 ### 默认开发闭环
 
@@ -82,7 +82,7 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 
 安装器还会在目标项目生成 `.dev-workflow/manifest.json`，记录流程版本、已安装流程包、逐文件来源、安装动作、原始哈希、接入状态和当前机器的交付执行权限。它是本地安装、升级、安全卸载和 AI 权限判断的元数据，不是团队共享配置。
 
-如果目标目录位于 Git 仓库，安装器还会通过 `git rev-parse --git-path` 定位该仓库（包括 worktree）的本地 `info/exclude`，维护一个 `dev-workflow managed` 排除区块。`.dev-workflow/` 和安装器实际创建的文件会加入其中；项目原有文件、被保留的文件和只追加核心区块的 `AGENTS.md` 不会被整文件忽略。嵌套目标路径会按 Git ignore 字面量规则转义，写入后再用 Git 验证最终忽略结果。安装器不会修改项目 `.gitignore`。非 Git 目录会跳过这一步并给出告警。已经被 Git 跟踪的文件，或被更高优先级 `.gitignore` 规则重新放行的文件，不会因为新增 exclude 而停止上传；安装器只告警，不会自动执行 `git rm --cached` 或改写 `.gitignore`。
+如果目标目录位于 Git 仓库，安装器还会通过 `git rev-parse --git-path` 定位该仓库（包括 worktree）的本地 `info/exclude`，维护一个 `dev-workflow managed` 排除区块。`.dev-workflow/`、本机长期记忆、任务上下文/工作日志和安装器实际创建的流程资料会加入其中；团队共享的 `docs/operations/runbooks/` 除外，Runbook 模板应进入 Git 跟踪范围。项目原有文件、被保留的文件和只追加核心区块的 `AGENTS.md` 不会被整文件忽略。嵌套目标路径会按 Git ignore 字面量规则转义，写入后再用 Git 验证最终忽略结果。安装器不会修改项目 `.gitignore`。非 Git 目录会跳过这一步并给出告警。已经被 Git 跟踪的文件，或被更高优先级 `.gitignore` 规则重新放行的文件，不会因为新增 exclude 而停止上传；安装器只告警，不会自动执行 `git rm --cached` 或改写 `.gitignore`。
 
 ## 可选流程包
 
@@ -98,6 +98,8 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
+
+纯本机记忆、临时上下文、部署流水和只读检查不创建分支或 worktree。团队共享文档按是否需要独立提交/评审决定分支；worktree 仅用于并行任务或目录/运行时隔离。没有共享交付价值的本任务临时分支可在确认无用户改动、未保存文件或需保留提交后清理。
 
 ## 安装
 
@@ -278,6 +280,7 @@ bash ./scripts/uninstall.sh \
 - `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
 - manifest schema 4 会记录三类 Git 交付执行权限、固定质量门和高权限操作默认拒绝策略，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
 - 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。
+- `.dev-workflow/` 和 Core `docs/project-memory/` 下全部本机记忆会始终加入 managed exclude；安装 Delivery 流程包后，`docs/working-context/` 与 `docs/工作日志/` 也按整个目录排除。团队 Runbook 模板进入 `docs/operations/runbooks/` 并保持 Git 可见；其他本机流程模板按 manifest 中实际创建的文件逐项排除。
 - 安装、审计和卸载都会验证 manifest 中的每个路径确实属于其声明的 Core 或流程包；未知路径会停止处理，不会据此删除项目文件。
 - 自动删除还要求 `created` 文件的安装哈希等于同版本分发文件哈希；卸载器版本不匹配时会停止，避免用新版模板推断旧版所有权。
 - 目标项目已有非 dev-workflow 管理的 `.dev-workflow/manifest.json` 时安装会停止，不覆盖未知元数据。
@@ -301,11 +304,13 @@ bash ./scripts/uninstall.sh \
     ├── WORKING-CONTEXT.md
     ├── WORKFLOW-ADOPTION.md
     ├── PROJECT-SUMMARY.md
-    └── project-memory/
-        └── README.md
+    ├── project-memory/
+    │   └── README.md (本机记忆)
+    └── operations/
+        └── runbooks/ (共享 Runbook 模板，安装 operations 包后)
 ```
 
-安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/`、`工作日志/` 和 Runbook 模板；设计包还会增加根 `DESIGN.md`。`feature-catalog` 包还会增加：
+安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/` 和 `工作日志/`；operations 包会在 `operations/runbooks/` 提供共享 Runbook 模板，设计包还会增加根 `DESIGN.md`。`feature-catalog` 包还会增加：
 
 ```text
 .
@@ -340,7 +345,7 @@ tag/Release、package/image publish、deploy、migration/backfill、rollback、t
 
 ## 版本与升级
 
-分发仓库的版本写在 `VERSION`。dev-workflow 安装内容按策略只用于本机，不应提交到 Git；安装器以本地 `info/exclude` 排除 `.dev-workflow/` 和其创建的文件，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，团队级强制门必须由远端 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 提供。
+分发仓库的版本写在 `VERSION`。安装器与 manifest、授权、个人记忆、任务上下文和临时日志按策略只用于本机，不应提交到 Git；团队共享的项目 Runbook、架构、契约、设计、部署配置仍属于源仓库内容。安装器以本地 `info/exclude` 区分两类内容，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，团队级强制门必须由远端 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 提供。
 
 升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
 

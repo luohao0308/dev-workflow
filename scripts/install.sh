@@ -177,8 +177,17 @@ build_git_exclude_patterns() {
   git_exclude_patterns=()
   pattern="$(git_exclude_pattern_for '.dev-workflow/')"
   git_exclude_patterns+=("$pattern")
+  pattern="$(git_exclude_pattern_for 'docs/project-memory/')"
+  git_exclude_patterns+=("$pattern")
+  if contains_item "delivery" "${selected_packs[@]+"${selected_packs[@]}"}"; then
+    pattern="$(git_exclude_pattern_for 'docs/working-context/')"
+    git_exclude_patterns+=("$pattern")
+    pattern="$(git_exclude_pattern_for 'docs/工作日志/')"
+    git_exclude_patterns+=("$pattern")
+  fi
   while IFS='|' read -r relative_path source action hash; do
     [[ -n "$relative_path" && "$action" == "created" ]] || continue
+    case "$relative_path" in docs/operations/runbooks/*) continue ;; esac
     pattern="$(git_exclude_pattern_for "$relative_path")"
     contains_git_exclude_pattern "$pattern" || git_exclude_patterns+=("$pattern")
   done <<< "$(inventory_summary)"
@@ -220,6 +229,7 @@ warn_tracked_git_excludes() {
     echo "警告：Git 已跟踪 dev-workflow 元数据，info/exclude 不会阻止上传：.dev-workflow/" >&2
   fi
   for index in "${!file_paths[@]}"; do
+    case "${file_paths[$index]}" in docs/operations/runbooks/*) continue ;; esac
     case "${file_actions[$index]}" in
       created|appended|managed-block) ;;
       *) continue ;;
@@ -238,6 +248,14 @@ warn_ineffective_git_excludes() {
   fi
   for index in "${!file_paths[@]}"; do
     [[ "${file_actions[$index]}" == "created" ]] || continue
+    case "${file_paths[$index]}" in
+      docs/operations/runbooks/*)
+        if git -C "$target_root" check-ignore --no-index -q -- "${file_paths[$index]}"; then
+          echo "警告：Git 的最终 ignore 规则错误地隐藏团队共享 Runbook：${file_paths[$index]}" >&2
+        fi
+        continue
+        ;;
+    esac
     if ! git -C "$target_root" check-ignore --no-index -q -- "${file_paths[$index]}"; then
       echo "警告：Git 的最终 ignore 规则未排除 dev-workflow 文件：${file_paths[$index]}" >&2
     fi

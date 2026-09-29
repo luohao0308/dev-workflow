@@ -1,6 +1,6 @@
 # docs/ 目录索引
 
-> 这是与具体技术栈无关的文档导航模板。项目应根据实际启用的流程包补充领域文档，但不要改变任务状态、短期上下文、稳定摘要和长期记忆的职责边界。
+> 这是与具体技术栈无关的文档导航模板。项目应根据实际启用的流程包补充领域文档，但不要改变任务状态、短期上下文、稳定摘要和本机记忆的职责边界。
 
 ## AI 读取规则
 
@@ -9,7 +9,7 @@
 3. 如果安装了 `feature-catalog`，功能状态、规划、缺陷定位和发布就绪任务先通过 `python3 scripts/feature_catalog.py --query "<task>"` 检索相关能力。
 4. 根据任务打开一个领域入口；禁止无差别加载整个 `docs/`。
 5. 自动生成文档、完整 Runbook 和历史工作日志按标题或关键词检索，不整份预载。
-6. 按内容类型区分权威来源：当前任务上下文 → `WORKING-CONTEXT.md`；任务状态 → `TASKS.md`；全量功能/成熟度 → `development/ai/feature-catalog.json`（如启用）；稳定事实 → `PROJECT-SUMMARY.md` 与 `architecture/`；当前设计 → `design/`；计划 → `plans/`；契约 → `contracts/`；可重复操作 → `project-memory/` 与 `operations/`；历史证据 → `工作日志/`。
+6. 按内容类型区分权威来源：当前任务上下文 → 本机 `WORKING-CONTEXT.md` 或 `.dev-workflow/`；任务状态 → `TASKS.md`；全量功能/成熟度 → `development/ai/feature-catalog.json`（如启用）；稳定事实 → `PROJECT-SUMMARY.md` 与 `architecture/`；当前设计 → `design/`；计划 → `plans/`；契约 → `contracts/`；团队可复用操作 → `operations/runbooks/`；本机长期记忆 → `project-memory/`；历史证据 → CI/部署平台或本机工作日志。
 7. 线上动态值、外部服务状态和环境信息必须重新验证，不能直接复用历史记录。
 8. 被 Git 忽略的敏感配置和本机运行资料不属于知识库，不读取、不索引、不提交。
 
@@ -18,10 +18,10 @@
 | 文件 | 用途 | 何时读 |
 |---|---|---|
 | [TASKS.md](TASKS.md) | 任务状态、待办、进行中、阻塞和技术债 | 开始任何任务前 |
-| [WORKING-CONTEXT.md](WORKING-CONTEXT.md) | 当前主任务的短期上下文、决策、阻塞、下一步和验证摘要 | active 且未过期时 |
+| [WORKING-CONTEXT.md](WORKING-CONTEXT.md) | 本机当前主任务的短期上下文、决策、阻塞、下一步和验证摘要 | active 且未过期时；不作为团队记录源 |
 | [WORKFLOW-ADOPTION.md](WORKFLOW-ADOPTION.md) | 首次接入状态、既有文档映射和审计记录 | 状态为 `pending` 或需要核验流程接入时 |
 | [PROJECT-SUMMARY.md](PROJECT-SUMMARY.md) | 稳定项目事实、拓扑、命令、模块、边界和路径速查 | 需要项目概览或路径定位时 |
-| [project-memory/](project-memory/) | 长期、可复用且已经验证的操作知识 | 排障、部署或复用经验时 |
+| [project-memory/](project-memory/) | 本机/Agent 的长期记忆，不作为团队项目事实源 | 仅本机检索；不提交 |
 
 ## 默认开发闭环
 
@@ -45,7 +45,7 @@ SDD/ATDD、TDD/EDD 是这条路径中的做法，不是每次都要执行的独�
 | `development/`、`testing/`、`working-context/` | delivery | 开发命令、Git 隔离、验证矩阵和并行上下文 |
 | `contracts/` | contracts | API、事件、Schema、CLI 等机器契约 |
 | `operations/` | operations | 发布、Preflight、观测、健康检查和回滚 |
-| `工作日志/` | delivery | 历史过程、验证证据和交付记录 |
+| `working-context/`、`工作日志/` | delivery | 本机临时上下文与日志；不要提交 |
 | `development/ai/feature-catalog.json`、`FEATURE-MATRIX.md` | feature-catalog | 全量功能层级、实现/成熟度、验证证据和生成矩阵 |
 
 未安装某个流程包时，不假定其目录或模板存在；应按项目现有文档和规则继续，并在项目扩展区说明替代入口。
@@ -60,3 +60,4 @@ SDD/ATDD、TDD/EDD 是这条路径中的做法，不是每次都要执行的独�
 - 模板完成后删除占位示例，保留状态、权威范围和更新时间。
 - 首次接入完成后将 `WORKFLOW-ADOPTION.md` 标记为 `ready`，并保留最近一次审计的简短证据。
 - `.dev-workflow/manifest.json` 只记录安装元数据和接入状态，不记录凭据、绝对本机路径或线上动态秘密。
+- 团队长期维护的架构、契约、Runbook 和部署配置属于项目源文档，应提交并评审；本机记忆、任务上下文和临时工作日志不应提交。

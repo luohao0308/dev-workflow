@@ -118,11 +118,17 @@ function Assert-GitExcludeBlockValid([string]$ExcludePath) {
     }
 }
 
-function Get-GitExcludePatterns([object]$Context, [object[]]$Inventory) {
+function Get-GitExcludePatterns([object]$Context, [object[]]$Inventory, [string[]]$InstalledPacks) {
     $patterns = [Collections.Generic.List[string]]::new()
     $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/'))
+    $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/project-memory/'))
+    if ($InstalledPacks -contains 'delivery') {
+        $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/working-context/'))
+        $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/工作日志/'))
+    }
     foreach ($entry in @($Inventory | Sort-Object { ([string]$_.path).ToLowerInvariant() })) {
         if ([string]$entry.action -ne 'created') { continue }
+        if ([string]$entry.path -like 'docs/operations/runbooks/*') { continue }
         $pattern = Get-GitExcludePattern -Context $Context -RelativePath ([string]$entry.path)
         if (-not $patterns.Contains($pattern)) { $patterns.Add($pattern) }
     }
@@ -178,6 +184,7 @@ function Warn-TrackedGitExcludePaths([object]$Context, [object[]]$Inventory) {
         Write-Warning 'Git already tracks dev-workflow metadata; info/exclude cannot prevent upload: .dev-workflow/'
     }
     foreach ($entry in @($Inventory | Sort-Object { ([string]$_.path).ToLowerInvariant() })) {
+        if ([string]$entry.path -like 'docs/operations/runbooks/*') { continue }
         if ([string]$entry.action -notin @('created', 'appended', 'managed-block')) { continue }
         $repoRelative = if ([string]::IsNullOrWhiteSpace([string]$Context.TargetPrefix)) {
             [string]$entry.path
@@ -198,7 +205,11 @@ function Warn-IneffectiveGitExcludes([object]$Context, [object[]]$Inventory, [st
     }
     foreach ($entry in @($Inventory | Where-Object { [string]$_.action -eq 'created' })) {
         & git -C $TargetRoot check-ignore --no-index -q -- ([string]$entry.path)
-        if ($LASTEXITCODE -ne 0) {
+        if ([string]$entry.path -like 'docs/operations/runbooks/*') {
+            if ($LASTEXITCODE -eq 0) {
+                Write-Warning "Git final ignore rules hide a shared operations runbook: $($entry.path)"
+            }
+        } elseif ($LASTEXITCODE -ne 0) {
             Write-Warning "Git final ignore rules do not exclude a dev-workflow file: $($entry.path)"
         }
     }
@@ -868,7 +879,7 @@ if ($manifestPlan.Changed) {
 
 if ($null -ne $gitExcludeContext) {
     $inventoryEntries = @($inventoryByPath.Values)
-    $gitExcludePatterns = @(Get-GitExcludePatterns -Context $gitExcludeContext -Inventory $inventoryEntries)
+    $gitExcludePatterns = @(Get-GitExcludePatterns -Context $gitExcludeContext -Inventory $inventoryEntries -InstalledPacks $installedPacks)
     Warn-TrackedGitExcludePaths -Context $gitExcludeContext -Inventory $inventoryEntries
     if ($DryRun) {
         $actions.Add("[git-exclude] $($gitExcludeContext.ExcludePath) (dry-run; update dev-workflow managed block)")

@@ -10,19 +10,19 @@
 | `AGENTS.md` | 项目级 AI 行为规则、协作约束和安全边界 |
 | `docs/README.md` | 文档导航、读取顺序和权威边界 |
 | `docs/TASKS.md` | 当前任务状态、待办、阻塞和技术债 |
-| `docs/WORKING-CONTEXT.md` | 当前主任务的短期上下文和交接摘要 |
+| `docs/WORKING-CONTEXT.md` | 本机当前主任务的短期上下文和交接摘要，不作为团队记录源 |
 | `docs/WORKFLOW-ADOPTION.md` | dev-workflow 首次接入状态、既有文档映射和审计记录 |
 | `docs/PROJECT-SUMMARY.md` | 稳定项目事实、模块摘要、技术决策、命令和路径速查 |
 | `.dev-workflow/manifest.json` | 已安装版本、流程包、文件归属和机器可读接入状态 |
 | `docs/development/ai/feature-catalog.json`（如启用） | 全量功能层级、实现状态、生产成熟度、证据和已知缺口 |
-| `docs/project-memory/` | 长期、可复用且已经验证的操作知识 |
+| `docs/project-memory/` | 本机/Agent 长期记忆，不作为团队项目事实源 |
 | `docs/architecture/`（如启用） | 系统、仓库、模块和运行时架构 |
 | `docs/design/` 或根 `DESIGN.md`（如启用） | 当前有效的产品/技术设计与验收口径 |
 | `docs/plans/`（如启用） | 多步骤变更的范围、阶段、风险和完成标准 |
 | `docs/development/`（如启用） | 开发命令、Git 隔离、验证矩阵和变更影响规则 |
 | `docs/contracts/`（如启用） | API、事件、Schema、CLI 等机器契约 |
 | `docs/operations/`（如启用） | 发布、Preflight、健康检查、观测和回滚 |
-| `docs/工作日志/`（如启用） | 历史过程和验证证据 |
+| `docs/工作日志/`（如启用） | 本机临时过程记录；正式验证证据留在 CI/部署平台 |
 
 ## 读取顺序
 
@@ -56,13 +56,14 @@
 
 - `TASKS.md` 只记录任务状态、明确待办、阻塞和技术债，不堆放完整过程证据。
 - `feature-catalog.json`（如启用）记录全量产品/系统能力、实现状态、成熟度和证据，不替代只记录当前工作的 `TASKS.md`；`FEATURE-MATRIX.md` 是生成视图，不手工维护。
-- `WORKING-CONTEXT.md` 只记录当前主任务的临时目标、决策、阻塞、下一步和验证摘要；任务完成或过期后清理。
+- `WORKING-CONTEXT.md` 只记录本机当前主任务的临时目标、决策、阻塞、下一步和验证摘要；任务完成或过期后清理，不提交。
 - `PROJECT-SUMMARY.md` 只保存稳定事实、命令、边界和路径速查，不作为实时任务或历史证据来源。
 - `architecture/` 记录从代码和运行事实中确认的稳定结构，不记录一次性方案争论。
 - `design/` 和 `plans/` 记录当前有效的目标、取舍、实施阶段和验收口径；被替代内容移入归档。
 - `contracts/` 记录机器可验证的接口/事件/Schema 契约；人工指南不能悄悄替代机器契约。
-- `project-memory/` 只保存长期、可复用、已经验证的经验，不保存当前任务状态或一次性推断。
-- 工作日志只用于历史追溯，不能覆盖当前代码、接口或任务状态。
+- `project-memory/` 只保存本机/Agent 的长期记忆，不作为团队 Runbook、架构、契约或部署规范的权威源。
+- 团队共享的可重复操作流程放在 `docs/operations/runbooks/` 并纳入 Git 评审；一次性部署流水、环境快照和命令输出留在受控平台或 artifacts。
+- 工作日志只用于本机临时追溯，不提交；不能覆盖当前代码、接口或任务状态。
 - 代码、测试结果和运行中接口是行为事实的最终证据；文档与代码冲突时必须显式报告并重新验证。
 
 ## 规则分层

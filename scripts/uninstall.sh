@@ -158,10 +158,19 @@ build_remaining_git_exclude_patterns() {
   if [[ "$full_uninstall" -eq 0 ]]; then
     pattern="$(git_exclude_pattern_for '.dev-workflow/')"
     git_exclude_patterns+=("$pattern")
+    pattern="$(git_exclude_pattern_for 'docs/project-memory/')"
+    git_exclude_patterns+=("$pattern")
+    if ! contains_item 'delivery' "${requested_packs[@]+"${requested_packs[@]}"}"; then
+      pattern="$(git_exclude_pattern_for 'docs/working-context/')"
+      git_exclude_patterns+=("$pattern")
+      pattern="$(git_exclude_pattern_for 'docs/工作日志/')"
+      git_exclude_patterns+=("$pattern")
+    fi
   fi
   while IFS='|' read -r relative_path source action hash; do
     [[ -n "$relative_path" && "$action" == "created" ]] || continue
     [[ "$full_uninstall" -eq 0 ]] || continue
+    case "$relative_path" in docs/operations/runbooks/*) continue ;; esac
     if contains_item "$source" "${requested_packs[@]+"${requested_packs[@]}"}"; then
       continue
     fi

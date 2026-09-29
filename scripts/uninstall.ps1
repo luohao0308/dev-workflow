@@ -115,10 +115,18 @@ function Get-RemainingGitExcludePatterns(
     [string[]]$RequestedPacks
 ) {
     $patterns = [Collections.Generic.List[string]]::new()
-    if (-not $FullUninstall) { $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/')) }
+    if (-not $FullUninstall) {
+        $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/'))
+        $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/project-memory/'))
+        if ($RequestedPacks -notcontains 'delivery') {
+            $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/working-context/'))
+            $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/工作日志/'))
+        }
+    }
     foreach ($entry in @($Inventory | Sort-Object { ([string]$_.path).ToLowerInvariant() })) {
         if ([string]$entry.action -ne 'created') { continue }
         if ($FullUninstall) { continue }
+        if ([string]$entry.path -like 'docs/operations/runbooks/*') { continue }
         if (-not $FullUninstall -and $RequestedPacks -contains ([string]$entry.source)) { continue }
         $pattern = Get-GitExcludePattern -Context $Context -RelativePath ([string]$entry.path)
         if (-not $patterns.Contains($pattern)) { $patterns.Add($pattern) }
