@@ -57,6 +57,15 @@ git worktree add <task-worktree-path> -b <task-branch> <base-ref>
 
 分支隔离准备进入 Git 的提交；worktree 是同一仓库额外的工作目录，通常绑定一个分支。具体任务分类和选择顺序见 [交付与隔离决策矩阵](DELIVERY-DECISION-MATRIX.md)。
 
+检查本地 worktree 生命周期时运行只读报告：
+
+```bash
+python3 scripts/report-worktrees.py --repo .
+python3 scripts/report-worktrees.py --repo . --base-ref origin/main --format json
+```
+
+报告包括缺失或可 prune 的 Git 元数据、锁定状态、重复分支绑定、脏工作树、相对基线的 ahead/behind、是否已合并、工作树体积和超过 30 天未修改的常见构建/依赖目录。目录年龄按目录自身 mtime 估算，不代表其内容最近访问时间。工具只报告，不运行 `git worktree prune`，也不删除分支、文件或缓存；删除前仍需人工检查归属、未提交内容和保留价值。
+
 | 任务/产物 | Git 处理 | 分支 | Worktree |
 |---|---|---|---|
 | 本机长期记忆、Agent 上下文、临时计划或会话日志 | 放在 `.dev-workflow/` 或明确的本机目录，由 `info/exclude` 忽略 | 不创建 | 不创建 |

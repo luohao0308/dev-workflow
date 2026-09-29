@@ -134,6 +134,8 @@ grep -Fq 'DELIVERY-DECISION-MATRIX.md' "$fresh_target/docs/development/GIT-WORKT
 grep -Fq 'DELIVERY-DECISION-MATRIX.md' "$fresh_target/docs/development/README.md" || fail "development README references the single decision authority"
 assert_file "$fresh_target/scripts/delivery_guard.py" "Core installs the delivery preflight guard"
 assert_file "$fresh_target/scripts/check-git-boundaries.py" "delivery installs the Git boundary check"
+assert_file "$fresh_target/scripts/report-worktrees.py" "delivery installs the read-only worktree report"
+grep -Eq '"path":"scripts/report-worktrees.py","source":"delivery"' "$fresh_manifest" || fail "manifest records worktree report ownership"
 assert_file "$fresh_target/docs/development/CI-BOUNDARY-CHECK.md" "delivery documents CI enforcement for Git boundaries"
 grep -Eq '"path":"scripts/check-git-boundaries.py","source":"delivery"' "$fresh_manifest" || fail "manifest records Git boundary check ownership"
 grep -Eq '"path":"scripts/delivery_guard.py","source":"core"' "$fresh_manifest" || fail "manifest records delivery guard ownership"
