@@ -14,7 +14,7 @@ updated: YYYY-MM-DD
 - `ready`：项目画像已根据代码和运行证据完成，后续任务可以按本流程直接执行。
 - `blocked`：接入被缺少权限、运行环境或无法验证的关键事实阻塞。
 
-机器可读的安装版本、流程包、接入状态和最近一次已记录审计时间保存在 `.dev-workflow/manifest.json`。该文件不应包含凭据、绝对本机路径或动态生产秘密。
+机器可读的安装版本、流程包、Git 交付权限、接入状态和最近一次已记录审计时间保存在 `.dev-workflow/manifest.json`。该文件不应包含凭据、绝对本机路径或动态生产秘密，只约束当前机器，不能替代远端平台门禁。
 
 ## 首次接入步骤
 
@@ -22,6 +22,7 @@ updated: YYYY-MM-DD
 2. 从仓库脚本、配置和 CI 中确认安装、启动、测试、lint、类型检查、构建、迁移和发布入口。
 3. 找出已有架构、设计、契约、测试、运维和工作日志文档，建立职责映射；不要因为模板路径不同就复制第二套权威文档。
 4. 识别受保护路径、凭据边界、需要人工授权的操作和无法验证的 Unknown。
+   核验 `gitPolicy` 中 push、PR 创建/更新、远端 PR merge 的 mode 与 actor；默认均为 `manual + user`。核验 PR、CI、独立 Review 默认强制，删除和发布类权限不在普通初始化中开放。
 5. 将已验证稳定事实填入 `PROJECT-SUMMARY.md`，将项目专属规则填入根 `AGENTS.md` 的项目扩展区或现有等价入口。
 6. 按实际启用的流程包补充导航、命令矩阵、契约索引、Runbook 和验证入口。
 7. 如果安装了 `feature-catalog`，运行 `python3 scripts/feature_catalog.py --init`，用项目事实替换脚手架，生成矩阵，并把 `--check` 接入适用的 CI。
@@ -36,6 +37,10 @@ updated: YYYY-MM-DD
 - [ ] 已有文档与新流程包已建立职责映射，没有并行权威源。
 - [ ] 契约、迁移、发布、健康检查和回滚入口按项目适用性登记。
 - [ ] 敏感信息和不可逆操作边界已明确。
+- [ ] manifest 中 push、PR 创建/更新、远端 PR merge 的审批模式和执行角色符合项目约定；策略变更已经人工确认并记录 `policyChangedAt` / `policyChangedBy`。
+- [ ] PR、required CI、独立 Review 的远端强制门已登记；实现者不能成为唯一审批者，AI review 不计作独立批准。
+- [ ] tag/Release、package/image publish、deploy、migration/backfill、rollback、traffic switch、仓库设置、凭据和删除权限保持未授予。
+- [ ] Git 仓库中的本地 `info/exclude` 已包含完整且顺序正确的 dev-workflow managed block，Git 最终确认安装器创建的文件被忽略，且相关文件未被 Git 跟踪。
 - [ ] Unknown、阻塞和需要人工确认的事项已记录。
 - [ ] 如安装 `feature-catalog`：活动清单已按项目事实初始化，矩阵已生成，`python3 scripts/feature_catalog.py --check` 通过。
 - [ ] 已从 dev-workflow 分发仓库运行 `audit.ps1` 或 `audit.sh`；最终 `ready` 状态审计退出码为 `0`，剩余告警已有解释。

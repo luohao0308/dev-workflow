@@ -1,6 +1,6 @@
 # <!-- 任务主题 -->实施计划
 
-_状态：draft | awaiting_user_confirmation | approved | in_progress | completed | blocked | 更新：YYYY-MM-DD | 关联任务：<!-- ID --> | 关联设计：<!-- link -->_
+_状态：draft | awaiting_user_confirmation | approved | in_progress | completed | blocked | superseded | 更新：YYYY-MM-DD | 关联任务：<!-- ID --> | 关联设计：<!-- link -->_
 
 ## 1. 目标、成功标准与停止条件
 
@@ -33,6 +33,7 @@ _状态：draft | awaiting_user_confirmation | approved | in_progress | complete
 - 确认状态：not_required / awaiting_user_confirmation / approved
 - 用户确认时间或消息指针：
 - 用户调整：
+- Issue（feature/bug/security/跨模块时）：
 
 大型计划确认前先在对话中列出以下切片，不开始实现：
 
@@ -99,7 +100,20 @@ _状态：draft | awaiting_user_confirmation | approved | in_progress | complete
 |---|---|---|---|
 |  |  |  |  |
 
-## 11. 文档同步
+## 11. 交付状态与 PR 证据
+
+- 当前状态：not_started | committed | pushed | pr_open | ci_passed | review_approved | merged
+- repo / remote：
+- PR 编号或链接：
+- source ref / target ref：
+- exact head SHA：
+- required CI 结果与时间：
+- 独立 reviewer 与批准时间：
+- merge commit（如已合并）：
+
+按实际到达的阶段顺序更新；没有证据的后续阶段不得提前标记。实现者不得作为唯一审批者，AI review 不计作独立批准。
+
+## 12. 文档同步
 
 - [ ] `TASKS.md` / 上下文
 - [ ] `PROJECT-SUMMARY.md`
@@ -107,10 +121,11 @@ _状态：draft | awaiting_user_confirmation | approved | in_progress | complete
 - [ ] 设计/契约/生成物
 - [ ] Runbook/工作日志
 
-## 12. 完成定义
+## 13. 完成定义
 
 - [ ] 大型计划已获得用户确认并记录切片版本，或本计划已标记为 `small / not_required`。
 - [ ] 所有切片验收通过，且过程状态按顺序更新。
 - [ ] 适用测试、构建、迁移、重启和冒烟通过。
 - [ ] 契约、文档和长期知识已同步。
 - [ ] 最终证据、SHA/产物身份和剩余风险已记录。
+- [ ] 如已进入远端交付，PR、CI 和独立 Review 证据完整；merge 只发生在 fail-closed 门禁通过后。

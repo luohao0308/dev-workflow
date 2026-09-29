@@ -70,7 +70,9 @@ _状态：未初始化 | 更新：YYYY-MM-DD_
 | 配置说明 | <!-- 填写路径，不写敏感值 --> |
 | 架构文档 | `docs/architecture/`（如启用） |
 | 设计文档 | `docs/design/` 或 `DESIGN.md`（如启用） |
-| 长期操作记忆 | `docs/project-memory/` |
+| 本机/Agent 长期记忆 | `docs/project-memory/`（本机忽略，不是团队事实源） |
+| 团队共享 Runbook | `docs/operations/runbooks/` |
+| 一次性部署证据 | CI/部署平台 artifacts 或受控日志 |
 | 任务状态 | `docs/TASKS.md` |
 | 当前任务上下文 | `docs/WORKING-CONTEXT.md` |
 

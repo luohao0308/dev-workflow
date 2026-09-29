@@ -66,7 +66,8 @@ Core 提供：
 - `docs/WORKING-CONTEXT.md`：当前主任务短期记忆；
 - `docs/WORKFLOW-ADOPTION.md`：首次接入状态、既有文档映射和审计记录；
 - `docs/PROJECT-SUMMARY.md`：仓库拓扑、模块、命令、契约、交付和风险画像；
-- `docs/project-memory/README.md`：长期、已验证经验库。
+- `docs/project-memory/README.md`：本机/Agent 长期记忆说明（本机忽略，不是团队事实源）。
+- 自适应技术决策门：按 `L0/L1/L2` 控制分析深度；简单改动直接实现，新能力给出简短推荐，高风险边界先说明兼容、迁移、回滚和验证，再按已有授权规则继续。
 
 ### 默认开发闭环
 
@@ -80,7 +81,9 @@ SDD/ATDD 和 TDD/EDD 是这条路径中的对应做法，不是每次都必须�
 Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；低风险局部改动保持短路径。
 每条验收标准都应映射到 test、Eval 或其他可执行检查，完成声明必须带有新鲜证据。
 
-安装器还会在目标项目生成 `.dev-workflow/manifest.json`，记录流程版本、已安装流程包、逐文件来源、安装动作、原始哈希和接入状态。它是安装、升级与安全卸载的元数据，不是日常运行时依赖。
+安装器还会在目标项目生成 `.dev-workflow/manifest.json`，记录流程版本、已安装流程包、逐文件来源、安装动作、原始哈希、接入状态和当前机器的交付执行权限。它是本地安装、升级、安全卸载和 AI 权限判断的元数据，不是团队共享配置。
+
+如果目标目录位于 Git 仓库，安装器还会通过 `git rev-parse --git-path` 定位该仓库（包括 worktree）的本地 `info/exclude`，维护一个 `dev-workflow managed` 排除区块。`.dev-workflow/`、本机长期记忆、任务上下文/工作日志和安装器实际创建的流程资料会加入其中；团队共享的 `docs/operations/runbooks/` 除外，Runbook 模板应进入 Git 跟踪范围。项目原有文件、被保留的文件和只追加核心区块的 `AGENTS.md` 不会被整文件忽略。嵌套目标路径会按 Git ignore 字面量规则转义，写入后再用 Git 验证最终忽略结果。安装器不会修改项目 `.gitignore`。非 Git 目录会跳过这一步并给出告警。已经被 Git 跟踪的文件，或被更高优先级 `.gitignore` 规则重新放行的文件，不会因为新增 exclude 而停止上传；安装器只告警，不会自动执行 `git rm --cached` 或改写 `.gitignore`。
 
 ## 可选流程包
 
@@ -88,14 +91,16 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 |---|---|---|
 | `architecture` | 系统架构、模块边界、ADR 模板 | 多模块、Monorepo、多仓库、长期维护项目 |
 | `design` | 根 `DESIGN.md`、设计索引与完整设计模板 | 新功能、产品/UI、复杂技术方案 |
-| `delivery` | 开发命令、Worktree、测试、计划、并行上下文、工作日志，以及大型计划拆分确认门 | 需要可重复的开发、验证和 Git 交付流程 |
+| `delivery` | 开发命令、Worktree 决策与只读生命周期报告、Git 内容门禁、测试、计划、并行上下文、工作日志，以及大型计划拆分确认门 | 需要可重复的开发、验证和 Git 交付流程 |
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 | `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
 
-多数流程包只包含普通 Markdown 文件。`feature-catalog` 额外安装一个零第三方依赖的 Python 3 脚本；它不会安装解释器、依赖包、后台进程或常驻服务。不启用该包时，Core 和其他流程包的行为保持不变。
+多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
+
+纯本机记忆、临时上下文、部署流水和只读检查不创建分支或 worktree。团队共享文档按是否需要独立提交/评审决定分支；worktree 仅用于并行任务或目录/运行时隔离。没有共享交付价值的本任务临时分支可在确认无用户改动、未保存文件或需保留提交后清理。
 
 ## 安装
 
@@ -122,6 +127,16 @@ Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁
 .\scripts\install.ps1 -TargetPath "D:\Projects\another-project" -AllPacks
 ```
 
+交互安装只确认 push、PR 创建/更新和远端 PR merge 的审批模式与执行角色。默认均为 `manual + user`；自动执行必须显式使用 `auto + ai`：
+
+```powershell
+.\scripts\install.ps1 `
+  -TargetPath "D:\Projects\another-project" `
+  -PushMode auto -PushActor ai `
+  -PullRequestMode manual -PullRequestActor user `
+  -MergeMode manual -MergeActor ai
+```
+
 ### Linux、macOS 或 WSL Bash
 
 ```bash
@@ -137,6 +152,18 @@ bash ./scripts/install.sh \
 # 安装全部流程包
 bash ./scripts/install.sh --target /path/to/project --all-packs
 ```
+
+交互安装只确认 push、PR 创建/更新和远端 PR merge 的审批模式与执行角色。默认均为 `manual + user`；自动执行必须显式使用 `auto + ai`：
+
+```bash
+bash ./scripts/install.sh \
+  --target /path/to/project \
+  --push-mode auto --push-actor ai \
+  --pull-request-mode manual --pull-request-actor user \
+  --merge-mode manual --merge-actor ai
+```
+
+首次安装在交互式终端中会询问三类远端操作的 mode/actor；如果 stdin 不是终端，安装器会停止并提示重新在交互式终端运行，不会静默假装完成确认。CI 或其他非交互环境必须显式使用 `--non-interactive`、PowerShell 的 `-NonInteractiveInstall`，或设置 `DEV_WORKFLOW_NON_INTERACTIVE=1`；它们只能采用安全默认值、保留既有策略或执行无参数的安全迁移，不能通过参数创建或修改持久权限。PR、CI、独立 Review 默认强制；force push、直接 push 保护分支和高权限操作默认拒绝，这些安全边界不作为普通初始化问题。
 
 ### 功能清单初始化与使用
 
@@ -165,7 +192,7 @@ python3 scripts/feature_catalog.py --query "login release evidence"
 
 ### 接入审计
 
-审计检查安装结构、流程包文件、核心标记、manifest 和初始化状态；安装了 `feature-catalog` 时还会只读运行目录校验与矩阵漂移检查。它不会修改项目代码，也不会读取凭据。
+审计检查安装结构、流程包文件、核心标记、manifest、初始化状态和本地 Git exclude；安装了 `feature-catalog` 时还会只读运行目录校验与矩阵漂移检查。受管排除区块缺失、重复、标记倒序、最终 Git ignore 未生效，或包含 dev-workflow 内容的文件已经被 Git 跟踪时都会告警，strict 模式会失败。审计不会修改项目代码，也不会读取凭据。
 
 ```powershell
 .\scripts\audit.ps1 -TargetPath "D:\Projects\another-project"
@@ -181,7 +208,7 @@ bash ./scripts/audit.sh --target /path/to/project
 
 ### Bash 版本兼容
 
-`scripts/install.sh`、`scripts/audit.sh` 和 `scripts/uninstall.sh` 支持 macOS 自带的 Bash 3.2。脚本在 `set -u` 下对空流程包、空文件清单和空错误列表使用兼容展开，不要求安装新版 Bash。完整 Bash 端到端回归入口为：
+`scripts/install.sh`、`scripts/audit.sh` 和 `scripts/uninstall.sh` 支持 macOS 自带的 Bash 3.2。脚本在 `set -u` 下对空流程包、空文件清单和空错误列表使用兼容展开，不要求安装新版 Bash。读取已有 manifest 的安全策略时需要 `python3`、`jq` 或 Node 中至少一个结构化 JSON 解析器；全部缺失时 fail-closed，不使用文本匹配降级。完整 Bash 端到端回归入口为：
 
 ```bash
 bash tests/integration.sh
@@ -189,7 +216,7 @@ bash tests/integration.sh
 
 ## 卸载
 
-卸载器必须从 `dev-workflow` 分发仓库运行。schema 2 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
+卸载器必须从 `dev-workflow` 分发仓库运行。schema 2/3/4 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
 
 ### Windows PowerShell
 
@@ -247,7 +274,14 @@ bash ./scripts/uninstall.sh \
 - 已经存在通用核心标记时保持不变，重复安装具有幂等性。
 - `-DryRun` / `--dry-run` 只输出将创建、追加或跳过的文件，不写入目标项目。
 - 首次安装会创建 `.dev-workflow/manifest.json`；重复安装会保留安装时间，合并已安装流程包并更新版本信息。
-- manifest schema 2 会记录安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
+- manifest 的 `gitPolicy` 分别记录 push、PR 创建/更新和远端 PR merge 的 `manual|auto` 模式与 `user|ai` 执行角色；缺失时按 `manual + user`。`auto` 只允许与 `ai` 组合，本地 `git merge` 不属于远端 merge 权限。
+- `pullRequestRequired`、`ciRequired`、`independentReviewRequired` 默认为 `true`；`forcePushAllowed`、`directProtectedBranchPushAllowed` 固定为 `false`，`privilegedOperationsDefault` 固定为 `deny`。
+- 修改持久权限策略本身始终需要人工确认，不能由现有权限推导，并记录 `policyChangedAt` / `policyChangedBy`。一次性授权必须绑定 `repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses`，不改变 manifest，也不授权其他目标或后续操作。
+- Core 安装的远端操作 guard 必须在 AI 执行 push、PR 创建/更新和远端 PR merge 前运行：`python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 拒绝 AI 执行；`actor=ai` 即使处于 `auto + ai` 也需要有效的一次性授权，`auto` 只免除该授权范围内的再次交互。最终 preflight 使用 `--consume` 记录授权次数；每类操作都需要绑定当前仓库/remote/ref/SHA 的新鲜 provider 证据，merge 还需 PR/CI/独立 Review/分支保护证据。
+- `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
+- manifest schema 4 会记录三类 Git 交付执行权限、固定质量门和高权限操作默认拒绝策略，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
+- 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。
+- `.dev-workflow/` 和 Core `docs/project-memory/` 下全部本机记忆会始终加入 managed exclude；安装 Delivery 流程包后，`docs/working-context/` 与 `docs/工作日志/` 也按整个目录排除。团队 Runbook 模板进入 `docs/operations/runbooks/` 并保持 Git 可见；其他本机流程模板按 manifest 中实际创建的文件逐项排除。
 - 安装、审计和卸载都会验证 manifest 中的每个路径确实属于其声明的 Core 或流程包；未知路径会停止处理，不会据此删除项目文件。
 - 自动删除还要求 `created` 文件的安装哈希等于同版本分发文件哈希；卸载器版本不匹配时会停止，避免用新版模板推断旧版所有权。
 - 目标项目已有非 dev-workflow 管理的 `.dev-workflow/manifest.json` 时安装会停止，不覆盖未知元数据。
@@ -271,11 +305,13 @@ bash ./scripts/uninstall.sh \
     ├── WORKING-CONTEXT.md
     ├── WORKFLOW-ADOPTION.md
     ├── PROJECT-SUMMARY.md
-    └── project-memory/
-        └── README.md
+    ├── project-memory/
+    │   └── README.md (本机记忆)
+    └── operations/
+        └── runbooks/ (共享 Runbook 模板，安装 operations 包后)
 ```
 
-安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/`、`工作日志/` 和 Runbook 模板；设计包还会增加根 `DESIGN.md`。`feature-catalog` 包还会增加：
+安装全部流程包后，会在同一 `docs/` 下增加 `architecture/`、`design/`、`development/`、`testing/`、`plans/`、`working-context/`、`contracts/`、`operations/` 和 `工作日志/`；operations 包会在 `operations/runbooks/` 提供共享 Runbook 模板，设计包还会增加根 `DESIGN.md`。`feature-catalog` 包还会增加：
 
 ```text
 .
@@ -302,15 +338,19 @@ bash ./scripts/uninstall.sh \
 
 完成项目画像后，先在 `pending` 状态运行审计并处理结构错误和告警，再同步将 `WORKFLOW-ADOPTION.md` 与 manifest 标记为 `ready`，记录审计时间，最后重跑审计确认退出码为 `0`。此后正常对话即可自动沿用这套开发风格，不需要每次调用 Skill 或运行 CLI。安装和审计脚本只在首次接入或升级时使用。
 
+交付治理分三层：流程要求决定何时需要 Issue、PR、CI 和独立 Review；执行权限决定谁可以 push、创建/更新 PR 和合并远端 PR；质量门禁决定准确 head SHA 是否允许进入目标分支。feature、bug、安全和跨模块工作应关联 Issue，小型低风险改动不强制。远端 PR merge 必须 fail-closed 验证 PR、head/base、required CI、独立 Review 和分支保护；实现者不得作为唯一审批者，AI review 不计作独立批准。
+
+tag/Release、package/image publish、deploy、migration/backfill、rollback、traffic switch、仓库设置、凭据和发布工作流操作不进入普通初始化，默认拒绝并按具体目标逐次授权。push、PR 或 merge 权限均不蕴含这些权限。
+
 如果选择了 `feature-catalog`，在切换到 `ready` 前还要运行 `--init`，用项目事实维护活动清单，再运行 `--generate` 和 `--check`。后续对话无需重复安装；AI 按任务查询清单，维护者在功能、证据或成熟度变化时更新清单并重新生成矩阵。
 
 ## 版本与升级
 
-分发仓库的版本写在 `VERSION`。目标项目的 manifest 应随项目文档一起提交到 Git，这样其他电脑克隆项目后无需重新安装即可获得同一套规则。
+分发仓库的版本写在 `VERSION`。安装器与 manifest、授权、个人记忆、任务上下文和临时日志按策略只用于本机，不应提交到 Git；团队共享的项目 Runbook、架构、契约、设计、部署配置仍属于源仓库内容。安装器以本地 `info/exclude` 区分两类内容，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，团队级强制门必须由远端 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 提供。
 
 升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
 
-从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1 manifest 会在升级时保守迁移到 schema 2；无法证明由旧安装器创建的普通文件，以及新版中模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
+从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1/2/3 manifest 会升级到 schema 4；schema 1 中无法证明由旧安装器创建的普通文件，以及升级时模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
 
 ## 不包含的内容
 
