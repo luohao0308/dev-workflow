@@ -7,6 +7,10 @@ param(
 
     [switch]$AllPacks,
 
+    [string[]]$EnableCapabilities = @(),
+
+    [string[]]$DisableCapabilities = @(),
+
     [ValidateSet('manual', 'auto')]
     [string]$PushMode,
 
@@ -299,7 +303,7 @@ function Read-ManagedManifest([string]$Path) {
         throw "Manifest exists but is not managed by dev-workflow: $Path"
     }
     $schemaVersion = [string]$manifest.schemaVersion
-    if ($schemaVersion -notin @('1', '2', '3', '4')) {
+    if ($schemaVersion -notin @('1', '2', '3', '4', '5')) {
         throw "Unsupported dev-workflow manifest schema in $Path"
     }
     if (([string]$manifest.workflowVersion) -notmatch '^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$') {
@@ -319,6 +323,13 @@ function Read-ManagedManifest([string]$Path) {
     if ($null -eq $manifest.onboarding -or ([string]$manifest.onboarding.status) -notin @('pending', 'ready', 'blocked')) {
         throw "Manifest has an invalid onboarding.status: $Path"
     }
+    if ($schemaVersion -eq '5') {
+        $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+        if ($null -eq $manifest.enabledCapabilities -or $manifest.enabledCapabilities -is [string] -or $manifest.enabledCapabilities -isnot [Collections.IEnumerable]) { throw "Manifest enabledCapabilities must be an array: $Path" }
+        $capabilities = @($manifest.enabledCapabilities | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+        if (@($capabilities | Where-Object { $_ -notin $allowedCapabilities }).Count -gt 0) { throw "Manifest contains an unknown enabled capability: $Path" }
+        if (@($capabilities | Group-Object | Where-Object Count -gt 1).Count -gt 0) { throw "Manifest enabledCapabilities contains duplicates: $Path" }
+    }
     if ($null -ne $manifest.gitPolicy) {
         $pushMode = ([string]$manifest.gitPolicy.pushMode).Trim().ToLowerInvariant()
         $pushActor = ([string]$manifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
@@ -329,7 +340,7 @@ function Read-ManagedManifest([string]$Path) {
         if ($manifest.gitPolicy.deleteAllowed -ne $false) {
             throw "Manifest gitPolicy.deleteAllowed must be false: $Path"
         }
-        if ($schemaVersion -eq '4') {
+        if ($schemaVersion -in @('4', '5')) {
             $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
             $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
             Assert-GitPolicy -Operation 'pull request' -Mode $pullRequestMode -Actor $pullRequestActor
@@ -343,10 +354,10 @@ function Read-ManagedManifest([string]$Path) {
             if ([string]::IsNullOrWhiteSpace([string]$manifest.gitPolicy.policyChangedAt)) { throw "Manifest gitPolicy.policyChangedAt is required: $Path" }
             if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { throw "Manifest gitPolicy.policyChangedBy is invalid: $Path" }
         }
-    } elseif ($schemaVersion -eq '4') {
+    } elseif ($schemaVersion -in @('4', '5')) {
         throw "Schema 4 manifest is missing gitPolicy: $Path"
     }
-    if ($schemaVersion -in @('2', '3', '4')) {
+    if ($schemaVersion -in @('2', '3', '4', '5')) {
         $filesProperty = $manifest.PSObject.Properties['files']
         if (
             $null -eq $filesProperty -or
@@ -387,6 +398,7 @@ function New-ManifestPlan(
     [string]$Path,
     [string]$Version,
     [string[]]$InstalledPacks,
+    [string[]]$EnabledCapabilities,
     [object[]]$Files,
     [object]$Existing,
     [object]$GitPolicy,
@@ -424,7 +436,7 @@ function New-ManifestPlan(
     )
     $oldPackSummary = if ($null -eq $Existing) { '' } else { @($Existing.installedPacks) -join ',' }
     $newPackSummary = @($InstalledPacks) -join ','
-    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -notin @('2', '3', '4')) {
+    $oldFileSummary = if ($null -eq $Existing -or [string]$Existing.schemaVersion -notin @('2', '3', '4', '5')) {
         ''
     } else {
         @($Existing.files | ForEach-Object {
@@ -440,22 +452,24 @@ function New-ManifestPlan(
         "$([string]$Existing.gitPolicy.pushMode)|$([string]$Existing.gitPolicy.pushActor)|$([string]$Existing.gitPolicy.mergeMode)|$([string]$Existing.gitPolicy.mergeActor)|$([string]$Existing.gitPolicy.pullRequestMode)|$([string]$Existing.gitPolicy.pullRequestActor)|$([string]$Existing.gitPolicy.deleteAllowed)"
     }
     $newPolicySummary = "$($GitPolicy.pushMode)|$($GitPolicy.pushActor)|$($GitPolicy.mergeMode)|$($GitPolicy.mergeActor)|$($GitPolicy.pullRequestMode)|$($GitPolicy.pullRequestActor)|False"
-    $policyChanged = $oldPolicySummary -ne $newPolicySummary -or $null -eq $Existing -or [string]$Existing.schemaVersion -ne '4'
+    $policyChanged = $oldPolicySummary -ne $newPolicySummary -or $null -eq $Existing -or [string]$Existing.schemaVersion -notin @('4', '5')
     $changed = (
         ($null -eq $Existing) -or
-        ([string]$Existing.schemaVersion -ne '4') -or
+        ([string]$Existing.schemaVersion -ne '5') -or
         ($oldVersion -ne $Version) -or
         ($oldPackSummary -ne $newPackSummary) -or
+        ((@($Existing.enabledCapabilities) -join ',') -ne (@($EnabledCapabilities) -join ',')) -or
         ($oldFileSummary -ne $newFileSummary) -or
         ($oldPolicySummary -ne $newPolicySummary)
     )
     $updatedAt = if ($changed -or [string]::IsNullOrWhiteSpace($oldUpdatedAt)) { $now } else { $oldUpdatedAt }
 
     $manifest = [ordered]@{
-        schemaVersion = 4
+        schemaVersion = 5
         managedBy = 'dev-workflow'
         workflowVersion = $Version
         installedPacks = @($InstalledPacks)
+        enabledCapabilities = @($EnabledCapabilities)
         gitPolicy = [ordered]@{
             pushMode = [string]$GitPolicy.pushMode
             pushActor = [string]$GitPolicy.pushActor
@@ -589,7 +603,7 @@ if ($hasExistingGitPolicy) {
     $pushActorValue = ([string]$existingManifest.gitPolicy.pushActor).Trim().ToLowerInvariant()
     $mergeModeValue = ([string]$existingManifest.gitPolicy.mergeMode).Trim().ToLowerInvariant()
     $mergeActorValue = ([string]$existingManifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
-    if ([string]$existingManifest.schemaVersion -eq '4') {
+    if ([string]$existingManifest.schemaVersion -in @('4', '5')) {
         $pullRequestModeValue = ([string]$existingManifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
         $pullRequestActorValue = ([string]$existingManifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
     }
@@ -658,7 +672,7 @@ $policyExplicitlyChanged = (
 )
 $policyChangedBy = if ($policyExplicitlyChanged) {
     'user'
-} elseif ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -ne '4') {
+} elseif ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -notin @('4', '5')) {
     'migration'
 } elseif ($null -eq $existingManifest) {
     'default'
@@ -702,8 +716,27 @@ foreach ($pack in $availablePacks) {
     }
 }
 
+$allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+$enabledCapabilities = [Collections.Generic.List[string]]::new()
+if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -eq '5') {
+    foreach ($capability in @($existingManifest.enabledCapabilities)) {
+        $normalized = ([string]$capability).Trim().ToLowerInvariant()
+        if ($normalized -and -not $enabledCapabilities.Contains($normalized)) { $enabledCapabilities.Add($normalized) }
+    }
+}
+foreach ($capability in $EnableCapabilities) {
+    $normalized = ([string]$capability).Trim().ToLowerInvariant()
+    if ($normalized -notin $allowedCapabilities) { throw "Unknown capability '$normalized'." }
+    if (-not $enabledCapabilities.Contains($normalized)) { $enabledCapabilities.Add($normalized) }
+}
+foreach ($capability in $DisableCapabilities) {
+    $normalized = ([string]$capability).Trim().ToLowerInvariant()
+    if ($normalized -notin $allowedCapabilities) { throw "Unknown capability '$normalized'." }
+    [void]$enabledCapabilities.Remove($normalized)
+}
+
 $inventoryByPath = @{}
-if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -in @('2', '3', '4')) {
+if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -in @('2', '3', '4', '5')) {
     foreach ($entry in @($existingManifest.files)) {
         Set-InventoryEntry `
             -Map $inventoryByPath `
@@ -860,6 +893,7 @@ $manifestPlan = New-ManifestPlan `
     -Path $manifestPath `
     -Version $workflowVersion `
     -InstalledPacks @($installedPacks) `
+    -EnabledCapabilities @($enabledCapabilities) `
     -Files @($inventoryByPath.Values) `
     -Existing $existingManifest `
     -GitPolicy $gitPolicy `

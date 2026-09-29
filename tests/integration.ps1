@@ -30,6 +30,8 @@ $powerShellExe = if ($PSVersionTable.PSEdition -eq 'Core') {
 Assert-True (@($installParameters | Where-Object { $_ -match 'delete' }).Count -eq 0) 'installer does not expose a delete permission option'
 Assert-True ($installParameters -contains 'PullRequestMode') 'installer exposes pull-request mode configuration'
 Assert-True ($installParameters -contains 'PullRequestActor') 'installer exposes pull-request actor configuration'
+Assert-True ($installParameters -contains 'EnableCapabilities') 'installer exposes capability enablement'
+Assert-True ($installParameters -contains 'DisableCapabilities') 'installer exposes capability disablement'
 $tempBase = [IO.Path]::GetTempPath()
 $tempRoot = Join-Path $tempBase ("dev-workflow-integration-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
@@ -42,10 +44,11 @@ try {
     Write-Utf8NoBom -Path (Join-Path $freshTarget '.gitignore') -Content "/project-local-only/`n"
     $gitignoreHashBeforeInstall = (Get-FileHash -LiteralPath (Join-Path $freshTarget '.gitignore') -Algorithm SHA256).Hash
 
-    & $installScript -TargetPath $freshTarget -AllPacks | Out-Null
+    & $installScript -TargetPath $freshTarget -AllPacks -EnableCapabilities @('api:rest-openapi', 'containers:compose') | Out-Null
     $freshManifestPath = Join-Path $freshTarget '.dev-workflow/manifest.json'
     $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$manifest.schemaVersion -eq '4') 'new installs use manifest schema 4'
+    Assert-True ([string]$manifest.schemaVersion -eq '5') 'new installs use manifest schema 5'
+    Assert-True (@($manifest.enabledCapabilities).Count -eq 2) 'installer persists enabled capabilities'
     Assert-True ([string]$manifest.gitPolicy.pushMode -eq 'manual') 'push defaults to manual approval'
     Assert-True ([string]$manifest.gitPolicy.pushActor -eq 'user') 'push defaults to user execution'
     Assert-True ([string]$manifest.gitPolicy.pullRequestMode -eq 'manual') 'pull requests default to manual approval'
@@ -131,6 +134,15 @@ try {
     Assert-True ($LASTEXITCODE -eq 0) 'Git ignores future working-context files'
     & git -C $freshTarget check-ignore -q -- 'docs/工作日志/future-session.md'
     Assert-True ($LASTEXITCODE -eq 0) 'Git ignores future workflow journal files'
+    & $installScript -TargetPath $freshTarget -NonInteractiveInstall | Out-Null
+    $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (@($manifest.enabledCapabilities) -contains 'api:rest-openapi' -and @($manifest.enabledCapabilities) -contains 'containers:compose') 'upgrade preserves enabled capabilities'
+    & $installScript -TargetPath $freshTarget -NonInteractiveInstall -DisableCapabilities 'containers:compose' | Out-Null
+    $manifest = Get-Content -LiteralPath $freshManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (@($manifest.enabledCapabilities).Count -eq 1 -and @($manifest.enabledCapabilities) -contains 'api:rest-openapi') 'installer disables only requested capability'
+    $unknownCapabilityRejected = $false
+    try { & $installScript -TargetPath $freshTarget -NonInteractiveInstall -EnableCapabilities 'api:not-real' | Out-Null } catch { $unknownCapabilityRejected = $true }
+    Assert-True $unknownCapabilityRejected 'installer rejects unknown capability IDs'
     foreach ($entry in @($manifest.files | Where-Object action -eq 'created')) {
         & git -C $freshTarget check-ignore -q -- ([string]$entry.path)
         if ([string]$entry.path -like 'docs/operations/runbooks/*') {
@@ -396,6 +408,12 @@ try {
     Assert-True ($LASTEXITCODE -eq 0) 'feature-catalog regeneration repairs matrix drift'
     & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget -Strict *> $null
     Assert-True ($LASTEXITCODE -eq 0) 'a completed schema 4 install passes strict audit'
+    $manifest.enabledCapabilities = @('api:not-real')
+    Write-Utf8NoBom -Path $freshManifestPath -Content (($manifest | ConvertTo-Json -Depth 8) + "`n")
+    & $powerShellExe -NoProfile -File $auditScript -TargetPath $freshTarget *> $null
+    Assert-True ($LASTEXITCODE -eq 1) 'audit rejects an unknown enabled capability'
+    $manifest.enabledCapabilities = @('api:rest-openapi')
+    Write-Utf8NoBom -Path $freshManifestPath -Content (($manifest | ConvertTo-Json -Depth 8) + "`n")
 
     $excludeWithoutCore = @(
         Get-Content -LiteralPath $freshExcludePath -Encoding UTF8 |
@@ -435,6 +453,7 @@ try {
     Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'partial uninstall preserves denied privileged operations'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'partial uninstall preserves denied delete permission'
     Assert-True ([string]$manifest.gitPolicy.policyChangedAt -eq $policyChangedAtBeforeUninstall) 'partial uninstall preserves the policy timestamp'
+    Assert-True (@($manifest.enabledCapabilities) -contains 'api:rest-openapi') 'partial uninstall preserves enabled capabilities'
     Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq $policyChangedByBeforeUninstall) 'partial uninstall preserves the policy origin'
     $partialExclude = Get-Content -LiteralPath $freshExcludePath -Raw -Encoding UTF8
     Assert-True ($partialExclude -match '/docs/README\.md') 'partial uninstall preserves Core Git excludes'
@@ -593,7 +612,7 @@ try {
     Write-Utf8NoBom -Path $schema3UpgradeManifestPath -Content (($schema3UpgradeManifest | ConvertTo-Json -Depth 8) + "`n")
     & $installScript -TargetPath $schema3UpgradeTarget | Out-Null
     $schema3UpgradeManifest = Get-Content -LiteralPath $schema3UpgradeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$schema3UpgradeManifest.schemaVersion -eq '4') 'schema 3 manifests upgrade to schema 4'
+    Assert-True ([string]$schema3UpgradeManifest.schemaVersion -eq '5') 'schema 3 manifests upgrade to schema 5'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pushMode -eq 'manual') 'schema 3 upgrade preserves push mode'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pushActor -eq 'ai') 'schema 3 upgrade preserves push actor'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.mergeMode -eq 'auto') 'schema 3 upgrade preserves merge mode'
@@ -623,7 +642,7 @@ try {
     $upgradedEntry = $upgradeManifest.files | Where-Object path -eq 'docs/TASKS.md'
     Assert-True ($upgradedEntry.action -eq 'legacy') 'changed created ownership becomes legacy during a version upgrade'
     Assert-True ($null -eq $upgradedEntry.installedSha256) 'legacy upgrade ownership clears the deletion hash'
-    Assert-True ([string]$upgradeManifest.schemaVersion -eq '4') 'schema 2 manifests upgrade to schema 4'
+    Assert-True ([string]$upgradeManifest.schemaVersion -eq '5') 'schema 2 manifests upgrade to schema 5'
     Assert-True ($upgradeManifest.workflowVersion -eq $workflowVersion) 'schema 2 upgrade records the current workflow version'
     Assert-True ([string]$upgradeManifest.gitPolicy.pushMode -eq 'manual') 'upgrade adds safe push policy when missing'
     Assert-True ([string]$upgradeManifest.gitPolicy.pushActor -eq 'user') 'upgrade adds safe push actor when missing'
@@ -651,7 +670,7 @@ try {
 
     & $installScript -TargetPath $legacyTarget | Out-Null
     $migratedManifest = Get-Content -LiteralPath $legacyManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    Assert-True ([string]$migratedManifest.schemaVersion -eq '4') 'legacy manifests migrate to schema 4'
+    Assert-True ([string]$migratedManifest.schemaVersion -eq '5') 'legacy manifests migrate to schema 5'
     Assert-True (($migratedManifest.files | Where-Object path -eq 'docs/architecture/SYSTEM.md').action -eq 'legacy') 'legacy pack files remain conservatively owned'
     Assert-True ([string]$migratedManifest.gitPolicy.pushMode -eq 'manual') 'schema 1 upgrade adds safe push policy'
     Assert-True ([string]$migratedManifest.gitPolicy.pushActor -eq 'user') 'schema 1 upgrade adds safe push actor'

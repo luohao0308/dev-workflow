@@ -12,6 +12,8 @@ usage() {
 选项：
   --packs architecture,design,delivery  安装指定流程包（至少一个名称）
   --all-packs                           安装全部流程包
+  --enable-capabilities api:rest-openapi,containers:compose  启用项目技术能力（升级默认保留）
+  --disable-capabilities api:rest-openapi,containers:compose 禁用项目技术能力
   --push-mode manual|auto              push 审批模式（默认 manual）
   --push-actor user|ai                 push 执行角色（默认 user）
   --merge-mode manual|auto             merge 审批模式（默认 manual）
@@ -179,7 +181,7 @@ build_git_exclude_patterns() {
   git_exclude_patterns+=("$pattern")
   pattern="$(git_exclude_pattern_for 'docs/project-memory/')"
   git_exclude_patterns+=("$pattern")
-  if contains_item "delivery" "${selected_packs[@]+"${selected_packs[@]}"}"; then
+  if contains_item "delivery" "${installed_packs[@]+"${installed_packs[@]}"}"; then
     pattern="$(git_exclude_pattern_for 'docs/working-context/')"
     git_exclude_patterns+=("$pattern")
     pattern="$(git_exclude_pattern_for 'docs/工作日志/')"
@@ -379,6 +381,19 @@ read_manifest_packs() {
     sed -n -E 's/^[[:space:]]*"([0-9A-Za-z._-]+)"[[:space:]]*$/\1/p'
 }
 
+read_manifest_capabilities() {
+  local path="$1"
+  local compact segment residual
+  compact="$(tr -d '\r\n' < "$path")"
+  if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then
+    return 1
+  fi
+  segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  [[ -z "$residual" ]] || return 1
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+}
+
 read_manifest_file_objects() {
   local path="$1"
   awk '
@@ -483,6 +498,7 @@ build_manifest() {
   local onboarding_status="$4"
   local last_audit_at="$5"
   local pack
+  local capability
   local index
   local packs_json=""
   for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
@@ -491,14 +507,21 @@ build_manifest() {
     fi
     packs_json+=$'\n    '"\"$pack\""
   done
+  local capabilities_json=""
+  for capability in "${enabled_capabilities[@]+"${enabled_capabilities[@]}"}"; do
+    if [[ -n "$capabilities_json" ]]; then capabilities_json+=","; fi
+    capabilities_json+=$'\n    '"\"$capability\""
+  done
   local last_audit_json="null"
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$last_audit_at\""
   cat <<EOF
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "managedBy": "dev-workflow",
   "workflowVersion": "$version",
   "installedPacks": [$packs_json
+  ],
+  "enabledCapabilities": [$capabilities_json
   ],
   "gitPolicy": {
     "pushMode": "$push_mode",
@@ -555,6 +578,8 @@ all_packs=0
 target=""
 packs_csv=""
 packs_option_seen=0
+enable_capabilities_csv=""
+disable_capabilities_csv=""
 push_mode_option=""
 push_actor_option=""
 merge_mode_option=""
@@ -591,6 +616,16 @@ while [[ $# -gt 0 ]]; do
     --all-packs)
       all_packs=1
       shift
+      ;;
+    --enable-capabilities)
+      [[ $# -ge 2 ]] || { echo "--enable-capabilities 需要逗号分隔的能力 ID" >&2; exit 2; }
+      enable_capabilities_csv="${enable_capabilities_csv:+$enable_capabilities_csv,}$2"
+      shift 2
+      ;;
+    --disable-capabilities)
+      [[ $# -ge 2 ]] || { echo "--disable-capabilities 需要逗号分隔的能力 ID" >&2; exit 2; }
+      disable_capabilities_csv="${disable_capabilities_csv:+$disable_capabilities_csv,}$2"
+      shift 2
       ;;
     --push-mode)
       [[ $# -ge 2 ]] || { echo "--push-mode 需要 manual 或 auto" >&2; exit 2; }
@@ -693,6 +728,9 @@ existing_pull_request_actor=""
 existing_policy_changed_at=""
 existing_policy_changed_by=""
 existing_packs=()
+enabled_capabilities=()
+old_capabilities_summary=""
+valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic '
 file_paths=()
 file_sources=()
 file_actions=()
@@ -704,7 +742,7 @@ if [[ -f "$manifest_path" ]]; then
   }
   existing_schema_version="$(json_number_field schemaVersion "$manifest_path")"
   case "$existing_schema_version" in
-    1|2|3|4) ;;
+    1|2|3|4|5) ;;
     *)
     echo "不支持的 dev-workflow manifest schema：$manifest_path" >&2
     exit 1
@@ -738,7 +776,7 @@ if [[ -f "$manifest_path" ]]; then
     existing_push_actor="$push_actor"
     existing_merge_mode="$merge_mode"
     existing_merge_actor="$merge_actor"
-    if [[ "$existing_schema_version" == "4" ]]; then
+    if [[ "$existing_schema_version" == "4" || "$existing_schema_version" == "5" ]]; then
       existing_pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
       existing_pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
       existing_policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
@@ -754,11 +792,22 @@ if [[ -f "$manifest_path" ]]; then
       case "$existing_policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
     fi
   fi
-  if [[ "$existing_schema_version" == "4" && "$existing_git_policy" -eq 0 ]]; then
-    echo "schemaVersion 4 manifest 缺少 gitPolicy。" >&2
+  if [[ ( "$existing_schema_version" == "4" || "$existing_schema_version" == "5" ) && "$existing_git_policy" -eq 0 ]]; then
+    echo "schemaVersion ${existing_schema_version} manifest 缺少 gitPolicy。" >&2
     exit 1
   fi
-  if [[ "$existing_schema_version" == "2" || "$existing_schema_version" == "3" || "$existing_schema_version" == "4" ]]; then
+  if [[ "$existing_schema_version" == "5" ]]; then
+    capability_output="$(read_manifest_capabilities "$manifest_path")" || { echo "manifest enabledCapabilities 格式无效。" >&2; exit 1; }
+    while IFS= read -r capability; do [[ -n "$capability" ]] && enabled_capabilities+=("$capability"); done <<< "$capability_output"
+    old_capabilities_summary="${enabled_capabilities[*]-}"
+    seen_capabilities=()
+    for capability in "${enabled_capabilities[@]+"${enabled_capabilities[@]}"}"; do
+      [[ "$valid_capabilities" == *" $capability "* ]] || { echo "未知 manifest 能力 ID：$capability" >&2; exit 1; }
+      contains_item "$capability" "${seen_capabilities[@]+"${seen_capabilities[@]}"}" && { echo "manifest enabledCapabilities 包含重复项：$capability" >&2; exit 1; }
+      seen_capabilities+=("$capability")
+    done
+  fi
+  if [[ "$existing_schema_version" == "2" || "$existing_schema_version" == "3" || "$existing_schema_version" == "4" || "$existing_schema_version" == "5" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")" || {
       echo "manifest files 格式无效：$manifest_path" >&2
       exit 1
@@ -773,6 +822,19 @@ if [[ -f "$manifest_path" ]]; then
     done <<< "$manifest_file_output"
   fi
 fi
+
+for capability in ${enable_capabilities_csv//,/ }; do
+  [[ "$valid_capabilities" == *" $capability "* ]] || { echo "未知能力 ID：$capability" >&2; exit 2; }
+  contains_item "$capability" "${enabled_capabilities[@]+"${enabled_capabilities[@]}"}" || enabled_capabilities+=("$capability")
+done
+for capability in ${disable_capabilities_csv//,/ }; do
+  [[ "$valid_capabilities" == *" $capability "* ]] || { echo "未知能力 ID：$capability" >&2; exit 2; }
+  remaining_capabilities=()
+  for existing_capability in "${enabled_capabilities[@]+"${enabled_capabilities[@]}"}"; do
+    [[ "$existing_capability" == "$capability" ]] || remaining_capabilities+=("$existing_capability")
+  done
+  enabled_capabilities=("${remaining_capabilities[@]+"${remaining_capabilities[@]}"}")
+done
 
 push_mode="${push_mode:-manual}"
 push_actor="${push_actor:-user}"
@@ -950,7 +1012,7 @@ if [[ "$existing_manifest" -eq 0 ]]; then
 elif [[ "$policy_mutation" -eq 1 ]]; then
   policy_changed_at="$now"
   policy_changed_by="user"
-elif [[ "$existing_schema_version" != "4" ]]; then
+elif [[ "$existing_schema_version" != "4" && "$existing_schema_version" != "5" ]]; then
   policy_changed_at="$now"
   policy_changed_by="migration"
 fi
@@ -1086,13 +1148,15 @@ for index in "${!overlay_roots[@]}"; do
 done
 
 new_inventory_summary="$(inventory_summary)"
+new_capabilities_summary="${enabled_capabilities[*]-}"
 manifest_changed=0
 if [[
   "$existing_manifest" -eq 0 ||
-  "$existing_schema_version" != "4" ||
+  "$existing_schema_version" != "5" ||
   "$old_version" != "$workflow_version" ||
   "$old_pack_summary" != "$new_pack_summary" ||
   "$old_inventory_summary" != "$new_inventory_summary" ||
+  "$old_capabilities_summary" != "$new_capabilities_summary" ||
   "$old_policy_summary" != "$new_policy_summary"
 ]]; then
   manifest_changed=1

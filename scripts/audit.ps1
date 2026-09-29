@@ -234,7 +234,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Error $errors 'manifest.json is not managed by dev-workflow.'
         }
         $schemaVersion = [string]$manifest.schemaVersion
-        if ($schemaVersion -notin @('1', '2', '3', '4')) {
+        if ($schemaVersion -notin @('1', '2', '3', '4', '5')) {
             Add-Error $errors 'manifest.json uses an unsupported schemaVersion.'
         } elseif ($schemaVersion -eq '1') {
             Add-Warning $warnings 'manifest.json uses legacy schemaVersion 1; reinstall with the current distribution to add safe uninstall ownership metadata.'
@@ -254,7 +254,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             Add-Warning $warnings 'Ready onboarding state has no recorded onboarding.lastAuditAt timestamp.'
         }
         if ($null -eq $manifest.gitPolicy) {
-            if ($schemaVersion -in @('3', '4')) {
+            if ($schemaVersion -in @('3', '4', '5')) {
                 Add-Error $errors "schemaVersion $schemaVersion manifest is missing gitPolicy."
             } else {
                 Add-Warning $warnings 'manifest.json is missing gitPolicy; rerun the current installer to confirm push/merge policy.'
@@ -271,7 +271,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             if ($pushMode -eq 'auto' -and $pushActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy push auto mode requires actor ai.' }
             if ($mergeMode -eq 'auto' -and $mergeActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy merge auto mode requires actor ai.' }
             if ($manifest.gitPolicy.deleteAllowed -ne $false) { Add-Error $errors 'manifest gitPolicy.deleteAllowed must be false.' }
-            if ($schemaVersion -eq '4') {
+            if ($schemaVersion -in @('4', '5')) {
                 $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
                 $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
                 if ($pullRequestMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestMode: $pullRequestMode" }
@@ -296,13 +296,24 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             }
         }
 
+        if ($schemaVersion -eq '5') {
+            $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+            if ($null -eq $manifest.enabledCapabilities -or $manifest.enabledCapabilities -is [string] -or $manifest.enabledCapabilities -isnot [Collections.IEnumerable]) {
+                Add-Error $errors 'manifest enabledCapabilities must be an array.'
+            } else {
+                $capabilities = @($manifest.enabledCapabilities | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
+                foreach ($capability in @($capabilities | Where-Object { $_ -notin $allowedCapabilities })) { Add-Error $errors "manifest contains unknown enabled capability: $capability" }
+                foreach ($capability in @($capabilities | Group-Object | Where-Object Count -gt 1 | ForEach-Object Name)) { Add-Error $errors "manifest enabledCapabilities contains duplicate: $capability" }
+            }
+        }
+
         $sourceVersionPath = Join-Path $sourceRoot 'VERSION'
         $sourceVersion = (Get-Content -LiteralPath $sourceVersionPath -Raw -Encoding UTF8).Trim()
         if ($manifest.workflowVersion -ne $sourceVersion) {
             Add-Warning $warnings "Manifest version $($manifest.workflowVersion) differs from distribution version $sourceVersion; run the installer in dry-run mode before upgrading."
         }
 
-        if ($schemaVersion -in @('2', '3', '4')) {
+        if ($schemaVersion -in @('2', '3', '4', '5')) {
             $filesProperty = $manifest.PSObject.Properties['files']
             if (
                 $null -eq $filesProperty -or
@@ -360,7 +371,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         foreach ($pack in $duplicatePacks) {
             Add-Error $errors "manifest installedPacks contains a duplicate: $pack"
         }
-        if ($schemaVersion -in @('2', '3', '4')) {
+        if ($schemaVersion -in @('2', '3', '4', '5')) {
             foreach ($entryPath in $inventoryPaths.Keys) {
                 $entrySource = $inventoryPaths[$entryPath]
                 if ($entrySource -ne 'core' -and $packNames -notcontains $entrySource) {
@@ -415,15 +426,15 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
                     Add-Error $errors "Workflow pack $pack is missing file: $relativePath"
                 }
-                if ($schemaVersion -in @('2', '3', '4') -and -not $inventoryPaths.ContainsKey($relativePath)) {
+                if ($schemaVersion -in @('2', '3', '4', '5') -and -not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing workflow pack file: $relativePath"
-                } elseif ($schemaVersion -in @('2', '3', '4') -and $inventoryPaths[$relativePath] -ne $pack) {
+                } elseif ($schemaVersion -in @('2', '3', '4', '5') -and $inventoryPaths[$relativePath] -ne $pack) {
                     Add-Error $errors "Manifest ownership inventory assigns '$relativePath' to '$($inventoryPaths[$relativePath])' instead of '$pack'."
                 }
             }
         }
 
-        if ($schemaVersion -in @('2', '3', '4')) {
+        if ($schemaVersion -in @('2', '3', '4', '5')) {
             foreach ($relativePath in $coreFiles) {
                 if (-not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing Core file: $relativePath"
@@ -435,7 +446,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     }
 }
 
-$auditInventoryPaths = if ($null -ne $manifest -and $schemaVersion -in @('2', '3', '4')) {
+$auditInventoryPaths = if ($null -ne $manifest -and $schemaVersion -in @('2', '3', '4', '5')) {
     @($inventoryPaths.Keys)
 } else {
     @()

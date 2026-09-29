@@ -265,6 +265,16 @@ read_manifest_packs() {
     sed -n -E 's/^[[:space:]]*"([0-9A-Za-z._-]+)"[[:space:]]*$/\1/p'
 }
 
+read_manifest_capabilities() {
+  local path="$1" compact segment residual
+  compact="$(tr -d '\r\n' < "$path")"
+  if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then return 1; fi
+  segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  [[ -z "$residual" ]] || return 1
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+}
+
 read_manifest_file_objects() {
   local path="$1"
   awk '
@@ -369,19 +379,27 @@ build_manifest() {
   local onboarding_status="$4"
   local last_audit_at="$5"
   local pack
+  local capability
   local packs_json=""
   for pack in "${installed_packs[@]+"${installed_packs[@]}"}"; do
     [[ -n "$packs_json" ]] && packs_json+=","
     packs_json+=$'\n    '"\"$(json_escape "$pack")\""
   done
+  local capabilities_json=""
+  for capability in "${enabled_capabilities[@]+"${enabled_capabilities[@]}"}"; do
+    if [[ -n "$capabilities_json" ]]; then capabilities_json+=","; fi
+    capabilities_json+=$'\n    '"\"$capability\""
+  done
   local last_audit_json="null"
   [[ -n "$last_audit_at" ]] && last_audit_json="\"$(json_escape "$last_audit_at")\""
   cat <<EOF
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "managedBy": "dev-workflow",
   "workflowVersion": "$(json_escape "$version")",
   "installedPacks": [$packs_json
+  ],
+  "enabledCapabilities": [$capabilities_json
   ],
   "gitPolicy": {
     "pushMode": "$(json_escape "$push_mode")",
@@ -497,7 +515,7 @@ grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" |
 }
 schema_version="$(json_number_field schemaVersion "$manifest_path")"
 case "$schema_version" in
-  1|2|3|4) ;;
+  1|2|3|4|5) ;;
   *) echo "不支持的 dev-workflow manifest schema：${schema_version:-missing}" >&2; exit 1 ;;
 esac
 
@@ -526,7 +544,7 @@ if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
   case "$push_mode:$push_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest push Git 策略无效。" >&2; exit 1 ;; esac
   case "$merge_mode:$merge_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest merge Git 策略无效。" >&2; exit 1 ;; esac
   [[ "$delete_allowed" == "false" ]] || { echo "manifest gitPolicy.deleteAllowed 必须为 false。" >&2; exit 1; }
-  if [[ "$schema_version" == "4" ]]; then
+  if [[ "$schema_version" == "4" || "$schema_version" == "5" ]]; then
     pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
     pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
     policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
@@ -542,8 +560,8 @@ if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
     case "$policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
   fi
 fi
-if [[ "$schema_version" == "4" ]] && ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
-  echo "schemaVersion 4 manifest 缺少 gitPolicy。" >&2
+if [[ ( "$schema_version" == "4" || "$schema_version" == "5" ) ]] && ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
+  echo "schemaVersion ${schema_version} manifest 缺少 gitPolicy。" >&2
   exit 1
 fi
 distribution_version="$(tr -d '[:space:]' < "$source_root/VERSION")"
@@ -553,6 +571,11 @@ if [[ "$schema_version" != "1" && "$distribution_version" != "$manifest_version"
 fi
 
 installed_packs=()
+enabled_capabilities=()
+if [[ "$schema_version" == "5" ]]; then
+  capability_output="$(read_manifest_capabilities "$manifest_path")" || { echo "manifest enabledCapabilities 格式无效。" >&2; exit 1; }
+  while IFS= read -r capability; do [[ -n "$capability" ]] && enabled_capabilities+=("$capability"); done <<< "$capability_output"
+fi
 pack_output="$(read_manifest_packs "$manifest_path")" || {
   echo "manifest installedPacks 格式无效：$manifest_path" >&2
   exit 1
@@ -581,7 +604,7 @@ file_paths=()
 file_sources=()
 file_actions=()
 file_hashes=()
-if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
   manifest_file_output="$(read_manifest_files "$manifest_path")" || {
     echo "manifest files 格式无效：$manifest_path" >&2
     exit 1

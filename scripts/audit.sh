@@ -326,6 +326,16 @@ read_manifest_packs() {
     sed -n -E 's/^[[:space:]]*"([0-9A-Za-z._-]+)"[[:space:]]*$/\1/p'
 }
 
+read_manifest_capabilities() {
+  local path="$1" compact segment residual
+  compact="$(tr -d '\r\n' < "$path")"
+  if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then return 1; fi
+  segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  [[ -z "$residual" ]] || return 1
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+}
+
 read_manifest_file_objects() {
   local path="$1"
   awk '
@@ -510,7 +520,7 @@ else
     1) add_warning "manifest.json 仍使用 schemaVersion 1；请用当前版本安装器升级，以获得安全卸载所需的文件归属信息。" ;;
     2) add_warning "manifest.json 仍使用 schemaVersion 2；请用当前版本安装器升级并确认 Git 交付权限。" ;;
     3) add_warning "manifest.json 仍使用 schemaVersion 3；请用当前版本安装器升级 Git 交付治理策略。" ;;
-    4) ;;
+    4|5) ;;
     *) add_error "manifest.json 使用了不支持的 schemaVersion。" ;;
   esac
   if [[ ! "$manifest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
@@ -526,7 +536,7 @@ else
   fi
 
   if ! grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
-    if [[ "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+    if [[ "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
       add_error "schemaVersion ${schema_version} manifest 缺少 gitPolicy。"
     else
       add_warning "manifest.json 缺少 gitPolicy；请用当前安装器确认 push/merge 策略。"
@@ -550,7 +560,7 @@ else
     if [[ "$delete_allowed" != "false" ]]; then
       add_error "manifest gitPolicy.deleteAllowed 必须为 false。"
     fi
-    if [[ "$schema_version" == "4" ]]; then
+    if [[ "$schema_version" == "4" || "$schema_version" == "5" ]]; then
       pull_request_mode="$(git_policy_string_field pullRequestMode "$manifest_path")"
       pull_request_actor="$(git_policy_string_field pullRequestActor "$manifest_path")"
       case "$pull_request_mode" in manual|auto) ;; *) add_error "manifest gitPolicy.pullRequestMode 无效：${pull_request_mode:-missing}" ;; esac
@@ -571,6 +581,23 @@ else
     fi
   fi
 
+  if [[ "$schema_version" == "5" ]]; then
+    capability_output="$(read_manifest_capabilities "$manifest_path")"
+    capability_result=$?
+    if [[ "$capability_result" -ne 0 ]]; then
+      add_error "manifest enabledCapabilities 格式无效。"
+    else
+      valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic '
+      seen_capabilities=()
+      while IFS= read -r capability; do
+        [[ -n "$capability" ]] || continue
+        [[ "$valid_capabilities" == *" $capability "* ]] || add_error "manifest 包含未知 enabledCapabilities 项：$capability"
+        contains_item "$capability" "${seen_capabilities[@]+"${seen_capabilities[@]}"}" && add_error "manifest enabledCapabilities 包含重复项：$capability"
+        seen_capabilities+=("$capability")
+      done <<< "$capability_output"
+    fi
+  fi
+
   if ! grep -Eq '"installedPacks"[[:space:]]*:' "$manifest_path"; then
     add_error "manifest.json 缺少 installedPacks。"
   else
@@ -585,7 +612,7 @@ else
     fi
   fi
 
-  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
     manifest_file_output="$(read_manifest_files "$manifest_path")"
     file_result=$?
     if [[ "$file_result" -ne 0 ]]; then
@@ -626,7 +653,7 @@ else
     fi
   fi
 
-  if [[ ( "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ) && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
+  if [[ ( "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ) && -n "${source_version:-}" && "$manifest_version" == "${source_version:-}" ]]; then
     for index in "${!inventory_paths[@]}"; do
       [[ "${inventory_actions[$index]}" == "created" ]] || continue
       owner_root="$source_root/core"
@@ -687,9 +714,9 @@ else
       if [[ ! -f "$target_root/$relative_path" ]]; then
         add_error "流程包 $pack 缺少文件：$relative_path"
       fi
-      if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
+      if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]] && ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少流程包文件：$relative_path"
-      elif [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+      elif [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
         inventory_source="$(inventory_source_for "$relative_path")"
         if [[ "$inventory_source" != "$pack" ]]; then
           add_error "manifest 将 ${relative_path} 归属于 ${inventory_source}，而不是 $pack"
@@ -697,7 +724,7 @@ else
       fi
     done < <(find "$pack_root" -type f | LC_ALL=C sort)
   done
-  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" ]]; then
+  if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
     for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
       if ! contains_item "$relative_path" "${inventory_paths[@]+"${inventory_paths[@]}"}"; then
         add_error "manifest 文件归属清单缺少 Core 文件：$relative_path"

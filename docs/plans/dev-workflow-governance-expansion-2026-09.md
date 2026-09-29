@@ -1,6 +1,6 @@
 # dev-workflow 治理能力扩展计划
 
-状态：`awaiting_user_confirmation`（S1-S4 已完成，S5 待开始）
+状态：`S5 完成；S6 awaiting_user_confirmation`
 
 本计划属于 `dev-workflow` 分发仓库本身，开发位置为：
 `/Users/luohao/Desktop/vibecoding/dev-workflow`。
@@ -39,7 +39,7 @@ Core 只负责通用判断、风险分级、复用优先、验证、回滚和所
 | S2 | 团队级 Git 安全门禁 | CI 检查本机记忆、上下文、日志、环境快照、凭据和已跟踪流程文件 | S1 | 合法样例通过，违规样例失败，workflow 校验 | 删除独立检查 | 已完成：`6048752` |
 | S3 | Worktree 生命周期报告 | 孤儿 worktree、重复分支绑定、未提交改动、已合并分支、磁盘占用和过期产物报告 | S1 | 构造多种状态并核对报告；默认只读 | 工具独立移除 | 已完成：`92e28a4` |
 | S4 | 自适应技术决策门 | `L0/L1/L2`、复用/边界/验证检查、ADR/RFC 触发条件和停止条件 | S1 | 用局部功能、跨模块功能、高风险变更演练 | 规则独立回退 | 已完成：`ce44956` |
-| S5 | 可选能力模型和任务路由 | manifest `capabilities`、profile、能力缺失提示、API/容器/部署/CI/CD 触点路由 | S1、S4 | 安装/升级/审计矩阵和 profile 路由测试 | 保留旧 packs 行为 |
+| S5 | 可选能力模型和任务路由 | manifest `enabledCapabilities`、profile、能力缺失提示、API/容器/部署/CI/CD 触点路由 | S1、S4 | 安装/升级/审计矩阵和 profile 路由测试 | 保留旧 packs 行为 | 已完成：本地变更待提交
 | S6 | 具体治理 packs | `api-governance`、`containers`、`delivery-cicd`、deployment profiles，以及安装器、卸载器、审计器和测试 | S2、S5 | 各 pack 独立集成测试、最小项目安装测试、审计结果 | 按 pack 独立禁用 |
 
 ## 决策等级
@@ -75,7 +75,8 @@ Core 只负责通用判断、风险分级、复用优先、验证、回滚和所
 - S2：新增只读 `scripts/check-git-boundaries.py`、CI required-check 接入说明和安装/违规用例；4 个定向测试、29 个 Python 单元测试、Bash 集成测试通过；分发仓库自身 57 个 Git 跟踪文件扫描通过。
 - S3：新增只读 `scripts/report-worktrees.py`，覆盖 orphan、重复分支、脏状态、ahead/behind、已合并和陈旧常见构建目录报告；3 个定向测试、32 个 Python 单元测试、Bash 安装集成通过；实仓报告为 1 个 worktree、0 orphan、0 重复分支，报告前后 Git worktree 元数据和工作树状态一致。
 - S4：Core 增加自适应 `L0/L1/L2` 决策门、相关边界维度、方案比较停止条件和“分析后默认继续已授权实现”的规则；32 个 Python 单元测试和 Bash 安装集成通过。
+- S5：manifest 升至 schema 5，新增独立于 installed packs 的 `enabledCapabilities` 注册表；Bash/PowerShell 安装器支持显式启用/禁用，升级保留，旧 schema 默认空，部分卸载保留；审计拒绝未知/重复项；Core 新增能力触点路由和未启用/缺少专用治理 pack 时的明确提示。验证：32 个 Python 单测、Bash 生命周期集成矩阵、`bash -n`、`git diff --check` 通过；PowerShell 因当前环境无 PowerShell 运行时未执行。
 
 ## 确认门
 
-S1-S5 可按已确认范围继续准备；S6 的具体 pack/profile 会在 S5 完成后根据 manifest 设计和最小安装矩阵再次确认，避免一次性把所有技术栈规则强制进入默认安装。
+S1-S5 可按已确认范围继续准备；S6 的具体 pack/profile 会在 S5 完成后根据 manifest 设计和最小安装矩阵再次确认，避免一次性把所有技术栈规则强制进入默认安装。S5 定义了可声明的领域/协议/平台 ID，但没有将它们默认安装，也没有创建具体专项治理 pack。S6 范围建议按 API、容器、CI/CD、部署分别独立可选，并为每个 pack 建立最小安装与审计矩阵。

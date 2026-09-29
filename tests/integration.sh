@@ -101,10 +101,11 @@ git -C "$fresh_target" init -q
 printf '%s\n' '# user exclude' '/user-local-only/' >> "$fresh_target/.git/info/exclude"
 printf '%s\n' '/project-local-only/' > "$fresh_target/.gitignore"
 gitignore_hash_before_install="$(sha256_file "$fresh_target/.gitignore")"
-bash "$install_script" --target "$fresh_target" --all-packs >/dev/null
+bash "$install_script" --target "$fresh_target" --all-packs --enable-capabilities api:rest-openapi,containers:compose >/dev/null
 fresh_manifest="$fresh_target/.dev-workflow/manifest.json"
 assert_file "$fresh_manifest" "new install creates manifest"
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$fresh_manifest" || fail "new installs use schema 4"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$fresh_manifest" || fail "new installs use schema 5"
+grep -Fq '"api:rest-openapi"' "$fresh_manifest" && grep -Fq '"containers:compose"' "$fresh_manifest" || fail "installer persists enabled capabilities"
 assert_json_string "$fresh_manifest" pushMode manual "push defaults to manual approval"
 assert_json_string "$fresh_manifest" pushActor user "push defaults to user execution"
 assert_json_string "$fresh_manifest" pullRequestMode manual "pull request defaults to manual approval"
@@ -119,6 +120,11 @@ assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "di
 assert_json_boolean "$fresh_manifest" deleteAllowed false "delete is always denied"
 assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "privileged operations default to deny"
 assert_json_string "$fresh_manifest" policyChangedBy default "safe defaults record their policy origin"
+bash "$install_script" --target "$fresh_target" --non-interactive >/dev/null
+grep -Fq '"api:rest-openapi"' "$fresh_manifest" && grep -Fq '"containers:compose"' "$fresh_manifest" || fail "upgrade preserves enabled capabilities"
+bash "$install_script" --target "$fresh_target" --non-interactive --disable-capabilities containers:compose >/dev/null
+grep -Fq '"api:rest-openapi"' "$fresh_manifest" && ! grep -Fq '"containers:compose"' "$fresh_manifest" || fail "installer disables only requested capability"
+if bash "$install_script" --target "$fresh_target" --non-interactive --enable-capabilities api:not-real >/dev/null 2>&1; then fail "installer rejects unknown capability IDs"; fi
 grep -Eq '"policyChangedAt"[[:space:]]*:[[:space:]]*"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"' "$fresh_manifest" || fail "new installs timestamp the initial policy"
 grep -Eq '"path":"AGENTS.md","source":"core","action":"created"' "$fresh_manifest" || fail "new installs record created ownership"
 grep -Fq '## 大型计划拆分与确认门' "$fresh_target/AGENTS.md" || fail "Core install includes the large-plan approval gate"
@@ -283,6 +289,19 @@ bash "$install_script" --target "$audit_policy_target" >/dev/null
 audit_policy_manifest="$audit_policy_target/.dev-workflow/manifest.json"
 audit_policy_baseline="$audit_policy_target/manifest.baseline.json"
 cp -- "$audit_policy_manifest" "$audit_policy_baseline"
+
+python3 - "$audit_policy_baseline" "$audit_policy_manifest" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    manifest = json.load(handle)
+manifest["enabledCapabilities"] = ["api:not-real"]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(manifest, handle)
+PY
+assert_audit_rejects "$audit_policy_target" "audit rejects an unknown enabled capability"
+cp -- "$audit_policy_baseline" "$audit_policy_manifest"
 
 sed -E 's/"pullRequestMode"[[:space:]]*:[[:space:]]*"manual"/"pullRequestMode": "sometimes"/' \
   "$audit_policy_baseline" > "$audit_policy_manifest"
@@ -550,6 +569,7 @@ bash "$uninstall_script" --target "$fresh_target" --packs delivery >/dev/null
 assert_file "$modified_delivery_file" "modified managed files are preserved"
 assert_not_file "$fresh_target/docs/plans/TEMPLATE.md" "unchanged pack files are deleted"
 assert_file "$fresh_target/scripts/delivery_guard.py" "partial delivery uninstall preserves the Core guard"
+grep -Fq '"api:rest-openapi"' "$fresh_manifest" || fail "partial uninstall preserves enabled capabilities"
 if tr -d '\r\n' < "$fresh_manifest" | grep -Eq '"installedPacks"[[:space:]]*:[[:space:]]*\[[^]]*"delivery"'; then
   fail "partial uninstall removes pack from manifest"
 fi
@@ -789,7 +809,7 @@ bash "$install_script" --target "$schema3_target" >/dev/null
 schema3_manifest="$schema3_target/.dev-workflow/manifest.json"
 schema3_tmp="$schema3_manifest.old"
 awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "3") }
+  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "3") }
   /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
   /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
   /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
@@ -798,7 +818,7 @@ awk '
 ' "$schema3_manifest" > "$schema3_tmp"
 mv -- "$schema3_tmp" "$schema3_manifest"
 bash "$install_script" --target "$schema3_target" >/dev/null
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$schema3_manifest" || fail "schema 3 manifests upgrade to schema 4"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema3_manifest" || fail "schema 3 manifests upgrade to schema 5"
 assert_json_string "$schema3_manifest" pushMode manual "schema 3 upgrade preserves push mode"
 assert_json_string "$schema3_manifest" pushActor ai "schema 3 upgrade preserves push actor"
 assert_json_string "$schema3_manifest" mergeMode manual "schema 3 upgrade preserves merge mode"
@@ -812,7 +832,7 @@ bash "$install_script" --target "$schema2_target" >/dev/null
 schema2_manifest="$schema2_target/.dev-workflow/manifest.json"
 schema2_tmp="$schema2_manifest.old"
 awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "2") }
+  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "2") }
   /"workflowVersion"[[:space:]]*:/ { sub(/"[^"]+"[[:space:]]*,[[:space:]]*$/, "\"0.1.9\",") }
   /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
   /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
@@ -824,7 +844,7 @@ awk '
 mv -- "$schema2_tmp" "$schema2_manifest"
 bash "$install_script" --target "$schema2_target" >/dev/null
 grep -Eq '"path":"docs/TASKS.md","source":"core","action":"legacy","installedSha256":null' "$schema2_manifest" || fail "changed created ownership becomes legacy during a version upgrade"
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$schema2_manifest" || fail "schema 2 manifests upgrade to schema 4"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema2_manifest" || fail "schema 2 manifests upgrade to schema 5"
 grep -Eq "\"workflowVersion\"[[:space:]]*:[[:space:]]*\"$workflow_version\"" "$schema2_manifest" || fail "schema 2 upgrade records current workflow version"
 assert_json_string "$schema2_manifest" pushMode manual "schema 2 upgrade preserves push mode"
 assert_json_string "$schema2_manifest" pushActor ai "schema 2 upgrade preserves push actor"
@@ -839,7 +859,7 @@ bash "$install_script" --target "$legacy_target" --packs architecture >/dev/null
 legacy_manifest="$legacy_target/.dev-workflow/manifest.json"
 legacy_tmp="$legacy_manifest.legacy"
 awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/4/, "1") }
+  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "1") }
   /"gitPolicy"[[:space:]]*:[[:space:]]*\{/ { skipping_policy=1; next }
   skipping_policy && /^[[:space:]]*\},[[:space:]]*$/ { skipping_policy=0; next }
   /"files"[[:space:]]*:[[:space:]]*\[/ { skipping_files=1; next }
@@ -849,7 +869,7 @@ awk '
 mv -- "$legacy_tmp" "$legacy_manifest"
 
 bash "$install_script" --target "$legacy_target" >/dev/null
-grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*4' "$legacy_manifest" || fail "schema 1 manifests upgrade to schema 4"
+grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$legacy_manifest" || fail "schema 1 manifests upgrade to schema 5"
 assert_json_string "$legacy_manifest" pushMode manual "schema 1 upgrade adds safe push mode"
 assert_json_string "$legacy_manifest" pushActor user "schema 1 upgrade adds safe push actor"
 assert_json_string "$legacy_manifest" mergeMode manual "schema 1 upgrade adds safe merge mode"
