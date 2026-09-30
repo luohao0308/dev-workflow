@@ -214,6 +214,8 @@ bash ./scripts/audit.sh --target /path/to/project
 bash tests/integration.sh
 ```
 
+仓库内 Python 工具最低支持 Python 3.10；CI 会在 Python 3.10 和 3.13 上运行测试。未来新增其他语言工具时，应在 CI 中增加对应语言的独立检查，不改变现有 Python 支持范围。
+
 ## 卸载
 
 卸载器必须从 `dev-workflow` 分发仓库运行。schema 2/3/4 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
