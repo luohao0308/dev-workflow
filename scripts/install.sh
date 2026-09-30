@@ -45,24 +45,40 @@ read_workflow_version() {
 json_string_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$path" | head -n 1
 }
 
 json_number_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
 }
 
 json_boolean_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
 git_policy_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field" --git-policy
+    return $?
+  fi
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json, sys
 p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
@@ -349,6 +365,22 @@ contains_item() {
     [[ "$item" == "$needle" ]] && return 0
   done
   return 1
+}
+
+assert_safe_target_path() {
+  local path="$1"
+  local cursor="$path"
+  while [[ "$cursor" != "$target_root" && "$cursor" == "$target_root"/* ]]; do
+    if [[ -L "$cursor" ]]; then
+      echo "目标路径包含符号链接，拒绝写入：${path#"$target_root"/}" >&2
+      return 1
+    fi
+    cursor="$(dirname -- "$cursor")"
+  done
+  [[ "$cursor" == "$target_root" ]] || {
+    echo "目标路径越出目标目录：$path" >&2
+    return 1
+  }
 }
 
 directory_has_entries() {
@@ -1059,6 +1091,7 @@ for index in "${!overlay_roots[@]}"; do
     fi
 
     target_path="$target_root/$relative_path"
+    assert_safe_target_path "$target_path"
     if [[ -e "$target_path" && ! -f "$target_path" ]]; then
       echo "目标路径存在但不是文件：$target_path" >&2
       exit 1

@@ -23,24 +23,40 @@ EOF
 json_string_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$path" | head -n 1
 }
 
 json_number_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
 }
 
 json_boolean_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
 git_policy_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field" --git-policy
+    return $?
+  fi
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json, sys
 p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
@@ -228,6 +244,22 @@ contains_item() {
     [[ "$item" == "$needle" ]] && return 0
   done
   return 1
+}
+
+assert_safe_target_path() {
+  local path="$1"
+  local cursor="$path"
+  while [[ "$cursor" != "$target_root" && "$cursor" == "$target_root"/* ]]; do
+    if [[ -L "$cursor" ]]; then
+      echo "目标路径包含符号链接，拒绝修改：${path#"$target_root"/}" >&2
+      return 1
+    fi
+    cursor="$(dirname -- "$cursor")"
+  done
+  [[ "$cursor" == "$target_root" ]] || {
+    echo "目标路径越出目标目录：$path" >&2
+    return 1
+  }
 }
 
 sha256_file() {
@@ -674,6 +706,7 @@ for index in "${!file_paths[@]}"; do
     continue
   fi
   target_path="$target_root/$entry_path"
+  assert_safe_target_path "$target_path"
   case "$target_path" in
     "$target_root"/*) ;;
     *) echo "manifest 路径越出目标目录：$entry_path" >&2; exit 1 ;;
@@ -772,6 +805,7 @@ for index in "${!plan_kinds[@]}"; do
   kind="${plan_kinds[$index]}"
   entry_path="${plan_paths[$index]}"
   target_path="$target_root/$entry_path"
+  assert_safe_target_path "$target_path"
   if [[ "$kind" == "delete" ]]; then
     rm -f -- "$target_path"
     removed_paths+=("$target_path")

@@ -101,7 +101,7 @@ def directory_size(path: Path) -> int:
     return total
 
 
-def artifact_dirs(root: Path, stale_days: int) -> list[dict[str, Any]]:
+def artifact_dirs(root: Path, stale_days: int, include_sizes: bool = True) -> list[dict[str, Any]]:
     cutoff = time.time() - stale_days * 86400
     found: list[dict[str, Any]] = []
     stack = [(root, 0)]
@@ -124,7 +124,7 @@ def artifact_dirs(root: Path, stale_days: int) -> list[dict[str, Any]]:
                                 found.append({
                                     "path": str(child),
                                     "ageDays": int((time.time() - modified) // 86400),
-                                    "sizeBytes": directory_size(child),
+                                    "sizeBytes": directory_size(child) if include_sizes else None,
                                 })
                         except OSError:
                             pass
@@ -135,7 +135,13 @@ def artifact_dirs(root: Path, stale_days: int) -> list[dict[str, Any]]:
     return found
 
 
-def inspect_worktree(repo: Path, item: dict[str, Any], base: str | None, stale_days: int) -> dict[str, Any]:
+def inspect_worktree(
+    repo: Path,
+    item: dict[str, Any],
+    base: str | None,
+    stale_days: int,
+    include_sizes: bool = True,
+) -> dict[str, Any]:
     path = Path(item["path"])
     result = dict(item)
     result["exists"] = path.is_dir() and not path.is_symlink()
@@ -154,8 +160,9 @@ def inspect_worktree(repo: Path, item: dict[str, Any], base: str | None, stale_d
     changes = [line for line in status.stdout.splitlines() if line]
     result["dirty"] = bool(changes)
     result["changes"] = len(changes)
-    result["sizeBytes"] = directory_size(path)
-    result["staleArtifacts"] = artifact_dirs(path, stale_days)
+    if include_sizes:
+        result["sizeBytes"] = directory_size(path)
+    result["staleArtifacts"] = artifact_dirs(path, stale_days, include_sizes)
     if base and item.get("head"):
         counts = git(repo, "rev-list", "--left-right", "--count", f"{base}...{item['head']}", check=False)
         if counts.returncode == 0:
@@ -184,6 +191,11 @@ def main() -> int:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--base-ref", help="Comparison base; auto-detected when omitted")
     parser.add_argument("--stale-days", type=int, default=30)
+    parser.add_argument(
+        "--no-size",
+        action="store_true",
+        help="skip recursive directory size scans for faster reports",
+    )
     parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args()
     if args.stale_days < 1:
@@ -201,7 +213,10 @@ def main() -> int:
         "repository": str(repo),
         "baseRef": base,
         "readOnly": True,
-        "worktrees": [inspect_worktree(repo, item, base, args.stale_days) for item in worktrees],
+        "worktrees": [
+            inspect_worktree(repo, item, base, args.stale_days, include_sizes=not args.no_size)
+            for item in worktrees
+        ],
         "duplicateBranches": duplicate_branches,
     }
     if args.format == "json":
