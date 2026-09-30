@@ -43,9 +43,7 @@ assert_v4_safety_defaults() {
   assert_json_string "$path" pullRequestActor user "$context adds safe pull request actor"
   assert_json_boolean "$path" pullRequestRequired true "$context requires pull requests"
   assert_json_boolean "$path" ciRequired true "$context requires CI"
-  assert_json_boolean "$path" independentReviewRequired true "$context requires independent review"
   assert_json_boolean "$path" forcePushAllowed false "$context denies force push"
-  assert_json_boolean "$path" directProtectedBranchPushAllowed false "$context denies direct protected branch push"
   assert_json_boolean "$path" deleteAllowed false "$context denies delete"
   assert_json_string "$path" privilegedOperationsDefault deny "$context denies privileged operations by default"
 }
@@ -114,9 +112,7 @@ assert_json_string "$fresh_manifest" mergeMode manual "merge defaults to manual 
 assert_json_string "$fresh_manifest" mergeActor user "merge defaults to user execution"
 assert_json_boolean "$fresh_manifest" pullRequestRequired true "pull requests are required by default"
 assert_json_boolean "$fresh_manifest" ciRequired true "CI is required by default"
-assert_json_boolean "$fresh_manifest" independentReviewRequired true "independent review is required by default"
 assert_json_boolean "$fresh_manifest" forcePushAllowed false "force push is denied by default"
-assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "direct protected branch push is denied by default"
 assert_json_boolean "$fresh_manifest" deleteAllowed false "delete is always denied"
 assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "privileged operations default to deny"
 assert_json_string "$fresh_manifest" policyChangedBy default "safe defaults record their policy origin"
@@ -324,9 +320,7 @@ while IFS='|' read -r safety_field secure_value relaxed_value; do
 done <<'EOF'
 pullRequestRequired|true|false
 ciRequired|true|false
-independentReviewRequired|true|false
 forcePushAllowed|false|true
-directProtectedBranchPushAllowed|false|true
 deleteAllowed|false|true
 EOF
 
@@ -347,11 +341,9 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
 manifest["gitPolicy"]["forcePushAllowed"] = True
-manifest["gitPolicy"]["directProtectedBranchPushAllowed"] = True
 manifest["gitPolicy"]["privilegedOperationsDefault"] = "allow"
 manifest["shadow"] = {
     "forcePushAllowed": False,
-    "directProtectedBranchPushAllowed": False,
     "privilegedOperationsDefault": "deny",
 }
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
@@ -586,9 +578,7 @@ assert_json_string "$fresh_manifest" mergeMode manual "partial uninstall preserv
 assert_json_string "$fresh_manifest" mergeActor user "partial uninstall preserves merge actor"
 assert_json_boolean "$fresh_manifest" pullRequestRequired true "partial uninstall preserves the pull request gate"
 assert_json_boolean "$fresh_manifest" ciRequired true "partial uninstall preserves the CI gate"
-assert_json_boolean "$fresh_manifest" independentReviewRequired true "partial uninstall preserves the independent review gate"
 assert_json_boolean "$fresh_manifest" forcePushAllowed false "partial uninstall preserves denied force push"
-assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "partial uninstall preserves denied direct protected branch push"
 assert_json_boolean "$fresh_manifest" deleteAllowed false "partial uninstall preserves denied delete permission"
 assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "partial uninstall preserves denied privileged operations"
 [[ "$(grep -E '"policyChangedAt"' "$fresh_manifest")" == "$policy_changed_at_before_uninstall" ]] || fail "partial uninstall preserves the policy timestamp"
@@ -825,7 +815,7 @@ awk '
   /"schemaVersion"[[:space:]]*:/ { sub(/5/, "3") }
   /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
   /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
+  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"forcePushAllowed"|"deleteAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
   /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
   { print }
 ' "$schema3_manifest" > "$schema3_tmp"
@@ -849,7 +839,7 @@ awk '
   /"workflowVersion"[[:space:]]*:/ { sub(/"[^"]+"[[:space:]]*,[[:space:]]*$/, "\"0.1.9\",") }
   /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
   /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
+  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"forcePushAllowed"|"deleteAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
   /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
   /"path":"docs\/TASKS.md"/ { sub(/"installedSha256":"[0-9a-f]{64}"/, "\"installedSha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"") }
   { print }

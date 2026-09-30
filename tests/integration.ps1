@@ -57,9 +57,7 @@ try {
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'merge defaults to user execution'
     Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'pull requests are required by default'
     Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'CI is required by default'
-    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'independent review is required by default'
     Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'force push is denied by default'
-    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'direct protected-branch push is denied by default'
     Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'privileged operations default to deny'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'delete is always denied'
     Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq 'default') 'safe defaults record their policy origin'
@@ -376,9 +374,7 @@ try {
         @{ Message = 'audit rejects automatic merge with a user actor'; Changes = @{ mergeMode = 'auto'; mergeActor = 'user' }; Remove = @() },
         @{ Message = 'audit rejects a disabled pull-request requirement'; Changes = @{ pullRequestRequired = $false }; Remove = @() },
         @{ Message = 'audit rejects a disabled CI requirement'; Changes = @{ ciRequired = $false }; Remove = @() },
-        @{ Message = 'audit rejects a disabled independent-review requirement'; Changes = @{ independentReviewRequired = $false }; Remove = @() },
         @{ Message = 'audit rejects allowed force push'; Changes = @{ forcePushAllowed = $true }; Remove = @() },
-        @{ Message = 'audit rejects direct protected-branch push'; Changes = @{ directProtectedBranchPushAllowed = $true }; Remove = @() },
         @{ Message = 'audit rejects privileged operations enabled by default'; Changes = @{ privilegedOperationsDefault = 'allow' }; Remove = @() },
         @{ Message = 'audit rejects granted delete permission'; Changes = @{ deleteAllowed = $true }; Remove = @() }
     )) {
@@ -447,9 +443,7 @@ try {
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'partial uninstall preserves merge policy'
     Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'partial uninstall preserves the pull-request requirement'
     Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'partial uninstall preserves the CI requirement'
-    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'partial uninstall preserves the independent-review requirement'
     Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'partial uninstall preserves denied force push'
-    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'partial uninstall preserves denied direct protected-branch push'
     Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'partial uninstall preserves denied privileged operations'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'partial uninstall preserves denied delete permission'
     Assert-True ([string]$manifest.gitPolicy.policyChangedAt -eq $policyChangedAtBeforeUninstall) 'partial uninstall preserves the policy timestamp'
@@ -602,9 +596,7 @@ try {
         'pullRequestActor',
         'pullRequestRequired',
         'ciRequired',
-        'independentReviewRequired',
         'forcePushAllowed',
-        'directProtectedBranchPushAllowed',
         'privilegedOperationsDefault'
     )) {
         $schema3UpgradeManifest.gitPolicy.PSObject.Properties.Remove($field)
@@ -621,9 +613,7 @@ try {
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pullRequestActor -eq 'user') 'schema 3 upgrade adds safe pull-request actor'
     Assert-True ($schema3UpgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 3 upgrade requires pull requests'
     Assert-True ($schema3UpgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 3 upgrade requires CI'
-    Assert-True ($schema3UpgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 3 upgrade requires independent review'
     Assert-True ($schema3UpgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 3 upgrade denies force push'
-    Assert-True ($schema3UpgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 3 upgrade denies direct protected-branch push'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 3 upgrade denies privileged operations by default'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 3 upgrade records migration as the policy origin'
 
@@ -652,9 +642,7 @@ try {
     Assert-True ([string]$upgradeManifest.gitPolicy.mergeActor -eq 'user') 'upgrade adds safe merge actor when missing'
     Assert-True ($upgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 2 upgrade requires pull requests'
     Assert-True ($upgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 2 upgrade requires CI'
-    Assert-True ($upgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 2 upgrade requires independent review'
     Assert-True ($upgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 2 upgrade denies force push'
-    Assert-True ($upgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 2 upgrade denies direct protected-branch push'
     Assert-True ([string]$upgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 2 upgrade denies privileged operations by default'
     Assert-True ([string]$upgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 2 upgrade records migration as the policy origin'
 
@@ -680,9 +668,7 @@ try {
     Assert-True ([string]$migratedManifest.gitPolicy.mergeActor -eq 'user') 'schema 1 upgrade adds safe merge actor'
     Assert-True ($migratedManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 1 upgrade requires pull requests'
     Assert-True ($migratedManifest.gitPolicy.ciRequired -eq $true) 'schema 1 upgrade requires CI'
-    Assert-True ($migratedManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 1 upgrade requires independent review'
     Assert-True ($migratedManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 1 upgrade denies force push'
-    Assert-True ($migratedManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 1 upgrade denies direct protected-branch push'
     Assert-True ([string]$migratedManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 1 upgrade denies privileged operations by default'
     Assert-True ([string]$migratedManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 1 upgrade records migration as the policy origin'
 

@@ -586,9 +586,7 @@ else
       fi
       [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.pullRequestRequired 必须为 true。"
       [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.ciRequired 必须为 true。"
-      [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.independentReviewRequired 必须为 true。"
       [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.forcePushAllowed 必须为 false。"
-      [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。"
       [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || add_error "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。"
       policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
       policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"

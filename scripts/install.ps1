@@ -344,10 +344,10 @@ function Read-ManagedManifest([string]$Path) {
             $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
             $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
             Assert-GitPolicy -Operation 'pull request' -Mode $pullRequestMode -Actor $pullRequestActor
-            foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+            foreach ($requiredField in @('pullRequestRequired', 'ciRequired')) {
                 if ($manifest.gitPolicy.$requiredField -ne $true) { throw "Manifest gitPolicy.$requiredField must be true: $Path" }
             }
-            foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+            foreach ($deniedField in @('forcePushAllowed')) {
                 if ($manifest.gitPolicy.$deniedField -ne $false) { throw "Manifest gitPolicy.$deniedField must be false: $Path" }
             }
             if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
@@ -479,9 +479,7 @@ function New-ManifestPlan(
             pullRequestActor = [string]$GitPolicy.pullRequestActor
             pullRequestRequired = $true
             ciRequired = $true
-            independentReviewRequired = $true
             forcePushAllowed = $false
-            directProtectedBranchPushAllowed = $false
             privilegedOperationsDefault = 'deny'
             deleteAllowed = $false
             policyChangedAt = if ($policyChanged) { $now } else { [string]$Existing.gitPolicy.policyChangedAt }

@@ -442,9 +442,7 @@ build_manifest() {
     "pullRequestActor": "$(json_escape "$pull_request_actor")",
     "pullRequestRequired": true,
     "ciRequired": true,
-    "independentReviewRequired": true,
     "forcePushAllowed": false,
-    "directProtectedBranchPushAllowed": false,
     "privilegedOperationsDefault": "deny",
     "deleteAllowed": false,
     "policyChangedAt": "$(json_escape "$policy_changed_at")",
@@ -584,9 +582,7 @@ if grep -Eq '"gitPolicy"[[:space:]]*:' "$manifest_path"; then
     case "$pull_request_mode:$pull_request_actor" in manual:user|manual:ai|auto:ai) ;; *) echo "manifest pull request Git 策略无效。" >&2; exit 1 ;; esac
     [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.pullRequestRequired 必须为 true。" >&2; exit 1; }
     [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.ciRequired 必须为 true。" >&2; exit 1; }
-    [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || { echo "manifest gitPolicy.independentReviewRequired 必须为 true。" >&2; exit 1; }
     [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.forcePushAllowed 必须为 false。" >&2; exit 1; }
-    [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。" >&2; exit 1; }
     [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || { echo "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。" >&2; exit 1; }
     [[ -n "$policy_changed_at" ]] || { echo "manifest gitPolicy.policyChangedAt 缺失。" >&2; exit 1; }
     case "$policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac

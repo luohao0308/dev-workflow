@@ -21,7 +21,7 @@ jobs:
       - run: python3 scripts/check-git-boundaries.py --repo .
 ```
 
-将 `git-boundaries` 配置为默认分支 Ruleset/Branch Protection 的 required check。其他 CI 平台运行同一命令即可。
+将 `git-boundaries` 配置为 CI 的 required check。其他 CI 平台运行同一命令即可。
 
 该工具是误提交预防和高置信度秘密标记检查，不是完整 secret scanner，也不能替代 GitHub Secret Scanning、组织 DLP 或凭据轮换流程。发现疑似泄漏时，CI 只报告路径和类别，不输出内容；应立即吊销凭据并按组织流程处理历史清理。
 

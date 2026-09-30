@@ -277,10 +277,10 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 if ($pullRequestMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestMode: $pullRequestMode" }
                 if ($pullRequestActor -notin @('user', 'ai')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestActor: $pullRequestActor" }
                 if ($pullRequestMode -eq 'auto' -and $pullRequestActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy pull request auto mode requires actor ai.' }
-                foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+                foreach ($requiredField in @('pullRequestRequired', 'ciRequired')) {
                     if ($manifest.gitPolicy.$requiredField -ne $true) { Add-Error $errors "manifest gitPolicy.$requiredField must be true." }
                 }
-                foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+                foreach ($deniedField in @('forcePushAllowed')) {
                     if ($manifest.gitPolicy.$deniedField -ne $false) { Add-Error $errors "manifest gitPolicy.$deniedField must be false." }
                 }
                 if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { Add-Error $errors 'manifest gitPolicy.privilegedOperationsDefault must be deny.' }

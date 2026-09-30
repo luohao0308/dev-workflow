@@ -79,7 +79,7 @@
 
 - 明确目标、范围、成功标准和不在范围内的事项；
 - 检查当前工作树、仓库拓扑和已有用户改动，不能覆盖或顺带提交无关变更；
-- 识别是否需要设计、计划、契约、迁移、运维或独立审查；
+- 识别是否需要设计、计划、契约、迁移或运维；
 - 如果安装了 `feature-catalog`，先查询相关功能的实现状态、成熟度、代码/测试入口和已知缺口；
 - 只读取当前任务需要的文档和代码。
 
@@ -159,9 +159,9 @@
 
 交付治理分为三层，任何一层都不能由另一层推导或覆盖：
 
-1. **流程要求**：决定何时需要 Issue、PR、CI 和独立 Review。feature、bug、安全、跨模块或其他需要追踪的工作应关联 Issue；小型、局部、低风险改动不强制创建 Issue。
+1. **流程要求**：决定何时需要 Issue、PR 和 CI。feature、bug、安全、跨模块或其他需要追踪的工作应关联 Issue；小型、局部、低风险改动不强制创建 Issue。
 2. **执行权限**：决定谁可以 push、创建/更新 PR、合并远端 PR，以及执行前是否需要人工确认。
-3. **质量门禁**：决定当前提交是否具备进入目标分支的证据。PR、CI 和独立 Review 默认强制，执行权限不能跳过它们。
+3. **质量门禁**：决定当前提交是否具备进入目标分支的证据。PR 和 CI 默认强制，执行权限不能跳过它们。
 
 开始改变远端 Git 状态前，读取 `.dev-workflow/manifest.json` 中的 `gitPolicy`：
 
@@ -172,16 +172,16 @@
 - 修改持久权限策略本身固定需要人工确认，并记录 `policyChangedAt` / `policyChangedBy`。不得根据现有 `auto`、现有 actor、历史对话、仓库写权限或已有凭据推导出修改策略的授权。
 - 一次性授权必须绑定 `repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses`。任一项改变、授权过期、次数耗尽或执行失败后需要重试时，重新获得授权；一次性授权不改变 manifest，也不延伸到其他操作。授权文件和消耗记录只放在 `.dev-workflow/`。
 - `deleteAllowed` 固定为 `false`。删除远端分支、标签、Release、仓库内容、数据或其他难恢复对象，必须针对明确目标另行授权并执行删除前安全检查。
-- `pullRequestRequired`、`ciRequired`、`independentReviewRequired` 默认并保持为 `true`；`forcePushAllowed`、`directProtectedBranchPushAllowed` 固定为 `false`，`privilegedOperationsDefault` 固定为 `deny`。
+- `pullRequestRequired`、`ciRequired` 默认并保持为 `true`；`forcePushAllowed`、`deleteAllowed` 固定为 `false`，`privilegedOperationsDefault` 固定为 `deny`。
 - Issue 的创建、编辑、评论、关闭或重新打开不在普通初始化权限中，默认按 `manual + user` 处理；流程要求存在 Issue 不等于授权 AI 修改远端 Issue。
 
-远端 PR merge 必须 fail-closed：执行前重新验证 PR 存在且仍开放、head/base 与授权目标一致、准确 head SHA 未变化、required CI 全部通过、独立 Review 已批准且分支保护允许合并。实现者不得作为唯一审批者；AI review 或 AI 自审不得计作独立批准。任何信息缺失、无法读取、过期或不一致都停止合并。
+远端 PR merge 必须 fail-closed：执行前重新验证 PR 存在且仍开放、head/base 与授权目标一致、准确 head SHA 未变化、required CI 全部通过且可合并。任何信息缺失、无法读取、过期或不一致都停止合并。
 
-AI 执行 push、PR 创建/更新和远端 PR merge 必须先通过 Core 自带的 `python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 不得为 AI 放行；`actor=ai` 即使为 `auto + ai` 也必须提供有效的一次性授权，`auto` 只免除授权范围内的再次交互。紧邻真实操作的最终检查使用 `--consume` 记录次数；每类操作同时提供五分钟内、绑定当前仓库/remote/ref/SHA 的托管平台证据，merge 再绑定 PR number、CI、独立人工 Review 和分支保护。guard 不通过时不得继续。
+AI 执行 push、PR 创建/更新和远端 PR merge 必须先通过 Core 自带的 `python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 不得为 AI 放行；`actor=ai` 即使为 `auto + ai` 也必须提供有效的一次性授权，`auto` 只免除授权范围内的再次交互。紧邻真实操作的最终检查使用 `--consume` 记录次数；每类操作同时提供五分钟内、绑定当前仓库/remote/ref/SHA 的托管平台证据，merge 再绑定 PR number 和 CI。guard 不通过时不得继续。
 
 创建或推送 tag、创建 Release、发布包或镜像、部署、迁移/回填、回滚、流量切换、修改仓库设置、操作凭据以及触发/取消发布工作流不进入普通初始化，默认拒绝。它们必须按具体目标、环境、不可变版本、有效期和操作逐次授权；push、PR 或 merge 权限均不蕴含这些权限。
 
-本地 manifest 只约束当前机器上的 AI 行为，不能替代远端强制控制。项目必须在代码托管和部署平台按风险配置 branch protection、required checks、CODEOWNERS/独立审批和 environment approval；本地规则与远端状态冲突或远端状态无法验证时按更严格边界执行。
+本地 manifest 只约束当前机器上的 AI 行为，不能替代远端 required checks 和 environment approval 等平台能力；本地规则与远端状态冲突或远端状态无法验证时按更严格边界执行。
 
 安装器在 Git 仓库中只维护 Git 解析出的 `info/exclude` 的 `dev-workflow managed` 区块，不修改项目 `.gitignore`。`.dev-workflow/` 和安装器实际创建的本地流程文件会按字面路径排除，并验证 Git 的最终 ignore 结果；已经被 Git 跟踪或被更高优先级规则重新放行的文件不受该 exclude 保护，遇到这种情况应告警并由用户决定是否调整 Git 索引或项目规则。受管区块标记不完整、重复或倒序时，安装和卸载必须在修改项目文件前停止。非 Git 目录跳过本地排除配置。
 

@@ -163,7 +163,7 @@ bash ./scripts/install.sh \
   --merge-mode manual --merge-actor ai
 ```
 
-首次安装在交互式终端中会询问三类远端操作的 mode/actor；如果 stdin 不是终端，安装器会停止并提示重新在交互式终端运行，不会静默假装完成确认。CI 或其他非交互环境必须显式使用 `--non-interactive`、PowerShell 的 `-NonInteractiveInstall`，或设置 `DEV_WORKFLOW_NON_INTERACTIVE=1`；它们只能采用安全默认值、保留既有策略或执行无参数的安全迁移，不能通过参数创建或修改持久权限。PR、CI、独立 Review 默认强制；force push、直接 push 保护分支和高权限操作默认拒绝，这些安全边界不作为普通初始化问题。
+首次安装在交互式终端中会询问三类远端操作的 mode/actor；如果 stdin 不是终端，安装器会停止并提示重新在交互式终端运行，不会静默假装完成确认。CI 或其他非交互环境必须显式使用 `--non-interactive`、PowerShell 的 `-NonInteractiveInstall`，或设置 `DEV_WORKFLOW_NON_INTERACTIVE=1`；它们只能采用安全默认值、保留既有策略或执行无参数的安全迁移，不能通过参数创建或修改持久权限。PR、CI 默认强制；force push、远端删除和高权限操作默认拒绝，这些安全边界不作为普通初始化问题。
 
 ### 功能清单初始化与使用
 
@@ -277,9 +277,9 @@ bash ./scripts/uninstall.sh \
 - `-DryRun` / `--dry-run` 只输出将创建、追加或跳过的文件，不写入目标项目。
 - 首次安装会创建 `.dev-workflow/manifest.json`；重复安装会保留安装时间，合并已安装流程包并更新版本信息。
 - manifest 的 `gitPolicy` 分别记录 push、PR 创建/更新和远端 PR merge 的 `manual|auto` 模式与 `user|ai` 执行角色；缺失时按 `manual + user`。`auto` 只允许与 `ai` 组合，本地 `git merge` 不属于远端 merge 权限。
-- `pullRequestRequired`、`ciRequired`、`independentReviewRequired` 默认为 `true`；`forcePushAllowed`、`directProtectedBranchPushAllowed` 固定为 `false`，`privilegedOperationsDefault` 固定为 `deny`。
+- `pullRequestRequired`、`ciRequired` 默认为 `true`；`forcePushAllowed`、`deleteAllowed` 固定为 `false`，`privilegedOperationsDefault` 固定为 `deny`。
 - 修改持久权限策略本身始终需要人工确认，不能由现有权限推导，并记录 `policyChangedAt` / `policyChangedBy`。一次性授权必须绑定 `repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses`，不改变 manifest，也不授权其他目标或后续操作。
-- Core 安装的远端操作 guard 必须在 AI 执行 push、PR 创建/更新和远端 PR merge 前运行：`python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 拒绝 AI 执行；`actor=ai` 即使处于 `auto + ai` 也需要有效的一次性授权，`auto` 只免除该授权范围内的再次交互。最终 preflight 使用 `--consume` 记录授权次数；每类操作都需要绑定当前仓库/remote/ref/SHA 的新鲜 provider 证据，merge 还需 PR/CI/独立 Review/分支保护证据。
+- Core 安装的远端操作 guard 必须在 AI 执行 push、PR 创建/更新和远端 PR merge 前运行：`python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 拒绝 AI 执行；`actor=ai` 即使处于 `auto + ai` 也需要有效的一次性授权，`auto` 只免除该授权范围内的再次交互。最终 preflight 使用 `--consume` 记录授权次数；每类操作都需要绑定当前仓库/remote/ref/SHA 的新鲜 provider 证据，merge 还需 PR/CI 证据。
 - `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
 - manifest schema 4 会记录三类 Git 交付执行权限、固定质量门和高权限操作默认拒绝策略，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
 - 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。
@@ -340,7 +340,7 @@ bash ./scripts/uninstall.sh \
 
 完成项目画像后，先在 `pending` 状态运行审计并处理结构错误和告警，再同步将 `WORKFLOW-ADOPTION.md` 与 manifest 标记为 `ready`，记录审计时间，最后重跑审计确认退出码为 `0`。此后正常对话即可自动沿用这套开发风格，不需要每次调用 Skill 或运行 CLI。安装和审计脚本只在首次接入或升级时使用。
 
-交付治理分三层：流程要求决定何时需要 Issue、PR、CI 和独立 Review；执行权限决定谁可以 push、创建/更新 PR 和合并远端 PR；质量门禁决定准确 head SHA 是否允许进入目标分支。feature、bug、安全和跨模块工作应关联 Issue，小型低风险改动不强制。远端 PR merge 必须 fail-closed 验证 PR、head/base、required CI、独立 Review 和分支保护；实现者不得作为唯一审批者，AI review 不计作独立批准。
+交付治理分三层：流程要求决定何时需要 Issue、PR 和 CI；执行权限决定谁可以 push、创建/更新 PR 和合并远端 PR；质量门禁决定准确 head SHA 是否允许进入目标分支。feature、bug、安全和跨模块工作应关联 Issue，小型低风险改动不强制。远端 PR merge 必须 fail-closed 验证 PR、head/base、required CI 和可合并状态。
 
 tag/Release、package/image publish、deploy、migration/backfill、rollback、traffic switch、仓库设置、凭据和发布工作流操作不进入普通初始化，默认拒绝并按具体目标逐次授权。push、PR 或 merge 权限均不蕴含这些权限。
 
@@ -348,7 +348,7 @@ tag/Release、package/image publish、deploy、migration/backfill、rollback、t
 
 ## 版本与升级
 
-分发仓库的版本写在 `VERSION`。安装器与 manifest、授权、个人记忆、任务上下文和临时日志按策略只用于本机，不应提交到 Git；团队共享的项目 Runbook、架构、契约、设计、部署配置仍属于源仓库内容。安装器以本地 `info/exclude` 区分两类内容，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，团队级强制门必须由远端 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 提供。
+分发仓库的版本写在 `VERSION`。安装器与 manifest、授权、个人记忆、任务上下文和临时日志按策略只用于本机，不应提交到 Git；团队共享的项目 Runbook、架构、契约、设计、部署配置仍属于源仓库内容。安装器以本地 `info/exclude` 区分两类内容，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，required checks 和 environment approval 等平台门禁按项目需要配置。
 
 升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
 

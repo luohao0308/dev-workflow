@@ -38,7 +38,7 @@ _状态：当前计划索引 | 更新：YYYY-MM-DD_
 - 计划必须有范围、非范围、证据基线、步骤、验收、风险、迁移/回滚和完成定义。
 - 大型计划必须记录用户确认状态和确认后的切片版本；`awaiting_user_confirmation` 不得进入实现。
 - 每次只允许一个切片为 `in_progress`，不得在结束时一次性把多个未记录过程的切片全部标为完成。
-- feature、bug、安全或跨模块计划应关联 Issue；默认整个计划通过一个 PR 交付，并记录准确 head SHA、base、CI 和独立 Review 证据。
+- feature、bug、安全或跨模块计划应关联 Issue；默认整个计划通过一个 PR 交付，并记录准确 head SHA、base 和 CI 证据。
 - 实施中发现事实变化时更新计划，不保留已经失真的步骤作为当前指令。
 - 完成后把稳定事实同步到架构/摘要；团队共享的可重复操作同步到 `operations/runbooks/`，本机/Agent 记忆才写入 `project-memory/`。
 - 旧计划标记为 superseded 或归档，不与当前计划并行充当权威源。
