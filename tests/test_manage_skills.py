@@ -126,5 +126,19 @@ class UpgradeSkillLifecycleTests(SkillLifecycleTests):
         self.assertFalse((self.root / '.dev-workflow').exists())
 
 
+class DeploySkillLifecycleTests(SkillLifecycleTests):
+    """Deployment planning is an independently selected optional Skill."""
+
+    def setUp(self):
+        super().setUp()
+        self.name = 'workflow-deploy'
+
+    def test_install_only_requested_deploy_skill(self):
+        self.assertEqual(self.run_manager('install'), 0)
+        self.assertEqual({item.name for item in self.dest.iterdir()}, {self.name})
+        self.assertFalse((self.root / 'scripts').exists())
+        self.assertFalse((self.root / '.dev-workflow').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 
@@ -24,6 +25,54 @@ CAPABILITY_PACKS = {
 }
 CONFIG_NAME = 'workflow.config.json'
 MANIFEST_NAME = '.dev-workflow/manifest.json'
+DEPLOYMENT_PHASES = ('preflight', 'deploy', 'health', 'smoke', 'rollback')
+DEPLOYMENT_OPTIONAL_PHASES = ('backup', 'restore', 'migrate')
+
+
+def portable_identifier(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= 128 and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', value) is not None
+
+
+def validate_deployment(deployment: object, commands: object) -> list[str]:
+    """Validate declarations only; capability activation and execution stay explicit."""
+    errors = []
+    if not isinstance(deployment, dict) or set(deployment) != {'components', 'environments'}:
+        return ['deployment must contain exactly components and environments']
+    components = deployment['components']
+    if (not isinstance(components, list) or not components
+            or any(not portable_identifier(name) for name in components)
+            or len(components) != len(set(components))):
+        errors.append('deployment components must be unique portable identifiers')
+    environments = deployment['environments']
+    if not isinstance(environments, dict) or not environments:
+        return errors + ['deployment environments must be a nonempty object']
+    for name, environment in environments.items():
+        if not portable_identifier(name):
+            errors.append('deployment environment names must be portable identifiers')
+        if not isinstance(environment, dict) or set(environment) != {'capability', 'target', 'commands', 'production', 'components'}:
+            errors.append('deployment environment must contain exactly capability, target, production, components and commands')
+            continue
+        capability = environment['capability']
+        if not isinstance(capability, str) or CAPABILITY_PACKS.get(capability) != 'deployment':
+            errors.append('deployment capability must be a registered deployment capability ID')
+        if not portable_identifier(environment['target']):
+            errors.append('deployment target must be a portable identifier')
+        if type(environment['production']) is not bool:
+            errors.append('deployment production must be a boolean')
+        selected = environment['components']
+        if (not isinstance(selected, list) or not selected
+                or any(not portable_identifier(name) for name in selected)
+                or len(selected) != len(set(selected))
+                or not isinstance(components, list) or any(name not in components for name in selected)):
+            errors.append('deployment environment components must be a nonempty unique subset of deployment components')
+        references = environment['commands']
+        if not isinstance(references, dict) or set(references) - set(DEPLOYMENT_PHASES + DEPLOYMENT_OPTIONAL_PHASES):
+            errors.append('deployment commands must contain only registered deployment phases')
+            continue
+        for reference in references.values():
+            if not portable_identifier(reference) or not isinstance(commands, dict) or reference not in commands:
+                errors.append('deployment commands must reference existing root command names')
+    return errors
 
 
 def safe_path(root: Path, relative: str) -> Path:
@@ -76,8 +125,10 @@ def validate_config(config: dict) -> list[str]:
             errors.append('document path must remain inside project: ' + name)
     extensions = config.get('extensions', {})
     if isinstance(extensions, dict):
-        if set(extensions) - {'release'}:
+        if set(extensions) - {'release', 'deployment'}:
             errors.append('unsupported extension')
+        if 'deployment' in extensions:
+            errors.extend(validate_deployment(extensions['deployment'], config.get('commands', {})))
         release = extensions.get('release')
         if release is not None:
             if not isinstance(release, dict) or set(release) - {'strategy', 'tagPrefix', 'components'}:

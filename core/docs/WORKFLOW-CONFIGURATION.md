@@ -67,3 +67,7 @@ python3 scripts/workflow_config.py withdraw --repo .
 退出码：结构/配置错误为 1；普通告警默认 0，`--strict` 时为 1。Git 基线来自本机 refs，远端及生产始终标为 `unknown`。配置 CLI 的 check 返回解析结果；写命令支持 dry-run，失败返回 1。
 
 体检只读取固定规则和显式声明的安全路径，不扫描 `.env`、日志和生产配置。旧脚手架短语与局部权限简写属于已知模式检查；任意文档的语义过期由 AI 按当前证据判断，脚本不伪装为完整语义审查。
+
+## 部署扩展
+
+`extensions.deployment` 声明全局组件及每个环境的 `production`、`target`、`capability`、组件子集与根 `commands` 引用；配置本身不启用能力或授予执行权限。部署计划需安装 `deployment` 包并显式启用对应能力。阶段命令的声明只用于计划及漂移绑定，体检和规划均不执行它们。字段示例、不可变目标/快照、回滚条件与本机证据边界见安装后的 [部署计划](operations/DEPLOYMENT-PLANNING.md)（分发源位于 `packs/deployment/docs/operations/`）。
