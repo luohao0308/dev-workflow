@@ -117,16 +117,16 @@ python3 scripts/workflow_config.py adopt --repo . --create
 
 `workflow.config.json` 保存项目能力、命令工作目录、文档映射和可选扩展。采用后它是能力权威，manifest 保存本机兼容快照；未采用的旧项目继续使用 manifest。配置无效或采用后文件失踪时拒绝回退；修改后使用 `sync`，撤回使用 `withdraw`，均支持 dry-run。详情见 [项目配置](core/docs/WORKFLOW-CONFIGURATION.md)。体检可发现已安装未启用、已知规则冲突和本机 Git 基线差异；开放文本的语义冲突仍需 AI 根据证据判断。
 
-三个 Skill 独立分发，`--all-packs` 不会安装它们。在 **dev-workflow 分发目录**显式执行：
+四个 Skill 独立分发，`--all-packs` 不会安装它们。在 **dev-workflow 分发目录**显式执行：
 
 ```bash
 python3 scripts/manage_skills.py install --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release --dry-run
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade --dry-run
 python3 scripts/manage_skills.py install --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade
 # 删除时仅移除可证明归属且未修改的 Skill；项目定制保留。
 python3 scripts/manage_skills.py uninstall --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release --dry-run
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade --dry-run
 ```
 
 默认项目级安装到 `.agents/skills/`；只有显式 `--scope user` 才写用户级 `~/.agents/skills/`，也可用 `--skills-dir` 指定隔离目标。同名文件夹不覆盖。路径按 [OpenAI 官方本地 Skill 发现规则](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills) 选择；其他客户端可使用自己的入口或直接运行脚本。安装 Skill 不授予任何远端权限。
@@ -136,6 +136,7 @@ python3 scripts/manage_skills.py uninstall --target /path/to/project \
 | `workflow-doctor` | 只读检查，解释冲突、能力缺口与未核实项 |
 | `workflow-closeout` | 当前任务收尾，保留人工验收、外部阻塞和未完成阶段，定向维护已有知识 |
 | `workflow-release` | 发布计划与变更说明草稿；仅准备，不创建本地/远端 tag、Release 或部署 |
+| `workflow-upgrade` | 审阅升级计划、保留定制、按事务回退及显式移交文档归属 |
 
 安装 `release` 包后，显式在项目配置启用 `release` 并声明 `extensions.release`。策略支持 `none`、`commit-sha`、`semver-tag`；普通 push 不要求 tag：
 
@@ -148,7 +149,7 @@ python3 scripts/release_prepare.py --repo . --version 1.0.0 --output .dev-workfl
 python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/v1.0.0.json
 ```
 
-配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。当前版本不含自动规则升级、真实 tag/Release 执行或生产部署。
+配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。规则升级使用下述显式计划机制；当前版本不含真实 tag/Release 执行或生产部署。
 
 ## 安装
 
@@ -338,7 +339,7 @@ bash ./scripts/uninstall.sh \
 - 安装脚本和 `core/`、`packs/` 分发目录不会复制到目标项目。
 - `feature-catalog` 的 Schema、模板、说明和工具由 manifest 管理；活动清单和生成矩阵由项目管理，不记录为安装器拥有的文件。
 - `audit` 不会自动把项目标记为已接入；必须先完成 `WORKFLOW-ADOPTION.md` 中的项目画像和文档映射，再同步更新文档状态、manifest 的 `onboarding.status` 与 `lastAuditAt`。
-- 自动升级不会静默改写已有规则；升级先比较 GitHub 版本差异，再用 dry-run 查看安装计划，审核合并后运行审计。
+- 升级不会静默改写已有规则；使用升级引擎审阅旧版、项目当前内容和新版的三方计划，存在冲突时停止应用。
 
 ## 目标项目结构
 
@@ -398,7 +399,17 @@ tag/Release、package/image publish、deploy、migration/backfill、rollback、t
 
 分发仓库的版本写在 `VERSION`。安装器与 manifest、授权、个人记忆、任务上下文和临时日志按策略只用于本机，不应提交到 Git；团队共享的项目 Runbook、架构、契约、设计、部署配置仍属于源仓库内容。安装器以本地 `info/exclude` 区分两类内容，其他电脑或新 clone 必须重新安装并完成接入。`info/exclude` 无法阻止已跟踪的宿主文件或其新增区块被提交；strict audit 遇到这种情况必须失败，并要求人工处理 Git 索引、项目规则或安装冲突后再交付。manifest 只约束当前机器，required checks 和 environment approval 等平台门禁按项目需要配置。
 
-升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
+S4 新增分发端升级引擎（Python 3.10+），只处理目标 manifest 已安装的 Core 与流程包。首次升级须提供可验证的原版本分发目录；之后可复用成功升级保存的原始分发快照。复杂文本合并需要 Git。先在新版分发目录执行：
+
+```bash
+python3 scripts/upgrade.py plan --target /project --baseline /old-dev-workflow --output /tmp/workflow-upgrade.json
+# 审阅计划；无冲突且输入未变化才可应用。
+python3 scripts/upgrade.py apply --target /project --plan /tmp/workflow-upgrade.json
+# 应用结果返回 transaction；需要回退时显式指定。
+python3 scripts/upgrade.py rollback --target /project --transaction TRANSACTION_ID
+```
+
+计划输出须在项目和新旧分发目录之外。未知基线、文本冲突或已修改的交付权限脚本会阻止整份计划应用。升级保留项目配置、执行权限和 Core 区块外内容，回退拒绝覆盖后续用户修改。旧安装器的重复安装不替代规则升级；升级后的版本切换须继续使用升级引擎。完整恢复、文档移交和兼容边界见 [升级指南](core/docs/WORKFLOW-UPGRADE.md)。
 
 从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1/2/3/4 manifest 会升级到 schema 5；schema 1 中无法证明由旧安装器创建的普通文件，以及升级时模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
 

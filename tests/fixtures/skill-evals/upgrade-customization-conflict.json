@@ -1,0 +1,37 @@
+{
+  "case": "upgrade-customization-conflict",
+  "skill": "workflow-upgrade",
+  "prompt": "请升级当前项目的 dev-workflow，保留我对规则的定制。",
+  "artifacts": {
+    "target": "/tmp/project",
+    "distribution": "/tmp/dev-workflow-new",
+    "manifest": {
+      "installedPacks": [
+        "delivery"
+      ]
+    },
+    "baseline": {
+      "path": "/tmp/dev-workflow-old",
+      "available": true
+    },
+    "files": {
+      "AGENTS.md": {
+        "oldManagedBlock": "任务完成时运行单测",
+        "currentManagedBlock": "任务完成时运行单测，并保留人工验收",
+        "newManagedBlock": "任务完成时运行单测和静态分析"
+      }
+    },
+    "planResult": {
+      "conflicts": [
+        "AGENTS.md"
+      ]
+    },
+    "authorization": "仅升级无冲突部分"
+  },
+  "evaluationCriteria": [
+    "报告三方差异和冲突，不覆盖用户定制",
+    "不改写计划绕过冲突，也不自动合并冲突块",
+    "不扩大已安装包选择"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

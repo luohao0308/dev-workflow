@@ -115,6 +115,9 @@ function Get-RemainingGitExcludePatterns(
     [string[]]$RequestedPacks
 ) {
     $patterns = [Collections.Generic.List[string]]::new()
+    if ($FullUninstall -and ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades') -PathType Container) -or (Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/releases') -PathType Container))) {
+        $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/'))
+    }
     if (-not $FullUninstall) {
         $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath '.dev-workflow/'))
         $patterns.Add((Get-GitExcludePattern -Context $Context -RelativePath 'docs/project-memory/'))
@@ -352,6 +355,28 @@ if (
 }
 
 $manifestPath = Join-Path $targetRoot '.dev-workflow/manifest.json'
+$lifecycleOwnerPath = Join-Path $targetRoot '.dev-workflow/lifecycle.lock/owner.json'
+foreach ($lockRelativePath in @('.dev-workflow', '.dev-workflow/lifecycle.lock', '.dev-workflow/lifecycle.lock/owner.json')) {
+    $lockItem = Get-Item -LiteralPath (Join-Path $targetRoot $lockRelativePath) -Force -ErrorAction SilentlyContinue
+    if ($null -ne $lockItem -and ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Lifecycle metadata path must not be linked: $lockRelativePath" }
+}
+if (Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/configuration.lock')) { throw 'Configuration lock is busy; no changes made.' }
+
+if (Test-Path -LiteralPath $lifecycleOwnerPath) { throw 'dev-workflow lifecycle lock is busy; no changes made.' }
+$manifestFingerprint = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash } else { 'missing' }
+$upgradePython = $null
+if ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades')) -or
+    ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and ((Get-Content -LiteralPath $manifestPath -Raw) -match '"upgradeState"\s*:'))) {
+    foreach ($candidate in @('python3', 'python')) {
+        $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $upgradePython = $command.Source; break }
+    }
+    if ($null -eq $upgradePython) { throw 'Python 3 is required to validate workflow upgrade state.' }
+    & $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') check --target $targetRoot --operation uninstall
+    if ($LASTEXITCODE -ne 0) { throw 'Workflow upgrade state validation failed; no changes made.' }
+
+}
+
 $manifest = Read-ManagedManifest $manifestPath
 $gitPolicy = if ($null -ne $manifest.gitPolicy) {
     [ordered]@{
@@ -518,6 +543,37 @@ if ($DryRun) {
     return
 }
 
+$lifecycleLockHeld = $false
+try {
+    if (-not $DryRun) {
+        $lockDirectory = Split-Path -Parent $lifecycleOwnerPath
+        [IO.Directory]::CreateDirectory($lockDirectory) | Out-Null
+        try {
+            $ownerStream = [IO.File]::Open($lifecycleOwnerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        } catch { throw 'dev-workflow lifecycle lock is busy; no changes made.' }
+        $lifecycleLockHeld = $true
+        try {
+            $ownerBytes = [Text.Encoding]::UTF8.GetBytes((@{ pid = $PID; operation = 'uninstall'; transaction = $null } | ConvertTo-Json -Compress))
+            $ownerStream.Write($ownerBytes, 0, $ownerBytes.Length)
+        } finally { $ownerStream.Dispose() }
+        $currentFingerprint = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash } else { 'missing' }
+        if ($currentFingerprint -ne $manifestFingerprint) { throw 'manifest changed during lifecycle preflight; retry the operation.' }
+        if ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades')) -or
+            ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and ((Get-Content -LiteralPath $manifestPath -Raw) -match '"upgradeState"\s*:'))) {
+            if ($null -eq $upgradePython) {
+                foreach ($candidate in @('python3', 'python')) {
+                    $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($null -ne $command) { $upgradePython = $command.Source; break }
+                }
+                if ($null -eq $upgradePython) { throw 'Python 3 is required to validate workflow upgrade state.' }
+            }
+            & $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') check --target $targetRoot --operation uninstall
+            if ($LASTEXITCODE -ne 0) { throw 'Workflow upgrade state changed during lifecycle preflight.' }
+        }
+        if (Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/configuration.lock')) { throw 'Configuration lock is busy; no changes made.' }
+
+    }
+
 foreach ($plan in $plans) {
     if ($plan.Kind -eq 'delete') {
         Remove-Item -LiteralPath $plan.Target
@@ -557,6 +613,9 @@ if ($fullUninstall) {
             lastAuditAt = if ($manifest.onboarding.lastAuditAt) { [string]$manifest.onboarding.lastAuditAt } else { $null }
         }
     }
+    if ($null -ne $manifest.upgradeState) {
+        $updatedManifest['upgradeState'] = $manifest.upgradeState
+    }
     if ($null -ne $manifest.projectConfiguration) {
         $updatedManifest['projectConfiguration'] = $manifest.projectConfiguration
     }
@@ -569,3 +628,13 @@ if ($null -ne $gitExcludeContext) {
 
 Remove-EmptyParents -Paths @($removedPaths) -Root $targetRoot
 Write-Output 'result: complete'
+
+} finally {
+    if ($lifecycleLockHeld) {
+        Remove-Item -LiteralPath $lifecycleOwnerPath -Force
+        $lockDirectory = Split-Path -Parent $lifecycleOwnerPath
+        try { [IO.Directory]::Delete($lockDirectory) } catch [IO.IOException] { }
+        $metadataDirectory = Split-Path -Parent $lockDirectory
+        try { [IO.Directory]::Delete($metadataDirectory) } catch [IO.IOException] { }
+    }
+}

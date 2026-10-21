@@ -549,6 +549,7 @@ build_manifest() {
   cat <<EOF
 {
   "schemaVersion": 5,
+$upgrade_manifest_field
   "managedBy": "dev-workflow",
   "workflowVersion": "$version",
   "installedPacks": [$packs_json
@@ -733,6 +734,43 @@ fi
 
 metadata_root="$target_root/.dev-workflow"
 manifest_path="$metadata_root/manifest.json"
+for lifecycle_path in "$target_root/.dev-workflow" "$target_root/.dev-workflow/lifecycle.lock" "$target_root/.dev-workflow/lifecycle.lock/owner.json"; do
+  if [[ -L "$lifecycle_path" ]]; then echo "Lifecycle metadata path must not be a symlink: $lifecycle_path" >&2; exit 1; fi
+done
+if [[ -e "$target_root/.dev-workflow/configuration.lock" || -L "$target_root/.dev-workflow/configuration.lock" ]]; then
+  echo "Configuration lock is busy; no changes made." >&2; exit 1
+fi
+assert_workflow_lock_compatible() {
+  local helper="$target_root/scripts/workflow_lock.py"
+  if [[ -e "$helper" || -L "$helper" ]]; then
+    if [[ ! -f "$helper" || -L "$helper" ]] || ! cmp -s "$helper" "$core_root/scripts/workflow_lock.py"; then
+      echo "Required workflow runtime helper conflicts with scripts/workflow_lock.py; no files replaced." >&2; exit 1
+    fi
+  fi
+}
+assert_workflow_lock_compatible
+upgrade_manifest_field=""
+project_owned_paths=()
+manifest_fingerprint="missing"
+[[ ! -f "$manifest_path" ]] || manifest_fingerprint="$(sha256_file "$manifest_path")"
+if [[ -e "$target_root/.dev-workflow/lifecycle.lock/owner.json" ]]; then
+  echo "dev-workflow lifecycle lock is busy; no changes made." >&2; exit 1
+fi
+if [[ -d "$target_root/.dev-workflow/upgrades" ]] || { [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; }; then
+  upgrade_python=""
+  if command -v python3 >/dev/null 2>&1; then upgrade_python=python3
+  elif command -v python >/dev/null 2>&1; then upgrade_python=python
+  else echo "Python 3 is required to validate workflow upgrade state." >&2; exit 1
+  fi
+  "$upgrade_python" "$script_dir/upgrade.py" check --target "$target_root" --operation install || exit 1
+  if [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; then
+    upgrade_state_json="$("$upgrade_python" "$script_dir/upgrade.py" state --target "$target_root")" || exit 1
+    upgrade_manifest_field="  \"upgradeState\": $upgrade_state_json,"
+    project_owned_output="$("$upgrade_python" "$script_dir/upgrade.py" project-paths --target "$target_root")" || exit 1
+    while IFS= read -r owned_path; do [[ -z "$owned_path" ]] || project_owned_paths+=("$owned_path"); done <<< "$project_owned_output"
+  fi
+fi
+
 if [[ -e "$metadata_root" && ! -d "$metadata_root" ]]; then
   echo ".dev-workflow 元数据路径不是目录：$metadata_root" >&2
   exit 1
@@ -743,7 +781,9 @@ if [[ -d "$metadata_root" && ! -f "$manifest_path" ]]; then
     # serve as installation metadata or as evidence of execution authority.
     preserved_records_only=1
     while IFS= read -r metadata_entry; do
-      if [[ "$metadata_entry" != "$metadata_root/releases" || ! -d "$metadata_entry" || -L "$metadata_entry" ]]; then
+      if [[ "$metadata_entry" != "$metadata_root/releases" && "$metadata_entry" != "$metadata_root/upgrades" && "$metadata_entry" != "$metadata_root/lifecycle.lock" || ! -d "$metadata_entry" || -L "$metadata_entry" ]]; then
+        preserved_records_only=0
+      elif [[ "$metadata_entry" == "$metadata_root/lifecycle.lock" ]] && directory_has_entries "$metadata_entry"; then
         preserved_records_only=0
       fi
     done < <(find "$metadata_root" -mindepth 1 -maxdepth 1 -print)
@@ -1099,6 +1139,40 @@ done
 actions=()
 seen_paths=()
 
+
+# The owner file is the shared atomic lock; an empty directory carries no authority.
+if [[ "$dry_run" -eq 0 ]]; then
+  lifecycle_lock="$target_root/.dev-workflow/lifecycle.lock"
+  mkdir -p "$lifecycle_lock"
+  if ! (set -o noclobber; printf '{"pid":%s,"operation":"install","transaction":null}\n' "$$" > "$lifecycle_lock/owner.json") 2>/dev/null; then
+    echo "dev-workflow lifecycle lock is busy; no changes made." >&2; exit 1
+  fi
+  cleanup_lifecycle_lock() {
+    rm -f -- "$lifecycle_lock/owner.json"
+    rmdir -- "$lifecycle_lock" 2>/dev/null || true
+    rmdir -- "$target_root/.dev-workflow" 2>/dev/null || true
+  }
+  trap cleanup_lifecycle_lock EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  assert_workflow_lock_compatible
+  current_manifest_fingerprint="missing"
+  [[ ! -f "$manifest_path" ]] || current_manifest_fingerprint="$(sha256_file "$manifest_path")"
+  if [[ "$current_manifest_fingerprint" != "$manifest_fingerprint" ]]; then
+    echo "manifest changed during lifecycle preflight; retry the operation." >&2; exit 1
+  fi
+  if [[ -d "$target_root/.dev-workflow/upgrades" ]] || { [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; }; then
+    if command -v python3 >/dev/null 2>&1; then upgrade_python=python3
+    elif command -v python >/dev/null 2>&1; then upgrade_python=python
+    else echo "Python 3 is required to validate workflow upgrade state." >&2; exit 1
+    fi
+    "$upgrade_python" "$script_dir/upgrade.py" check --target "$target_root" --operation install || exit 1
+  fi
+  if [[ -e "$target_root/.dev-workflow/configuration.lock" || -L "$target_root/.dev-workflow/configuration.lock" ]]; then
+    echo "Configuration lock is busy; no changes made." >&2; exit 1
+  fi
+fi
+
 for index in "${!overlay_roots[@]}"; do
   overlay_name="${overlay_names[$index]}"
   overlay_root="${overlay_roots[$index]}"
@@ -1119,6 +1193,12 @@ for index in "${!overlay_roots[@]}"; do
         echo "manifest 文件归属冲突：${relative_path}（${file_sources[$existing_index]} / ${overlay_name}）" >&2
         exit 1
       fi
+    fi
+
+    if contains_item "$relative_path" "${project_owned_paths[@]+"${project_owned_paths[@]}"}"; then
+      set_inventory "$relative_path" "$overlay_name" "preserved" ""
+      echo "[skip] $relative_path (project-owned)"
+      continue
     fi
 
     target_path="$target_root/$relative_path"

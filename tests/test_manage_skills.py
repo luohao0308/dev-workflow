@@ -112,5 +112,19 @@ class SkillLifecycleTests(unittest.TestCase):
         self.assertFalse((self.dest / self.name).exists())
 
 
+class UpgradeSkillLifecycleTests(SkillLifecycleTests):
+    """The optional upgrade entry point obeys the existing lifecycle boundaries."""
+
+    def setUp(self):
+        super().setUp()
+        self.name = 'workflow-upgrade'
+
+    def test_install_only_requested_upgrade_skill(self):
+        self.assertEqual(self.run_manager('install'), 0)
+        self.assertEqual({item.name for item in self.dest.iterdir()}, {self.name})
+        self.assertFalse((self.root / 'scripts').exists())
+        self.assertFalse((self.root / '.dev-workflow').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

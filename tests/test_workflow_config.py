@@ -42,6 +42,35 @@ class ConfigurationTests(unittest.TestCase):
         self.write(self.project, self.declaration)
         self.cli('adopt')
 
+    def test_pending_upgrades_block_configuration_mutations(self):
+        self.adopt()
+        transaction = 'a' * 32
+        journal = self.root / '.dev-workflow/upgrades' / transaction / 'journal.json'
+        journal.parent.mkdir(parents=True)
+        for status in ('prepared', 'interrupted', 'rolling-back'):
+            self.write(journal, dict(schemaVersion=1, target=str(self.root.resolve()),
+                                     transaction=transaction, status=status))
+            for arguments in (('adopt',), ('sync',), ('withdraw',),
+                              ('update', '--enable', 'containers:compose'), ('installer-sync',)):
+                with self.subTest(status=status, action=arguments[0]):
+                    before = self.manifest.read_bytes(), self.project.read_bytes()
+                    result = self.cli(*arguments, success=False)
+                    self.assertIn('Incomplete upgrade transaction', result.stderr)
+                    self.assertEqual(before, (self.manifest.read_bytes(), self.project.read_bytes()))
+        for status in ('committed', 'rolled-back'):
+            self.write(journal, dict(schemaVersion=1, target=str(self.root.resolve()),
+                                     transaction=transaction, status=status))
+            self.cli('sync')
+
+    def test_malformed_upgrade_history_blocks_configuration(self):
+        journal = self.root / '.dev-workflow/upgrades' / ('a' * 32) / 'journal.json'
+        journal.parent.mkdir(parents=True)
+        self.write(journal, {'status': 'committed'})
+        before = self.manifest.read_bytes()
+        self.cli('adopt', '--create', success=False)
+        self.assertEqual(before, self.manifest.read_bytes())
+        self.assertFalse(self.project.exists())
+
     def test_legacy_configuration_remains_supported(self):
         value = config.resolve_configuration(self.root)
         self.assertFalse(value['errors'])

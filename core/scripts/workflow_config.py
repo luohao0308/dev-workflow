@@ -13,6 +13,7 @@ import tempfile
 
 # Importing this helper from a read-only tool must not create project bytecode.
 sys.dont_write_bytecode = True
+from workflow_lock import LifecycleLock, pending_upgrades
 
 CAPABILITY_PACKS = {
     **dict.fromkeys(('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse'), 'api-governance'),
@@ -238,19 +239,22 @@ def main() -> int:
             writes = [(manifest_path, manifest)]
         output = dict(action=args.action, dryRun=args.dry_run, capabilities=caps, writes=[str(p.relative_to(root)) for p, _ in writes], permissionsChanged=False)
         if not args.dry_run:
-            lock = safe_path(root, '.dev-workflow/configuration.lock')
-            fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.close(fd)
-                # Recheck the input under the lock; an interrupted write is reported as drift.
-                if read_object(manifest_path) != result['manifest']:
-                    raise ValueError('manifest changed during preparation; retry')
-                if config_path.exists() and result['config'] and read_object(config_path) != result['config']:
-                    raise ValueError('configuration changed during preparation; retry')
-                for path, value in writes:
-                    atomic_json(path, value)
-            finally:
-                lock.unlink()
+            with LifecycleLock(root, 'configuration', borrow_parent=True):
+                if pending_upgrades(root):
+                    raise ValueError('Incomplete upgrade transaction; recover it before changing configuration')
+                lock = safe_path(root, '.dev-workflow/configuration.lock')
+                fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                try:
+                    os.close(fd)
+                    # Recheck under both locks; interrupted writes are diagnosed as drift.
+                    if read_object(manifest_path) != result['manifest']:
+                        raise ValueError('manifest changed during preparation; retry')
+                    if config_path.exists() and result['config'] and read_object(config_path) != result['config']:
+                        raise ValueError('configuration changed during preparation; retry')
+                    for path, value in writes:
+                        atomic_json(path, value)
+                finally:
+                    lock.unlink()
         print(json.dumps(output, ensure_ascii=False))
         return 0
     except (OSError, ValueError, TypeError, KeyError) as exc:
