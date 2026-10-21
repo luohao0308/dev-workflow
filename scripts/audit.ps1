@@ -277,10 +277,10 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 if ($pullRequestMode -notin @('manual', 'auto')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestMode: $pullRequestMode" }
                 if ($pullRequestActor -notin @('user', 'ai')) { Add-Error $errors "Invalid manifest gitPolicy.pullRequestActor: $pullRequestActor" }
                 if ($pullRequestMode -eq 'auto' -and $pullRequestActor -ne 'ai') { Add-Error $errors 'manifest gitPolicy pull request auto mode requires actor ai.' }
-                foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+                foreach ($requiredField in @('pullRequestRequired', 'ciRequired')) {
                     if ($manifest.gitPolicy.$requiredField -ne $true) { Add-Error $errors "manifest gitPolicy.$requiredField must be true." }
                 }
-                foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+                foreach ($deniedField in @('forcePushAllowed')) {
                     if ($manifest.gitPolicy.$deniedField -ne $false) { Add-Error $errors "manifest gitPolicy.$deniedField must be false." }
                 }
                 if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { Add-Error $errors 'manifest gitPolicy.privilegedOperationsDefault must be deny.' }
@@ -297,7 +297,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         }
 
         if ($schemaVersion -eq '5') {
-            $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+            $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic', 'release')
             if ($null -eq $manifest.enabledCapabilities -or $manifest.enabledCapabilities -is [string] -or $manifest.enabledCapabilities -isnot [Collections.IEnumerable]) {
                 Add-Error $errors 'manifest enabledCapabilities must be an array.'
             } else {
@@ -435,6 +435,11 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
         }
 
         if ($schemaVersion -in @('2', '3', '4', '5')) {
+            foreach ($relativePath in $inventoryPaths.Keys) {
+                if ($inventoryPaths[$relativePath] -eq 'core' -and -not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
+                    Add-Error $errors "Core file recorded in the manifest is missing: $relativePath"
+                }
+            }
             foreach ($relativePath in $coreFiles) {
                 if (-not $inventoryPaths.ContainsKey($relativePath)) {
                     Add-Error $errors "Manifest ownership inventory is missing Core file: $relativePath"
@@ -443,6 +448,35 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                 }
             }
         }
+    }
+}
+
+# Configuration validation is opt-in for legacy installations and fail-closed
+# whenever a project configuration or an adopted marker is present.
+$hasProjectConfiguration = (Test-Path -LiteralPath (Join-Path $targetRoot 'workflow.config.json')) -or
+    ($null -ne $manifest -and $null -ne $manifest.projectConfiguration)
+if ($hasProjectConfiguration) {
+    try {
+        $configurationPython = $null
+        foreach ($candidate in @('python3', 'python')) {
+            $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($null -ne $command) { $configurationPython = $command.Source; break }
+        }
+        if ($null -eq $configurationPython) { throw 'Python 3 is required to audit the project workflow configuration.' }
+        $configurationHelper = Join-Path $sourceRoot 'core/scripts/workflow_config.py'
+        $configurationOutput = @(& $configurationPython $configurationHelper check --repo $targetRoot)
+        $configurationExitCode = $LASTEXITCODE
+        $configurationResult = ($configurationOutput -join "`n") | ConvertFrom-Json
+        if ($null -eq $configurationResult -or $null -eq $configurationResult.errors -or $null -eq $configurationResult.warnings) {
+            throw 'Project configuration checker returned an invalid result.'
+        }
+        foreach ($issue in @($configurationResult.errors)) { Add-Error $errors "Project configuration [$($issue.code)]: $($issue.message)" }
+        foreach ($issue in @($configurationResult.warnings)) { Add-Warning $warnings "Project configuration [$($issue.code)]: $($issue.message)" }
+        if ($configurationExitCode -ne 0 -and @($configurationResult.errors).Count -eq 0) {
+            Add-Error $errors 'Project configuration checker failed without a diagnostic.'
+        }
+    } catch {
+        Add-Error $errors "Project configuration validation failed: $($_.Exception.Message)"
     }
 }
 

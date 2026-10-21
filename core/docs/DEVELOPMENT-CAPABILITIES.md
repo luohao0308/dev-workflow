@@ -1,6 +1,6 @@
 # 项目能力路由
 
-`.dev-workflow/manifest.json` 的 `enabledCapabilities` 是项目明确声明的技术触点，不是已安装流程包清单。旧 manifest 升级到 schema 5 时默认为空；安装器不扫描代码、不推断栈，也不自动启用 profile。
+`enabledCapabilities` 是项目明确声明的技术触点，不是已安装流程包清单。已采用的 `workflow.config.json` 为能力权威；未采用配置的旧项目继续使用 `.dev-workflow/manifest.json`。采用、同步和撤回规则见 [项目配置](WORKFLOW-CONFIGURATION.md)。旧 manifest 升级到 schema 5 时默认为空；安装器不扫描代码、不推断栈，也不自动启用 profile。
 
 通过安装器显式维护声明：
 
@@ -31,6 +31,7 @@ bash scripts/install.sh --target /path/to/project --disable-capabilities contain
 | Deployment | `deployment:vm-systemd` | VM, systemd service deployment | `deployment` |
 | Deployment | `deployment:serverless` | Function/serverless deployment | `deployment` |
 | Deployment | `deployment:generic` | Other deployment target | `deployment` |
+| Release | `release` | 发布计划、版本身份、可选 Git tag 的只读准备 | `release` |
 
 The specialist packs are independent. Install only the pack that matches the
 enabled capability; no pack enables a capability by itself. Existing `contracts`

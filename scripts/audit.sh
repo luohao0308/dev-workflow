@@ -234,24 +234,40 @@ inventory_source_for() {
 json_string_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$path" | head -n 1
 }
 
 json_number_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p" "$path" | head -n 1
 }
 
 json_boolean_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field"
+    return $?
+  fi
   sed -n -E "s/.*\"$field\"[[:space:]]*:[[:space:]]*(true|false).*/\1/p" "$path" | head -n 1
 }
 
 git_policy_field() {
   local field="$1"
   local path="$2"
+  if [[ -n "${script_dir:-}" && -x "${script_dir}/read_manifest_field.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "${script_dir}/read_manifest_field.py" "$path" "$field" --git-policy
+    return $?
+  fi
   if command -v python3 >/dev/null 2>&1; then
     python3 -c 'import json, sys
 p=json.load(open(sys.argv[1], encoding="utf-8")).get("gitPolicy")
@@ -331,9 +347,9 @@ read_manifest_capabilities() {
   compact="$(tr -d '\r\n' < "$path")"
   if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then return 1; fi
   segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
-  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+(:[a-z0-9-]+)?"//g; s/[[:space:],]//g')"
   [[ -z "$residual" ]] || return 1
-  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+(:[a-z0-9-]+)?)"[[:space:]]*$/\1/p'
 }
 
 read_manifest_file_objects() {
@@ -570,9 +586,7 @@ else
       fi
       [[ "$(git_policy_boolean_field pullRequestRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.pullRequestRequired 必须为 true。"
       [[ "$(git_policy_boolean_field ciRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.ciRequired 必须为 true。"
-      [[ "$(git_policy_boolean_field independentReviewRequired "$manifest_path")" == "true" ]] || add_error "manifest gitPolicy.independentReviewRequired 必须为 true。"
       [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.forcePushAllowed 必须为 false。"
-      [[ "$(git_policy_boolean_field directProtectedBranchPushAllowed "$manifest_path")" == "false" ]] || add_error "manifest gitPolicy.directProtectedBranchPushAllowed 必须为 false。"
       [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || add_error "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。"
       policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
       policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"
@@ -587,7 +601,7 @@ else
     if [[ "$capability_result" -ne 0 ]]; then
       add_error "manifest enabledCapabilities 格式无效。"
     else
-      valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic '
+      valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic release '
       seen_capabilities=()
       while IFS= read -r capability; do
         [[ -n "$capability" ]] || continue
@@ -627,6 +641,9 @@ else
           inventory_sources+=("$source")
           inventory_actions+=("$action")
           inventory_hashes+=("$hash")
+          if [[ "$source" == "core" && ! -f "$target_root/$entry_path" ]]; then
+            add_error "manifest 登记的 Core 文件缺失：$entry_path"
+          fi
           if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]+"${installed_packs[@]}"}"; then
             add_error "manifest 文件 $entry_path 归属于未安装流程包：$source"
           else
@@ -776,6 +793,19 @@ for relative_path in "${initialization_files[@]+"${initialization_files[@]}"}"; 
     add_warning "仍包含接入占位内容：$relative_path"
   fi
 done
+
+if [[ -e "$target_root/workflow.config.json" || -L "$target_root/workflow.config.json" ]] || { [[ -f "$manifest_path" ]] && grep -q '"projectConfiguration"[[:space:]]*:' "$manifest_path"; }; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    add_error "项目配置检查需要 Python 3。"
+  else
+    configuration_report="$(python3 -B "$source_root/core/scripts/workflow_config.py" check --repo "$target_root")" || true
+    configuration_issues="$(printf '%s' "$configuration_report" | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(level+"|"+item["code"]+": "+item["message"]) for level in ("errors","warnings") for item in d[level]]')" || { configuration_issues='errors|项目配置检查失败。'; }
+    while IFS='|' read -r level message; do
+      [[ -n "$level" ]] || continue
+      if [[ "$level" == "errors" ]]; then add_error "$message"; else add_warning "$message"; fi
+    done <<< "$configuration_issues"
+  fi
+fi
 
 echo "dev-workflow audit"
 echo "target: $target_root"

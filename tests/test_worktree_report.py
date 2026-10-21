@@ -60,6 +60,15 @@ class WorktreeReportTests(unittest.TestCase):
             self.assertEqual(self.git(repo, "worktree", "list", "--porcelain"), worktrees_before)
             self.assertTrue(worktree.exists())
 
+            fast_result = subprocess.run(
+                ["python3", str(SCRIPT), "--repo", str(repo), "--base-ref", "main", "--stale-days", "1", "--no-size", "--format", "json"],
+                check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            fast_report = json.loads(fast_result.stdout)
+            fast_feature = next(item for item in fast_report["worktrees"] if item.get("branch") == "feature/sample")
+            self.assertIsNone(fast_feature["sizeBytes"])
+            self.assertIsNone(fast_feature["staleArtifacts"][0]["sizeBytes"])
+
     def test_reports_merged_branch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

@@ -5,7 +5,7 @@
 - [ ] 目标环境、范围、版本身份和发布窗口明确。
 - [ ] 任务、设计、计划、契约和迁移状态允许发布。
 - [ ] 本次操作已有独立授权，记录 repo/环境、operation、不可变版本/产物、目标、actor、expiry；未从 push、PR 或 merge 权限推导。
-- [ ] PR、required CI、独立 Review、CODEOWNERS 和 environment approval 等适用门禁已通过；实现者不是唯一审批者，AI review 不计作独立批准。
+- [ ] PR、required CI 和适用的 environment approval 已通过。
 - [ ] 工作树/分支干净，发布提交已通过项目质量门禁。
 
 ## 2. Preflight

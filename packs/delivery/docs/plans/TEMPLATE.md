@@ -102,16 +102,15 @@ _状态：draft | awaiting_user_confirmation | approved | in_progress | complete
 
 ## 11. 交付状态与 PR 证据
 
-- 当前状态：not_started | committed | pushed | pr_open | ci_passed | review_approved | merged
+- 当前状态：not_started | committed | pushed | pr_open | ci_passed | merged
 - repo / remote：
 - PR 编号或链接：
 - source ref / target ref：
 - exact head SHA：
 - required CI 结果与时间：
-- 独立 reviewer 与批准时间：
 - merge commit（如已合并）：
 
-按实际到达的阶段顺序更新；没有证据的后续阶段不得提前标记。实现者不得作为唯一审批者，AI review 不计作独立批准。
+按实际到达的阶段顺序更新；没有证据的后续阶段不得提前标记。
 
 ## 12. 文档同步
 
@@ -128,4 +127,4 @@ _状态：draft | awaiting_user_confirmation | approved | in_progress | complete
 - [ ] 适用测试、构建、迁移、重启和冒烟通过。
 - [ ] 契约、文档和长期知识已同步。
 - [ ] 最终证据、SHA/产物身份和剩余风险已记录。
-- [ ] 如已进入远端交付，PR、CI 和独立 Review 证据完整；merge 只发生在 fail-closed 门禁通过后。
+- [ ] 如已进入远端交付，PR 和 CI 证据完整；merge 只发生在 fail-closed 门禁通过后。

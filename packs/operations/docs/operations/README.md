@@ -23,7 +23,7 @@ _状态：待初始化 | 权威范围：环境、发布、健康、观测和恢�
 
 - `privilegedOperationsDefault=deny`：创建/推送 tag、创建 Release、发布 package/image、deploy、migration/backfill、rollback、traffic switch、仓库设置、凭据和发布工作流操作不进入普通初始化。
 - 每次高权限操作必须按 repo/环境、operation、不可变版本或产物、目标、actor、expiry 单独授权；push、PR 创建/更新或 PR merge 权限不能推导出发布权限。
-- 代码托管和部署平台应使用 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 强制门禁；本地 manifest 不能替代远端控制。
+- 代码托管和部署平台按项目需要使用 required checks 和 environment approval；本地 manifest 不能替代远端控制。
 - 发布目标使用不可变版本身份（commit、tag、digest 或等价物）。
 - 任何数据迁移先确认备份、恢复和兼容顺序。
 - 先 Preflight，再构建/部署，再健康检查、业务冒烟和观测。

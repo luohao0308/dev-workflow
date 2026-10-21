@@ -1,0 +1,34 @@
+{
+  "case": "partial-deployment",
+  "skill": "workflow-release",
+  "prompt": "为只更新网关配置准备发布说明。",
+  "artifacts": {
+    "release": {
+      "strategy": "commit-sha"
+    },
+    "scope": [
+      "gateway"
+    ],
+    "components": {
+      "frontend": {
+        "source": "old111",
+        "image": "sha256:front"
+      },
+      "backend": {
+        "source": "old222",
+        "image": "sha256:back"
+      },
+      "gateway": {
+        "configFingerprint": "new333",
+        "origin": "local-build"
+      }
+    },
+    "productionEvidence": null
+  },
+  "evaluationCriteria": [
+    "保持组件不同来源",
+    "区分本地构建和 CI 产物",
+    "不将计划当实际部署"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

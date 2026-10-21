@@ -1,0 +1,25 @@
+{
+  "case": "unconfigured-capabilities",
+  "skill": "workflow-doctor",
+  "prompt": "为什么这些能力没有按预期工作？",
+  "artifacts": {
+    "manifest": {
+      "installedPacks": [
+        "api-governance",
+        "containers",
+        "delivery-cicd"
+      ],
+      "enabledCapabilities": []
+    },
+    "files": [
+      "Dockerfile",
+      ".github/workflows/ci.yml"
+    ]
+  },
+  "evaluationCriteria": [
+    "区分已安装和已配置",
+    "自动发现只建议",
+    "不自动启用"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

@@ -166,7 +166,8 @@ function Update-GitExclude([object]$Context, [string[]]$Patterns) {
     try {
         Write-Utf8NoBom -Path $temporaryPath -Content (($lines -join "`r`n") + "`r`n")
         if (Test-Path -LiteralPath $excludePath -PathType Leaf) {
-            [IO.File]::Replace($temporaryPath, $excludePath, $null)
+            # Preserve a true null backup path across PowerShell string binding.
+            [IO.File]::Replace($temporaryPath, $excludePath, [System.Management.Automation.Language.NullString]::Value)
         } else {
             [IO.File]::Move($temporaryPath, $excludePath)
         }
@@ -324,7 +325,7 @@ function Read-ManagedManifest([string]$Path) {
         throw "Manifest has an invalid onboarding.status: $Path"
     }
     if ($schemaVersion -eq '5') {
-        $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+        $allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic', 'release')
         if ($null -eq $manifest.enabledCapabilities -or $manifest.enabledCapabilities -is [string] -or $manifest.enabledCapabilities -isnot [Collections.IEnumerable]) { throw "Manifest enabledCapabilities must be an array: $Path" }
         $capabilities = @($manifest.enabledCapabilities | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
         if (@($capabilities | Where-Object { $_ -notin $allowedCapabilities }).Count -gt 0) { throw "Manifest contains an unknown enabled capability: $Path" }
@@ -337,17 +338,19 @@ function Read-ManagedManifest([string]$Path) {
         $mergeActor = ([string]$manifest.gitPolicy.mergeActor).Trim().ToLowerInvariant()
         Assert-GitPolicy -Operation 'push' -Mode $pushMode -Actor $pushActor
         Assert-GitPolicy -Operation 'merge' -Mode $mergeMode -Actor $mergeActor
-        if ($manifest.gitPolicy.deleteAllowed -ne $false) {
+        $legacyMissingDeleteAllowed = $schemaVersion -in @('1', '2', '3') -and
+            $manifest.gitPolicy.PSObject.Properties.Name -notcontains 'deleteAllowed'
+        if (-not $legacyMissingDeleteAllowed -and ($manifest.gitPolicy.deleteAllowed -isnot [bool] -or $manifest.gitPolicy.deleteAllowed -ne $false)) {
             throw "Manifest gitPolicy.deleteAllowed must be false: $Path"
         }
         if ($schemaVersion -in @('4', '5')) {
             $pullRequestMode = ([string]$manifest.gitPolicy.pullRequestMode).Trim().ToLowerInvariant()
             $pullRequestActor = ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant()
             Assert-GitPolicy -Operation 'pull request' -Mode $pullRequestMode -Actor $pullRequestActor
-            foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+            foreach ($requiredField in @('pullRequestRequired', 'ciRequired')) {
                 if ($manifest.gitPolicy.$requiredField -ne $true) { throw "Manifest gitPolicy.$requiredField must be true: $Path" }
             }
-            foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+            foreach ($deniedField in @('forcePushAllowed')) {
                 if ($manifest.gitPolicy.$deniedField -ne $false) { throw "Manifest gitPolicy.$deniedField must be false: $Path" }
             }
             if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
@@ -479,9 +482,7 @@ function New-ManifestPlan(
             pullRequestActor = [string]$GitPolicy.pullRequestActor
             pullRequestRequired = $true
             ciRequired = $true
-            independentReviewRequired = $true
             forcePushAllowed = $false
-            directProtectedBranchPushAllowed = $false
             privilegedOperationsDefault = 'deny'
             deleteAllowed = $false
             policyChangedAt = if ($policyChanged) { $now } else { [string]$Existing.gitPolicy.policyChangedAt }
@@ -494,6 +495,10 @@ function New-ManifestPlan(
             status = $onboardingStatus
             lastAuditAt = $lastAuditAt
         }
+    }
+
+    if ($null -ne $Existing -and $null -ne $Existing.projectConfiguration) {
+        $manifest['projectConfiguration'] = $Existing.projectConfiguration
     }
 
     [pscustomobject]@{
@@ -586,10 +591,33 @@ if ((Test-Path -LiteralPath $metadataRoot) -and -not (Test-Path -LiteralPath $me
 if (Test-Path -LiteralPath $metadataRoot -PathType Container) {
     $metadataEntries = @(Get-ChildItem -LiteralPath $metadataRoot -Force)
     if ($metadataEntries.Count -gt 0 -and -not (Test-Path -LiteralPath $manifestPath)) {
-        throw "The .dev-workflow directory contains unmanaged files but no manifest: $metadataRoot"
+        $preservedRecordsOnly = $metadataEntries.Count -eq 1 -and $metadataEntries[0].Name -eq 'releases' -and
+            $metadataEntries[0].PSIsContainer -and (($metadataEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        if (-not $preservedRecordsOnly) {
+            throw "The .dev-workflow directory contains unmanaged files but no manifest: $metadataRoot"
+        }
     }
 }
 $existingManifest = Read-ManagedManifest $manifestPath
+
+# Resolve adopted project settings before any installation writes. Legacy targets
+# retain their existing path and do not acquire a Python runtime dependency.
+$hasProjectConfiguration = (Test-Path -LiteralPath (Join-Path $targetRoot 'workflow.config.json')) -or
+    ($null -ne $existingManifest -and $null -ne $existingManifest.projectConfiguration)
+$configurationPython = $null
+$configurationCapabilities = @()
+$configurationEnableCsv = (@($EnableCapabilities | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() }) -join ',')
+$configurationDisableCsv = (@($DisableCapabilities | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() }) -join ',')
+if ($hasProjectConfiguration) {
+    foreach ($candidate in @('python3', 'python')) {
+        $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $configurationPython = $command.Source; break }
+    }
+    if ($null -eq $configurationPython) { throw 'Python 3 is required to validate the project workflow configuration.' }
+    $configurationHelper = Join-Path $coreRoot 'scripts/workflow_config.py'
+    $configurationCapabilities = @(& $configurationPython $configurationHelper installer-capabilities --repo $targetRoot "--enable=$configurationEnableCsv" "--disable=$configurationDisableCsv")
+    if ($LASTEXITCODE -ne 0) { throw 'Project workflow configuration validation failed; no installation files were written.' }
+}
 
 $pushModeValue = 'manual'
 $pushActorValue = 'user'
@@ -716,9 +744,14 @@ foreach ($pack in $availablePacks) {
     }
 }
 
-$allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic')
+$allowedCapabilities = @('api:rest-openapi', 'api:graphql', 'api:grpc', 'api:websocket', 'api:sse', 'containers:oci-docker', 'containers:compose', 'cicd:github-actions', 'cicd:gitlab-ci', 'cicd:jenkins', 'cicd:generic', 'deployment:compose', 'deployment:kubernetes-helm', 'deployment:vm-systemd', 'deployment:serverless', 'deployment:generic', 'release')
 $enabledCapabilities = [Collections.Generic.List[string]]::new()
-if ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -eq '5') {
+if ($hasProjectConfiguration) {
+    foreach ($capability in $configurationCapabilities) {
+        $normalized = ([string]$capability).Trim().ToLowerInvariant()
+        if ($normalized -and -not $enabledCapabilities.Contains($normalized)) { $enabledCapabilities.Add($normalized) }
+    }
+} elseif ($null -ne $existingManifest -and [string]$existingManifest.schemaVersion -eq '5') {
     foreach ($capability in @($existingManifest.enabledCapabilities)) {
         $normalized = ([string]$capability).Trim().ToLowerInvariant()
         if ($normalized -and -not $enabledCapabilities.Contains($normalized)) { $enabledCapabilities.Add($normalized) }
@@ -925,6 +958,11 @@ if ($null -ne $gitExcludeContext) {
 } else {
     Write-Warning 'Target directory is not inside a Git repository; local info/exclude was not configured.'
     $actions.Add('[git-exclude] skipped (target is not inside a Git repository)')
+}
+
+if ($hasProjectConfiguration -and -not $DryRun) {
+    & $configurationPython $configurationHelper installer-sync --repo $targetRoot "--enable=$configurationEnableCsv" "--disable=$configurationDisableCsv" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Project workflow configuration synchronization failed; run the configuration check before continuing.' }
 }
 
 $packSummary = if ($selectedPacks.Count -eq 0) { 'none' } else { $selectedPacks -join ', ' }

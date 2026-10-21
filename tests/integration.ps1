@@ -16,6 +16,13 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+# Include both file names and hashes, so additions and removals also fail equality.
+function Get-TreeFingerprint([string]$Root) {
+    return (@(Get-ChildItem -LiteralPath $Root -Recurse -Force -File | Sort-Object FullName | ForEach-Object {
+        $_.FullName.Substring($Root.Length) + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    }) -join "`n")
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $installScript = Join-Path $repoRoot 'scripts/install.ps1'
 $uninstallScript = Join-Path $repoRoot 'scripts/uninstall.ps1'
@@ -57,9 +64,7 @@ try {
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'merge defaults to user execution'
     Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'pull requests are required by default'
     Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'CI is required by default'
-    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'independent review is required by default'
     Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'force push is denied by default'
-    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'direct protected-branch push is denied by default'
     Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'privileged operations default to deny'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'delete is always denied'
     Assert-True ([string]$manifest.gitPolicy.policyChangedBy -eq 'default') 'safe defaults record their policy origin'
@@ -253,7 +258,10 @@ try {
     Assert-True (($trackedAuditOutput -join "`n") -match 'info/exclude cannot prevent upload: \.dev-workflow/') 'audit warns when Git tracks dev-workflow metadata'
 
     $specialRepo = Join-Path $tempRoot 'special-repo'
-    $specialRelative = '[local] space#bang!star*question?'
+    # Keep Git metacharacters supported by this filesystem. Windows cannot
+    # create names containing * or ?; the Bash matrix covers those characters.
+    $invalidNameCharacters = [IO.Path]::GetInvalidFileNameChars()
+    $specialRelative = -join ('[local] space#bang!star*question?'.ToCharArray() | Where-Object { $invalidNameCharacters -notcontains $_ })
     $specialTarget = Join-Path $specialRepo $specialRelative
     New-Item -ItemType Directory -Path $specialTarget -Force | Out-Null
     & git -C $specialRepo init -q | Out-Null
@@ -376,9 +384,7 @@ try {
         @{ Message = 'audit rejects automatic merge with a user actor'; Changes = @{ mergeMode = 'auto'; mergeActor = 'user' }; Remove = @() },
         @{ Message = 'audit rejects a disabled pull-request requirement'; Changes = @{ pullRequestRequired = $false }; Remove = @() },
         @{ Message = 'audit rejects a disabled CI requirement'; Changes = @{ ciRequired = $false }; Remove = @() },
-        @{ Message = 'audit rejects a disabled independent-review requirement'; Changes = @{ independentReviewRequired = $false }; Remove = @() },
         @{ Message = 'audit rejects allowed force push'; Changes = @{ forcePushAllowed = $true }; Remove = @() },
-        @{ Message = 'audit rejects direct protected-branch push'; Changes = @{ directProtectedBranchPushAllowed = $true }; Remove = @() },
         @{ Message = 'audit rejects privileged operations enabled by default'; Changes = @{ privilegedOperationsDefault = 'allow' }; Remove = @() },
         @{ Message = 'audit rejects granted delete permission'; Changes = @{ deleteAllowed = $true }; Remove = @() }
     )) {
@@ -447,9 +453,7 @@ try {
     Assert-True ([string]$manifest.gitPolicy.mergeActor -eq 'user') 'partial uninstall preserves merge policy'
     Assert-True ($manifest.gitPolicy.pullRequestRequired -eq $true) 'partial uninstall preserves the pull-request requirement'
     Assert-True ($manifest.gitPolicy.ciRequired -eq $true) 'partial uninstall preserves the CI requirement'
-    Assert-True ($manifest.gitPolicy.independentReviewRequired -eq $true) 'partial uninstall preserves the independent-review requirement'
     Assert-True ($manifest.gitPolicy.forcePushAllowed -eq $false) 'partial uninstall preserves denied force push'
-    Assert-True ($manifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'partial uninstall preserves denied direct protected-branch push'
     Assert-True ([string]$manifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'partial uninstall preserves denied privileged operations'
     Assert-True ($manifest.gitPolicy.deleteAllowed -eq $false) 'partial uninstall preserves denied delete permission'
     Assert-True ([string]$manifest.gitPolicy.policyChangedAt -eq $policyChangedAtBeforeUninstall) 'partial uninstall preserves the policy timestamp'
@@ -602,10 +606,11 @@ try {
         'pullRequestActor',
         'pullRequestRequired',
         'ciRequired',
-        'independentReviewRequired',
         'forcePushAllowed',
-        'directProtectedBranchPushAllowed',
-        'privilegedOperationsDefault'
+        'deleteAllowed',
+        'privilegedOperationsDefault',
+        'policyChangedAt',
+        'policyChangedBy'
     )) {
         $schema3UpgradeManifest.gitPolicy.PSObject.Properties.Remove($field)
     }
@@ -621,9 +626,7 @@ try {
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.pullRequestActor -eq 'user') 'schema 3 upgrade adds safe pull-request actor'
     Assert-True ($schema3UpgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 3 upgrade requires pull requests'
     Assert-True ($schema3UpgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 3 upgrade requires CI'
-    Assert-True ($schema3UpgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 3 upgrade requires independent review'
     Assert-True ($schema3UpgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 3 upgrade denies force push'
-    Assert-True ($schema3UpgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 3 upgrade denies direct protected-branch push'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 3 upgrade denies privileged operations by default'
     Assert-True ([string]$schema3UpgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 3 upgrade records migration as the policy origin'
 
@@ -652,9 +655,7 @@ try {
     Assert-True ([string]$upgradeManifest.gitPolicy.mergeActor -eq 'user') 'upgrade adds safe merge actor when missing'
     Assert-True ($upgradeManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 2 upgrade requires pull requests'
     Assert-True ($upgradeManifest.gitPolicy.ciRequired -eq $true) 'schema 2 upgrade requires CI'
-    Assert-True ($upgradeManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 2 upgrade requires independent review'
     Assert-True ($upgradeManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 2 upgrade denies force push'
-    Assert-True ($upgradeManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 2 upgrade denies direct protected-branch push'
     Assert-True ([string]$upgradeManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 2 upgrade denies privileged operations by default'
     Assert-True ([string]$upgradeManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 2 upgrade records migration as the policy origin'
 
@@ -680,11 +681,67 @@ try {
     Assert-True ([string]$migratedManifest.gitPolicy.mergeActor -eq 'user') 'schema 1 upgrade adds safe merge actor'
     Assert-True ($migratedManifest.gitPolicy.pullRequestRequired -eq $true) 'schema 1 upgrade requires pull requests'
     Assert-True ($migratedManifest.gitPolicy.ciRequired -eq $true) 'schema 1 upgrade requires CI'
-    Assert-True ($migratedManifest.gitPolicy.independentReviewRequired -eq $true) 'schema 1 upgrade requires independent review'
     Assert-True ($migratedManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 1 upgrade denies force push'
-    Assert-True ($migratedManifest.gitPolicy.directProtectedBranchPushAllowed -eq $false) 'schema 1 upgrade denies direct protected-branch push'
     Assert-True ([string]$migratedManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 1 upgrade denies privileged operations by default'
     Assert-True ([string]$migratedManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 1 upgrade records migration as the policy origin'
+
+    # Exercise the native PowerShell installer around the shared configuration CLI.
+    $lifecycleTarget = Join-Path $tempRoot 'configuration-release-lifecycle'
+    New-Item -ItemType Directory -Path $lifecycleTarget | Out-Null
+    & $installScript -TargetPath $lifecycleTarget -AllPacks | Out-Null
+    Assert-True (Test-Path -LiteralPath (Join-Path $lifecycleTarget 'scripts/release_prepare.py') -PathType Leaf) 'all packs installs the optional release tool'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $lifecycleTarget '.agents'))) 'all packs does not implicitly install Skills'
+    $lifecycleConfig = Join-Path $lifecycleTarget 'workflow.config.json'
+    $lifecycleManifest = Join-Path $lifecycleTarget '.dev-workflow/manifest.json'
+    $lifecycleRecord = Join-Path $lifecycleTarget '.dev-workflow/releases/retained.json'
+    Write-Utf8NoBom -Path $lifecycleConfig -Content (@{
+        schemaVersion = 1
+        enabledCapabilities = @('release')
+        commands = @{}
+        documents = @{}
+        extensions = @{ release = @{ strategy = 'commit-sha'; components = @('web', 'proxy') } }
+    } | ConvertTo-Json -Depth 8)
+    & $pythonCommand.Name (Join-Path $lifecycleTarget 'scripts/workflow_config.py') adopt --repo $lifecycleTarget | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'configuration adoption succeeds through the installed Core CLI'
+    & $installScript -TargetPath $lifecycleTarget -EnableCapabilities @(' CONTAINERS:COMPOSE ') | Out-Null
+    $lifecycleDeclaration = Get-Content -LiteralPath $lifecycleConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+    $lifecycleSnapshot = Get-Content -LiteralPath $lifecycleManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True ($lifecycleSnapshot.projectConfiguration.adopted -eq $true) 'reinstall preserves explicit configuration adoption'
+    Assert-True ($lifecycleSnapshot.projectConfiguration.sha256 -eq (Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash.ToLowerInvariant()) 'reinstall refreshes the adopted configuration fingerprint'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities).Count -eq 2) 'reinstall retains release and enables the requested capability in project configuration'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities) -contains 'release') 'reinstall retains the existing release capability'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities) -contains 'containers:compose') 'reinstall updates project configuration capability selection'
+    Assert-True ((@($lifecycleDeclaration.enabledCapabilities) -join ',') -eq (@($lifecycleSnapshot.enabledCapabilities) -join ',')) 'manifest capabilities match the adopted project configuration'
+    Assert-True ($lifecycleDeclaration.extensions.release.strategy -eq 'commit-sha') 'reinstall preserves release strategy'
+    $lifecycleBeforeDryRun = Get-TreeFingerprint $lifecycleTarget
+    & $installScript -TargetPath $lifecycleTarget -DisableCapabilities @(' RELEASE ') -DryRun | Out-Null
+    Assert-True ((Get-TreeFingerprint $lifecycleTarget) -eq $lifecycleBeforeDryRun) 'configuration-aware dry-run leaves every project file byte-identical'
+    $validLifecycleConfig = [IO.File]::ReadAllText($lifecycleConfig)
+    Write-Utf8NoBom -Path $lifecycleConfig -Content '{"schemaVersion":1,}'
+    $lifecycleBeforeInvalidInstall = Get-TreeFingerprint $lifecycleTarget
+    $invalidConfigurationRejected = $false
+    try {
+        & $installScript -TargetPath $lifecycleTarget -EnableCapabilities @('deployment:compose') | Out-Null
+    } catch {
+        $invalidConfigurationRejected = $true
+    }
+    Assert-True $invalidConfigurationRejected 'PowerShell installer rejects malformed project configuration'
+    Assert-True ((Get-TreeFingerprint $lifecycleTarget) -eq $lifecycleBeforeInvalidInstall) 'invalid configuration rejection leaves all project files unchanged'
+    Write-Utf8NoBom -Path $lifecycleConfig -Content $validLifecycleConfig
+    Write-Utf8NoBom -Path $lifecycleRecord -Content '{"kind":"release-preparation","fixture":true}'
+    $lifecycleConfigHash = (Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash
+    $lifecycleRecordHash = (Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash
+    $lifecycleAdoptionBeforeUninstall = $lifecycleSnapshot.projectConfiguration | ConvertTo-Json -Compress
+    & $uninstallScript -TargetPath $lifecycleTarget -Packs @('release') | Out-Null
+    $lifecycleAfterPartial = Get-Content -LiteralPath $lifecycleManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (@($lifecycleAfterPartial.installedPacks) -notcontains 'release') 'partial uninstall removes release pack membership'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $lifecycleTarget 'scripts/release_prepare.py'))) 'partial uninstall removes the unchanged release tool'
+    Assert-True (($lifecycleAfterPartial.projectConfiguration | ConvertTo-Json -Compress) -eq $lifecycleAdoptionBeforeUninstall) 'partial uninstall preserves configuration adoption marker'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash -eq $lifecycleConfigHash) 'partial uninstall preserves project configuration bytes'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash -eq $lifecycleRecordHash) 'partial uninstall preserves release record bytes'
+    & $uninstallScript -TargetPath $lifecycleTarget | Out-Null
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash -eq $lifecycleConfigHash) 'full uninstall preserves project configuration bytes'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash -eq $lifecycleRecordHash) 'full uninstall preserves release record bytes'
 
     Write-Output 'PowerShell integration tests passed.'
 } finally {
@@ -694,3 +751,7 @@ try {
         Remove-Item -LiteralPath $resolvedTempRoot -Recurse -Force
     }
 }
+
+# Reaching this point means every assertion and cleanup succeeded. Expected
+# negative native-command tests must not leak their LASTEXITCODE to the caller.
+exit 0

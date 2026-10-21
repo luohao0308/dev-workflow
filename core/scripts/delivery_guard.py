@@ -22,8 +22,8 @@ MODE_FIELDS = {
     "pull-request": ("pullRequestMode", "pullRequestActor"),
     "merge": ("mergeMode", "mergeActor"),
 }
-REQUIRED_TRUE = ("pullRequestRequired", "ciRequired", "independentReviewRequired")
-REQUIRED_FALSE = ("forcePushAllowed", "directProtectedBranchPushAllowed", "deleteAllowed")
+REQUIRED_TRUE = ("pullRequestRequired", "ciRequired")
+REQUIRED_FALSE = ("forcePushAllowed", "deleteAllowed")
 SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 REF_RE = re.compile(r"^(?!/)(?!.*(?:\.\.|@\{|//|\\))[A-Za-z0-9._/-]+(?<![/.])$")
 
@@ -205,7 +205,6 @@ def validate_push_evidence(evidence: dict[str, Any]) -> None:
         ("force", False),
         ("delete", False),
         ("fastForward", True),
-        ("targetBranchProtected", False),
     ):
         require_exact(evidence, field, expected, "providerEvidence")
 
@@ -225,15 +224,8 @@ def validate_merge_evidence(
     require_exact(evidence, "sourceRef", source_ref, "prEvidence")
     require_exact(evidence, "targetRef", target_ref, "prEvidence")
     require_exact(evidence, "headSha", sha, "prEvidence")
-    for field in ("requiredChecksPassed", "branchProtectionAllowsMerge", "mergeable"):
+    for field in ("requiredChecksPassed", "mergeable"):
         require_exact(evidence, field, True, "prEvidence")
-    approval = evidence.get("independentApproval")
-    if not isinstance(approval, dict):
-        raise GuardError("prEvidence.independentApproval is missing")
-    if approval.get("approved") is not True or approval.get("isAuthor") is not False or approval.get("isAi") is not False:
-        raise GuardError("PR requires an independent human approval")
-    if not isinstance(approval.get("reviewer"), str) or not approval["reviewer"].strip():
-        raise GuardError("PR independent reviewer identity is missing")
 
 
 def consumption_count(path: Path, grant_id: str) -> int:

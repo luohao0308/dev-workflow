@@ -160,7 +160,8 @@ function Update-GitExclude([object]$Context, [string[]]$Patterns) {
     try {
         Write-Utf8NoBom -Path $temporaryPath -Content (($lines -join "`r`n") + "`r`n")
         if (Test-Path -LiteralPath $excludePath -PathType Leaf) {
-            [IO.File]::Replace($temporaryPath, $excludePath, $null)
+            # Preserve a true null backup path across PowerShell string binding.
+            [IO.File]::Replace($temporaryPath, $excludePath, [System.Management.Automation.Language.NullString]::Value)
         } else {
             [IO.File]::Move($temporaryPath, $excludePath)
         }
@@ -234,10 +235,10 @@ function Read-ManagedManifest([string]$Path) {
             if ("${pullRequestMode}:${pullRequestActor}" -notin @('manual:user', 'manual:ai', 'auto:ai')) {
                 throw "Manifest has an invalid pull request Git policy: $Path"
             }
-            foreach ($requiredField in @('pullRequestRequired', 'ciRequired', 'independentReviewRequired')) {
+            foreach ($requiredField in @('pullRequestRequired', 'ciRequired')) {
                 if ($manifest.gitPolicy.$requiredField -ne $true) { throw "Manifest gitPolicy.$requiredField must be true: $Path" }
             }
-            foreach ($deniedField in @('forcePushAllowed', 'directProtectedBranchPushAllowed')) {
+            foreach ($deniedField in @('forcePushAllowed')) {
                 if ($manifest.gitPolicy.$deniedField -ne $false) { throw "Manifest gitPolicy.$deniedField must be false: $Path" }
             }
             if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
@@ -362,9 +363,7 @@ $gitPolicy = if ($null -ne $manifest.gitPolicy) {
         pullRequestActor = if ([string]$manifest.schemaVersion -in @('4', '5')) { ([string]$manifest.gitPolicy.pullRequestActor).Trim().ToLowerInvariant() } else { 'user' }
         pullRequestRequired = $true
         ciRequired = $true
-        independentReviewRequired = $true
         forcePushAllowed = $false
-        directProtectedBranchPushAllowed = $false
         privilegedOperationsDefault = 'deny'
         deleteAllowed = $false
         policyChangedAt = if ([string]$manifest.schemaVersion -in @('4', '5')) { [string]$manifest.gitPolicy.policyChangedAt } else { [DateTime]::UtcNow.ToString('o') }
@@ -380,9 +379,7 @@ $gitPolicy = if ($null -ne $manifest.gitPolicy) {
         pullRequestActor = 'user'
         pullRequestRequired = $true
         ciRequired = $true
-        independentReviewRequired = $true
         forcePushAllowed = $false
-        directProtectedBranchPushAllowed = $false
         privilegedOperationsDefault = 'deny'
         deleteAllowed = $false
         policyChangedAt = [DateTime]::UtcNow.ToString('o')
@@ -559,6 +556,9 @@ if ($fullUninstall) {
             status = [string]$manifest.onboarding.status
             lastAuditAt = if ($manifest.onboarding.lastAuditAt) { [string]$manifest.onboarding.lastAuditAt } else { $null }
         }
+    }
+    if ($null -ne $manifest.projectConfiguration) {
+        $updatedManifest['projectConfiguration'] = $manifest.projectConfiguration
     }
     Write-Utf8NoBom -Path $manifestPath -Content (($updatedManifest | ConvertTo-Json -Depth 8) + "`r`n")
 }

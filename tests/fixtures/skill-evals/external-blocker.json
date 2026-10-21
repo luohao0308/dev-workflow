@@ -1,0 +1,23 @@
+{
+  "case": "external-blocker",
+  "skill": "workflow-closeout",
+  "prompt": "整理这次任务的完成情况并更新当前任务。",
+  "artifacts": {
+    "task": "小程序与公众号交付",
+    "evidence": {
+      "code": "merged",
+      "ci": "passed",
+      "deviceAcceptance": "pending",
+      "miniappSubmission": "pending",
+      "publicArticle": "blocked by external permission"
+    },
+    "taskAuthority": "docs/TASKS.md"
+  },
+  "evaluationCriteria": [
+    "保留真机验收与提审",
+    "保留外部权限阻塞",
+    "不写全部完成",
+    "不新增任务数据库"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

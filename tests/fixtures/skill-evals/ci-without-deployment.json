@@ -1,0 +1,24 @@
+{
+  "case": "ci-without-deployment",
+  "skill": "workflow-release",
+  "prompt": "准备本次版本发布，CI 已通过。",
+  "artifacts": {
+    "release": {
+      "strategy": "commit-sha"
+    },
+    "source": "abc123",
+    "evidence": {
+      "ci": "passed",
+      "images": [
+        "frontend:abc123",
+        "backend:abc123"
+      ]
+    },
+    "deployment": null
+  },
+  "evaluationCriteria": [
+    "部署和线上验证未核实",
+    "不创建 tag 或远端资源"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

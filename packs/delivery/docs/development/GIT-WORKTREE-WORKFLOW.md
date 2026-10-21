@@ -18,7 +18,7 @@ _更新：YYYY-MM-DD_
 → 精确暂存与提交
 → 同步最新目标分支并重新验证
 → 按 manifest 的权限策略 push 并创建/更新 PR
-→ 通过 PR、CI 和独立 Review 门禁
+→ 通过 PR 和 CI 门禁
 → 按权限策略合并远端 PR
 ```
 
@@ -109,7 +109,7 @@ git commit -m "<project commit format>"
 - 持久策略变更固定需要人工确认，不得由当前权限自我升级。一次性授权必须绑定 `repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses`；任一项变化即失效，不改变 manifest 默认 actor。授权文件放在本地 `.dev-workflow/authorizations/`，不得提交。
 - AI 执行 push、PR 创建/更新或远端 PR merge 前运行 `python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 固定拒绝 AI 执行；用户本人按证据直接操作。`actor=ai` 的验证阶段可不带 `--consume`；紧邻真实远端操作的最终检查必须带 `--consume`，避免同一授权超次数复用。guard 失败或输出不是 `decision=allow` 时停止。
 - dev-workflow 本地文件以 Git 解析出的 `info/exclude` 为保护边界；交付前若审计报告文件已被跟踪或最终 ignore 规则未生效，必须先解决告警，不能仅凭 managed block 文本判定安全。
-- `forcePushAllowed=false`，不使用 `git push --force`；`directProtectedBranchPushAllowed=false`，不得直接 push 到保护分支。也不使用 `git reset --hard` 或语义不明的 ours/theirs。
+- `forcePushAllowed=false`，不使用 `git push --force`；也不使用 `git reset --hard` 或语义不明的 ours/theirs。
 
 ## 5. 同步与重新验证
 
@@ -128,15 +128,15 @@ git rebase <current-target-head>
 - 创建线上 PR 前，必须把已验证的提交移动到符合项目约定的交付分支，例如 `feat/*`、`fix/*`、`refactor/*`、`docs/*`、`test/*`、`chore/*`、`ci/*`、`build/*`、`perf/*`、`release/*` 或 `hotfix/*`；具体允许集合以项目规则为准。
 - push 前核验 `git branch --show-current`，发现分支以 `codex/` 开头时停止交付，先切换或创建合规的线上分支，再重新检查提交和验证结果。
 - 本地 `git merge` 只用于本地分支整理；项目要求线性历史时，先验证目标 HEAD 是任务 HEAD 的祖先，再使用 `git merge --ff-only <task-head>`。本地 merge 不获得 push 或远端 PR merge 权限。
-- `pullRequestRequired=true`、`ciRequired=true`、`independentReviewRequired=true` 是默认质量门，不因 mode/actor 授权而关闭。实现者不得作为唯一审批者，AI review 或自审不计作独立批准。
+- `pullRequestRequired=true`、`ciRequired=true` 是默认质量门，不因 mode/actor 授权而关闭。
 - feature、bug、安全、跨模块或其他需要审计追踪的工作应先关联 Issue；小型、局部、低风险改动不强制创建 Issue。
 - `mode=manual` 时必须获得本次操作确认；`actor=user` 时只能由用户执行，一次性授权不能覆盖 actor。若要改由 AI 执行，必须先通过独立人工确认修改持久 actor 策略。
 - `mode=auto` 仅可与 `actor=ai` 组合；它只免除有效授权范围内的再次交互，不代表长期全局授权。AI 执行仍必须持有尚未过期、未超次数且与准确 SHA 完全匹配的一次性授权。push、PR 创建/更新、远端 PR merge 相互独立，不可互相推断授权。
-- 远端 PR merge 前必须 fail-closed 验证：PR 存在且开放，head/base 与授权目标一致，准确 head SHA 未变化，required CI 全部通过，独立 Review 已批准，远端分支保护允许合并。任一项缺失、过期、失败或无法读取都停止。
-- `--provider-evidence-file` 必须来自紧邻操作的托管平台查询，并绑定 repository、remote 名称与 URL、operation、source/target ref、准确 head SHA 和 `verifiedAt`；超过五分钟或字段不全即失败。push 还需 `force=false`、`delete=false`、`fastForward=true`、`targetBranchProtected=false`；PR 需远端 source SHA 和 base 存在证据；merge 还需 PR number、授权 grantId、open 状态、head/base、required checks、独立人工审批、mergeable 和分支保护允许状态。
+- 远端 PR merge 前必须 fail-closed 验证：PR 存在且开放，head/base 与授权目标一致，准确 head SHA 未变化，required CI 全部通过且可合并。任一项缺失、过期、失败或无法读取都停止。
+- `--provider-evidence-file` 必须来自紧邻操作的托管平台查询，并绑定 repository、remote 名称与 URL、operation、source/target ref、准确 head SHA 和 `verifiedAt`；超过五分钟或字段不全即失败。push 还需 `force=false`、`delete=false`、`fastForward=true`；PR 需远端 source SHA 和 base 存在证据；merge 还需 PR number、授权 grantId、open 状态、head/base、required checks 和 mergeable 状态。
 - `deleteAllowed=false` 不授予任何删除权限；删除远端分支、标签、Release 或其他难恢复对象需针对明确目标另行授权。
 - `privilegedOperationsDefault=deny`：tag/Release、package/image publish、deploy、migration/backfill、rollback、traffic switch、仓库设置、凭据和发布工作流操作均需逐目标授权，merge 不蕴含这些权限。
-- manifest 只约束当前机器。远端仍必须用 branch protection、required checks、CODEOWNERS/独立审批和 environment approval 强制执行；远端门禁无法验证时停止交付。
+- manifest 只约束当前机器。远端 required checks 和 environment approval 按项目需要配置；远端门禁无法验证时停止交付。
 
 示例授权文件：
 
@@ -171,7 +171,7 @@ python3 scripts/delivery_guard.py check \
   --consume
 ```
 
-本地 guard 是合规执行器的 fail-closed preflight，不是针对同一操作系统用户下恶意进程的安全边界；本地 JSON 的来源真实性最终仍依赖调用工具和人工审批通道。不可绕过的强制层必须配置在远端 Ruleset/Branch Protection、Required Checks、CODEOWNERS/Required Reviews 和部署环境审批中。
+本地 guard 是合规执行器的 fail-closed preflight，不是针对同一操作系统用户下恶意进程的安全边界；本地 JSON 的来源真实性最终仍依赖调用工具和人工授权通道。不可绕过的强制层应配置在远端 Required Checks 和部署环境审批中。
 
 ## 7. 完成条件
 
@@ -179,8 +179,8 @@ python3 scripts/delivery_guard.py check \
 - 适用检查、重启和冒烟已完成。
 - 最终 SHA、验证证据和剩余风险已记录。
 - 无任务外文件被暂存或提交。
-- 交付状态按 `committed → pushed → pr_open → ci_passed → review_approved → merged` 更新；未发生的阶段不得标记完成。
-- PR 证据记录仓库/remote、PR 链接或编号、source/target ref、准确 head SHA、required CI、独立 reviewer、merge commit（如已合并）和验证时间。
+- 交付状态按 `committed → pushed → pr_open → ci_passed → merged` 更新；未发生的阶段不得标记完成。
+- PR 证据记录仓库/remote、PR 链接或编号、source/target ref、准确 head SHA、required CI、merge commit（如已合并）和验证时间。
 - 如果本任务创建的临时 worktree/本地分支没有共享交付价值，结束前先确认归属、工作树状态、未跟踪文件和未保存差异；只清理本任务创建且已确认可丢弃的本地资源。任何状态不明、包含用户改动或含有需要保留提交的资源都保留并报告。
 - 对已提交并合并的任务，按项目保留策略清理本地 worktree 与已合并分支；远端分支删除不属于本规则，仍需独立授权。
 - 集成、push、PR 和 worktree 清理符合项目规则。

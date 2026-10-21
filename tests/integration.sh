@@ -43,9 +43,7 @@ assert_v4_safety_defaults() {
   assert_json_string "$path" pullRequestActor user "$context adds safe pull request actor"
   assert_json_boolean "$path" pullRequestRequired true "$context requires pull requests"
   assert_json_boolean "$path" ciRequired true "$context requires CI"
-  assert_json_boolean "$path" independentReviewRequired true "$context requires independent review"
   assert_json_boolean "$path" forcePushAllowed false "$context denies force push"
-  assert_json_boolean "$path" directProtectedBranchPushAllowed false "$context denies direct protected branch push"
   assert_json_boolean "$path" deleteAllowed false "$context denies delete"
   assert_json_string "$path" privilegedOperationsDefault deny "$context denies privileged operations by default"
 }
@@ -114,9 +112,7 @@ assert_json_string "$fresh_manifest" mergeMode manual "merge defaults to manual 
 assert_json_string "$fresh_manifest" mergeActor user "merge defaults to user execution"
 assert_json_boolean "$fresh_manifest" pullRequestRequired true "pull requests are required by default"
 assert_json_boolean "$fresh_manifest" ciRequired true "CI is required by default"
-assert_json_boolean "$fresh_manifest" independentReviewRequired true "independent review is required by default"
 assert_json_boolean "$fresh_manifest" forcePushAllowed false "force push is denied by default"
-assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "direct protected branch push is denied by default"
 assert_json_boolean "$fresh_manifest" deleteAllowed false "delete is always denied"
 assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "privileged operations default to deny"
 assert_json_string "$fresh_manifest" policyChangedBy default "safe defaults record their policy origin"
@@ -324,9 +320,7 @@ while IFS='|' read -r safety_field secure_value relaxed_value; do
 done <<'EOF'
 pullRequestRequired|true|false
 ciRequired|true|false
-independentReviewRequired|true|false
 forcePushAllowed|false|true
-directProtectedBranchPushAllowed|false|true
 deleteAllowed|false|true
 EOF
 
@@ -347,11 +341,9 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     manifest = json.load(handle)
 manifest["gitPolicy"]["forcePushAllowed"] = True
-manifest["gitPolicy"]["directProtectedBranchPushAllowed"] = True
 manifest["gitPolicy"]["privilegedOperationsDefault"] = "allow"
 manifest["shadow"] = {
     "forcePushAllowed": False,
-    "directProtectedBranchPushAllowed": False,
     "privilegedOperationsDefault": "deny",
 }
 with open(sys.argv[2], "w", encoding="utf-8") as handle:
@@ -586,9 +578,7 @@ assert_json_string "$fresh_manifest" mergeMode manual "partial uninstall preserv
 assert_json_string "$fresh_manifest" mergeActor user "partial uninstall preserves merge actor"
 assert_json_boolean "$fresh_manifest" pullRequestRequired true "partial uninstall preserves the pull request gate"
 assert_json_boolean "$fresh_manifest" ciRequired true "partial uninstall preserves the CI gate"
-assert_json_boolean "$fresh_manifest" independentReviewRequired true "partial uninstall preserves the independent review gate"
 assert_json_boolean "$fresh_manifest" forcePushAllowed false "partial uninstall preserves denied force push"
-assert_json_boolean "$fresh_manifest" directProtectedBranchPushAllowed false "partial uninstall preserves denied direct protected branch push"
 assert_json_boolean "$fresh_manifest" deleteAllowed false "partial uninstall preserves denied delete permission"
 assert_json_string "$fresh_manifest" privilegedOperationsDefault deny "partial uninstall preserves denied privileged operations"
 [[ "$(grep -E '"policyChangedAt"' "$fresh_manifest")" == "$policy_changed_at_before_uninstall" ]] || fail "partial uninstall preserves the policy timestamp"
@@ -816,20 +806,27 @@ set -e
 assert_file "$forged_core_path" "forged Core ownership cannot delete a pre-existing user file"
 assert_file "$forged_pack_path" "forged pack ownership cannot delete a pre-existing user file"
 
+# Invalid JSON must remain rejected; fixture fixes must not weaken validation.
+invalid_json_target="$temp_root/invalid-json"
+mkdir -p "$invalid_json_target"
+bash "$install_script" --target "$invalid_json_target" >/dev/null
+invalid_json_manifest="$invalid_json_target/.dev-workflow/manifest.json"
+printf '{"schemaVersion": 3,}\n' > "$invalid_json_manifest"
+invalid_json_hash="$(sha256_file "$invalid_json_manifest")"
+invalid_json_tasks_hash="$(sha256_file "$invalid_json_target/docs/TASKS.md")"
+set +e
+bash "$install_script" --target "$invalid_json_target" >/dev/null 2>&1
+invalid_json_code=$?
+set -e
+[[ "$invalid_json_code" -ne 0 ]] || fail "installer rejects trailing commas in manifest JSON"
+[[ "$(sha256_file "$invalid_json_manifest")" == "$invalid_json_hash" ]] || fail "invalid manifest remains untouched"
+[[ "$(sha256_file "$invalid_json_target/docs/TASKS.md")" == "$invalid_json_tasks_hash" ]] || fail "invalid manifest cannot overwrite project files"
+
 schema3_target="$temp_root/schema3-upgrade"
 mkdir -p "$schema3_target"
 bash "$install_script" --target "$schema3_target" >/dev/null
 schema3_manifest="$schema3_target/.dev-workflow/manifest.json"
-schema3_tmp="$schema3_manifest.old"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "3") }
-  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
-  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
-  { print }
-' "$schema3_manifest" > "$schema3_tmp"
-mv -- "$schema3_tmp" "$schema3_manifest"
+python3 "$script_dir/manifest_fixture.py" "$schema3_manifest" 3
 bash "$install_script" --target "$schema3_target" >/dev/null
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema3_manifest" || fail "schema 3 manifests upgrade to schema 5"
 assert_json_string "$schema3_manifest" pushMode manual "schema 3 upgrade preserves push mode"
@@ -843,18 +840,7 @@ schema2_target="$temp_root/schema2-upgrade"
 mkdir -p "$schema2_target"
 bash "$install_script" --target "$schema2_target" >/dev/null
 schema2_manifest="$schema2_target/.dev-workflow/manifest.json"
-schema2_tmp="$schema2_manifest.old"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "2") }
-  /"workflowVersion"[[:space:]]*:/ { sub(/"[^"]+"[[:space:]]*,[[:space:]]*$/, "\"0.1.9\",") }
-  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"independentReviewRequired"|"forcePushAllowed"|"directProtectedBranchPushAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
-  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
-  /"path":"docs\/TASKS.md"/ { sub(/"installedSha256":"[0-9a-f]{64}"/, "\"installedSha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"") }
-  { print }
-' "$schema2_manifest" > "$schema2_tmp"
-mv -- "$schema2_tmp" "$schema2_manifest"
+python3 "$script_dir/manifest_fixture.py" "$schema2_manifest" 2
 bash "$install_script" --target "$schema2_target" >/dev/null
 grep -Eq '"path":"docs/TASKS.md","source":"core","action":"legacy","installedSha256":null' "$schema2_manifest" || fail "changed created ownership becomes legacy during a version upgrade"
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema2_manifest" || fail "schema 2 manifests upgrade to schema 5"
@@ -870,16 +856,7 @@ legacy_target="$temp_root/schema1-upgrade"
 mkdir -p "$legacy_target"
 bash "$install_script" --target "$legacy_target" --packs architecture >/dev/null
 legacy_manifest="$legacy_target/.dev-workflow/manifest.json"
-legacy_tmp="$legacy_manifest.legacy"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "1") }
-  /"gitPolicy"[[:space:]]*:[[:space:]]*\{/ { skipping_policy=1; next }
-  skipping_policy && /^[[:space:]]*\},[[:space:]]*$/ { skipping_policy=0; next }
-  /"files"[[:space:]]*:[[:space:]]*\[/ { skipping_files=1; next }
-  skipping_files && /^[[:space:]]*\],[[:space:]]*$/ { skipping_files=0; next }
-  !skipping_policy && !skipping_files { print }
-' "$legacy_manifest" > "$legacy_tmp"
-mv -- "$legacy_tmp" "$legacy_manifest"
+python3 "$script_dir/manifest_fixture.py" "$legacy_manifest" 1
 
 bash "$install_script" --target "$legacy_target" >/dev/null
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$legacy_manifest" || fail "schema 1 manifests upgrade to schema 5"

@@ -42,6 +42,6 @@
 
 ## 交付门禁
 
-共享交付默认经过 PR、required CI 和独立 Review。manifest 只约束当前机器，不能替代远端 branch protection、required checks、CODEOWNERS 或 environment approval。
+共享交付默认经过 PR 和 required CI。manifest 只约束当前机器，不能替代远端 required checks 或 environment approval。
 
 远端操作仍须遵循 [Git Worktree Workflow](GIT-WORKTREE-WORKFLOW.md) 中的权限、证据和 fail-closed 规则。

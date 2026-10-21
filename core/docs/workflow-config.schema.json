@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dev-workflow project configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "enabledCapabilities"],
+  "properties": {
+    "schemaVersion": {"const": 1, "type": "integer"},
+    "enabledCapabilities": {"type": "array", "uniqueItems": true, "items": {"enum": ["api:rest-openapi", "api:graphql", "api:grpc", "api:websocket", "api:sse", "containers:oci-docker", "containers:compose", "cicd:github-actions", "cicd:gitlab-ci", "cicd:jenkins", "cicd:generic", "deployment:compose", "deployment:kubernetes-helm", "deployment:vm-systemd", "deployment:serverless", "deployment:generic", "release"]}},
+    "commands": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["command"], "properties": {"command": {"type": "string", "minLength": 1}, "cwd": {"type": "string", "default": "."}}}},
+    "documents": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "extensions": {"type": "object", "additionalProperties": false, "properties": {"release": {"type": "object", "additionalProperties": false, "required": ["strategy"], "properties": {"strategy": {"enum": ["none", "commit-sha", "semver-tag"]}, "tagPrefix": {"type": "string", "default": "v"}, "components": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}}}}}
+  }
+}
