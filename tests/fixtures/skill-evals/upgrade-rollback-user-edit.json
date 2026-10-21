@@ -1,0 +1,33 @@
+{
+  "case": "upgrade-rollback-user-edit",
+  "skill": "workflow-upgrade",
+  "prompt": "撤回 upgrade-20261021-01 这次升级。",
+  "artifacts": {
+    "target": "/tmp/project",
+    "distribution": "/tmp/dev-workflow-new",
+    "transaction": {
+      "id": "upgrade-20261021-01",
+      "state": "applied",
+      "paths": {
+        "docs/DELIVERY.md": {
+          "before": "旧交付规则",
+          "after": "新交付规则"
+        },
+        "scripts/check.py": {
+          "before": "旧检查工具",
+          "after": "新检查工具"
+        }
+      }
+    },
+    "currentFiles": {
+      "docs/DELIVERY.md": "新交付规则，加上用户刚写的验收说明",
+      "scripts/check.py": "新检查工具"
+    }
+  },
+  "evaluationCriteria": [
+    "使用指定事务的按路径回退",
+    "保留升级后用户新增内容，报告该路径的回退冲突",
+    "不把部分回退宣称为全部恢复"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

@@ -497,6 +497,9 @@ function New-ManifestPlan(
         }
     }
 
+    if ($null -ne $Existing -and $null -ne $Existing.upgradeState) {
+        $manifest['upgradeState'] = $Existing.upgradeState
+    }
     if ($null -ne $Existing -and $null -ne $Existing.projectConfiguration) {
         $manifest['projectConfiguration'] = $Existing.projectConfiguration
     }
@@ -585,14 +588,52 @@ if (-not (Test-Path -LiteralPath $packsRoot -PathType Container)) {
 
 $metadataRoot = Join-Path $targetRoot '.dev-workflow'
 $manifestPath = Join-Path $metadataRoot 'manifest.json'
+$lifecycleOwnerPath = Join-Path $targetRoot '.dev-workflow/lifecycle.lock/owner.json'
+foreach ($lockRelativePath in @('.dev-workflow', '.dev-workflow/lifecycle.lock', '.dev-workflow/lifecycle.lock/owner.json')) {
+    $lockItem = Get-Item -LiteralPath (Join-Path $targetRoot $lockRelativePath) -Force -ErrorAction SilentlyContinue
+    if ($null -ne $lockItem -and ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Lifecycle metadata path must not be linked: $lockRelativePath" }
+}
+if (Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/configuration.lock')) { throw 'Configuration lock is busy; no changes made.' }
+
+if (Test-Path -LiteralPath $lifecycleOwnerPath) { throw 'dev-workflow lifecycle lock is busy; no changes made.' }
+function Assert-WorkflowLockCompatibility {
+    $helper = Join-Path $targetRoot 'scripts/workflow_lock.py'
+    $item = Get-Item -LiteralPath $helper -Force -ErrorAction SilentlyContinue
+    if ($null -ne $item) {
+        if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            ((Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath (Join-Path $coreRoot 'scripts/workflow_lock.py') -Algorithm SHA256).Hash)) {
+            throw 'Required workflow runtime helper conflicts with scripts/workflow_lock.py; no files replaced.'
+        }
+    }
+}
+Assert-WorkflowLockCompatibility
+$manifestFingerprint = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash } else { 'missing' }
+$upgradePython = $null
+$projectOwnedPaths = @()
+if ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades')) -or
+    ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and ((Get-Content -LiteralPath $manifestPath -Raw) -match '"upgradeState"\s*:'))) {
+    foreach ($candidate in @('python3', 'python')) {
+        $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $upgradePython = $command.Source; break }
+    }
+    if ($null -eq $upgradePython) { throw 'Python 3 is required to validate workflow upgrade state.' }
+    & $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') check --target $targetRoot --operation install
+    if ($LASTEXITCODE -ne 0) { throw 'Workflow upgrade state validation failed; no changes made.' }
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        $projectOwnedPaths = @(& $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') project-paths --target $targetRoot)
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot read workflow project ownership state.' }
+    }
+}
+
 if ((Test-Path -LiteralPath $metadataRoot) -and -not (Test-Path -LiteralPath $metadataRoot -PathType Container)) {
     throw "The .dev-workflow metadata path is not a directory: $metadataRoot"
 }
 if (Test-Path -LiteralPath $metadataRoot -PathType Container) {
     $metadataEntries = @(Get-ChildItem -LiteralPath $metadataRoot -Force)
     if ($metadataEntries.Count -gt 0 -and -not (Test-Path -LiteralPath $manifestPath)) {
-        $preservedRecordsOnly = $metadataEntries.Count -eq 1 -and $metadataEntries[0].Name -eq 'releases' -and
-            $metadataEntries[0].PSIsContainer -and (($metadataEntries[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)
+        $preservedRecordsOnly = @($metadataEntries | Where-Object { $_.Name -notin @('releases', 'upgrades', 'lifecycle.lock') -or -not $_.PSIsContainer -or (($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) }).Count -eq 0
+        $bootstrapLockDirectory = Join-Path $metadataRoot 'lifecycle.lock'
+        if ((Test-Path -LiteralPath $bootstrapLockDirectory -PathType Container) -and @(Get-ChildItem -LiteralPath $bootstrapLockDirectory -Force).Count -gt 0) { $preservedRecordsOnly = $false }
         if (-not $preservedRecordsOnly) {
             throw "The .dev-workflow directory contains unmanaged files but no manifest: $metadataRoot"
         }
@@ -826,6 +867,38 @@ $coreBlock = Get-CoreBlock $coreTemplate
 $actions = [Collections.Generic.List[string]]::new()
 $seenPaths = @{}
 
+$lifecycleLockHeld = $false
+try {
+    if (-not $DryRun) {
+        $lockDirectory = Split-Path -Parent $lifecycleOwnerPath
+        [IO.Directory]::CreateDirectory($lockDirectory) | Out-Null
+        try {
+            $ownerStream = [IO.File]::Open($lifecycleOwnerPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        } catch { throw 'dev-workflow lifecycle lock is busy; no changes made.' }
+        $lifecycleLockHeld = $true
+        try {
+            $ownerBytes = [Text.Encoding]::UTF8.GetBytes((@{ pid = $PID; operation = 'install'; transaction = $null } | ConvertTo-Json -Compress))
+            $ownerStream.Write($ownerBytes, 0, $ownerBytes.Length)
+        } finally { $ownerStream.Dispose() }
+        Assert-WorkflowLockCompatibility
+        $currentFingerprint = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash } else { 'missing' }
+        if ($currentFingerprint -ne $manifestFingerprint) { throw 'manifest changed during lifecycle preflight; retry the operation.' }
+        if ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades')) -or
+            ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and ((Get-Content -LiteralPath $manifestPath -Raw) -match '"upgradeState"\s*:'))) {
+            if ($null -eq $upgradePython) {
+                foreach ($candidate in @('python3', 'python')) {
+                    $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($null -ne $command) { $upgradePython = $command.Source; break }
+                }
+                if ($null -eq $upgradePython) { throw 'Python 3 is required to validate workflow upgrade state.' }
+            }
+            & $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') check --target $targetRoot --operation install
+            if ($LASTEXITCODE -ne 0) { throw 'Workflow upgrade state changed during lifecycle preflight.' }
+        }
+        if (Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/configuration.lock')) { throw 'Configuration lock is busy; no changes made.' }
+
+    }
+
 foreach ($overlay in $overlays) {
     $overlayPrefix = $overlay.Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
     $files = Get-ChildItem -LiteralPath $overlay.Root -Recurse -File | Sort-Object FullName
@@ -839,6 +912,12 @@ foreach ($overlay in $overlays) {
 
         if ($inventoryByPath.ContainsKey($relativePath) -and $inventoryByPath[$relativePath].source -ne $overlay.Name) {
             throw "Manifest ownership collision for '$relativePath': $($inventoryByPath[$relativePath].source) and $($overlay.Name)"
+        }
+
+        if ($projectOwnedPaths -contains $relativePath) {
+            Set-InventoryEntry -Map $inventoryByPath -RelativePath $relativePath -Source $overlay.Name -Action 'preserved' -InstalledSha256 $null
+            $actions.Add("[skip] $relativePath (project-owned)")
+            continue
         }
 
         $targetPathResolved = Join-Path $targetRoot $relativePath
@@ -972,3 +1051,13 @@ if ($DryRun) {
     "dev-workflow installation complete (packs: $packSummary)"
 }
 $actions | ForEach-Object { $_ }
+
+} finally {
+    if ($lifecycleLockHeld) {
+        Remove-Item -LiteralPath $lifecycleOwnerPath -Force
+        $lockDirectory = Split-Path -Parent $lifecycleOwnerPath
+        try { [IO.Directory]::Delete($lockDirectory) } catch [IO.IOException] { }
+        $metadataDirectory = Split-Path -Parent $lockDirectory
+        try { [IO.Directory]::Delete($metadataDirectory) } catch [IO.IOException] { }
+    }
+}

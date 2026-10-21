@@ -214,6 +214,28 @@ if (Test-Path -LiteralPath $agentsPath -PathType Leaf) {
 }
 
 $manifestPath = Join-Path $targetRoot '.dev-workflow/manifest.json'
+$lifecycleOwnerPath = Join-Path $targetRoot '.dev-workflow/lifecycle.lock/owner.json'
+foreach ($lockRelativePath in @('.dev-workflow', '.dev-workflow/lifecycle.lock', '.dev-workflow/lifecycle.lock/owner.json')) {
+    $lockItem = Get-Item -LiteralPath (Join-Path $targetRoot $lockRelativePath) -Force -ErrorAction SilentlyContinue
+    if ($null -ne $lockItem -and ($lockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Lifecycle metadata path must not be linked: $lockRelativePath" }
+}
+
+if (Test-Path -LiteralPath $lifecycleOwnerPath) { throw 'dev-workflow lifecycle lock is busy; no changes made.' }
+$upgradePython = $null
+if ((Test-Path -LiteralPath (Join-Path $targetRoot '.dev-workflow/upgrades')) -or
+    ((Test-Path -LiteralPath $manifestPath -PathType Leaf) -and ((Get-Content -LiteralPath $manifestPath -Raw) -match '"upgradeState"\s*:'))) {
+    foreach ($candidate in @('python3', 'python')) {
+        $command = Get-Command -Name $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $upgradePython = $command.Source; break }
+    }
+    if ($null -eq $upgradePython) { throw 'Python 3 is required to validate workflow upgrade state.' }
+    $upgradeCheckArguments = @('check', '--target', $targetRoot, '--operation', 'audit')
+    if ($Strict) { $upgradeCheckArguments += '--strict' }
+    & $upgradePython (Join-Path $PSScriptRoot 'upgrade.py') @upgradeCheckArguments
+    if ($LASTEXITCODE -ne 0) { throw 'Workflow upgrade state validation failed; no changes made.' }
+
+}
+
 $manifest = $null
 $manifestStatus = 'missing'
 $schemaVersion = ''

@@ -171,6 +171,9 @@ build_remaining_git_exclude_patterns() {
   local hash
   local pattern
   git_exclude_patterns=()
+  if [[ "$full_uninstall" -eq 1 && ( -d "$target_root/.dev-workflow/upgrades" || -d "$target_root/.dev-workflow/releases" ) ]]; then
+    git_exclude_patterns+=("$(git_exclude_pattern_for '.dev-workflow/')")
+  fi
   if [[ "$full_uninstall" -eq 0 ]]; then
     pattern="$(git_exclude_pattern_for '.dev-workflow/')"
     git_exclude_patterns+=("$pattern")
@@ -427,6 +430,7 @@ build_manifest() {
   cat <<EOF
 {
   "schemaVersion": 5,
+$upgrade_manifest_field
 $project_configuration_field
   "managedBy": "dev-workflow",
   "workflowVersion": "$(json_escape "$version")",
@@ -539,6 +543,32 @@ case "$target_root" in
 esac
 
 manifest_path="$target_root/.dev-workflow/manifest.json"
+for lifecycle_path in "$target_root/.dev-workflow" "$target_root/.dev-workflow/lifecycle.lock" "$target_root/.dev-workflow/lifecycle.lock/owner.json"; do
+  if [[ -L "$lifecycle_path" ]]; then echo "Lifecycle metadata path must not be a symlink: $lifecycle_path" >&2; exit 1; fi
+done
+if [[ -e "$target_root/.dev-workflow/configuration.lock" || -L "$target_root/.dev-workflow/configuration.lock" ]]; then
+  echo "Configuration lock is busy; no changes made." >&2; exit 1
+fi
+upgrade_manifest_field=""
+manifest_fingerprint="missing"
+[[ ! -f "$manifest_path" ]] || manifest_fingerprint="$(sha256_file "$manifest_path")"
+if [[ -e "$target_root/.dev-workflow/lifecycle.lock/owner.json" ]]; then
+  echo "dev-workflow lifecycle lock is busy; no changes made." >&2; exit 1
+fi
+if [[ -d "$target_root/.dev-workflow/upgrades" ]] || { [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; }; then
+  upgrade_python=""
+  if command -v python3 >/dev/null 2>&1; then upgrade_python=python3
+  elif command -v python >/dev/null 2>&1; then upgrade_python=python
+  else echo "Python 3 is required to validate workflow upgrade state." >&2; exit 1
+  fi
+  "$upgrade_python" "$script_dir/upgrade.py" check --target "$target_root" --operation uninstall || exit 1
+  if [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; then
+    upgrade_state_json="$("$upgrade_python" "$script_dir/upgrade.py" state --target "$target_root")" || exit 1
+    upgrade_manifest_field="  \"upgradeState\": $upgrade_state_json,"
+
+  fi
+fi
+
 [[ -f "$manifest_path" ]] || { echo "缺少 dev-workflow manifest：$manifest_path" >&2; exit 1; }
 grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" || {
   echo "manifest 不是由 dev-workflow 管理：$manifest_path" >&2
@@ -808,6 +838,39 @@ if [[ "$dry_run" -eq 1 ]]; then
     echo "[git-exclude] 跳过（目标目录不在 Git 仓库中）"
   fi
   exit 0
+fi
+
+
+# The owner file is the shared atomic lock; an empty directory carries no authority.
+if [[ "$dry_run" -eq 0 ]]; then
+  lifecycle_lock="$target_root/.dev-workflow/lifecycle.lock"
+  mkdir -p "$lifecycle_lock"
+  if ! (set -o noclobber; printf '{"pid":%s,"operation":"uninstall","transaction":null}\n' "$$" > "$lifecycle_lock/owner.json") 2>/dev/null; then
+    echo "dev-workflow lifecycle lock is busy; no changes made." >&2; exit 1
+  fi
+  cleanup_lifecycle_lock() {
+    rm -f -- "$lifecycle_lock/owner.json"
+    rmdir -- "$lifecycle_lock" 2>/dev/null || true
+    rmdir -- "$target_root/.dev-workflow" 2>/dev/null || true
+  }
+  trap cleanup_lifecycle_lock EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  current_manifest_fingerprint="missing"
+  [[ ! -f "$manifest_path" ]] || current_manifest_fingerprint="$(sha256_file "$manifest_path")"
+  if [[ "$current_manifest_fingerprint" != "$manifest_fingerprint" ]]; then
+    echo "manifest changed during lifecycle preflight; retry the operation." >&2; exit 1
+  fi
+  if [[ -d "$target_root/.dev-workflow/upgrades" ]] || { [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; }; then
+    if command -v python3 >/dev/null 2>&1; then upgrade_python=python3
+    elif command -v python >/dev/null 2>&1; then upgrade_python=python
+    else echo "Python 3 is required to validate workflow upgrade state." >&2; exit 1
+    fi
+    "$upgrade_python" "$script_dir/upgrade.py" check --target "$target_root" --operation uninstall || exit 1
+  fi
+  if [[ -e "$target_root/.dev-workflow/configuration.lock" || -L "$target_root/.dev-workflow/configuration.lock" ]]; then
+    echo "Configuration lock is busy; no changes made." >&2; exit 1
+  fi
 fi
 
 removed_paths=()

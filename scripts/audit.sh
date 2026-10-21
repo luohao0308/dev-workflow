@@ -507,6 +507,24 @@ if [[ -f "$agents_path" ]]; then
 fi
 
 manifest_path="$target_root/.dev-workflow/manifest.json"
+for lifecycle_path in "$target_root/.dev-workflow" "$target_root/.dev-workflow/lifecycle.lock" "$target_root/.dev-workflow/lifecycle.lock/owner.json"; do
+  if [[ -L "$lifecycle_path" ]]; then echo "Lifecycle metadata path must not be a symlink: $lifecycle_path" >&2; exit 1; fi
+done
+if [[ -e "$target_root/.dev-workflow/lifecycle.lock/owner.json" ]]; then
+  echo "dev-workflow lifecycle lock is busy; no changes made." >&2; exit 1
+fi
+if [[ -d "$target_root/.dev-workflow/upgrades" ]] || { [[ -f "$manifest_path" ]] && grep -q '"upgradeState"[[:space:]]*:' "$manifest_path"; }; then
+  upgrade_python=""
+  if command -v python3 >/dev/null 2>&1; then upgrade_python=python3
+  elif command -v python >/dev/null 2>&1; then upgrade_python=python
+  else echo "Python 3 is required to validate workflow upgrade state." >&2; exit 1
+  fi
+  upgrade_check_args=(check --target "$target_root" --operation audit)
+  [[ "$strict" -eq 0 ]] || upgrade_check_args+=(--strict)
+  "$upgrade_python" "$script_dir/upgrade.py" "${upgrade_check_args[@]}" || exit 1
+
+fi
+
 manifest_status="missing"
 manifest_version=""
 installed_packs=()

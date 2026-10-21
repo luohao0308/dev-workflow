@@ -743,6 +743,52 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash -eq $lifecycleConfigHash) 'full uninstall preserves project configuration bytes'
     Assert-True ((Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash -eq $lifecycleRecordHash) 'full uninstall preserves release record bytes'
 
+    # S4 lifecycle locks are shared with upgrades and never stolen by installers.
+    $lockedTarget = Join-Path $tempRoot 'upgrade-locked'
+    $lockedOwner = Join-Path $lockedTarget '.dev-workflow/lifecycle.lock/owner.json'
+    Write-Utf8NoBom -Path $lockedOwner -Content '{"pid":987654,"operation":"upgrade","transaction":null}'
+    $lockedFingerprint = Get-TreeFingerprint $lockedTarget
+    foreach ($entrypoint in @($installScript, $uninstallScript, $auditScript)) {
+        $rejected = $false
+        try { & $entrypoint -TargetPath $lockedTarget | Out-Null } catch { $rejected = $true }
+        Assert-True $rejected 'existing lifecycle owner blocks every entrypoint'
+        Assert-True ((Get-TreeFingerprint $lockedTarget) -eq $lockedFingerprint) 'lock rejection does not change project files'
+    }
+
+    $upgradeTarget = Join-Path $tempRoot 'upgrade-state'
+    New-Item -ItemType Directory -Path $upgradeTarget | Out-Null
+    & git -C $upgradeTarget init -q | Out-Null
+    & $installScript -TargetPath $upgradeTarget -Packs @('delivery') | Out-Null
+    $upgradeManifestPath = Join-Path $upgradeTarget '.dev-workflow/manifest.json'
+    $upgradeManifest = Get-Content -LiteralPath $upgradeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $coreText = Get-Content -LiteralPath (Join-Path $repoRoot 'core/AGENTS.md') -Raw -Encoding UTF8
+    $coreMatch = [regex]::Match($coreText, '(?s)<!-- AI-WORKFLOW:CORE:START -->.*?<!-- AI-WORKFLOW:CORE:END -->')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $blockHash = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($coreMatch.Value)))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $upgradeState = [ordered]@{
+        schemaVersion = 1
+        coreBlock = [ordered]@{ version = $workflowVersion; baselineSha256 = $blockHash; installedSha256 = $blockHash }
+        projectOwned = @('docs/PROJECT-SUMMARY.md')
+        lastTransaction = $null
+    }
+    $upgradeManifest | Add-Member -NotePropertyName upgradeState -NotePropertyValue $upgradeState
+    $transferredEntry = @($upgradeManifest.files | Where-Object path -eq 'docs/PROJECT-SUMMARY.md')[0]
+    $transferredEntry.action = 'preserved'
+    $transferredEntry.installedSha256 = $null
+    Write-Utf8NoBom -Path $upgradeManifestPath -Content ($upgradeManifest | ConvertTo-Json -Depth 12)
+    Remove-Item -LiteralPath (Join-Path $upgradeTarget 'docs/PROJECT-SUMMARY.md')
+    New-Item -ItemType Directory -Path (Join-Path $upgradeTarget '.dev-workflow/upgrades') | Out-Null
+    & $installScript -TargetPath $upgradeTarget | Out-Null
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $upgradeTarget 'docs/PROJECT-SUMMARY.md'))) 'same-version installation does not resurrect transferred documents'
+    & $uninstallScript -TargetPath $upgradeTarget -Packs @('delivery') | Out-Null
+    $afterPartialUpgrade = Get-Content -LiteralPath $upgradeManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (($afterPartialUpgrade.upgradeState | ConvertTo-Json -Depth 8 -Compress) -eq ($upgradeState | ConvertTo-Json -Depth 8 -Compress)) 'partial uninstall preserves complete upgrade state'
+    & $uninstallScript -TargetPath $upgradeTarget | Out-Null
+    Assert-True (Test-Path -LiteralPath (Join-Path $upgradeTarget '.dev-workflow/upgrades') -PathType Container) 'full uninstall preserves upgrade history'
+    Assert-True ((Get-Content -LiteralPath (Join-Path $upgradeTarget '.git/info/exclude') -Raw) -match '/\.dev-workflow/') 'full uninstall retains metadata ignore protection for upgrade history'
+    & $installScript -TargetPath $upgradeTarget | Out-Null
+    Assert-True (Test-Path -LiteralPath (Join-Path $upgradeTarget '.dev-workflow/upgrades') -PathType Container) 'bootstrap accepts inert upgrade history'
+
     Write-Output 'PowerShell integration tests passed.'
 } finally {
     $resolvedTempRoot = [IO.Path]::GetFullPath($tempRoot)
