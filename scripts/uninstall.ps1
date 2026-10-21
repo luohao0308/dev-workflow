@@ -160,7 +160,8 @@ function Update-GitExclude([object]$Context, [string[]]$Patterns) {
     try {
         Write-Utf8NoBom -Path $temporaryPath -Content (($lines -join "`r`n") + "`r`n")
         if (Test-Path -LiteralPath $excludePath -PathType Leaf) {
-            [IO.File]::Replace($temporaryPath, $excludePath, $null)
+            # Preserve a true null backup path across PowerShell string binding.
+            [IO.File]::Replace($temporaryPath, $excludePath, [System.Management.Automation.Language.NullString]::Value)
         } else {
             [IO.File]::Move($temporaryPath, $excludePath)
         }
