@@ -421,9 +421,9 @@ read_manifest_capabilities() {
     return 1
   fi
   segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
-  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+(:[a-z0-9-]+)?"//g; s/[[:space:],]//g')"
   [[ -z "$residual" ]] || return 1
-  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+(:[a-z0-9-]+)?)"[[:space:]]*$/\1/p'
 }
 
 read_manifest_file_objects() {
@@ -555,6 +555,7 @@ build_manifest() {
   ],
   "enabledCapabilities": [$capabilities_json
   ],
+$configuration_manifest_field
   "gitPolicy": {
     "pushMode": "$push_mode",
     "pushActor": "$push_actor",
@@ -738,8 +739,18 @@ if [[ -e "$metadata_root" && ! -d "$metadata_root" ]]; then
 fi
 if [[ -d "$metadata_root" && ! -f "$manifest_path" ]]; then
   if directory_has_entries "$metadata_root"; then
-    echo ".dev-workflow 目录包含未受管理文件，但缺少 manifest：$metadata_root" >&2
-    exit 1
+    # Full removal preserves inert project-owned release records. They never
+    # serve as installation metadata or as evidence of execution authority.
+    preserved_records_only=1
+    while IFS= read -r metadata_entry; do
+      if [[ "$metadata_entry" != "$metadata_root/releases" || ! -d "$metadata_entry" || -L "$metadata_entry" ]]; then
+        preserved_records_only=0
+      fi
+    done < <(find "$metadata_root" -mindepth 1 -maxdepth 1 -print)
+    if [[ "$preserved_records_only" -ne 1 ]]; then
+      echo ".dev-workflow 目录包含未受管理文件，但缺少 manifest：$metadata_root" >&2
+      exit 1
+    fi
   fi
 fi
 
@@ -760,7 +771,7 @@ existing_policy_changed_by=""
 existing_packs=()
 enabled_capabilities=()
 old_capabilities_summary=""
-valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic '
+valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic release '
 file_paths=()
 file_sources=()
 file_actions=()
@@ -795,7 +806,12 @@ if [[ -f "$manifest_path" ]]; then
     push_actor="$(git_policy_string_field pushActor "$manifest_path")"
     merge_mode="$(git_policy_string_field mergeMode "$manifest_path")"
     merge_actor="$(git_policy_string_field mergeActor "$manifest_path")"
-    delete_allowed="$(git_policy_boolean_field deleteAllowed "$manifest_path")"
+    if [[ "$existing_schema_version" == "1" || "$existing_schema_version" == "2" || "$existing_schema_version" == "3" ]] && ! grep -Eq '"deleteAllowed"[[:space:]]*:' "$manifest_path"; then
+      # This field did not exist in legacy policies; migrate to the deny default.
+      delete_allowed=false
+    else
+      delete_allowed="$(git_policy_boolean_field deleteAllowed "$manifest_path")" || { echo "manifest gitPolicy.deleteAllowed 无效。" >&2; exit 1; }
+    fi
     validate_git_policy push "$push_mode" "$push_actor" || exit 1
     validate_git_policy merge "$merge_mode" "$merge_actor" || exit 1
     [[ "$delete_allowed" == "false" ]] || {
@@ -863,6 +879,25 @@ for capability in ${disable_capabilities_csv//,/ }; do
   done
   enabled_capabilities=("${remaining_capabilities[@]+"${remaining_capabilities[@]}"}")
 done
+
+# Optional project configuration uses the same contract as the standalone CLI.
+# No new interpreter requirement is imposed on legacy installations.
+configuration_state_json="null"
+configuration_manifest_field=""
+configuration_active=0
+if [[ -e "$target_root/workflow.config.json" || -L "$target_root/workflow.config.json" ]] || { [[ -f "$manifest_path" ]] && grep -q '"projectConfiguration"[[:space:]]*:' "$manifest_path"; }; then
+  command -v python3 >/dev/null 2>&1 || { echo "项目配置需要 Python 3。" >&2; exit 1; }
+  configuration_active=1
+  configuration_capabilities="$(python3 -B "$core_root/scripts/workflow_config.py" installer-capabilities --repo "$target_root" --enable "$enable_capabilities_csv" --disable "$disable_capabilities_csv")" || exit 1
+  enabled_capabilities=()
+  while IFS= read -r capability; do [[ -n "$capability" ]] && enabled_capabilities+=("$capability"); done <<< "$configuration_capabilities"
+  if [[ "$existing_manifest" -eq 1 ]]; then
+    configuration_state_json="$(python3 -B "$core_root/scripts/workflow_config.py" state --repo "$target_root")" || exit 1
+    if [[ "$configuration_state_json" != "null" ]]; then
+      configuration_manifest_field="  \"projectConfiguration\": $configuration_state_json,"
+    fi
+  fi
+fi
 
 push_mode="${push_mode:-manual}"
 push_actor="${push_actor:-user}"
@@ -1229,6 +1264,10 @@ if [[ "$git_exclude_available" -eq 1 ]]; then
 else
   actions+=("[git-exclude] 跳过（目标目录不在 Git 仓库中）")
   echo "警告：目标目录不在 Git 仓库中，未配置本地 info/exclude；安装仍继续。" >&2
+fi
+
+if [[ "$configuration_active" -eq 1 && "$dry_run" -eq 0 ]]; then
+  python3 -B "$core_root/scripts/workflow_config.py" installer-sync --repo "$target_root" --enable "$enable_capabilities_csv" --disable "$disable_capabilities_csv" >/dev/null || exit 1
 fi
 
 if [[ "${#selected_packs[@]}" -eq 0 ]]; then

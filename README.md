@@ -95,12 +95,60 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 | `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
+| `release` | 可选版本策略、只读发布准备工具与本机计划记录 | 需要按 SHA 或 SemVer 规划发布的项目；当前不执行 tag、远端 Release 或部署 |
 
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
 
 纯本机记忆、临时上下文、部署流水和只读检查不创建分支或 worktree。团队共享文档按是否需要独立提交/评审决定分支；worktree 仅用于并行任务或目录/运行时隔离。没有共享交付价值的本任务临时分支可在确认无用户改动、未保存文件或需保留提交后清理。
+
+## 项目体检、配置与可选 Skill
+
+Core 增加两个 Python 3.10+ 标准库入口，不依赖 Skill 或常驻进程：
+
+```bash
+# 安装 Core 后，在目标项目中只读检查；不执行项目命令或访问远端/生产。
+python3 scripts/workflow_check.py --repo . --json
+# 显式创建/采用可提交的项目配置；先预览，不改变 Git 执行权限。
+python3 scripts/workflow_config.py adopt --repo . --create --dry-run
+python3 scripts/workflow_config.py adopt --repo . --create
+```
+
+`workflow.config.json` 保存项目能力、命令工作目录、文档映射和可选扩展。采用后它是能力权威，manifest 保存本机兼容快照；未采用的旧项目继续使用 manifest。配置无效或采用后文件失踪时拒绝回退；修改后使用 `sync`，撤回使用 `withdraw`，均支持 dry-run。详情见 [项目配置](core/docs/WORKFLOW-CONFIGURATION.md)。体检可发现已安装未启用、已知规则冲突和本机 Git 基线差异；开放文本的语义冲突仍需 AI 根据证据判断。
+
+三个 Skill 独立分发，`--all-packs` 不会安装它们。在 **dev-workflow 分发目录**显式执行：
+
+```bash
+python3 scripts/manage_skills.py install --target /path/to/project \
+  --skills workflow-doctor workflow-closeout workflow-release --dry-run
+python3 scripts/manage_skills.py install --target /path/to/project \
+  --skills workflow-doctor workflow-closeout workflow-release
+# 删除时仅移除可证明归属且未修改的 Skill；项目定制保留。
+python3 scripts/manage_skills.py uninstall --target /path/to/project \
+  --skills workflow-doctor workflow-closeout workflow-release --dry-run
+```
+
+默认项目级安装到 `.agents/skills/`；只有显式 `--scope user` 才写用户级 `~/.agents/skills/`，也可用 `--skills-dir` 指定隔离目标。同名文件夹不覆盖。路径按 [OpenAI 官方本地 Skill 发现规则](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills) 选择；其他客户端可使用自己的入口或直接运行脚本。安装 Skill 不授予任何远端权限。
+
+| Skill | 结果 |
+|---|---|
+| `workflow-doctor` | 只读检查，解释冲突、能力缺口与未核实项 |
+| `workflow-closeout` | 当前任务收尾，保留人工验收、外部阻塞和未完成阶段，定向维护已有知识 |
+| `workflow-release` | 发布计划与变更说明草稿；仅准备，不创建本地/远端 tag、Release 或部署 |
+
+安装 `release` 包后，显式在项目配置启用 `release` 并声明 `extensions.release`。策略支持 `none`、`commit-sha`、`semver-tag`；普通 push 不要求 tag：
+
+```bash
+python3 scripts/release_prepare.py --repo . --json
+# 仅 semver-tag 策略需要指定版本。
+python3 scripts/release_prepare.py --repo . --version 1.0.0 --json
+# 显式保存新计划，不覆盖；后续可只读检查计划是否已失效。
+python3 scripts/release_prepare.py --repo . --version 1.0.0 --output .dev-workflow/releases/v1.0.0.json
+python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/v1.0.0.json
+```
+
+配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。当前版本不含自动规则升级、真实 tag/Release 执行或生产部署。
 
 ## 安装
 
@@ -218,7 +266,7 @@ bash tests/integration.sh
 
 ## 卸载
 
-卸载器必须从 `dev-workflow` 分发仓库运行。schema 2/3/4 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
+卸载器必须从 `dev-workflow` 分发仓库运行。schema 2/3/4/5 安装要求分发仓库 `VERSION` 与目标项目 manifest 的 `workflowVersion` 一致，应先检出对应版本 tag；schema 1 旧安装可由当前卸载器保守处理。然后执行 dry-run 查看删除、编辑和保留清单：
 
 ### Windows PowerShell
 
@@ -281,7 +329,7 @@ bash ./scripts/uninstall.sh \
 - 修改持久权限策略本身始终需要人工确认，不能由现有权限推导，并记录 `policyChangedAt` / `policyChangedBy`。一次性授权必须绑定 `repo + remote + remote URL + operation + source ref + target ref + exact SHA + expiry + maxUses`，不改变 manifest，也不授权其他目标或后续操作。
 - Core 安装的远端操作 guard 必须在 AI 执行 push、PR 创建/更新和远端 PR merge 前运行：`python3 scripts/delivery_guard.py check`。`actor=user` 时 guard 拒绝 AI 执行；`actor=ai` 即使处于 `auto + ai` 也需要有效的一次性授权，`auto` 只免除该授权范围内的再次交互。最终 preflight 使用 `--consume` 记录授权次数；每类操作都需要绑定当前仓库/remote/ref/SHA 的新鲜 provider 证据，merge 还需 PR/CI 证据。
 - `deleteAllowed` 固定为 `false`，安装初始化不展示或授予删除权限；具体删除必须针对明确目标另行授权。
-- manifest schema 4 会记录三类 Git 交付执行权限、固定质量门和高权限操作默认拒绝策略，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
+- manifest schema 5 会记录三类 Git 交付执行权限、固定质量门和高权限操作默认拒绝策略，以及安装器实际创建、追加、保留或从旧版迁移的文件；卸载器据此判断文件所有权。
 - 安装器只维护 Git 解析出的 `info/exclude` 中带 `# BEGIN dev-workflow managed excludes` / `# END dev-workflow managed excludes` 标记的本地区块；更新前会验证标记完整且顺序正确，重复安装幂等，部分卸载按剩余文件重建，完整卸载只移除该区块并保留用户自己的 exclude 内容。
 - `.dev-workflow/` 和 Core `docs/project-memory/` 下全部本机记忆会始终加入 managed exclude；安装 Delivery 流程包后，`docs/working-context/` 与 `docs/工作日志/` 也按整个目录排除。团队 Runbook 模板进入 `docs/operations/runbooks/` 并保持 Git 可见；其他本机流程模板按 manifest 中实际创建的文件逐项排除。
 - 安装、审计和卸载都会验证 manifest 中的每个路径确实属于其声明的 Core 或流程包；未知路径会停止处理，不会据此删除项目文件。
@@ -352,7 +400,7 @@ tag/Release、package/image publish、deploy、migration/backfill、rollback、t
 
 升级时先比较 GitHub 新旧 tag 或 release 的变更，再从新版分发仓库运行安装器的 dry-run。安装器只创建缺失文件，不覆盖目标项目已经存在的 Core 文件、流程包文档或受管控 `AGENTS.md` 区块；因此新版新增的 Core 规则必须由人工或 AI 对比后合并到项目现有权威文件，不能把“manifest 已升级”理解为规则正文已经同步。确认合并后运行正式安装以创建缺失文件并更新 manifest，最后运行 audit。
 
-从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1/2/3 manifest 会升级到 schema 4；schema 1 中无法证明由旧安装器创建的普通文件，以及升级时模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
+从旧版新增 `feature-catalog` 时，把它加入 `-Packs` / `--packs` 即可安装通用资产；随后在目标项目运行 `--init`、填写项目事实、`--generate` 和 `--check`。schema 1/2/3/4 manifest 会升级到 schema 5；schema 1 中无法证明由旧安装器创建的普通文件，以及升级时模板内容已变化的旧 `created` 文件，会记录为 `legacy`。若旧 manifest 不是由 `dev-workflow` 管理，安装器会停止并要求先处理冲突。
 
 ## 不包含的内容
 

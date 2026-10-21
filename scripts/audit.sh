@@ -347,9 +347,9 @@ read_manifest_capabilities() {
   compact="$(tr -d '\r\n' < "$path")"
   if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then return 1; fi
   segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
-  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+(:[a-z0-9-]+)?"//g; s/[[:space:],]//g')"
   [[ -z "$residual" ]] || return 1
-  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+(:[a-z0-9-]+)?)"[[:space:]]*$/\1/p'
 }
 
 read_manifest_file_objects() {
@@ -601,7 +601,7 @@ else
     if [[ "$capability_result" -ne 0 ]]; then
       add_error "manifest enabledCapabilities 格式无效。"
     else
-      valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic '
+      valid_capabilities=' api:rest-openapi api:graphql api:grpc api:websocket api:sse containers:oci-docker containers:compose cicd:github-actions cicd:gitlab-ci cicd:jenkins cicd:generic deployment:compose deployment:kubernetes-helm deployment:vm-systemd deployment:serverless deployment:generic release '
       seen_capabilities=()
       while IFS= read -r capability; do
         [[ -n "$capability" ]] || continue
@@ -641,6 +641,9 @@ else
           inventory_sources+=("$source")
           inventory_actions+=("$action")
           inventory_hashes+=("$hash")
+          if [[ "$source" == "core" && ! -f "$target_root/$entry_path" ]]; then
+            add_error "manifest 登记的 Core 文件缺失：$entry_path"
+          fi
           if [[ "$source" != "core" ]] && ! contains_item "$source" "${installed_packs[@]+"${installed_packs[@]}"}"; then
             add_error "manifest 文件 $entry_path 归属于未安装流程包：$source"
           else
@@ -790,6 +793,19 @@ for relative_path in "${initialization_files[@]+"${initialization_files[@]}"}"; 
     add_warning "仍包含接入占位内容：$relative_path"
   fi
 done
+
+if [[ -e "$target_root/workflow.config.json" || -L "$target_root/workflow.config.json" ]] || { [[ -f "$manifest_path" ]] && grep -q '"projectConfiguration"[[:space:]]*:' "$manifest_path"; }; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    add_error "项目配置检查需要 Python 3。"
+  else
+    configuration_report="$(python3 -B "$source_root/core/scripts/workflow_config.py" check --repo "$target_root")" || true
+    configuration_issues="$(printf '%s' "$configuration_report" | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(level+"|"+item["code"]+": "+item["message"]) for level in ("errors","warnings") for item in d[level]]')" || { configuration_issues='errors|项目配置检查失败。'; }
+    while IFS='|' read -r level message; do
+      [[ -n "$level" ]] || continue
+      if [[ "$level" == "errors" ]]; then add_error "$message"; else add_warning "$message"; fi
+    done <<< "$configuration_issues"
+  fi
+fi
 
 echo "dev-workflow audit"
 echo "target: $target_root"

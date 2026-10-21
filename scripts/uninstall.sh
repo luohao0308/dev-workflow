@@ -302,9 +302,9 @@ read_manifest_capabilities() {
   compact="$(tr -d '\r\n' < "$path")"
   if ! printf '%s' "$compact" | grep -Eq '"enabledCapabilities"[[:space:]]*:[[:space:]]*\[[^]]*\]'; then return 1; fi
   segment="$(printf '%s' "$compact" | sed -n -E 's/.*"enabledCapabilities"[[:space:]]*:[[:space:]]*\[([^]]*)\].*/\1/p')"
-  residual="$(printf '%s' "$segment" | sed -E 's/"[a-z0-9-]+:[a-z0-9-]+"//g; s/[[:space:],]//g')"
+  residual="$(printf '%s' "$segment" | sed -E 's/"([a-z0-9-]+:[a-z0-9-]+|release)"//g; s/[[:space:],]//g')"
   [[ -z "$residual" ]] || return 1
-  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+)"[[:space:]]*$/\1/p'
+  printf '%s' "$segment" | tr ',' '\n' | sed -n -E 's/^[[:space:]]*"([a-z0-9-]+:[a-z0-9-]+|release)"[[:space:]]*$/\1/p'
 }
 
 read_manifest_file_objects() {
@@ -427,6 +427,7 @@ build_manifest() {
   cat <<EOF
 {
   "schemaVersion": 5,
+$project_configuration_field
   "managedBy": "dev-workflow",
   "workflowVersion": "$(json_escape "$version")",
   "installedPacks": [$packs_json
@@ -543,6 +544,19 @@ grep -Eq '"managedBy"[[:space:]]*:[[:space:]]*"dev-workflow"' "$manifest_path" |
   echo "manifest 不是由 dev-workflow 管理：$manifest_path" >&2
   exit 1
 }
+# Preserve adopted/withdrawn local state when rebuilding a partial manifest.
+# Legacy targets without this optional field retain the dependency-free path.
+project_configuration_field=""
+if grep -q '"projectConfiguration"[[:space:]]*:' "$manifest_path"; then
+  configuration_python=""
+  if command -v python3 >/dev/null 2>&1; then configuration_python=python3
+  elif command -v python >/dev/null 2>&1; then configuration_python=python
+  else echo "Python 3 is required to preserve project configuration state." >&2; exit 1
+  fi
+  project_configuration_json="$("$configuration_python" "$script_dir/../core/scripts/workflow_config.py" state --repo "$target_root")" || exit 1
+  project_configuration_field="  \"projectConfiguration\": $project_configuration_json,"
+fi
+
 schema_version="$(json_number_field schemaVersion "$manifest_path")"
 case "$schema_version" in
   1|2|3|4|5) ;;

@@ -806,20 +806,27 @@ set -e
 assert_file "$forged_core_path" "forged Core ownership cannot delete a pre-existing user file"
 assert_file "$forged_pack_path" "forged pack ownership cannot delete a pre-existing user file"
 
+# Invalid JSON must remain rejected; fixture fixes must not weaken validation.
+invalid_json_target="$temp_root/invalid-json"
+mkdir -p "$invalid_json_target"
+bash "$install_script" --target "$invalid_json_target" >/dev/null
+invalid_json_manifest="$invalid_json_target/.dev-workflow/manifest.json"
+printf '{"schemaVersion": 3,}\n' > "$invalid_json_manifest"
+invalid_json_hash="$(sha256_file "$invalid_json_manifest")"
+invalid_json_tasks_hash="$(sha256_file "$invalid_json_target/docs/TASKS.md")"
+set +e
+bash "$install_script" --target "$invalid_json_target" >/dev/null 2>&1
+invalid_json_code=$?
+set -e
+[[ "$invalid_json_code" -ne 0 ]] || fail "installer rejects trailing commas in manifest JSON"
+[[ "$(sha256_file "$invalid_json_manifest")" == "$invalid_json_hash" ]] || fail "invalid manifest remains untouched"
+[[ "$(sha256_file "$invalid_json_target/docs/TASKS.md")" == "$invalid_json_tasks_hash" ]] || fail "invalid manifest cannot overwrite project files"
+
 schema3_target="$temp_root/schema3-upgrade"
 mkdir -p "$schema3_target"
 bash "$install_script" --target "$schema3_target" >/dev/null
 schema3_manifest="$schema3_target/.dev-workflow/manifest.json"
-schema3_tmp="$schema3_manifest.old"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "3") }
-  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"forcePushAllowed"|"deleteAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
-  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
-  { print }
-' "$schema3_manifest" > "$schema3_tmp"
-mv -- "$schema3_tmp" "$schema3_manifest"
+python3 "$script_dir/manifest_fixture.py" "$schema3_manifest" 3
 bash "$install_script" --target "$schema3_target" >/dev/null
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema3_manifest" || fail "schema 3 manifests upgrade to schema 5"
 assert_json_string "$schema3_manifest" pushMode manual "schema 3 upgrade preserves push mode"
@@ -833,18 +840,7 @@ schema2_target="$temp_root/schema2-upgrade"
 mkdir -p "$schema2_target"
 bash "$install_script" --target "$schema2_target" >/dev/null
 schema2_manifest="$schema2_target/.dev-workflow/manifest.json"
-schema2_tmp="$schema2_manifest.old"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "2") }
-  /"workflowVersion"[[:space:]]*:/ { sub(/"[^"]+"[[:space:]]*,[[:space:]]*$/, "\"0.1.9\",") }
-  /"pushActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"mergeActor"[[:space:]]*:/ { sub(/"user"/, "\"ai\"") }
-  /"pullRequestMode"|"pullRequestActor"|"pullRequestRequired"|"ciRequired"|"forcePushAllowed"|"deleteAllowed"|"privilegedOperationsDefault"|"policyChangedAt"|"policyChangedBy"/ { next }
-  /"deleteAllowed"[[:space:]]*:/ { sub(/,[[:space:]]*$/, "") }
-  /"path":"docs\/TASKS.md"/ { sub(/"installedSha256":"[0-9a-f]{64}"/, "\"installedSha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"") }
-  { print }
-' "$schema2_manifest" > "$schema2_tmp"
-mv -- "$schema2_tmp" "$schema2_manifest"
+python3 "$script_dir/manifest_fixture.py" "$schema2_manifest" 2
 bash "$install_script" --target "$schema2_target" >/dev/null
 grep -Eq '"path":"docs/TASKS.md","source":"core","action":"legacy","installedSha256":null' "$schema2_manifest" || fail "changed created ownership becomes legacy during a version upgrade"
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$schema2_manifest" || fail "schema 2 manifests upgrade to schema 5"
@@ -860,16 +856,7 @@ legacy_target="$temp_root/schema1-upgrade"
 mkdir -p "$legacy_target"
 bash "$install_script" --target "$legacy_target" --packs architecture >/dev/null
 legacy_manifest="$legacy_target/.dev-workflow/manifest.json"
-legacy_tmp="$legacy_manifest.legacy"
-awk '
-  /"schemaVersion"[[:space:]]*:/ { sub(/5/, "1") }
-  /"gitPolicy"[[:space:]]*:[[:space:]]*\{/ { skipping_policy=1; next }
-  skipping_policy && /^[[:space:]]*\},[[:space:]]*$/ { skipping_policy=0; next }
-  /"files"[[:space:]]*:[[:space:]]*\[/ { skipping_files=1; next }
-  skipping_files && /^[[:space:]]*\],[[:space:]]*$/ { skipping_files=0; next }
-  !skipping_policy && !skipping_files { print }
-' "$legacy_manifest" > "$legacy_tmp"
-mv -- "$legacy_tmp" "$legacy_manifest"
+python3 "$script_dir/manifest_fixture.py" "$legacy_manifest" 1
 
 bash "$install_script" --target "$legacy_target" >/dev/null
 grep -Eq '"schemaVersion"[[:space:]]*:[[:space:]]*5' "$legacy_manifest" || fail "schema 1 manifests upgrade to schema 5"

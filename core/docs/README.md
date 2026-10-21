@@ -15,6 +15,8 @@
 
 ## 核心文件
 
+配置与诊断入口见 [WORKFLOW-CONFIGURATION.md](WORKFLOW-CONFIGURATION.md)；能力来源见 [DEVELOPMENT-CAPABILITIES.md](DEVELOPMENT-CAPABILITIES.md)。
+
 | 文件 | 用途 | 何时读 |
 |---|---|---|
 | [TASKS.md](TASKS.md) | 任务状态、待办、进行中、阻塞和技术债 | 开始任何任务前 |

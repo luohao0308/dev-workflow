@@ -556,6 +556,9 @@ if ($fullUninstall) {
             lastAuditAt = if ($manifest.onboarding.lastAuditAt) { [string]$manifest.onboarding.lastAuditAt } else { $null }
         }
     }
+    if ($null -ne $manifest.projectConfiguration) {
+        $updatedManifest['projectConfiguration'] = $manifest.projectConfiguration
+    }
     Write-Utf8NoBom -Path $manifestPath -Content (($updatedManifest | ConvertTo-Json -Depth 8) + "`r`n")
 }
 

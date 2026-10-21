@@ -16,6 +16,13 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
     [IO.File]::WriteAllText($Path, $Content, [Text.UTF8Encoding]::new($false))
 }
 
+# Include both file names and hashes, so additions and removals also fail equality.
+function Get-TreeFingerprint([string]$Root) {
+    return (@(Get-ChildItem -LiteralPath $Root -Recurse -Force -File | Sort-Object FullName | ForEach-Object {
+        $_.FullName.Substring($Root.Length) + ':' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+    }) -join "`n")
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $installScript = Join-Path $repoRoot 'scripts/install.ps1'
 $uninstallScript = Join-Path $repoRoot 'scripts/uninstall.ps1'
@@ -597,7 +604,10 @@ try {
         'pullRequestRequired',
         'ciRequired',
         'forcePushAllowed',
-        'privilegedOperationsDefault'
+        'deleteAllowed',
+        'privilegedOperationsDefault',
+        'policyChangedAt',
+        'policyChangedBy'
     )) {
         $schema3UpgradeManifest.gitPolicy.PSObject.Properties.Remove($field)
     }
@@ -671,6 +681,64 @@ try {
     Assert-True ($migratedManifest.gitPolicy.forcePushAllowed -eq $false) 'schema 1 upgrade denies force push'
     Assert-True ([string]$migratedManifest.gitPolicy.privilegedOperationsDefault -eq 'deny') 'schema 1 upgrade denies privileged operations by default'
     Assert-True ([string]$migratedManifest.gitPolicy.policyChangedBy -eq 'migration') 'schema 1 upgrade records migration as the policy origin'
+
+    # Exercise the native PowerShell installer around the shared configuration CLI.
+    $lifecycleTarget = Join-Path $tempRoot 'configuration-release-lifecycle'
+    New-Item -ItemType Directory -Path $lifecycleTarget | Out-Null
+    & $installScript -TargetPath $lifecycleTarget -AllPacks | Out-Null
+    Assert-True (Test-Path -LiteralPath (Join-Path $lifecycleTarget 'scripts/release_prepare.py') -PathType Leaf) 'all packs installs the optional release tool'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $lifecycleTarget '.agents'))) 'all packs does not implicitly install Skills'
+    $lifecycleConfig = Join-Path $lifecycleTarget 'workflow.config.json'
+    $lifecycleManifest = Join-Path $lifecycleTarget '.dev-workflow/manifest.json'
+    $lifecycleRecord = Join-Path $lifecycleTarget '.dev-workflow/releases/retained.json'
+    Write-Utf8NoBom -Path $lifecycleConfig -Content (@{
+        schemaVersion = 1
+        enabledCapabilities = @('release')
+        commands = @{}
+        documents = @{}
+        extensions = @{ release = @{ strategy = 'commit-sha'; components = @('web', 'proxy') } }
+    } | ConvertTo-Json -Depth 8)
+    & $pythonCommand.Name (Join-Path $lifecycleTarget 'scripts/workflow_config.py') adopt --repo $lifecycleTarget | Out-Null
+    Assert-True ($LASTEXITCODE -eq 0) 'configuration adoption succeeds through the installed Core CLI'
+    & $installScript -TargetPath $lifecycleTarget -EnableCapabilities @(' CONTAINERS:COMPOSE ') | Out-Null
+    $lifecycleDeclaration = Get-Content -LiteralPath $lifecycleConfig -Raw -Encoding UTF8 | ConvertFrom-Json
+    $lifecycleSnapshot = Get-Content -LiteralPath $lifecycleManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True ($lifecycleSnapshot.projectConfiguration.adopted -eq $true) 'reinstall preserves explicit configuration adoption'
+    Assert-True ($lifecycleSnapshot.projectConfiguration.sha256 -eq (Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash.ToLowerInvariant()) 'reinstall refreshes the adopted configuration fingerprint'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities).Count -eq 2) 'reinstall retains release and enables the requested capability in project configuration'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities) -contains 'release') 'reinstall retains the existing release capability'
+    Assert-True (@($lifecycleDeclaration.enabledCapabilities) -contains 'containers:compose') 'reinstall updates project configuration capability selection'
+    Assert-True ((@($lifecycleDeclaration.enabledCapabilities) -join ',') -eq (@($lifecycleSnapshot.enabledCapabilities) -join ',')) 'manifest capabilities match the adopted project configuration'
+    Assert-True ($lifecycleDeclaration.extensions.release.strategy -eq 'commit-sha') 'reinstall preserves release strategy'
+    $lifecycleBeforeDryRun = Get-TreeFingerprint $lifecycleTarget
+    & $installScript -TargetPath $lifecycleTarget -DisableCapabilities @(' RELEASE ') -DryRun | Out-Null
+    Assert-True ((Get-TreeFingerprint $lifecycleTarget) -eq $lifecycleBeforeDryRun) 'configuration-aware dry-run leaves every project file byte-identical'
+    $validLifecycleConfig = [IO.File]::ReadAllText($lifecycleConfig)
+    Write-Utf8NoBom -Path $lifecycleConfig -Content '{"schemaVersion":1,}'
+    $lifecycleBeforeInvalidInstall = Get-TreeFingerprint $lifecycleTarget
+    $invalidConfigurationRejected = $false
+    try {
+        & $installScript -TargetPath $lifecycleTarget -EnableCapabilities @('deployment:compose') | Out-Null
+    } catch {
+        $invalidConfigurationRejected = $true
+    }
+    Assert-True $invalidConfigurationRejected 'PowerShell installer rejects malformed project configuration'
+    Assert-True ((Get-TreeFingerprint $lifecycleTarget) -eq $lifecycleBeforeInvalidInstall) 'invalid configuration rejection leaves all project files unchanged'
+    Write-Utf8NoBom -Path $lifecycleConfig -Content $validLifecycleConfig
+    Write-Utf8NoBom -Path $lifecycleRecord -Content '{"kind":"release-preparation","fixture":true}'
+    $lifecycleConfigHash = (Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash
+    $lifecycleRecordHash = (Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash
+    $lifecycleAdoptionBeforeUninstall = $lifecycleSnapshot.projectConfiguration | ConvertTo-Json -Compress
+    & $uninstallScript -TargetPath $lifecycleTarget -Packs @('release') | Out-Null
+    $lifecycleAfterPartial = Get-Content -LiteralPath $lifecycleManifest -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True (@($lifecycleAfterPartial.installedPacks) -notcontains 'release') 'partial uninstall removes release pack membership'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $lifecycleTarget 'scripts/release_prepare.py'))) 'partial uninstall removes the unchanged release tool'
+    Assert-True (($lifecycleAfterPartial.projectConfiguration | ConvertTo-Json -Compress) -eq $lifecycleAdoptionBeforeUninstall) 'partial uninstall preserves configuration adoption marker'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash -eq $lifecycleConfigHash) 'partial uninstall preserves project configuration bytes'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash -eq $lifecycleRecordHash) 'partial uninstall preserves release record bytes'
+    & $uninstallScript -TargetPath $lifecycleTarget | Out-Null
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleConfig -Algorithm SHA256).Hash -eq $lifecycleConfigHash) 'full uninstall preserves project configuration bytes'
+    Assert-True ((Get-FileHash -LiteralPath $lifecycleRecord -Algorithm SHA256).Hash -eq $lifecycleRecordHash) 'full uninstall preserves release record bytes'
 
     Write-Output 'PowerShell integration tests passed.'
 } finally {

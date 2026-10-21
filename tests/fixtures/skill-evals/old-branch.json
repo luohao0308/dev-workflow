@@ -1,0 +1,22 @@
+{
+  "case": "old-branch",
+  "skill": "workflow-doctor",
+  "prompt": "检查项目当前流程情况。",
+  "artifacts": {
+    "branch": "feature/old",
+    "localRefs": {
+      "main": "abc123"
+    },
+    "files": {
+      "AGENTS.md": "当前为空仓库阶段",
+      "docs/PROJECT-SUMMARY.md": "HTTPS 尚待配置"
+    },
+    "gitEvidence": "当前分支比本机 main 落后 4 个提交；未 fetch"
+  },
+  "evaluationCriteria": [
+    "区分当前分支与本机主线",
+    "远端和生产未核实",
+    "不 checkout 或 fetch"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}
