@@ -254,6 +254,8 @@ class WindowsUpgradeTests(unittest.TestCase):
         self.assertEqual(snapshot(self.target), before)
 
     def test_powershell_rechecks_history_appearing_after_preflight_under_lock(self):
+        # This exercises lifecycle concurrency within the installed version.
+        write_utf8(self.source / 'VERSION', '0.8.0\n')
         transaction = 'a' * 32
         relative = '.dev-workflow/upgrades/' + transaction + '/journal.json'
         for name in ('install', 'uninstall'):
