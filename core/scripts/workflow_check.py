@@ -38,7 +38,8 @@ def check(root: Path) -> dict:
         installed = []
         issues.append(dict(code='manifest.packs_invalid', severity='error', message='Installed pack list is invalid.'))
     capabilities = []
-    tools = {'release': 'scripts/release_prepare.py'}
+    tools = {'release': 'scripts/release_prepare.py',
+             **{capability: 'scripts/deployment_prepare.py' for capability, pack in CAPABILITY_PACKS.items() if pack == 'deployment'}}
     for capability in resolved['capabilities']:
         pack = CAPABILITY_PACKS[capability]
         tool = tools.get(capability)

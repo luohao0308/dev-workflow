@@ -9,7 +9,7 @@ import shutil
 import sys
 
 SOURCE = Path(__file__).resolve().parents[1] / 'extensions' / 'skills'
-NAMES = ('workflow-doctor', 'workflow-closeout', 'workflow-release', 'workflow-upgrade')
+NAMES = ('workflow-doctor', 'workflow-closeout', 'workflow-release', 'workflow-upgrade', 'workflow-deploy')
 MARKER = '.dev-workflow-skill.json'
 OWNER = 'dev-workflow/optional-skills/v1'
 

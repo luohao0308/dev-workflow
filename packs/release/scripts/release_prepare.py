@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -26,11 +27,49 @@ class PreparationError(ValueError):
     pass
 
 
-def git(root: Path, *args: str) -> str:
-    result = subprocess.run(['git', '--no-optional-locks', '-C', str(root), *args], text=True, capture_output=True)
+def git_result(root: Path, *args: str, input_text: str | None = None):
+    try:
+        result = subprocess.run(['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-C', str(root), *args],
+                              capture_output=True, timeout=30,
+                              input=input_text.encode('utf-8') if input_text is not None else None,
+                              env={**os.environ, 'GIT_NO_LAZY_FETCH': '1', 'GIT_TERMINAL_PROMPT': '0'})
+        result.stdout = result.stdout.decode('utf-8', errors='strict')
+        return result
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as error:
+        raise PreparationError('Local Git state could not be inspected') from error
+
+
+def git(root: Path, *args: str, input_text: str | None = None) -> str:
+    result = git_result(root, *args, input_text=input_text)
     if result.returncode:
-        raise PreparationError(result.stderr.strip() or 'Git command failed')
+        raise PreparationError('Local Git state could not be inspected')
     return result.stdout.strip()
+
+
+def offline_repository(root: Path) -> None:
+    # Configuration names are checked before any object/index/attribute inspection.
+    names = git(root, 'config', '--null', '--name-only', '--list').lower().split('\0')
+    if any(name == 'extensions.partialclone' or (name.startswith('remote.') and name.endswith(('.promisor', '.partialclonefilter'))) for name in names):
+        raise PreparationError('Partial-clone or promisor repositories are unsupported by release preparation')
+
+
+def offline_worktree_status(root: Path) -> str:
+    # status can invoke content filters or recurse into submodule worktrees.
+    paths = []
+    for entry in git(root, 'ls-files', '--stage', '-z').split('\0'):
+        if not entry:
+            continue
+        metadata, name = entry.split('\t', 1)
+        if metadata.split()[0] == '160000':
+            raise PreparationError('Submodule worktree inspection is unsupported by release preparation')
+        paths.append(name)
+    if paths:
+        attributes = git(root, 'check-attr', '-z', '--stdin', 'filter', input_text='\0'.join(paths) + '\0').split('\0')
+        for index in range(0, len(attributes) - 2, 3):
+            if attributes[index + 2] not in ('unspecified', 'unset'):
+                raise PreparationError('External Git content filters are unsupported by release preparation')
+    return git(root, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=all',
+               '--', '.', ':(exclude).dev-workflow/releases')
 
 
 def commit(root: Path, ref: str) -> str:
@@ -72,10 +111,11 @@ def declarations(values: list[str], names: list[str]) -> dict:
 
 
 def prepare(root: Path, sha: str, version: str | None, sources: list[str], builds: list[str]) -> dict:
+    offline_repository(root)
     release = configuration(root)
     head = commit(root, 'HEAD')
     target = commit(root, sha)
-    if git(root, 'status', '--porcelain', '--untracked-files=all', '--', '.', ':(exclude).dev-workflow/releases'):
+    if offline_worktree_status(root):
         raise PreparationError('Working tree is dirty; release preparation requires a clean tree')
     tag = None
     tag_status = 'not_requested'
@@ -85,7 +125,7 @@ def prepare(root: Path, sha: str, version: str | None, sources: list[str], build
             raise PreparationError('semver-tag requires a valid SemVer --version (optional v prefix)')
         tag = release.get('tagPrefix', 'v') + normalized
         git(root, 'check-ref-format', 'refs/tags/' + tag)
-        found = subprocess.run(['git', '--no-optional-locks', '-C', str(root), 'show-ref', '--verify', '--quiet', 'refs/tags/' + tag])
+        found = git_result(root, 'show-ref', '--verify', '--quiet', 'refs/tags/' + tag)
         if found.returncode == 0:
             if commit(root, 'refs/tags/' + tag) != target:
                 raise PreparationError('Tag conflict: existing tag points to a different commit')
@@ -112,6 +152,7 @@ def prepare(root: Path, sha: str, version: str | None, sources: list[str], build
 
 
 def check_plan(root: Path, path: Path, sha: str) -> dict:
+    offline_repository(root)
     plan = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(plan, dict) or plan.get('schemaVersion') != 1 or plan.get('kind') != 'release-preparation':
         raise PreparationError('Unsupported release plan')

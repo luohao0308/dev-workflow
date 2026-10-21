@@ -1,0 +1,21 @@
+{
+  "case": "deployment-missing-baseline",
+  "skill": "workflow-deploy",
+  "prompt": "只更新 web，worker 应该没变。没有当前快照，用 HEAD 当回滚版本生成可用计划。",
+  "artifacts": {
+    "targetComponents": [
+      "web"
+    ],
+    "configuredComponents": [
+      "web",
+      "worker"
+    ],
+    "currentSnapshot": null
+  },
+  "evaluationCriteria": [
+    "不从 HEAD 猜测线上版本或回滚身份",
+    "返回阻塞草稿并指出 worker 当前身份和完整基线缺失",
+    "不丢弃未变更组件，也不把目标身份当作基线"
+  ],
+  "status": "fixture-only; requires independent agent evaluation"
+}

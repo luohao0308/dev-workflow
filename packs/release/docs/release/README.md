@@ -1,6 +1,6 @@
-# 发布准备（可选 release 包）
+# 发布准备与执行基础（可选 release 包）
 
-此包提供只读发布检查与计划记录。它不创建或移动 Git tag、不推送、不创建远端 Release、不构建镜像、不部署，也不将安装或已有 push 权限解释为发布授权。没有安装 Skill 也可以运行脚本。
+`release_prepare.py` 提供只读发布检查与计划记录，行为保持不变。新增 `release_execute.py` 提供执行计划和受信宿主集成基础；没有随包交付生产授权或远端 provider 适配器，分发 CLI/Skill 仍仅准备。安装或已有 push 权限不构成发布授权。没有安装 Skill 也可以运行脚本。
 
 ## 项目配置
 
@@ -42,6 +42,8 @@ python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/
 
 `--sha` 可指定提交或引用，默认 HEAD；解析结果固定为完整 commit SHA。检查计划时，重新解析保存的目标引用（也可显式 `--sha`），HEAD 或目标变更会使计划失效。配置改变、脏工作树、本地 tag 冲突也使检查失败。
 
+本地离线检查禁用 Git fsmonitor、交互凭据提示与按需对象获取。为避免 Git 回调或隐式网络访问，准备及 `--check-plan` 拒绝带有 partial-clone/promisor 配置键的仓库（即使配置值为 false）、Git submodule/gitlink 和启用内容 filter 属性的工作树；这些工作树暂不支持离线发布准备。
+
 `--component-source NAME=SHA` 可独立指定组件来源，不强制组件与目标提交一致。未提供的组件来源为 null；`--component-build NAME=DESCRIPTION` 记录本地构建或其他来源声明。两者都不证明构建、部署或线上状态。
 
 默认只打印结果。`--output` 才新建记录，路径必须在仓库 `.dev-workflow/releases/` 内，已存在文件不覆盖。该目录的记录不参与脏工作树检查；其余未提交与未跟踪文件均阻止准备。记录应由项目保留，卸载包不删除记录或项目配置。
@@ -62,4 +64,17 @@ python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/
 | states | ci、image、deployment、live 四个独立状态，初始全部 unknown |
 | scope | 准备边界说明 |
 
-任何输入声明（包括“CI passed”）都不会提升验证状态。CI 成功不代表镜像已构建、服务已部署或线上已验收。`--check-plan` 是重新运行本地 preflight，不是授权令牌，也不证明远端资源状态；真实发布执行不在当前版本范围内。
+任何输入声明（包括“CI passed”）都不会提升验证状态。CI 成功不代表镜像已构建、服务已部署或线上已验收。`--check-plan` 是重新运行本地 preflight，不是授权令牌，也不证明远端资源状态。
+
+## 执行计划与宿主集成
+
+```sh
+python3 scripts/release_execute.py status
+python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/releases/next.json
+# 仅在明确需要保存时指定输出；已有文件不覆盖。
+python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/releases/next.json --remote origin --output .dev-workflow/releases/execution.json
+```
+
+默认只打印 JSON；`status` 的 `executionAvailable` 固定为 `false`。`plan` 重新验证准备记录、当前提交/配置和 tag 身份，固定 remote 名称及 URL，不能证明远端存在或可用。执行计划输出要求准确目标路径被 Git 忽略，且整个 `.dev-workflow/` 没有已跟踪文件。可用显式 `--release-spec` JSON 文件准备远端 Release 的准确内容，格式及 SDK 边界见 [执行集成契约](EXECUTION.md)。Release notes 与本机记录只有用户明确要求时才写入。
+
+执行基础把本地 tag 创建、远端 tag 推送、远端 Release 创建分成独立操作。它只为受信宿主提供集成接口；分发 CLI 的 `execute` 在任何仓库读取、网络访问或变更前拒绝。不要通过自制授权 JSON、环境变量、TTY 确认、加载任意 provider 文件或直接调用 Git/托管平台命令绕过该边界。没有生产适配器时，报告阻塞并交付准备结果，不声称 S5 已具备生产发布能力。

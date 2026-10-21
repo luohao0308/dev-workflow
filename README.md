@@ -95,7 +95,8 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 | `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
-| `release` | 可选版本策略、只读发布准备工具与本机计划记录 | 需要按 SHA 或 SemVer 规划发布的项目；当前不执行 tag、远端 Release 或部署 |
+| `deployment` | 部署/回滚只读计划、不可变组件身份和显式快照比较 | 需要按环境规划部署的项目；无执行入口或生产宿主适配器 |
+| `release` | 可选版本策略、发布准备、执行计划与受信宿主集成基础 | 需要按 SHA 或 SemVer 规划发布的项目；分发 CLI/Skill 仅准备，未提供生产执行适配器 |
 
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
@@ -117,16 +118,16 @@ python3 scripts/workflow_config.py adopt --repo . --create
 
 `workflow.config.json` 保存项目能力、命令工作目录、文档映射和可选扩展。采用后它是能力权威，manifest 保存本机兼容快照；未采用的旧项目继续使用 manifest。配置无效或采用后文件失踪时拒绝回退；修改后使用 `sync`，撤回使用 `withdraw`，均支持 dry-run。详情见 [项目配置](core/docs/WORKFLOW-CONFIGURATION.md)。体检可发现已安装未启用、已知规则冲突和本机 Git 基线差异；开放文本的语义冲突仍需 AI 根据证据判断。
 
-四个 Skill 独立分发，`--all-packs` 不会安装它们。在 **dev-workflow 分发目录**显式执行：
+五个 Skill 独立分发，`--all-packs` 不会安装它们。在 **dev-workflow 分发目录**显式执行：
 
 ```bash
 python3 scripts/manage_skills.py install --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade --dry-run
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade workflow-deploy --dry-run
 python3 scripts/manage_skills.py install --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade workflow-deploy
 # 删除时仅移除可证明归属且未修改的 Skill；项目定制保留。
 python3 scripts/manage_skills.py uninstall --target /path/to/project \
-  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade --dry-run
+  --skills workflow-doctor workflow-closeout workflow-release workflow-upgrade workflow-deploy --dry-run
 ```
 
 默认项目级安装到 `.agents/skills/`；只有显式 `--scope user` 才写用户级 `~/.agents/skills/`，也可用 `--skills-dir` 指定隔离目标。同名文件夹不覆盖。路径按 [OpenAI 官方本地 Skill 发现规则](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills) 选择；其他客户端可使用自己的入口或直接运行脚本。安装 Skill 不授予任何远端权限。
@@ -137,6 +138,7 @@ python3 scripts/manage_skills.py uninstall --target /path/to/project \
 | `workflow-closeout` | 当前任务收尾，保留人工验收、外部阻塞和未完成阶段，定向维护已有知识 |
 | `workflow-release` | 发布计划与变更说明草稿；仅准备，不创建本地/远端 tag、Release 或部署 |
 | `workflow-upgrade` | 审阅升级计划、保留定制、按事务回退及显式移交文档归属 |
+| `workflow-deploy` | 部署/回滚只读计划与所提供快照的身份比较；不执行部署或验证线上健康 |
 
 安装 `release` 包后，显式在项目配置启用 `release` 并声明 `extensions.release`。策略支持 `none`、`commit-sha`、`semver-tag`；普通 push 不要求 tag：
 
@@ -149,7 +151,30 @@ python3 scripts/release_prepare.py --repo . --version 1.0.0 --output .dev-workfl
 python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/v1.0.0.json
 ```
 
-配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。规则升级使用下述显式计划机制；当前版本不含真实 tag/Release 执行或生产部署。
+配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。
+
+S5 提供 Python 3.10+ 标准库执行基础，供受信宿主在进程内注入授权与远端 provider；没有随包交付生产适配器。分发 CLI 和 `workflow-release` 仍仅准备，`execute` 默认拒绝，在任何仓库读取、网络访问或变更前退出。可只读查看可用性，或从准备记录生成执行计划：
+
+```bash
+python3 scripts/release_execute.py status
+python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/releases/v1.0.0.json
+```
+
+`status` 返回机器可读 JSON，`executionAvailable` 为 `false`；计划不构成授权。三个独立操作及宿主边界见 [执行集成契约](packs/release/docs/release/EXECUTION.md)。这不是生产发布就绪声明，不包含包/镜像发布或部署。规则升级使用下述显式计划机制。
+
+安装 `deployment` 包后，在已采用的项目配置中启用对应 `deployment:*` 能力并声明 `extensions.deployment`。使用显式目标清单和当前快照生成部署及回滚计划；缺少基线时返回阻塞草稿，不从仓库 HEAD 猜测线上版本：
+
+```bash
+python3 scripts/deployment_prepare.py status
+python3 scripts/deployment_prepare.py plan --repo . --environment production \
+  --target-manifest target.json --current-snapshot current.json \
+  --conditions conditions.json --output .dev-workflow/releases/deployments/plan.json
+python3 scripts/deployment_prepare.py check-plan --repo . --plan .dev-workflow/releases/deployments/plan.json
+python3 scripts/deployment_prepare.py compare --repo . --plan .dev-workflow/releases/deployments/plan.json \
+  --observed-snapshot observed.json --direction deploy
+```
+
+全部命令返回 JSON，无需 `--json`。计划只读取本机声明和证据，只有显式 `--output` 写计划文件；不执行声明命令、不连接服务器。`executionAvailable` 和 `productionReady` 始终为 `false`，快照匹配不证明实际部署或健康成功。完整配置、输入与比较边界见 [部署计划](packs/deployment/docs/operations/DEPLOYMENT-PLANNING.md)。
 
 ## 安装
 

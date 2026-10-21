@@ -34,7 +34,7 @@ jobs:
         shell: pwsh
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m unittest tests.test_workflow_config tests.test_release_prepare tests.test_manage_skills tests.test_manifest_fixture tests.test_workflow_lock tests.test_upgrade_windows
+        run: python -m unittest tests.test_workflow_config tests.test_release_prepare tests.test_release_execute tests.test_release_offline tests.test_deployment_config tests.test_deployment_prepare tests.test_manage_skills tests.test_manifest_fixture tests.test_workflow_lock tests.test_upgrade_windows
       - name: Run PowerShell integration tests
         shell: pwsh
         run: ./tests/integration.ps1
