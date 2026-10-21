@@ -258,7 +258,10 @@ try {
     Assert-True (($trackedAuditOutput -join "`n") -match 'info/exclude cannot prevent upload: \.dev-workflow/') 'audit warns when Git tracks dev-workflow metadata'
 
     $specialRepo = Join-Path $tempRoot 'special-repo'
-    $specialRelative = '[local] space#bang!star*question?'
+    # Keep Git metacharacters supported by this filesystem. Windows cannot
+    # create names containing * or ?; the Bash matrix covers those characters.
+    $invalidNameCharacters = [IO.Path]::GetInvalidFileNameChars()
+    $specialRelative = -join ('[local] space#bang!star*question?'.ToCharArray() | Where-Object { $invalidNameCharacters -notcontains $_ })
     $specialTarget = Join-Path $specialRepo $specialRelative
     New-Item -ItemType Directory -Path $specialTarget -Force | Out-Null
     & git -C $specialRepo init -q | Out-Null
