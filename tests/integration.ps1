@@ -751,3 +751,7 @@ try {
         Remove-Item -LiteralPath $resolvedTempRoot -Recurse -Force
     }
 }
+
+# Reaching this point means every assertion and cleanup succeeded. Expected
+# negative native-command tests must not leak their LASTEXITCODE to the caller.
+exit 0
