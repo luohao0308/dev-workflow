@@ -96,7 +96,7 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 | `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
 | `deployment` | 部署/回滚只读计划、不可变组件身份和显式快照比较 | 需要按环境规划部署的项目；无执行入口或生产宿主适配器 |
-| `release` | 可选版本策略、发布准备、执行计划与受信宿主集成基础 | 需要按 SHA 或 SemVer 规划发布的项目；分发 CLI/Skill 仅准备，未提供生产执行适配器 |
+| `release` | 可选版本策略、发布准备、执行计划、GitHub Tag / Release provider 与受信 Actions 宿主 | 需要按 SHA 或 SemVer 发布的项目；本地 CLI 仅准备，真实执行需配置独立可信宿主 |
 
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
@@ -136,7 +136,7 @@ python3 scripts/manage_skills.py uninstall --target /path/to/project \
 |---|---|
 | `workflow-doctor` | 只读检查，解释冲突、能力缺口与未核实项 |
 | `workflow-closeout` | 当前任务收尾，保留人工验收、外部阻塞和未完成阶段，定向维护已有知识 |
-| `workflow-release` | 发布计划与变更说明草稿；仅准备，不创建本地/远端 tag、Release 或部署 |
+| `workflow-release` | 发布计划、说明草稿及可信宿主审核指引；本地不创建 tag / Release，真实执行由已配置的宿主完成 |
 | `workflow-upgrade` | 审阅升级计划、保留定制、按事务回退及显式移交文档归属 |
 | `workflow-deploy` | 部署/回滚只读计划与所提供快照的身份比较；不执行部署或验证线上健康 |
 
@@ -153,14 +153,14 @@ python3 scripts/release_prepare.py --repo . --check-plan .dev-workflow/releases/
 
 配置格式、独立组件来源及记录契约见 [release 包](packs/release/docs/release/README.md)。CI、镜像、部署和线上验证分别保持 `unknown`，不会从本地准备推导远端成功。项目配置和本机发布记录都是项目数据，卸载不会删除。
 
-S5 提供 Python 3.10+ 标准库执行基础，供受信宿主在进程内注入授权与远端 provider；没有随包交付生产适配器。分发 CLI 和 `workflow-release` 仍仅准备，`execute` 默认拒绝，在任何仓库读取、网络访问或变更前退出。可只读查看可用性，或从准备记录生成执行计划：
+发布模块提供 Python 3.10+ 执行 SDK、真实 GitHub.com Tag / Release provider 和受信 GitHub Actions 宿主。项目本地的 `release_execute.py execute` 仍在任何仓库读取、网络访问或变更前拒绝；安装包、配置、普通 push 权限和本地授权 JSON 均不能放行。可只读查看本地可用性，或从准备记录生成执行计划：
 
 ```bash
 python3 scripts/release_execute.py status
 python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/releases/v1.0.0.json
 ```
 
-`status` 返回机器可读 JSON，`executionAvailable` 为 `false`；计划不构成授权。三个独立操作及宿主边界见 [执行集成契约](packs/release/docs/release/EXECUTION.md)。这不是生产发布就绪声明，不包含包/镜像发布或部署。规则升级使用下述显式计划机制。
+`status` 返回的 `executionAvailable: false` 描述本地 CLI，不表示没有真实 provider。真实执行须在固定可信代码的独立 Actions 宿主中，核验签名 OIDC、准确操作集合的人工环境审批，并先向目标项目之外的账本原子登记一次性消耗；失败或结果未知均不退还次数。远端 tag 只为目标仓库已有的 commit 创建不存在的 lightweight ref，不推送分支或上传对象；Release 不隐式改变 latest。宿主配置、审核流程和限制见 [执行集成契约](packs/release/docs/release/EXECUTION.md)。真实端到端验收必须另有独立测试仓库的实际执行证据，不能由单元测试推导；不包含包/镜像发布或部署。规则升级使用下述显式计划机制。
 
 安装 `deployment` 包后，在已采用的项目配置中启用对应 `deployment:*` 能力并声明 `extensions.deployment`。使用显式目标清单和当前快照生成部署及回滚计划；缺少基线时返回阻塞草稿，不从仓库 HEAD 猜测线上版本：
 

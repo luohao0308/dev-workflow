@@ -402,6 +402,12 @@ def execute(root: Path, plan: dict, operation: str, *, approval=None, tag_provid
         try:
             validate_grant(grant, request)
             if operation == 'local-tag-create':
+                # A production host may recheck revocation and its durable
+                # receipt immediately before this local mutation as well.
+                guard = getattr(approval, 'guard', None)
+                if guard is not None:
+                    guard(request)
+                validate_grant(grant, request)
                 mutation_started = True
                 run_git(root, 'update-ref', '--no-deref', '--stdin',
                         input_text='create refs/tags/' + request.tag + ' ' + request.tag_object_sha + '\n')
