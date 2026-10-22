@@ -1,6 +1,6 @@
-# 固定 Docker API 部署与回滚（P1-3）
+# 固定 Docker API 部署与回滚（P1-3 至 P1-5）
 
-首个实际执行后端是 `deployment_execute.py` 的 `docker-container-replace-v1`，每次仅替换一个选中组件，保留环境内其余组件的完整映射与实例。它由固定可信源码宿主嵌入，不是项目命令执行器。离线 CLI 仍返回 `executionAvailable: false` 并拒绝执行；只有实际配置的可信宿主能调用 SDK，实际后端结果可为 `executionAvailable: true`。`productionReady` 始终为 `false`，健康/业务冒烟为 `unknown`。
+首个实际执行后端是 `deployment_execute.py` 的 `docker-container-replace-v1`，每次仅替换一个选中组件，保留环境内其余组件的完整映射与实例。它由固定可信源码宿主嵌入，不是项目命令执行器。离线 CLI 仍返回 `executionAvailable: false` 并拒绝执行；只有实际配置的可信宿主能调用 SDK，实际后端结果可为 `executionAvailable: true`。`productionReady` 始终为 `false`。未配置可选探针时健康/业务冒烟为 `unknown`；配置 P1-4 后按实际检查报告，见 [健康与业务验收](DEPLOYMENT-VERIFICATION.md)。P1-5 的持久化历史和中断恢复须显式配置，见 [持久化与恢复](DEPLOYMENT-RECOVERY.md)。
 
 ## 支持范围与可信规格
 
@@ -39,7 +39,7 @@
 
 表中路径均带 `/v1.45` 前缀。304 不视为本次成功完成转换。唯一资源名用于定位和核对，不是幂等令牌。先创建停止态容器可在停止旧实例前核验配置，但不保证后续启动成功，也不提供零停机、readiness 或流量切换。唯一名称不保留原容器名、Compose 名称或 service-DNS 连续性；Compose labels 仅用于成员选择，不提供 endpoint alias。
 
-删除旧容器后，其实例 ID、元数据和容器日志不作为可恢复对象保留；`v=false` 也不保留这些内容。回滚保留的是旧镜像、可信规格/catalog 以及 collector 进程内历史 observation，重新创建等价规格的新实例。
+删除旧容器后，其实例 ID、元数据和容器日志不作为可恢复对象保留；`v=false` 也不保留这些内容。回滚保留的是旧镜像、可信规格/catalog 以及 collector 进程内历史 observation；可选 HostStore 也能保留经认证的历史记录。两种方式均重新创建等价规格的新实例。
 
 ## 成功结果与回滚能力
 
@@ -61,6 +61,12 @@ observation = result.pop('observation', None)
 
 HTTP 错误、超时、漂移、guard 失败或结果未知立即停止。结果区分 `failed`、`unknown`、`executed-unverified`，审计记录 lastAction、尝试状态、唯一资源名及已知 ID；已发生写入不宣称未执行。写入尝试或不确定结果要求核对现场，不自动 retry、cleanup、rollback、退款、恢复或重放。
 
-创建后双实例、旧容器停止或删除后新容器未运行等中间态，会使普通 collector 返回不完整。此时不能用普通新授权“直接回滚”；须先核对并协调现场至可证明的完整状态，中断恢复契约留待 P1-5。当前没有 JSON 恢复或进程重启续跑机制。
+创建后双实例、旧容器停止或删除后新容器未运行等中间态，会使普通 collector 返回不完整。此时不能用普通新授权“直接回滚”；须先核对并协调现场至可证明的完整状态，可选 P1-5 宿主使用签名日志、网关排空证明和独立恢复授权处理受支持中间态。未启用该宿主、未知请求结果或不支持状态仍阻塞，不能从 JSON 自动续跑。
 
-本 profile 不交付生产部署验收、切流、数据库、备份/恢复、迁移、健康/业务 smoke probes 或 readiness。合成 Docker smoke 中的假授权不是 GitHub 证明；真实 OIDC、两道独立精确审批门与实际部署/回滚须另有独立环境证据。本文描述接口和限制，不声明测试已完成。
+本 profile 不交付生产部署验收、切流、数据库、备份/恢复、迁移或生产 readiness／流量管理。可选 P1-4 提供固定只读健康／业务 GET 验收；通过它也不代表生产验收。合成 Docker smoke 中的假授权不是 GitHub 证明；真实 OIDC、两道独立精确审批门与实际部署/回滚须另有独立环境证据。本文描述接口和限制，不声明测试已完成。
+
+## 可选宿主扩展
+
+`ExecutionPolicy.verification_policy_hash` 绑定 P1-4 探针策略，`DockerExecutor(..., verifier=...)` 必须提供原始匹配检查器。结果 `executed-unhealthy` 表示替换已执行但未通过验收，不自动回滚；权限或现场复核失败仍是 `executed-unverified`。实际 `observation` 可用于另一次精确回滚。
+
+P1-5 同时配置 `history_policy_hash`、`gateway_policy_hash` 和原始 `HostCoordinator`；缺少其中一项就拒绝执行。`with coordinator.operation(...) as operation` 持有目标宿主锁，`authorize(..., host_operation=operation)` 与 `execute(..., host_operation=operation)` 使用同一对象。每次写入前记录签名日志、取得单次网关 admission，最后再复核 SDK guard；网关在实际上游完整响应后记录完成。Core 仅增加可选 `expected_owner` 精确恢复校验，默认安装／升级锁行为保持原义。

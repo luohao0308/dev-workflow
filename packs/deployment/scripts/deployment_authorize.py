@@ -183,6 +183,7 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
             or any(item['migrationVersion'] is not None for item in before + desired)):
         raise AuthorizationError('Backup or migration requires separate trusted evidence and authority')
     history_hash = None
+    history_proof = {}
     if operation == 'deployment-rollback':
         if rollback_target is None:
             raise AuthorizationError('Rollback requires an explicit authenticated historical target')
@@ -194,6 +195,14 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
             if item['name'] in selected and item != history[item['name']]:
                 raise AuthorizationError('Rollback target differs from authenticated history')
         history_hash = rollback_target.evidence_hash
+        historical_type = getattr(sys.modules.get('deployment_store'), 'HistoricalSnapshot', None)
+        if historical_type is not None and type(rollback_target) is historical_type:
+            if rollback_target._store.policy.repository_id != repository_id:
+                raise AuthorizationError('Historical repository identity differs from request')
+            history_proof = dict(rollbackHistoryProof=dict(
+                proofHash=rollback_target.proof_hash, storePolicyHash=rollback_target.store_policy_hash,
+                producerPolicyHash=rollback_target.policy_hash,
+                currentPolicyHash=rollback_target.current_policy_hash))
     elif rollback_target is not None:
         raise AuthorizationError('Deploy cannot borrow a rollback history capability')
     execution_json = None
@@ -211,7 +220,7 @@ def build_request(root, plan, operation, *, collector, observation, repository_s
                    before_json=canonical(dict(version=snapshot['version'], components=before)),
                    after_json=canonical(dict(version=saved['version'], components=desired)),
                    conditions_json=canonical(dict(conditions=conditions, evidence=saved['inputs']['evidence'],
-                                                   rollbackHistoryHash=history_hash)),
+                                                   rollbackHistoryHash=history_hash, **history_proof)),
                    plan_hash=fingerprint(saved), observation_hash=observation.evidence_hash,
                    state_hash=observation.state_hash, runtime_policy_hash=observation.policy_hash,
                    expires_at=expires_at, execution_json=execution_json)
@@ -305,7 +314,7 @@ class DeploymentPermit:
 
 
 def authorize(root, plan, request, *, collector, observation, approval=None, rollback_target=None,
-              execution_intent=None):
+              execution_intent=None, host_operation=None):
     if approval is None:
         raise AuthorizationError('Trusted deployment authority unavailable; no execution')
     if type(request) is not Request:
@@ -320,7 +329,18 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
         if fresh != request:
             raise AuthorizationError('Deployment request or plan changed')
     recheck()
-    with LifecycleLock(root, 'deployment-authorization'):
+    if execution_intent is not None:
+        from deployment_execute import DockerExecutor
+        DockerExecutor._operation(execution_intent._issuer, root, execution_intent, host_operation)
+    elif host_operation is not None:
+        raise AuthorizationError('Host operation requires an execution intent')
+    lifecycle = (LifecycleLock(root, 'deployment-authorization') if host_operation is None
+                 else host_operation.lifecycle('deployment-authorization'))
+    with lifecycle as core_lock:
+        if host_operation is not None:
+            from deployment_recover import HostOperation
+            HostOperation.record_owner(host_operation, core_lock)
+            HostOperation.check_gateway(host_operation)
         if pending_upgrades(root):
             raise AuthorizationError('Recover unfinished upgrade before deployment authorization')
         recheck()
@@ -382,6 +402,8 @@ def authorize(root, plan, request, *, collector, observation, approval=None, rol
         permit = DeploymentPermit(request=request, grant=grant, receipt=receipt, check=final_check,
                                   result=result, execution_guard=execution_guard)
         _ISSUED_PERMITS.add(permit)
+        if host_operation is not None:
+            HostOperation.record_authorization(host_operation, request, grant, receipt)
         return permit
 
 

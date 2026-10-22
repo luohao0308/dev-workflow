@@ -209,6 +209,10 @@ def _catalog(policy):
         raise RuntimeCollectionError('Invalid trusted runtime catalog') from None
 
 
+class DockerNotFound(RuntimeCollectionError):
+    """Trusted test transport's exact Docker HTTP 404; never a generic read error."""
+
+
 class DockerTLSClient:
     """Explicit mTLS, verified hostname and peer pin before every GET request.
 
@@ -236,7 +240,7 @@ class DockerTLSClient:
         self.list_path = '/v1.45/containers/json?' + urlencode({'all': '1', 'filters': canonical({'label': ['com.docker.compose.project=' + policy.project]})})
 
     def get(self, path, *, deadline=None):
-        if not (path in ('/v1.45/info', self.list_path)
+        if not (path in ('/v1.45/info', '/v1.45/workflow/gate-info', self.list_path)
                 or re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/json', path)
                 or re.fullmatch(r'/v1\.45/images/sha256:[0-9a-f]{64}/json', path)):
             raise RuntimeCollectionError('Docker read route refused')
@@ -244,6 +248,26 @@ class DockerTLSClient:
             return parse_json(self._request(path, deadline=deadline).decode('utf-8'))
         except Exception:
             raise RuntimeCollectionError('Trusted Docker read failed') from None
+
+    def lookup_container(self, reference, *, deadline=None):
+        """Exact known ID/name lookup; None means authenticated HTTP 404 only."""
+        if (type(reference) is not str or not (
+                CONTAINER.fullmatch(reference) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', reference))):
+            raise RuntimeCollectionError('Docker exact lookup reference refused')
+        raw = self._request('/v1.45/containers/' + reference + '/json',
+                            deadline=deadline, allow_missing=True)
+        if raw is None:
+            return None
+        try:
+            value = parse_json(raw.decode('utf-8'))
+            if (type(value) is not dict or type(value.get('Id')) is not str
+                    or not CONTAINER.fullmatch(value['Id'])
+                    or (value['Id'] != reference if CONTAINER.fullmatch(reference)
+                        else value.get('Name') != '/' + reference)):
+                raise ValueError
+            return value
+        except Exception:
+            raise RuntimeCollectionError('Docker exact lookup proof rejected') from None
 
     def managed_file(self, container_id, name, *, deadline=None) -> bytes:
         """Read only a fixed Docker-managed /etc file; never a host inspect path."""
@@ -273,7 +297,7 @@ class DockerTLSClient:
         except Exception:
             raise RuntimeCollectionError('Trusted Docker managed file read failed') from None
 
-    def _request(self, path, *, deadline=None, binary=False):
+    def _request(self, path, *, deadline=None, binary=False, allow_missing=False):
         """Shared pinned mTLS request for internally allowlisted JSON/binary GETs."""
         connection = None
         response = None
@@ -284,7 +308,12 @@ class DockerTLSClient:
                 raise RuntimeCollectionError('Runtime capture deadline exceeded')
             if self._transport is not None:
                 # Round-trip to detach injected mutable objects and reject non-JSON values.
-                value = self._transport(path)
+                try:
+                    value = self._transport(path)
+                except DockerNotFound:
+                    if allow_missing:
+                        return None
+                    raise
                 raw = value if binary else canonical(value).encode()
                 if not isinstance(raw, bytes) or len(raw) > MAX_RESPONSE:
                     raise RuntimeCollectionError('Runtime response exceeds limit')
@@ -307,6 +336,8 @@ class DockerTLSClient:
             watchdog = deadline_watchdog(peer, read_deadline)
             connection.request('GET', path, headers={'Accept': 'application/x-tar' if binary else 'application/json'})
             response = connection.getresponse()
+            if allow_missing and response.status == 404:
+                return None
             if response.status != 200:
                 raise RuntimeCollectionError('Runtime read failed')
             raw = bytearray()
@@ -558,7 +589,7 @@ class TrustedDockerCollector:
         except Exception:
             raise RuntimeCollectionError('Runtime evidence could not be collected') from None
 
-    def validate_history(self, observation, *, before=None):
+    def _validate_live_history(self, observation, *, before=None):
         record = self._issued.get(id(observation))
         if (not isinstance(observation, RuntimeObservation) or record is None or record[0] is not observation
                 or observation.policy_hash != self._policy_hash or self.policy.identity_hash() != self._policy_hash
@@ -567,13 +598,23 @@ class TrustedDockerCollector:
         if observation.to_dict().get('complete') is not True:
             raise RuntimeCollectionError('Runtime observation is incomplete')
         if before is not None:
-            self.validate_history(before)
+            self._validate_live_history(before)
             if observation is before or record[2] >= self._issued[id(before)][2]:
                 raise RuntimeCollectionError('Runtime history must precede the baseline observation')
         return observation
 
+    def validate_history(self, observation, *, before=None):
+        if type(observation) is RuntimeObservation:
+            return self._validate_live_history(observation, before=before)
+        from deployment_store import HostStore
+        if before is None:
+            raise RuntimeCollectionError('Durable history requires a live baseline')
+        self.validate(before)
+        return HostStore.validate_history(observation, collector=self, before=before)
+
     def validate(self, observation):
-        self.validate_history(observation)
+        # Historical proof never becomes authority for the current running state.
+        self._validate_live_history(observation)
         issued = self._issued[id(observation)][1]
         age = (utcnow() - datetime.fromisoformat(observation.captured_at)).total_seconds()
         if not 0 <= age <= self.policy.maximum_age or not 0 <= time.monotonic() - issued <= self.policy.maximum_age:
