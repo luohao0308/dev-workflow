@@ -118,7 +118,7 @@
 
 开始涉及 API、容器、CI/CD、发布或部署触点时，按 [项目配置](docs/WORKFLOW-CONFIGURATION.md) 解析能力来源，再按 [项目能力路由](docs/DEVELOPMENT-CAPABILITIES.md) 加载对应治理规则。有效且已采用的 `workflow.config.json` 优先；旧项目兼容读取 manifest。已安装的流程包不代表启用了相关技术能力。
 
-需要检查接入状态、规则冲突或当前 Git 基线时，运行只读 `python3 scripts/workflow_check.py --repo . --json`。它不运行项目命令，远端和生产状态保持未核实；配置无效或已采用文件失踪时不得静默回退。发布包和 Skill 的安装、采用均不构成操作授权；分发 release CLI/Skill 仅准备，执行基础需要受信宿主在进程内提供独立授权与 provider，当前未交付生产适配器，不得绕过默认拒绝创建 tag、远端 Release 或部署。
+需要检查接入状态、规则冲突或当前 Git 基线时，运行只读 `python3 scripts/workflow_check.py --repo . --json`。它不运行项目命令，远端和生产状态保持未核实；配置无效或已采用文件失踪时不得静默回退。发布包和 Skill 的安装、采用均不构成操作授权；分发 release CLI/Skill 仅准备；P0 已提供真实 GitHub Tag / Release provider 与受信 Actions 宿主，执行须由宿主在进程内提供独立授权与 provider。deployment 的 P1 提供可信采集/授权与固定 Docker API 单组件替换 SDK；只有实际已配置的可信执行 profile、执行绑定与新鲜精确授权才能调用后端，本地 CLI 仍默认拒绝。按已安装的 `docs/operations/DEPLOYMENT-RUNTIME.md` 与 `DEPLOYMENT-EXECUTION.md` 核验宿主；不得回退到项目命令、宿主 shell、插件或环境凭据。已有明确授权不重复索要，新精确范围须新审批；auth-only permit、claim 或导出 JSON 不能启用执行。回滚须新鲜基线、新请求/授权及同一 collector 的较早历史证明；失败或未知立即停止，不自动重试、清理、回滚或从 JSON 续跑。实际执行也不证明健康、冒烟或生产就绪；不得绕过本地默认拒绝创建 tag、远端 Release 或部署。
 
 - 只应用与本次实际触点对应且已启用的 capability；未启用时不强制引入其技术标准。
 - 任务明显涉及某能力但 manifest 未启用时，说明专业审查未覆盖，并建议启用合适 profile；不得声称已完成该领域专项审查。

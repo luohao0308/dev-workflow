@@ -95,7 +95,7 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `contracts` | API/事件/Schema 契约、变更和迁移模板 | 对外接口、事件、数据库或文件格式项目 |
 | `operations` | 发布、Preflight、观测、回滚和 Runbook 模板 | 有测试、预发布或生产环境的项目 |
 | `feature-catalog` | 功能层级/状态/成熟度 Schema、初始化模板、生成/查询/校验工具 | 功能较多、需要 AI 排查、成熟度治理或发布证据追踪的项目 |
-| `deployment` | 部署/回滚只读计划、不可变组件身份和显式快照比较 | 需要按环境规划部署的项目；无执行入口或生产宿主适配器 |
+| `deployment` | 离线计划、可信采集/授权 SDK 与固定 Docker API 单组件替换后端 | 按环境审核部署/回滚；真实执行仅限已配置的可信宿主，非生产就绪 |
 | `release` | 可选版本策略、发布准备、执行计划、GitHub Tag / Release provider 与受信 Actions 宿主 | 需要按 SHA 或 SemVer 发布的项目；本地 CLI 仅准备，真实执行需配置独立可信宿主 |
 
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
@@ -138,7 +138,7 @@ python3 scripts/manage_skills.py uninstall --target /path/to/project \
 | `workflow-closeout` | 当前任务收尾，保留人工验收、外部阻塞和未完成阶段，定向维护已有知识 |
 | `workflow-release` | 发布计划、说明草稿及可信宿主审核指引；本地不创建 tag / Release，真实执行由已配置的宿主完成 |
 | `workflow-upgrade` | 审阅升级计划、保留定制、按事务回退及显式移交文档归属 |
-| `workflow-deploy` | 部署/回滚只读计划与所提供快照的身份比较；不执行部署或验证线上健康 |
+| `workflow-deploy` | 离线计划与快照比较；实际可信执行 profile 已配置时路由 SDK 单组件部署/回滚，健康与冒烟仍未知 |
 
 安装 `release` 包后，显式在项目配置启用 `release` 并声明 `extensions.release`。策略支持 `none`、`commit-sha`、`semver-tag`；普通 push 不要求 tag：
 
@@ -175,6 +175,10 @@ python3 scripts/deployment_prepare.py compare --repo . --plan .dev-workflow/rele
 ```
 
 全部命令返回 JSON，无需 `--json`。计划只读取本机声明和证据，只有显式 `--output` 写计划文件；不执行声明命令、不连接服务器。`executionAvailable` 和 `productionReady` 始终为 `false`，快照匹配不证明实际部署或健康成功。完整配置、输入与比较边界见 [部署计划](packs/deployment/docs/operations/DEPLOYMENT-PLANNING.md)。
+
+P1-1/P1-2 提供可信采集/授权 SDK 与独立 GitHub Actions 授权宿主；P1-3 增加首个固定 Docker API 后端，每次仅替换一个选中组件，其余组件实例保持不变。镜像须预加载、不可变且为 Linux，受信 recipe 经实测核验；执行顺序为创建停止态新容器、停止旧容器、删除旧容器、启动新容器。宿主须配置独立写入 TLS 身份、服务端路由权限及精确执行策略绑定；旧 auth-only permit 即使已 claim 也不能执行。安装后的 deployment 包不依赖 release 包，本地 CLI 不加载宿主、插件或环境凭据。
+
+实际宿主后端结果可为 `executionAvailable: true`、`executed-verified`，但 `productionReady: false`，健康/冒烟仍为 `unknown`；这不证明生产验收。回滚用新鲜现场、新请求/授权和同一 collector 保留的较早证明重建旧镜像/规格，不保留旧容器及其日志/实例 ID，不倒用旧 permit。进程内历史与授权不能从 JSON 恢复。固定可信源码、采集和授权边界见 [运行时采集与授权](packs/deployment/docs/operations/DEPLOYMENT-RUNTIME.md)，执行 API、失败停止及限制见 [部署执行](packs/deployment/docs/operations/DEPLOYMENT-EXECUTION.md)。真实 Docker/GitHub 验收须另附独立证据。
 
 ## 安装
 

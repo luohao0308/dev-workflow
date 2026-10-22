@@ -1,0 +1,118 @@
+name: P1 isolated runtime and authorization
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: p1-isolated-validation
+  cancel-in-progress: false
+jobs:
+  observer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    environment: p1-observer
+    permissions:
+      contents: write
+      actions: read
+      deployments: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Start isolated runtime observer
+        env:
+          P1_GITHUB_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 - <<'PYTHON'
+          import subprocess,sys,time
+          from pathlib import Path
+          log=open('p1-observer.log','wb')
+          subprocess.Popen([sys.executable,'-I','tests/support/p1_runtime_live.py'],stdout=log,stderr=log,start_new_session=True)
+          for _ in range(90):
+              if Path('p1-results/failure.json').exists():
+                  raise SystemExit(Path('p1-results/failure.json').read_text())
+              if Path('p1-results/deployment-deploy-preview.json').exists():
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Runtime preview timeout')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p1-deploy-preview
+          path: p1-results/deployment-deploy-preview.json
+          retention-days: 7
+      - name: Await deploy authorization and collect fresh rollback baseline
+        run: |
+          python3 - <<'PYTHON'
+          import time
+          from pathlib import Path
+          for _ in range(450):
+              if Path('p1-results/failure.json').exists():
+                  raise SystemExit(Path('p1-results/failure.json').read_text())
+              if Path('p1-results/deployment-rollback-preview.json').exists():
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Deploy review timeout')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p1-rollback-preview
+          path: p1-results/deployment-rollback-preview.json
+          retention-days: 7
+      - name: Await independent rollback authorization
+        run: |
+          python3 - <<'PYTHON'
+          import time
+          from pathlib import Path
+          for _ in range(450):
+              if Path('p1-results/failure.json').exists():
+                  raise SystemExit(Path('p1-results/failure.json').read_text())
+              if Path('p1-results/summary.json').exists():
+                  print(Path('p1-results/summary.json').read_text())
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Rollback review timeout')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: p1-results
+          path: |
+            p1-results/
+            p1-observer.log
+          retention-days: 7
+  deploy-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: p1-deploy-approval
+    steps:
+      - run: echo 'Deployment authorization review recorded; no backend connected'
+  rollback-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+    steps:
+      - name: Start rollback gate only after its fresh preview exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in $(seq 1 260); do
+            found=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '[.artifacts[] | select(.name == "p1-rollback-preview")] | length')
+            if [ "$found" = 1 ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
+  rollback-review:
+    needs: rollback-ready
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: p1-rollback-approval
+    steps:
+      - run: echo 'Rollback authorization review recorded; no backend connected'

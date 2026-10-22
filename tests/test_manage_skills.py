@@ -48,10 +48,10 @@ class SkillLifecycleTests(unittest.TestCase):
     def test_changed_files_and_extra_files_preserved(self):
         self.run_manager('install')
         target = self.dest / self.name
-        original = (target / 'SKILL.md').read_text()
+        original = (target / 'SKILL.md').read_text(encoding='utf-8')
         (target / 'SKILL.md').write_text('changed')
         self.assertEqual(self.run_manager('uninstall'), 1)
-        (target / 'SKILL.md').write_text(original)
+        (target / 'SKILL.md').write_text(original, encoding='utf-8')
         (target / 'notes.txt').write_text('user content')
         self.assertEqual(self.run_manager('uninstall'), 1)
         self.assertTrue((target / 'notes.txt').exists())

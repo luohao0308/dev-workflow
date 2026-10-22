@@ -110,6 +110,101 @@ class ReleaseHostTests(unittest.TestCase):
             approval.consume(grant, self.req)
         self.assertEqual(self.client.posts, 1)
 
+    def test_release_host_defaults_remain_bound(self):
+        approval = self.make_host()
+        self.assertIs(approval.request_type, Request)
+        self.assertEqual(approval.operations, host.OPERATIONS)
+        self.assertEqual(approval.audience, 'dev-workflow-release-host')
+        self.assertEqual(approval.ledger_namespace, 'workflow-grants')
+        self.assertEqual(approval._approval_environment(), self.policy.environment)
+        grant = approval.validate(self.req)
+        self.assertIs(type(grant), host.Grant)
+        self.assertEqual(grant.grant_id, 'github-actions:123:remote-tag-push')
+        receipt = approval.consume(grant, self.req)
+        self.assertIs(type(receipt), host.Receipt)
+        self.assertTrue(next(iter(self.client.markers)).startswith('tags/workflow-grants/123/'))
+
+    def test_before_consume_runs_after_last_authority_reads_at_before_send(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        events = []
+        original = self.client.request
+        def request(method, path, payload=None, **kwargs):
+            if method == 'GET':
+                events.append('authority')
+            return original(method, path, payload, **kwargs)
+        def guard():
+            self.assertEqual(self.client.posts, 0)
+            self.assertEqual(events[-1], 'authority')
+            events.append('sdk')
+        with mock.patch.object(self.client, 'request', side_effect=request):
+            approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(events[-1], 'sdk')
+        self.assertEqual(self.client.posts, 1)
+
+    def test_before_send_guard_failure_never_posts_or_refunds_attempt(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        original = self.client.request
+        state = {'runtime': 'approved'}
+        def request(method, path, payload=None, **kwargs):
+            value = original(method, path, payload, **kwargs)
+            if method == 'GET' and path.endswith('/approvals'):
+                state['runtime'] = 'drifted'
+            return value
+        def guard():
+            if state['runtime'] != 'approved':
+                raise RuntimeError('runtime changed during authority reads')
+        with mock.patch.object(self.client, 'request', side_effect=request):
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(self.client.posts, 0)
+        self.assertIn(self.req.digest(), approval._consumed)
+        self.assertNotIn(self.req.digest(), approval._verified_consumptions)
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(grant, self.req)
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.guard(self.req)
+        self.assertEqual(self.client.posts, 0)
+
+    def test_callback_expiry_rejected_without_post_or_refund(self):
+        approval = self.make_host()
+        grant = approval.validate(self.req)
+        def guard():
+            approval._expires = 0
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(grant, self.req, before_consume=guard)
+        self.assertEqual(self.client.posts, 0)
+        self.assertIn(self.req.digest(), approval._consumed)
+
+    def test_noncallable_consumption_guard_denied(self):
+        approval = self.make_host()
+        with self.assertRaises(AuthorizationUnavailable):
+            approval.consume(approval.validate(self.req), self.req, before_consume=True)
+        self.assertEqual(self.client.posts, 0)
+
+    def test_request_subclasses_cannot_replace_frozen_domain(self):
+        class OtherRequest(Request):
+            pass
+        other = OtherRequest(**vars(self.req))
+        with self.assertRaises(AuthorizationUnavailable):
+            host.GitHubActionsApproval(self.client, 'token', [other], self.policy,
+                                      verifier=lambda token: self.claims)
+        with self.assertRaises(AuthorizationUnavailable):
+            self.make_host().validate(other)
+
+    def test_wrong_grant_types_cannot_consume_even_with_matching_equality(self):
+        class OtherGrant(host.Grant):
+            def __eq__(self, other):
+                return True
+        approval = self.make_host()
+        expected = approval.validate(self.req)
+        for grant in (OtherGrant(**vars(expected)),
+                      host.Receipt(expected.grant_id, expected.request_hash, 1, expected.expires_at)):
+            with self.subTest(kind=type(grant)), self.assertRaises(AuthorizationUnavailable):
+                approval.consume(grant, self.req)
+        self.assertEqual(self.client.posts, 0)
+
     def test_bundle_binds_order_and_expiry(self):
         second = request('local-tag-create')
         self.assertNotEqual(host.bundle_digest([self.req, second], self.policy.expires_at),
