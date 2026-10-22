@@ -1,6 +1,6 @@
 # 部署与回滚只读计划
 
-本包提供 Python 3.10+ 标准库工具 `scripts/deployment_prepare.py`，规划环境内的组件变更、完整目标与回滚身份，并比较显式提供的观测快照。它不执行项目命令、不访问网络、不连接服务器；没有部署执行器或生产宿主适配器。`executionAvailable` 与 `productionReady` 始终为 `false`。可直接使用工具，无需安装 Skill；`workflow-deploy` 是独立显式安装的第五个可选入口，`--all-packs` 不安装 Skill。
+本包提供 Python 3.10+ 标准库工具 `scripts/deployment_prepare.py`，规划环境内的组件变更、完整目标与回滚身份，并比较显式提供的观测快照。该离线 CLI 不执行项目命令、不访问网络、不连接服务器，`executionAvailable` 与 `productionReady` 始终为 `false`。另外提供的固定 Docker API 执行 SDK 仅由实际配置的可信宿主嵌入，见 [部署执行](DEPLOYMENT-EXECUTION.md)；计划通过不会启用它。可直接使用工具，无需安装 Skill；`workflow-deploy` 是独立显式安装的第五个可选入口，`--all-packs` 不安装 Skill。
 
 ## 配置与命令引用
 
@@ -124,6 +124,8 @@ python3 scripts/deployment_prepare.py compare --repo . \
 
 `--direction` 默认 `deploy`，可选 `rollback`。部署方向比较完整期望状态（含原样保留的组件）；回滚方向比较基线身份。比较只读取用户提供的快照，逐组件检查来源、artifact、配置摘要与迁移版本，报告差异或未知，并单独给出快照新鲜度；过期或过度超前快照返回 `stale-supplied-snapshot`。即使全部匹配，实际执行、在线健康和业务冒烟仍为 `unknown`，不声明生产验证完成。
 
-配置、Skill 安装、计划文件、普通 push 权限或用户编写的授权 JSON 均不提供执行能力。执行部署、迁移、回滚或切流请求在本阶段只能返回执行集成缺口与已有计划；不通过 shell、SSH、Docker、kubectl、云 CLI 或动态 provider 绕过。实际运行仍需项目单独提供受信执行集成及其授权与证据机制，本包未实现该机制。
+配置、Skill 安装、计划文件、普通 push 权限或用户编写的授权 JSON 均不提供执行能力。只有实际可信宿主配置了 `docker-container-replace-v1` profile、受信规格与写入身份，并完成新鲜精确授权时，才能调用固定 SDK。宿主缺失时返回集成缺口与已有计划，不回退到 shell、SSH、Docker CLI、kubectl、云 CLI 或动态 provider。数据库、备份、迁移、切流、健康/冒烟探测不属于该执行 profile。
+
+规划器 `compare` 仍严格比较全局 `version`，不把业务 release alias 自动换成 runtime version。执行后端另外核验完整组件映射，分别记录 `declaredVersion` 与 `runtimeVersion`；后端成功不能改写离线比较结果。可信 recipe 的 `configurationDigest` 与旧 observed-v2 配置摘要含义不同，须使用匹配 profile 的新鲜基线重新规划，不能手工替换摘要。
 
 保存的计划同时绑定快照新鲜度：即使文件字节未变，原基线超过 `maxSnapshotAge` 后，`check-plan`/`compare` 也会要求重新规划。刷新采集材料并重新审阅计划；重新规划仍可能返回 `blocked`，输入一致或快照匹配都不解除执行阻塞。历史回滚清单仍保留，不能把旧计划当成新的现场验证或执行授权。
