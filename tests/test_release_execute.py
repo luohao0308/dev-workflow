@@ -223,6 +223,15 @@ class ReleaseExecuteTests(unittest.TestCase):
         self.assertFalse(result['authorizationConsumed'])
         self.assertEqual(self.host.consume_calls, 1)
 
+    def test_host_guard_revocation_prevents_local_tag_after_consumption(self):
+        self.host.guard = mock.Mock(side_effect=execution.AuthorizationUnavailable('Host revoked approval'))
+        result = self.execute()
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['phase'], 'pre-dispatch')
+        self.assertEqual(self.host.consume_calls, 1)
+        self.host.guard.assert_called_once()
+        self.assertEqual(self.git('tag'), '')
+
     def test_existing_annotated_tag_at_same_commit_is_refused(self):
         self.git('tag', '-a', 'v1.2.3', '-m', 'annotated', self.sha)
         self.assertNotEqual(self.git('rev-parse', 'v1.2.3'), self.sha)

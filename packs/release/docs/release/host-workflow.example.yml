@@ -1,0 +1,103 @@
+# Install in a separate, reviewed host repository. This is never auto-installed
+# as an executable workflow in the candidate project. Pin every action SHA and
+# protect the host default branch and release environment before using it.
+name: Trusted release validation
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact explicit synthetic release version
+        required: true
+        type: string
+      target_sha:
+        description: Exact full commit already in the permitted target repository
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: trusted-release-validation
+  cancel-in-progress: false
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: trusted
+          persist-credentials: false
+      - name: Read target policy from trusted host
+        id: policy
+        working-directory: trusted
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          python3 -I -c 'import json,os,re; assert re.fullmatch("[0-9a-f]{40}",os.environ["TARGET_SHA"]), "target_sha must be a full commit SHA"; p=json.load(open("host-policy.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("repository="+p["targetRepository"]+"\n"); f.close()'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ steps.policy.outputs.repository }}
+          ref: ${{ inputs.target_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.TARGET_READ_TOKEN }}
+      - name: Generate exact review bundle without execution credentials
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          mv candidate /tmp/dev-workflow-target
+          python3 -I trusted/scripts/release_host_runner.py prepare --policy trusted/host-policy.json --repo /tmp/dev-workflow-target --record preview.json --version "$RELEASE_VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-preview
+          path: preview.json
+          retention-days: 7
+  execute:
+    needs: preview
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-validation
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          path: trusted
+          persist-credentials: false
+      - name: Read target policy from trusted host
+        id: policy
+        working-directory: trusted
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          python3 -I -c 'import json,os,re; assert re.fullmatch("[0-9a-f]{40}",os.environ["TARGET_SHA"]), "target_sha must be a full commit SHA"; p=json.load(open("host-policy.json")); f=open(os.environ["GITHUB_OUTPUT"],"a"); f.write("repository="+p["targetRepository"]+"\n"); f.close()'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: ${{ steps.policy.outputs.repository }}
+          ref: ${{ inputs.target_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.RELEASE_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-preview
+      - name: Execute approved bundle using verified host identity
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          mv candidate /tmp/dev-workflow-target
+          python3 -I trusted/scripts/release_host_runner.py execute --policy trusted/host-policy.json --repo /tmp/dev-workflow-target --record preview.json --output results.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: release-results
+          path: |
+            results.json
+            /tmp/dev-workflow-target/.dev-workflow/releases/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
