@@ -5,8 +5,8 @@ all candidate checkouts. POSIX directories/files must be owned by the effective
 user with modes 0700/0600. Windows hosts must provision equivalent private ACLs
 on the directory AND its ancestors; stdlib cannot establish or audit those ACLs.
 Locks coordinate one host/shared filesystem, never distributed hosts. They have
-no TTL, PID recovery, or unlink/steal path. Lock order: target_lock, then any
-caller-owned lifecycle lock. History capture alone does not start an operation.
+no TTL, PID recovery, or unlink/steal path. Lock order: target, history, gate.
+History capture alone does not start an operation.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ import stat
 import threading
 
 import deployment_runtime as runtime
+import deployment_maintenance_state as _maintenance
 
 
 class StoreError(runtime.RuntimeCollectionError):
@@ -134,6 +135,91 @@ def _private(info, *, directory=False):
         raise StoreError('Store reparse points are forbidden')
 
 
+def _validate_source_identity(value):
+    if (type(value) is not dict
+            or set(value) != {'storeId', 'keyId', 'storePolicyHash', 'recordHash'}
+            or any(type(value[k]) is not str or not runtime.NAME.fullmatch(value[k])
+                   for k in ('storeId', 'keyId'))
+            or any(type(value[k]) is not str or not runtime.HEX.fullmatch(value[k])
+                   for k in ('storePolicyHash', 'recordHash'))):
+        raise StoreError('Invalid history provenance identity')
+
+
+def _validate_provenance(value):
+    if type(value) is not dict or set(value) != {'original', 'immediate', 'archiveHash', 'importedAt'}:
+        raise StoreError('Invalid history provenance')
+    _validate_source_identity(value['original'])
+    _validate_source_identity(value['immediate'])
+    if type(value['archiveHash']) is not str or not runtime.HEX.fullmatch(value['archiveHash']):
+        raise StoreError('Invalid archive provenance hash')
+    _utc(value['importedAt'])
+
+
+def imported_history_record(source_record, source_identity, archive_hash, new_policy, new_ref, imported_at):
+    """Build an import attestation from an already authenticated source record."""
+    _validate_source_identity(source_identity)
+    if (type(new_policy) is not StorePolicy or type(new_ref) is not str or not _REF.fullmatch(new_ref)
+            or source_identity != dict(storeId=source_record['storeId'], keyId=source_record['keyId'],
+                                      storePolicyHash=source_record['storePolicyHash'], recordHash=runtime.digest(source_record))
+            or source_record['scope'] != new_policy._scope()):
+        raise StoreError('Imported history source mismatch')
+    original = source_identity
+    if source_record['schemaVersion'] == 2:
+        _validate_provenance(source_record['provenance'])
+        original = source_record['provenance']['original']
+    provenance = dict(original=original, immediate=source_identity, archiveHash=archive_hash, importedAt=imported_at)
+    _validate_provenance(provenance)
+    if _utc(imported_at) < _utc(source_record['capturedAt']):
+        raise StoreError('Import precedes historical capture')
+    record = dict(source_record, schemaVersion=2, reference=new_ref, storeId=new_policy.store_id,
+                  keyId=new_policy.key_id, storePolicyHash=new_policy.identity_hash(), provenance=provenance)
+    # Detach from caller-owned dictionaries, retaining original evidence exactly.
+    return runtime.parse_json(runtime.canonical(record))
+
+
+def authenticate_history(raw, policy, key, reference):
+    """Verify a bounded envelope without opening or constructing a source store."""
+    if (type(raw) is not bytes or len(raw) > _MAX_RECORD
+            or type(policy) is not StorePolicy or type(key) is not bytes or len(key) < 32
+            or type(reference) is not str or not _REF.fullmatch(reference)):
+        raise StoreError('Invalid history verification input')
+    try:
+        envelope = runtime.parse_json(raw.decode('ascii'))
+        if len(raw) > _MAX_RECORD or set(envelope) != {'record', 'signature'}:
+            raise ValueError
+        record = envelope['record']
+        signature = hmac.new(key, _DOMAIN + runtime.canonical(record).encode(), hashlib.sha256).hexdigest()
+        if (type(envelope['signature']) is not str
+                or not hmac.compare_digest(envelope['signature'], signature)
+                or runtime.canonical(envelope).encode() != raw):
+            raise ValueError
+        fields = {'schemaVersion', 'kind', 'reference', 'storeId', 'keyId', 'storePolicyHash',
+                  'scope', 'producerPolicyHash', 'capturedAt', 'observation', 'entries'}
+        if record.get('schemaVersion') == 2:
+            fields.add('provenance')
+        if (set(record) != fields
+                or type(record['schemaVersion']) is not int or record['schemaVersion'] not in (1, 2)
+                or record['kind'] != 'authenticated-deployment-history' or record['reference'] != reference
+                or record['storeId'] != policy.store_id or record['keyId'] != policy.key_id
+                or record['storePolicyHash'] != policy.identity_hash()
+                or record['scope'] != policy._scope()):
+            raise ValueError
+        if record['schemaVersion'] == 2:
+            _validate_provenance(record['provenance'])
+            if _utc(record['provenance']['importedAt']) < _utc(record['capturedAt']):
+                raise ValueError
+        payload = dict(record['observation'])
+        evidence = payload.pop('evidenceHash')
+        if (payload['complete'] is not True or runtime.digest(payload) != evidence
+                or payload['policyHash'] != record['producerPolicyHash']
+                or not runtime.HEX.fullmatch(record['producerPolicyHash'])
+                or _utc(payload['capturedAt']) > _utc(record['capturedAt'])):
+            raise ValueError
+        return record
+    except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError, OverflowError):
+        raise StoreError('History authentication or record validation failed') from None
+
+
 class HostStore:
     """Concrete store. root must be absolute with NO symlink path components.
 
@@ -156,6 +242,8 @@ class HostStore:
         self._issued = {}
         self._captures = {}
         self._issuance_lock = threading.Lock()
+        self._history_identity = None
+        self._history_pin = None
         self._root_identity = None
         try:
             with self._directory(create=True) as directory:
@@ -163,6 +251,16 @@ class HostStore:
                 self._root_identity = (info.st_dev, info.st_ino)
         except OSError:
             raise StoreError('Private host directory is unavailable') from None
+        with self.history_lock():
+            pass
+
+    def __del__(self):
+        fd = getattr(self, '_history_pin', None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     @contextmanager
     def _directory(self, *, create=False):
@@ -219,14 +317,46 @@ class HostStore:
 
     @contextmanager
     def target_lock(self):
+        """Non-reentrant target mutex; acquire before history and gate locks."""
+        with self._mutex('target.lock'):
+            yield
+
+    def _maintenance_guard(self):
+        try:
+            _maintenance._guard(self.root, self._policy_hash, self._key, 'store')
+        except (OSError, _maintenance.MaintenanceStateError):
+            raise StoreError('History maintenance authority unavailable') from None
+
+    @contextmanager
+    def history_lock(self):
+        """Fixed non-reentrant history mutex shared by all store instances."""
+        try:
+            with self._mutex('history.lock'):
+                self._maintenance_guard()
+                yield
+        except _maintenance.MaintenanceStateError:
+            raise StoreError('History maintenance authority unavailable') from None
+
+    @contextmanager
+    def _mutex(self, name):
         """Block on the kernel mutex until its live owner releases or exits.
 
         Non-reentrant. Never delete/replace the lock file or infer expiry from PID
-        or time. Callers may hold this across capture/load (those do not lock).
+        or time. Public entry points select a fixed mutex name.
         """
         with self._directory() as directory:
-            fd = self._open(directory, 'target.lock', os.O_RDWR | os.O_CREAT)
+            fd = self._open(directory, name, os.O_RDWR | os.O_CREAT)
             info = os.fstat(fd)
+            if name == 'history.lock':
+                identity = (info.st_dev, info.st_ino)
+                with self._issuance_lock:
+                    if self._history_identity is None:
+                        self._history_identity = identity
+                        if os.name == 'posix':
+                            self._history_pin = os.dup(fd)
+                    elif self._history_identity != identity:
+                        os.close(fd)
+                        raise StoreError('History mutex identity changed')
             with _LOCKS_GUARD:
                 local = _LOCKS.setdefault((info.st_dev, info.st_ino), threading.Lock())
             try:
@@ -255,14 +385,19 @@ class HostStore:
                     try:
                         # Revalidate the path after waiting, before entering.
                         with self._directory() as current_directory:
-                            check = self._open(current_directory, 'target.lock', os.O_RDWR)
+                            check = self._open(current_directory, name, os.O_RDWR)
                             try:
                                 current = os.fstat(check)
                                 if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
                                     raise StoreError('Store mutex identity changed')
                             finally:
                                 os.close(check)
-                            yield
+                            if name == 'history.lock':
+                                binding = _maintenance._binding(self.root, self._policy_hash, self._key, 'store')
+                                with _maintenance._held(binding, fd):
+                                    yield
+                            else:
+                                yield
                     finally:
                         if os.name == 'posix':
                             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -317,32 +452,33 @@ class HostStore:
         payload = observation.to_dict()
         entries = self._entries(collector.policy, payload)
         collector.recheck(observation)
-        collector.validate(observation)
-        ref = 'history-' + secrets.token_hex(32) + '.json'
-        record = dict(schemaVersion=1, kind='authenticated-deployment-history', reference=ref,
-                      storeId=self.policy.store_id, keyId=self.policy.key_id,
-                      storePolicyHash=self._policy_hash, scope=self.policy._scope(),
-                      producerPolicyHash=observation.policy_hash,
-                      capturedAt=datetime.now(timezone.utc).isoformat(),
-                      observation=payload, entries=entries)
-        raw = runtime.canonical(self._envelope(record)).encode()
-        if len(raw) > _MAX_RECORD:
-            raise StoreError('History record exceeds size limit')
-        with self._directory() as directory:
-            fd = self._open(directory, ref, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-            try:
-                with os.fdopen(fd, 'wb') as stream:
-                    stream.write(raw)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                if directory is not None:
-                    os.fsync(directory)
-            except OSError:
-                # A partial record stays invalid; never overwrite or repair it.
-                raise StoreError('History record persistence failed') from None
-        with self._issuance_lock:
-            self._captures[ref] = (collector, observation)
-        return ref
+        with self.history_lock():
+            collector.validate(observation)
+            ref = 'history-' + secrets.token_hex(32) + '.json'
+            record = dict(schemaVersion=1, kind='authenticated-deployment-history', reference=ref,
+                          storeId=self.policy.store_id, keyId=self.policy.key_id,
+                          storePolicyHash=self._policy_hash, scope=self.policy._scope(),
+                          producerPolicyHash=observation.policy_hash,
+                          capturedAt=datetime.now(timezone.utc).isoformat(),
+                          observation=payload, entries=entries)
+            raw = runtime.canonical(self._envelope(record)).encode()
+            if len(raw) > _MAX_RECORD:
+                raise StoreError('History record exceeds size limit')
+            with self._directory() as directory:
+                fd = self._open(directory, ref, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                try:
+                    with os.fdopen(fd, 'wb') as stream:
+                        stream.write(raw)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if directory is not None:
+                        os.fsync(directory)
+                except OSError:
+                    # A partial record stays invalid; never overwrite or repair it.
+                    raise StoreError('History record persistence failed') from None
+            with self._issuance_lock:
+                self._captures[ref] = (collector, observation)
+            return ref
 
     def _read(self, ref):
         if type(ref) is not str or not _REF.fullmatch(ref):
@@ -351,34 +487,7 @@ class HostStore:
             fd = self._open(directory, ref, os.O_RDONLY)
             with os.fdopen(fd, 'rb') as stream:
                 raw = stream.read(_MAX_RECORD + 1)
-        try:
-            envelope = runtime.parse_json(raw.decode('ascii'))
-            if len(raw) > _MAX_RECORD or set(envelope) != {'record', 'signature'}:
-                raise ValueError
-            record = envelope['record']
-            expected = self._envelope(record)
-            if (type(envelope['signature']) is not str
-                    or not hmac.compare_digest(envelope['signature'], expected['signature'])
-                    or runtime.canonical(envelope).encode() != raw):
-                raise ValueError
-            if (set(record) != {'schemaVersion', 'kind', 'reference', 'storeId', 'keyId', 'storePolicyHash',
-                                'scope', 'producerPolicyHash', 'capturedAt', 'observation', 'entries'}
-                    or type(record['schemaVersion']) is not int or record['schemaVersion'] != 1
-                    or record['kind'] != 'authenticated-deployment-history' or record['reference'] != ref
-                    or record['storeId'] != self.policy.store_id or record['keyId'] != self.policy.key_id
-                    or record['storePolicyHash'] != self._policy_hash
-                    or record['scope'] != self.policy._scope()):
-                raise ValueError
-            payload = dict(record['observation'])
-            evidence = payload.pop('evidenceHash')
-            if (payload['complete'] is not True or runtime.digest(payload) != evidence
-                    or payload['policyHash'] != record['producerPolicyHash']
-                    or not runtime.HEX.fullmatch(record['producerPolicyHash'])
-                    or _utc(payload['capturedAt']) > _utc(record['capturedAt'])):
-                raise ValueError
-            return record
-        except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, RecursionError, OverflowError):
-            raise StoreError('History authentication or record validation failed') from None
+        return authenticate_history(raw, self.policy, self._key, ref)
 
     def _compatible(self, ref, collector, before):
         self._check_policy(collector)
@@ -403,11 +512,12 @@ class HostStore:
     def load_history(self, ref: str, *, collector, before) -> HistoricalSnapshot:
         self._compatible(ref, collector, before)
         collector.recheck(before)
-        self._compatible(ref, collector, before)
-        history = HistoricalSnapshot(self, ref, collector, before)
-        with self._issuance_lock:
-            self._issued[id(history)] = (history, collector, before)
-        return history
+        with self.history_lock():
+            self._compatible(ref, collector, before)
+            history = HistoricalSnapshot(self, ref, collector, before)
+            with self._issuance_lock:
+                self._issued[id(history)] = (history, collector, before)
+            return history
 
     @classmethod
     def _validate(cls, observation, *, collector, before):
@@ -420,7 +530,8 @@ class HostStore:
                 or issued[2] is not before or observation._collector is not collector
                 or observation._before is not before):
             raise StoreError('History capability identity or baseline binding mismatch')
-        return store._compatible(observation._ref, collector, before)
+        with store.history_lock():
+            return store._compatible(observation._ref, collector, before)
 
     @classmethod
     def validate_history(cls, observation, *, collector, before):

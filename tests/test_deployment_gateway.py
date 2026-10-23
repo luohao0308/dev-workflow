@@ -80,6 +80,41 @@ class GatewayTests(unittest.TestCase):
                                str(self.root), *arguments], capture_output=True, text=True,
                               timeout=15)
 
+    def test_retirement_fences_all_capability_boundaries(self):
+        import deployment_maintenance_state as state
+        session, attempt = self.prepared()
+        info = self.gate.info()
+        proof = self.gate.close_generation(GEN)
+        binding = state._binding(self.root, policy().identity_hash(), KEY, 'gate')
+        # Primitive is inert: the maintenance orchestrator must first establish
+        # drained healthy generations; this test isolates final-use fencing.
+        with state._locked_binding(binding):
+            state._transition(binding, H, 'retired')
+        for action in (lambda: session.headers(attempt),
+                       lambda: session.prepare_attempt('POST', CREATE, BODY),
+                       lambda: self.admit(attempt), self.gate.info,
+                       lambda: self.gate.verify_info(info), self.open,
+                       lambda: self.gate.close_generation(GEN),
+                       lambda: self.gate.load_proof(GEN),
+                       lambda: self.gate.validate_proof(proof),
+                       lambda: gateway.FileWriterGate(policy(), self.root, key=KEY)):
+            with self.assertRaises(gateway.GateError):
+                action()
+        (self.root / 'maintenance.json').unlink()
+        with self.assertRaises(gateway.GateError):
+            self.gate.info()
+
+    def test_pending_gate_has_no_public_construction_window(self):
+        import deployment_maintenance_state as state
+        root = self.root.parent / 'pending-gate'
+        binding = state._initialize_pending(root, policy(), KEY, 'gate', H)
+        with self.assertRaises(gateway.GateError):
+            gateway.FileWriterGate(policy(), root, key=KEY)
+        with state._locked_binding(binding):
+            state._transition(binding, H, 'active')
+        active = gateway.FileWriterGate(policy(), root, key=KEY)
+        self.assertTrue(active.verify_info(active.info()))
+
     def test_full_lifecycle_all_fixed_routes(self):
         operations = (('POST', CREATE, sha(BODY)), ('POST', STOP, sha(b'')),
                       ('POST', START, sha(b'')), ('DELETE', DELETE, sha(b'')))

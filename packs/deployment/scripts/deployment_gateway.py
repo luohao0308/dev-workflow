@@ -25,6 +25,8 @@ import secrets
 import stat
 import threading
 
+import deployment_maintenance_state as _maintenance
+
 _HEX = re.compile(r'[0-9a-f]{64}')
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 _ZERO = '0' * 64
@@ -305,6 +307,13 @@ class FileWriterGate:
             raise
 
     def _live(self):
+        if self._mutex_identity is not None:
+            try:
+                binding = _maintenance._binding(self.root, self.policy.identity_hash(), self._key, 'gate')
+                if _maintenance._has_holder(binding):
+                    _maintenance._guard(self.root, self.policy.identity_hash(), self._key, 'gate')
+            except (OSError, _maintenance.MaintenanceStateError):
+                raise GateError('gate-maintenance-authority-unavailable') from None
         self._ancestors(self.root.parent)
         for path, identity in self._ancestor_ids.items():
             if self._identity(path) != identity:
@@ -342,7 +351,7 @@ class FileWriterGate:
 
     def _open_record(self, path, flags, parent):
         return os.open(path.name if parent is not None else path,
-                       flags | getattr(os, 'O_NOFOLLOW', 0), 0o600,
+                       flags | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600,
                        **({'dir_fd': parent} if parent is not None else {}))
 
     @contextmanager
@@ -394,13 +403,15 @@ class FileWriterGate:
                     import fcntl
                     fcntl.flock(fd, fcntl.LOCK_EX)
                 locked = True
-                self._live()
-                if not self._initializing:
-                    if self._read(self.root / 'policy.json', 'policy') != self._storage_binding():
-                        self._fail()
-                yield
-                self._live()
-            except OSError:
+                binding = _maintenance._binding(self.root, self.policy.identity_hash(), self._key, 'gate')
+                with _maintenance._held(binding, fd):
+                    self._live()
+                    if not self._initializing:
+                        if self._read(self.root / 'policy.json', 'policy') != self._storage_binding():
+                            self._fail()
+                    yield
+                    self._live()
+            except (OSError, _maintenance.MaintenanceStateError):
                 raise GateError('gate-storage-rejected') from None
             finally:
                 if fd is not None:
@@ -777,6 +788,7 @@ class FileWriterGate:
             return self._seal('info', dict(policy_hash=self.policy.identity_hash()))
 
     def verify_info(self, info):
-        if self._verify(info, 'info') != dict(policy_hash=self.policy.identity_hash()):
-            raise GateError('invalid-gate-info')
-        return True
+        with self._locked():
+            if self._verify(info, 'info') != dict(policy_hash=self.policy.identity_hash()):
+                raise GateError('invalid-gate-info')
+            return True

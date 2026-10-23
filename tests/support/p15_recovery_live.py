@@ -193,7 +193,7 @@ def actual_approval(config, request, output):
     return authority.GitHubRecoveryApproval(gh, token, [request], policy)
 
 
-def exercise(state):
+def exercise(state, after_recovery=None):
     import ssl
     directory, metadata = state['directory'], state['metadata']
     if (metadata['targetRepository'] != 'luohao0308/dev-workflow-p0-target-20261022'
@@ -331,6 +331,8 @@ def exercise(state):
             pass
         else:
             raise AssertionError('Recovery request replay succeeded')
+        if after_recovery is not None:
+            after_recovery(coordinator, collector, executor, config, state)
         provision.save(output / 'summary.json', dict(result='passed', realDocker=True, realMTLS=True,
             actualChildCrash=True, crashAfterCompletedWrite=crash_after, staleCoreOwnerReclaimed=True,
             actualRecoveryChildCrash=bool(recovery_crash_after),

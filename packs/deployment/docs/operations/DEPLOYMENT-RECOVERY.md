@@ -62,7 +62,7 @@ with coordinator.operation(root, plan, intent) as host_operation:
 - admission 已持久化但上游完成未知时永久拒绝自动排空；需宿主运维核对，不能用超时强解锁或复用审批。
 - 本机 Unix Docker 网关参考宿主用于 Linux；Windows 测试覆盖 SDK、持久化／文件锁和 PowerShell，不代表 Windows 容器执行或 Windows daemon 网关已交付。
 - 未设置可选哈希时保留 P1-3 行为和原哈希，不自动启用存储、探针或恢复。不迁移进程内旧 capability，不为已有 P1-3 中断现场补造签名日志。首次启用须创建受控私有存储和全新精确授权。
-- 旧的无签名 inode／mutex 绑定存储不自动升级；新建受控存储，不覆盖未知记录。密钥轮换／备份迁移尚无自动适配器。
+- 旧的无签名 inode／mutex 绑定存储不自动升级；新建受控存储，不覆盖未知记录。历史备份校验、仅历史恢复和健康宿主离线密钥轮换见 [存储维护](DEPLOYMENT-MAINTENANCE.md)。维护不会复制或重签网关权限；未完成操作和未知上游结果仍不得迁移。
 - 此恢复只针对现有无状态、只读、无挂载、无需迁移的单组件规格；不提供数据库／备份恢复、生产验收、切流或多宿主编排。`productionReady` 保持 false。
 
 ## 阻塞时如何核对
