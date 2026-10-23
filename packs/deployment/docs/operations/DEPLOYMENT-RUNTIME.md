@@ -1,6 +1,6 @@
 # 可信运行时采集与部署授权（P1-1/P1-3）
 
-本阶段提供 `deployment_runtime.py` 采集 SDK、`deployment_authorize.py` 授权 SDK，以及分发目录中的 `scripts/deployment_host.py` GitHub Actions 授权宿主。P1-3 另提供 `deployment_spec.py` 可信规格和 `deployment_execute.py` 固定 Docker API 单组件替换后端，见 [部署执行](DEPLOYMENT-EXECUTION.md)。采集/授权本身不写 Docker，也不运行项目声明命令；本地 CLI 与授权结果的 `executionAvailable` 为 `false`，实际宿主执行后端可为 `true`。`productionReady` 为 `false`，健康、冒烟、备份保持 `unknown`；仅实际成功执行后才能报告对应部署/回滚已核验。离线计划与显式快照比较仍按 [部署计划](DEPLOYMENT-PLANNING.md) 工作，不因 SDK 存在而联网。
+本阶段提供 `deployment_runtime.py` 采集 SDK、`deployment_authorize.py` 授权 SDK，以及分发目录中的 `scripts/deployment_host.py` GitHub Actions 授权宿主。P1-3 另提供 `deployment_spec.py` 可信规格和 `deployment_execute.py` 固定 Docker API 单组件替换后端，见 [部署执行](DEPLOYMENT-EXECUTION.md)。采集/授权本身不写 Docker，也不运行项目声明命令；本地 CLI 与授权结果的 `executionAvailable` 为 `false`，实际宿主执行后端可为 `true`。`productionReady` 为 `false`，采集／授权结果中的健康、冒烟、备份保持 `unknown`；仅实际成功执行后才能报告对应部署/回滚已核验。离线计划与显式快照比较仍按 [部署计划](DEPLOYMENT-PLANNING.md) 工作，不因 SDK 存在而联网。
 
 ## 可信源码宿主
 
@@ -45,10 +45,16 @@ Request 固定 operation（`deployment-deploy` / `deployment-rollback`）、仓�
 
 `DeploymentHostPolicy.environment` 是签名 OIDC 调用者环境，`approval_environment` 是受保护人工审核环境；两者可相同，也可分开以便只读 observer 持续运行并保留历史。部署环境/target/production、runtime policy hash、允许组件另行固定。宿主核验 OIDC 签名/issuer/audience/subject、仓库身份、workflow ref/SHA、run ID、首次 attempt、调用者环境与 actor；运行须为进行中的 workflow_dispatch。受保护审核环境、reviewer ID、自审规则和禁止管理员绕过规则必须匹配，审批评论精确为 `dev-workflow approve <bundle_hash>`。bundle 摘要绑定全部宿主策略上下文、请求集合和到期时间，不能只审目标业务版本或另一环境的审批。沿用用户已有明确授权，不重复索要相同权限；对话授权不替代这些宿主核验。
 
-`authorize` 在消耗前和返回 permit 前重核项目/计划、现场 observation 与宿主权限；完成远端权限查询后，紧邻账本 CAS 再执行运行状态和项目 guard。dispatch claim 的最后一次现场读取后再检查项目/计划。跨 Git、Docker 和 GitHub 的检查仍不构成原子事务，固定执行器在每次写入前核对预期中间态、完整项目 inventory 和未选中实例；这些检查仍不是分布式事务，唯一资源名也不是可重试的幂等令牌。宿主在目标项目之外的可信账本，以只允许不存在时创建 ref 的 CAS 语义记录一次消耗；重复、响应丢失或结果未知均按次数已消耗处理，停止，不退款、不自动重试/恢复。消耗后漂移也不恢复次数。最终 guard 再验证实时授权和账本；进程内 `DeploymentPermit.claim_for_dispatch()` 仅允许一次 claim，固定执行器在生命周期锁内调用它。执行绑定 permit claim 后，`guard_for_execution(runtime_check=...)` 在每次写入前验证授权、预期中间态和项目/计划；旧 auth-only permit 即使已 claim 也被拒绝。任何不确定调度须先核对现场和账本，再另行构建新请求，不能从旧文件自动续跑。普通 collector 不接受创建后双实例、旧实例停止或缺失等中间态；在现场恢复为完整受支持状态前，不能通过普通回滚授权绕过阻塞，后续恢复契约留待 P1-5。
+`authorize` 在消耗前和返回 permit 前重核项目/计划、现场 observation 与宿主权限；完成远端权限查询后，紧邻账本 CAS 再执行运行状态和项目 guard。dispatch claim 的最后一次现场读取后再检查项目/计划。跨 Git、Docker 和 GitHub 的检查仍不构成原子事务，固定执行器在每次写入前核对预期中间态、完整项目 inventory 和未选中实例；这些检查仍不是分布式事务，唯一资源名也不是可重试的幂等令牌。宿主在目标项目之外的可信账本，以只允许不存在时创建 ref 的 CAS 语义记录一次消耗；重复、响应丢失或结果未知均按次数已消耗处理，停止，不退款、不自动重试/恢复。消耗后漂移也不恢复次数。最终 guard 再验证实时授权和账本；进程内 `DeploymentPermit.claim_for_dispatch()` 仅允许一次 claim，固定执行器在生命周期锁内调用它。执行绑定 permit claim 后，`guard_for_execution(runtime_check=...)` 在每次写入前验证授权、预期中间态和项目/计划；旧 auth-only permit 即使已 claim 也被拒绝。任何不确定调度须先核对现场和账本，再另行构建新请求，不能从旧文件自动续跑。普通 collector 不接受创建后双实例、旧实例停止或缺失等中间态；在现场恢复为完整受支持状态前，不能通过普通回滚授权绕过阻塞，受支持中断态可通过显式配置的 P1-5 独立恢复宿主处理，不能复用普通部署／回滚授权。
 
 本机审计保存于 Git 忽略且无已跟踪内容的 `.dev-workflow/releases/deployments/`，POSIX 文件权限为 `0600`；Windows 的 `chmod` 不提供同等 ACL 隔离，嵌入宿主须提供受控目录权限。首个 GitHub 授权宿主仍运行于 Linux。JSON、Receipt 导出和 `authorizationConsumed=true` 只说明审计/消耗结果，不是可加载的执行 capability，也不是部署成功证明。
 
 ## 验收边界
 
-mock/单元测试只能证明相应 SDK 分支。真实 Docker + 服务端 GET-only mTLS 网关、GitHub OIDC/受保护审批及账本的端到端验收须另附独立环境证据；本文不声明这些真实验收已完成。授权成功仍不是部署执行证据。实际执行结果与进程内 observation 的使用见执行文档；健康/冒烟及生产就绪结论不由该后端提供。历史 P1-1/P1-2 验证记录保持原义，P1-3 独立验证指引见分发仓库 `tests/support/P13-EXECUTION-VALIDATION.md`，不据此声明验收已完成。
+mock/单元测试只能证明相应 SDK 分支。真实 Docker + 服务端 GET-only mTLS 网关、GitHub OIDC/受保护审批及账本的端到端验收须另附独立环境证据；本文不声明这些真实验收已完成。授权成功仍不是部署执行证据。实际执行结果与进程内 observation 的使用见执行文档；未配置探针时健康/冒烟保持 unknown；可选 P1-4 只报告实际探针结论，不提供生产就绪保证。历史 P1-1/P1-2 验证记录保持原义，P1-3 独立验证指引见分发仓库 `tests/support/P13-EXECUTION-VALIDATION.md`，不据此声明验收已完成。
+
+## 可选持久化历史
+
+P1-5 的 `HostStore.capture_history()` 只接受 collector 签发且现场复核通过的完整 observation。重启后 `load_history(..., collector=new_collector, before=fresh_current)` 校验宿主签名、固定目标和全部历史组件的镜像／来源／规格仍存在，签发独立 `HistoricalSnapshot`。它仅能用于 `validate_history(..., before=...)` 和新回滚请求；`validate()`／`recheck()` 仍只认可本 collector 的新鲜现场对象。
+
+历史记录保留原始 producer policy；当前 catalog 增加版本、传输证书轮换不必抹去旧历史。删除或改变历史配方、变更目标／组件集合、错误签名密钥均拒绝。请求额外绑定签名记录、store、producer/current policy 摘要和真实仓库数值 ID。已有进程内历史路径及未配置扩展时的执行策略哈希保持兼容。详见 [持久化与恢复](DEPLOYMENT-RECOVERY.md)。

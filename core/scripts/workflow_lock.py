@@ -78,12 +78,22 @@ class LifecycleLock:
     execution permission. No timeout-based stealing or deletion of live owners.
     """
     def __init__(self, root: Path, operation: str, *, transaction: str | None = None,
-                 borrow_parent: bool = False, recover: bool = False):
+                 borrow_parent: bool = False, recover: bool = False, expected_owner: dict | None = None):
         self.root = root.resolve()
         self.directory = self.root / '.dev-workflow/lifecycle.lock'
         self.path = self.directory / 'owner.json'
         self.operation, self.transaction = operation, transaction
         self.borrow_parent, self.recover = borrow_parent, recover
+        self._expected_owner = None
+        if expected_owner is not None:
+            if (not recover or type(expected_owner) is not dict
+                    or set(expected_owner) != {'pid', 'token', 'operation', 'transaction'}
+                    or type(expected_owner['pid']) is not int or expected_owner['pid'] <= 0
+                    or type(expected_owner['token']) is not str or not re.fullmatch(r'[0-9a-f]{32}', expected_owner['token'])
+                    or type(expected_owner['operation']) is not str
+                    or expected_owner['transaction'] != transaction):
+                raise ValueError('Invalid attested owner for lifecycle recovery')
+            self._expected_owner = json.dumps(expected_owner, sort_keys=True, separators=(',', ':'))
         self.token = uuid.uuid4().hex
         self.owned = False
 
@@ -110,6 +120,8 @@ class LifecycleLock:
             guard.unlink()
 
     def _acquire(self):
+        if self._expected_owner is not None and not self.path.exists():
+            raise ValueError('Lifecycle attested owner disappeared before recovery')
         if self.path.exists():
             try:
                 previous = json.loads(self.path.read_text(encoding='utf-8'))
@@ -123,6 +135,15 @@ class LifecycleLock:
                 return self
             if (self.recover and self.transaction and previous.get('transaction') == self.transaction
                     and process_alive(previous.get('pid')) is False):
+                # Runs while recovery.lock is held. Recompare the complete frozen
+                # attestation here; a precheck outside this boundary is insufficient.
+                if self._expected_owner is not None:
+                    if linked(self.path) or self.path.stat().st_nlink != 1:
+                        raise ValueError('Lifecycle attested owner is linked before recovery')
+                    current = json.loads(self.path.read_text(encoding='utf-8'))
+                    if (current != previous
+                            or json.dumps(current, sort_keys=True, separators=(',', ':')) != self._expected_owner):
+                        raise ValueError('Lifecycle attested owner changed before recovery')
                 self.path.unlink()
             else:
                 raise ValueError('Lifecycle operation is already locked; live or unknown owners are never stolen')

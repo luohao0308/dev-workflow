@@ -178,7 +178,7 @@ python3 scripts/deployment_prepare.py compare --repo . --plan .dev-workflow/rele
 
 P1-1/P1-2 提供可信采集/授权 SDK 与独立 GitHub Actions 授权宿主；P1-3 增加首个固定 Docker API 后端，每次仅替换一个选中组件，其余组件实例保持不变。镜像须预加载、不可变且为 Linux，受信 recipe 经实测核验；执行顺序为创建停止态新容器、停止旧容器、删除旧容器、启动新容器。宿主须配置独立写入 TLS 身份、服务端路由权限及精确执行策略绑定；旧 auth-only permit 即使已 claim 也不能执行。安装后的 deployment 包不依赖 release 包，本地 CLI 不加载宿主、插件或环境凭据。
 
-实际宿主后端结果可为 `executionAvailable: true`、`executed-verified`，但 `productionReady: false`，健康/冒烟仍为 `unknown`；这不证明生产验收。回滚用新鲜现场、新请求/授权和同一 collector 保留的较早证明重建旧镜像/规格，不保留旧容器及其日志/实例 ID，不倒用旧 permit。进程内历史与授权不能从 JSON 恢复。固定可信源码、采集和授权边界见 [运行时采集与授权](packs/deployment/docs/operations/DEPLOYMENT-RUNTIME.md)，执行 API、失败停止及限制见 [部署执行](packs/deployment/docs/operations/DEPLOYMENT-EXECUTION.md)。真实 Docker/GitHub 验收须另附独立证据。
+实际宿主后端结果可为 `executionAvailable: true`、`executed-verified`，但 `productionReady: false`，未配置可选探针时健康/冒烟为 `unknown`；P1-4 可验证固定健康和业务响应，失败报告 `executed-unhealthy`，不会自动回滚。回滚用新鲜现场、新请求/授权和同一 collector 保留的较早证明重建旧镜像/规格，不保留旧容器及其日志/实例 ID，不倒用旧 permit。进程内授权不能从 JSON 恢复。P1-5 可用宿主私有签名存储保留历史，并在网关证明旧写入已结束后，通过新的独立授权恢复受支持的中断状态。固定可信源码、采集和授权边界见 [运行时采集与授权](packs/deployment/docs/operations/DEPLOYMENT-RUNTIME.md)，执行 API、失败停止及限制见 [部署执行](packs/deployment/docs/operations/DEPLOYMENT-EXECUTION.md)。真实 Docker/GitHub 验收须另附独立证据。可选能力的配置及限制见 [健康验收](packs/deployment/docs/operations/DEPLOYMENT-VERIFICATION.md) 和 [持久化／恢复](packs/deployment/docs/operations/DEPLOYMENT-RECOVERY.md)。
 
 ## 安装
 
