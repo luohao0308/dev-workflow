@@ -591,6 +591,7 @@ class FileWriterGate:
                             else data['response_hash'] is not None)):
                     self._fail()
                 state['admissions'][data['ref']]['status'] = 'done' if data['definitive'] else 'unknown'
+                state['admissions'][data['ref']]['response_hash'] = data['response_hash']
             elif kind == 'close':
                 if state['closed'] or data is not None:
                     self._fail()
@@ -703,6 +704,33 @@ class FileWriterGate:
                 raise GateError('admission-already-finished')
             self._append(ticket.generation, state, 'finish',
                          dict(ref=ticket.attempt_ref, definitive=definitive, response_hash=response_hash))
+
+    def diagnose_generation(self, generation):
+        """Read verified state without fencing writers or issuing authority.
+
+        Codes describe operator actions, never permission to modify records or
+        synthesize an upstream outcome. Unknown outcomes remain blocked.
+        """
+        with self._locked():
+            state = self._state(generation)
+            counts = {status: sum(item['status'] == status
+                                  for item in state['admissions'].values())
+                      for status in ('pending', 'unknown', 'done')}
+            if counts['unknown']:
+                blocker, next_step = 'upstream-outcome-unknown', 'investigate-upstream-outcome'
+                summary = '上游写入结果未知；保持阻塞，核查上游证据，不得用超时或修改记录解除。'
+            elif counts['pending']:
+                blocker, next_step = 'upstream-write-pending', 'await-original-writer-completion'
+                summary = '上游写入仍待完成；等待原写入者登记确定结果，重启不能接管或伪造完成。'
+            elif not state['closed']:
+                blocker, next_step = 'generation-open', 'close-generation'
+                summary = '尚未关闭写入代次；由可信协调器执行关闭并重新验证静止状态。'
+            else:
+                blocker = None
+                next_step = 'load-proof' if state['proof'] is not None else 'close-generation'
+                summary = '写入代次已关闭且无未决写入；由可信协调器获取静止证明后继续独立授权流程。'
+            return dict(closed=state['closed'], **counts, blocker=blocker, nextStep=next_step,
+                        summary=summary, authorityGranted=False)
 
     def close_generation(self, generation) -> QuiescenceProof:
         with self._locked():

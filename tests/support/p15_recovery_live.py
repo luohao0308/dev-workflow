@@ -123,6 +123,33 @@ class RecoveryTestApproval:
             raise ValueError('Recovery not consumed')
 
 
+def recovery_child(config_path, crash_after):
+    """Crash a separately authorized recovery after its real gateway write."""
+    if os.environ.get('P15_REAL_AUTHORITY') != 'false':
+        raise ValueError('Recovery crash fixture requires explicit synthetic authority')
+    config = json.loads(Path(config_path).read_text())
+    _, coordinator, _ = embedding(config)
+    pending = coordinator._ids()
+    assert len(pending) == 1
+    request = coordinator.prepare_recovery(Path(config['candidate']), pending[0],
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=40)).isoformat())
+    output = ROOT / 'p15-results'
+    provision.save(output / 'recovery-child-request.json', dict(requestId=request.request_id,
+        requestHash=request.digest(), producerPID=os.getpid(), actions=json.loads(request.actions_json),
+        authority='synthetic-test-double'))
+    original = recovery.HostOperation.after_write
+    completed = 0
+    def crash(operation, session, digest):
+        nonlocal completed
+        completed += 1
+        if completed == crash_after:
+            os._exit(78)  # Gateway completed; observer has not journaled its response.
+        return original(operation, session, digest)
+    recovery.HostOperation.after_write = crash
+    coordinator.recover(request, RecoveryTestApproval())
+    raise AssertionError('Recovery crash point was not reached')
+
+
 def actual_approval(config, request, output):
     metadata = config['metadata']
     expires = request.expires_at
@@ -173,6 +200,11 @@ def exercise(state):
             or metadata['targetRepositoryId'] != 1428943581
             or metadata['hostRepository'] != 'luohao0308/dev-workflow-p0-host-public-20261022'):
         raise ValueError('Only the explicit independent synthetic repositories are allowed')
+    recovery_crash_after = int(os.environ.get('P15_RECOVERY_CRASH_AFTER', '0'))
+    real = os.environ.get('P15_REAL_AUTHORITY') == 'true'
+    if (recovery_crash_after not in (0, 1, 2, 3)
+            or (recovery_crash_after and os.environ.get('P15_REAL_AUTHORITY') != 'false')):
+        raise ValueError('Recovery crash requires synthetic authority and write 1/2/3')
     output = ROOT / 'p15-results'
     output.mkdir()
     before = state['collector'].collect()
@@ -223,7 +255,32 @@ def exercise(state):
         provision.save(output / 'partial-state.json', inspected)
         request = coordinator.prepare_recovery(state['candidate'], oid,
             expires_at=(datetime.now(timezone.utc) + timedelta(minutes=40)).isoformat())
-        real = os.environ.get('P15_REAL_AUTHORITY') == 'true'
+        crashed_recovery = None
+        if recovery_crash_after:
+            assert crash_after == 3, 'Recovery crash matrix starts after deployment write 3'
+            recovery_process = subprocess.run([sys.executable, '-I', '-B', str(Path(__file__).resolve()),
+                '--recovery-child', str(config_path), str(recovery_crash_after)],
+                capture_output=True, timeout=180)
+            (output / 'recovery-child.log').write_bytes(recovery_process.stdout + recovery_process.stderr)
+            assert recovery_process.returncode == 78, 'Recovery child did not reach its completed gateway write'
+            crashed_recovery = json.loads((output / 'recovery-child-request.json').read_text())
+            assert process_alive(crashed_recovery['producerPID']) is False
+            collector, coordinator, executor = embedding(config)
+            assert coordinator._ids() == [oid]
+            interrupted_events = coordinator._load(oid)
+            assert interrupted_events[-1]['kind'] == 'attempt'
+            current_inventory = execution.DockerExecutor._inventory(executor,
+                time.monotonic() + executor.policy.execution_deadline)
+            old_id = interrupted_events[0]['data']['binding']['beforeContainerId']
+            for cid, before_hash in interrupted_events[0]['data']['baseline'].items():
+                if cid != old_id:
+                    assert runtime.digest(current_inventory[cid]) == before_hash, 'Unselected instance changed'
+            inspected = coordinator.inspect(state['candidate'], oid)
+            provision.save(output / 'recovery-partial-state.json', inspected)
+            request = coordinator.prepare_recovery(state['candidate'], oid,
+                expires_at=(datetime.now(timezone.utc) + timedelta(minutes=40)).isoformat())
+            assert request.request_id != crashed_recovery['requestId']
+            assert request.digest() != crashed_recovery['requestHash']
         approval = actual_approval(config, request, output) if real else RecoveryTestApproval()
         original_inventory = execution.DockerExecutor._inventory
         prior_inventory = {}
@@ -265,7 +322,9 @@ def exercise(state):
         after_api = next(item for item in observation.to_dict()['instances'] if item['component'] == 'api')
         assert after_api == before_api
         assert coordinator._load(oid)[-1]['kind'] == 'terminal'
-        assert len(result['actions']) == (1 if crash_after == 1 else 3)
+        assert len(result['actions']) == len(json.loads(request.actions_json))
+        if not recovery_crash_after:
+            assert len(result['actions']) == (1 if crash_after == 1 else 3)
         try:
             coordinator.recover(request, approval)
         except Exception:
@@ -274,6 +333,10 @@ def exercise(state):
             raise AssertionError('Recovery request replay succeeded')
         provision.save(output / 'summary.json', dict(result='passed', realDocker=True, realMTLS=True,
             actualChildCrash=True, crashAfterCompletedWrite=crash_after, staleCoreOwnerReclaimed=True,
+            actualRecoveryChildCrash=bool(recovery_crash_after),
+            recoveryCrashAfterCompletedWrite=recovery_crash_after,
+            independentRecoveryRequest=crashed_recovery is not None,
+            recoveryCrashAuthority='synthetic-test-double' if recovery_crash_after else None,
             originalDeployAuthority='synthetic-test-double',
             recoveryAuthority='github-oidc-exact-review-cas' if real else 'synthetic-test-double',
             realRecoveryGitHubOIDC=real, restoredBefore=True, preservedApiInstance=True,
@@ -286,6 +349,8 @@ def exercise(state):
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == '--child':
         return child(sys.argv[2], int(sys.argv[3]))
+    if len(sys.argv) == 4 and sys.argv[1] == '--recovery-child':
+        return recovery_child(sys.argv[2], int(sys.argv[3]))
     if sys.platform != 'linux' or os.environ.get('GITHUB_ACTIONS') != 'true':
         raise SystemExit('Disposable Linux Actions fixture only')
     os.environ['P14_MODE'] = 'smoke'

@@ -45,6 +45,32 @@ class Approval:
         self.calls.append('guard')
 
 
+class RecoveryDiagnosticTests(unittest.TestCase):
+    def test_known_blockers_have_fixed_guidance_without_granting_authority(self):
+        for error in (recover.gateway.GateError('writer-not-quiescent'),
+                      recover.RecoveryError('producer-alive-or-unknown'),
+                      recover.RecoveryError('unattested-or-live-core-owner'),
+                      recover.RecoveryError('unknown-core-recovery-guard'),
+                      recover.RecoveryError('unproven-empty-selected-state'),
+                      recover.RecoveryError('journal-authentication-failed')):
+            with self.subTest(code=error.args[0]):
+                result = recover.explain_failure(error)
+                self.assertEqual(result['code'], error.args[0])
+                self.assertFalse(result['authorityGranted'])
+                self.assertFalse(result['automaticRetry'])
+                self.assertTrue(result['nextStep'])
+
+    def test_unknown_exception_text_and_arbitrary_objects_are_not_reflected(self):
+        class PrivateError(ValueError):
+            def __str__(self):
+                raise AssertionError('must not stringify arbitrary exceptions')
+        for error in (PrivateError(fixtures.SECRET), recover.RecoveryError(fixtures.SECRET),
+                      recover.RecoveryError({'secret': fixtures.SECRET}), object()):
+            result = recover.explain_failure(error)
+            self.assertEqual(result['code'], 'unclassified-recovery-failure')
+            self.assertNotIn(fixtures.SECRET, json.dumps(result))
+
+
 class RecoveryStartIdentityTests(unittest.TestCase):
     def test_first_start_initializes_only_known_docker_defaults(self):
         docker = fixtures.MutableDocker()
@@ -132,7 +158,8 @@ class RecoveryTests(unittest.TestCase):
             ticket = self.gate.admit(session.generation, attempt.ref, method=method, path=path, body=raw,
                                      writer_certificate_sha256='a' * 64)
             status, response = self.f.docker.write(method, path, body)
-            self.gate.finish(ticket, definitive=True, response_hash=recover._hash(response))
+            self.gate.finish(ticket, definitive=True, response_hash=hashlib.sha256(
+                str(status).encode() + b'\0' + (b'' if response is None else fixtures.backend.canonical(response).encode())).hexdigest())
             operation.after_write(session, recover._hash(response))
             return response
         def create(client, name, body, *, before_send, host_operation):
@@ -191,7 +218,8 @@ class RecoveryTests(unittest.TestCase):
                                  writer_certificate_sha256='a' * 64)
         status, response = self.f.docker.write(method, path, body)
         if not pending:
-            self.gate.finish(ticket, definitive=True, response_hash=recover._hash(response))
+            self.gate.finish(ticket, definitive=True, response_hash=hashlib.sha256(
+                str(status).encode() + b'\0' + (b'' if response is None else fixtures.backend.canonical(response).encode())).hexdigest())
             op.after_write(session, recover._hash(response))
         return session
 
@@ -289,6 +317,14 @@ class RecoveryTests(unittest.TestCase):
                 recover.RecoveryError, 'synthetic-observer-crash'):
             self.c.recover(first, Approval())
         self.assertEqual(self.c.inspect(self.root, self.oid)['state'], 'retained-restoration-stopped')
+        # A restoration that disappears externally cannot be mistaken for the
+        # proven empty state after our earlier candidate cleanup.
+        retained = deepcopy(self.f.docker.containers)
+        restored = next(cid for cid in retained if cid != fixtures.API)
+        del self.f.docker.containers[restored]
+        with self.assertRaisesRegex(recover.RecoveryError, 'unproven-empty-selected-state'):
+            self.request()
+        self.f.docker.containers = retained
         second = self.request()
         self.assertNotEqual(first.request_id, second.request_id)
         self.assertEqual([x['action'] for x in json.loads(second.actions_json)], ['start'])
@@ -296,16 +332,83 @@ class RecoveryTests(unittest.TestCase):
         creates = [x for x in self.f.docker.writes if '/create?' in x[1]]
         self.assertEqual(len(creates), 2)  # original candidate + one restoration
 
-    def test_empty_selected_state_after_cleanup_crash_is_explicitly_blocked(self):
+    def test_empty_selected_state_after_cleanup_crash_resumes_with_new_authority(self):
         self.begin('absent')
         request = self.request()
+        first = Approval()
         original = self.c._after_write
         def stopped(oid, session, digest):
             original(oid, session, digest)
             raise recover.RecoveryError('synthetic-crash-after-cleanup')
         with mock.patch.object(self.c, '_after_write', stopped), self.assertRaises(recover.RecoveryError):
+            self.c.recover(request, first)
+        self.assertTrue(first.used)
+        self.assertEqual(self.c.inspect(self.root, self.oid)['state'], 'candidate-cleaned-old-absent')
+        second = self.request()
+        self.assertNotEqual(second.request_id, request.request_id)
+        self.assertEqual([a['action'] for a in json.loads(second.actions_json)], ['create', 'start'])
+        count = len(self.f.docker.writes)
+        with self.assertRaises(recover.RecoveryError):
+            self.c.recover(request, first)
+        self.assertEqual(len(self.f.docker.writes), count)
+        result = self.c.recover(second, Approval())
+        self.assertEqual(result['observation'].snapshot()['components'], self.f.observation.snapshot()['components'])
+        self.assertEqual(len(self.f.docker.writes), count + 2)
+
+    def test_cleanup_lost_observer_response_is_proven_by_gateway_and_restart(self):
+        self.begin('absent', stale=True)
+        request = self.request()
+        def lost(oid, session, digest):
+            raise recover.RecoveryError('synthetic-response-journal-loss')
+        with mock.patch.object(self.c, '_after_write', lost), mock.patch(
+                'workflow_lock.process_alive', return_value=False), self.assertRaises(recover.RecoveryError):
             self.c.recover(request, Approval())
-        with self.assertRaisesRegex(recover.RecoveryError, 'unsupported-empty-selected-state'):
+        previous = self.c
+        self.c = recover.HostCoordinator(self.store, self.gate, self.f.collector, self.f.policy,
+                                         executor=self.f.engine)
+        self.assertIsNot(self.c, previous)
+        self.assertEqual(self.c.inspect(self.root, self.oid)['state'], 'candidate-cleaned-old-absent')
+        second = self.request()
+        self.assertEqual([a['action'] for a in json.loads(second.actions_json)], ['create', 'start'])
+        result = self.c.recover(second, Approval())
+        self.assertEqual(result['status'], 'recovered-runtime-verified')
+        self.assertEqual(result['observation'].snapshot()['components'], self.f.observation.snapshot()['components'])
+
+    def test_external_candidate_disappearance_never_authorizes_empty_recovery(self):
+        self.begin('absent')
+        candidate = next(cid for cid in self.f.docker.containers if cid != fixtures.API)
+        del self.f.docker.containers[candidate]
+        with self.assertRaisesRegex(recover.RecoveryError, 'unproven-empty-selected-state'):
+            self.request()
+
+    def test_complete_http_error_then_external_disappearance_is_not_cleanup_proof(self):
+        self.begin('absent')
+        original = self.f.docker.write
+        for status in (500, 404):
+            with self.subTest(status=status):
+                request = self.request()
+                def failed_delete(method, path, body):
+                    if method == 'DELETE':
+                        # A complete upstream failure is quiescent, not successful.
+                        return status, {'message': 'synthetic deletion failed'}
+                    return original(method, path, body)
+                with mock.patch.object(self.f.docker, 'write', failed_delete), self.assertRaises(recover.RecoveryError):
+                    self.c.recover(request, Approval())
+                candidate = next(cid for cid in self.f.docker.containers if cid != fixtures.API)
+                value = self.f.docker.containers.pop(candidate)
+                with self.assertRaisesRegex(recover.RecoveryError, 'unproven-empty-selected-state'):
+                    self.request()
+                self.f.docker.containers[candidate] = value
+
+    def test_cleanup_without_definitive_gateway_completion_remains_blocked(self):
+        self.begin('absent')
+        request = self.request()
+        def unfinished(*args, **kwargs):
+            raise recover.gateway.GateError('synthetic-lost-upstream-completion')
+        with mock.patch.object(self.gate, 'finish', unfinished), self.assertRaises(recover.gateway.GateError):
+            self.c.recover(request, Approval())
+        self.assertEqual(set(self.f.docker.containers), {fixtures.API})
+        with self.assertRaisesRegex(recover.gateway.GateError, 'writer-not-quiescent'):
             self.request()
 
     def test_authority_revocation_stops_remaining_writes_and_preserves_pending_journal(self):
