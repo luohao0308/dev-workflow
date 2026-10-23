@@ -37,7 +37,7 @@ with coordinator.operation(root, plan, intent) as host_operation:
 
 ## 独立恢复授权
 
-`inspect(root, operation_id)` 关闭旧 generation 并只读核对签名日志、实际完整项目 inventory、已知完整 ID／名称的直接查询、未选中实例与管理文件、来源／规格、原始 Core owner 和实际进程存活。只有经认证的 Docker HTTP 404 能证明准确资源不存在；过滤列表里没看到、网络失败或任意空 JSON 都不算。
+`inspect(root, operation_id)` 关闭旧 generation 并核对签名日志、实际完整项目 inventory、已知完整 ID／名称的直接查询、未选中实例与管理文件、来源／规格、原始 Core owner 和实际进程存活。关闭 generation 会持久化改变网关准入状态；此入口不执行 Docker 写入，但不是完全无副作用的只读诊断。只有经认证的 Docker HTTP 404 能证明准确资源不存在；过滤列表里没看到、网络失败或任意空 JSON 都不算。
 
 `prepare_recovery(..., expires_at=...)` 签发新的 RecoveryRequest，绑定原日志、现场、排空证明、准确动作、项目 HEAD／配置和全部宿主策略。`recover(request, approval)` 在持有目标锁时消费新的恢复域授权，再执行。普通 release、deploy、rollback 请求／grant 均不能替代它。GitHub 使用独立 audience `dev-workflow-deployment-recovery-host`、账本 `workflow-recovery-grants` 和受保护精确审批。即使只核对完整前／后状态、没有 Docker 写入，关闭中断日志或接管旧锁仍需新恢复授权。
 
@@ -48,6 +48,7 @@ with coordinator.operation(root, plan, intent) as host_operation:
 | 原实例仍运行，候选已创建且停止 | 删除准确候选，核对原映射和验收 |
 | 原实例停止，候选停止或不存在 | 先清理候选（如有），再启动原实例 |
 | 原实例已删除，准确候选停止 | 清理候选，再按保留的旧配方创建和启动恢复实例 |
+| 先前恢复已清理候选，旧实例与恢复实例均不存在 | 仅在签名日志与网关证明准确候选删除已完成后，重新申请独立恢复授权，创建并启动旧版本恢复实例 |
 | 已知恢复实例已创建／运行 | 按日志和现场检查后继续受支持步骤，不盲目重复 create |
 | 完整新版本已运行 | 只核验并解决日志，不隐式回滚；要回旧版本另申请普通回滚 |
 | 外来／变更资源、未知上游响应、无可验证日志或旧配方 | 阻塞，无写入 |
@@ -57,9 +58,28 @@ with coordinator.operation(root, plan, intent) as host_operation:
 ## 当前限制和升级注意事项
 
 - 中断操作需保留原 coordinator 策略身份；普通历史能兼容 catalog 增加，不意味着中断日志可跨任意策略升级恢复。
-- 若恢复在“候选已清理、旧实例尚未重建”的空选中状态再次崩溃，当前闭合状态表会阻塞，不能保证所有中断点都可自动恢复。
+- 支持恢复在“候选已清理、旧实例尚未重建”时再次崩溃后重新申请恢复。`candidate-cleaned-old-absent` 只接受最后写入是带独立恢复授权的准确候选 DELETE，且网关已证明该写入 definitive completion 及 HTTP 204 空响应成功摘要、直接查询证明相关实例不存在、未选中映射保持不变的现场；随后仅创建并启动固定旧版本恢复实例。完整 HTTP 错误响应只证明写入结束，不证明删除成功；外部删除或空 inventory 本身不能证明清理，返回 `unproven-empty-selected-state`；未知写入仍阻塞。此扩展不承诺任意中断点均可恢复，也不自动续用已消费授权。
 - admission 已持久化但上游完成未知时永久拒绝自动排空；需宿主运维核对，不能用超时强解锁或复用审批。
 - 本机 Unix Docker 网关参考宿主用于 Linux；Windows 测试覆盖 SDK、持久化／文件锁和 PowerShell，不代表 Windows 容器执行或 Windows daemon 网关已交付。
 - 未设置可选哈希时保留 P1-3 行为和原哈希，不自动启用存储、探针或恢复。不迁移进程内旧 capability，不为已有 P1-3 中断现场补造签名日志。首次启用须创建受控私有存储和全新精确授权。
 - 旧的无签名 inode／mutex 绑定存储不自动升级；新建受控存储，不覆盖未知记录。密钥轮换／备份迁移尚无自动适配器。
 - 此恢复只针对现有无状态、只读、无挂载、无需迁移的单组件规格；不提供数据库／备份恢复、生产验收、切流或多宿主编排。`productionReady` 保持 false。
+
+## 阻塞时如何核对
+
+先保留原日志和私有存储，暂停新的写操作。下表中的核对由持有原宿主配置的运维人员通过可信只读连接和受控日志完成；不要把原始 Env/Config、证书、密钥或完整响应上传到项目、审批评论或 CI 制品。
+
+| 现象 | 需要核对的证据 | 允许的后续处理 |
+|---|---|---|
+| 网关排空失败／上游结果未知 | 对应 generation 的签名 admission、完整上游响应及 definitive completion；准确请求 method/path/body 摘要 | 保持阻塞；不能用当前容器状态、TTL 或重启网关补造完成证明。首版没有运维强制确认未知写入完成的入口 |
+| 等待目标文件锁 | 原可信宿主进程是否仍持有内核锁，存储路径和文件身份是否正确 | 让真实持有者完成或退出后由内核释放；不删除／重建 `target.lock`，不按 PID 或文件年龄抢占 |
+| Core owner 活跃或存活未知 | 日志记录与现场 owner 的完整 pid/token/operation/transaction，实际进程存活 | 保留锁并停止；只有准确匹配、可证明已死的 owner 才能在新恢复审批消费后由恢复 guard 接管 |
+| `recovery.lock` 未知、owner 不匹配或文件身份变更 | Core 目录身份、链接／reparse 状态及受控审计记录 | 保持阻塞，交宿主运维核查；没有通用删除锁文件的修复命令 |
+| 现场漂移／历史配方不匹配 | 完整 inventory、已知 ID／名称直接查询、未选中组件、当前配置与原策略身份、旧镜像和配方 | 保留现场；不要修改签名记录迎合现场。恢复原可信配置也不等于获得新写入授权，仍需重新核验和新请求 |
+| 请求过期、已消费或消费结果未知 | 当前请求 ID／摘要、消费账本和受保护审批记录 | 不复用旧授权，不退款，不盲目重发写入；待现场可核验后生成独立的新恢复请求 |
+
+可以先读取已有脱敏错误码和摘要定位阻塞原因。需要调用 `inspect` 时应明确其 fencing 影响；它仍不能接管 Core owner、解决日志或执行恢复。`prepare_recovery` 生成精确请求，`recover` 消费该请求的新恢复授权后才进入受支持恢复步骤。没有 Docker 动作的“仅核验并解决日志”同样需要这份独立授权。
+
+`deployment_recover.explain_failure(error)` 是模块级纯函数，不读取现场、不访问网络、不关闭 generation，也不签发请求或授权。它把已知恢复／网关固定错误码映射为 `code/category/summary/nextStep`，始终返回 `automaticRetry: false`、`authorityGranted: false`；未知异常仅返回未分类指引，不回显原始异常文本。此解释帮助定位下一项证据，不能证明阻塞已解除。
+
+`FileWriterGate.diagnose_generation(generation)` 在持锁验证网关记录后返回 `closed`、`pending/unknown/done` 计数及固定 `blocker/nextStep`。它不追加日志、不关闭 generation、不签发排空证明，也不授予恢复权。未知上游结果优先报告 `upstream-outcome-unknown`；未完成写入报告 `upstream-write-pending`。`close-generation` 或 `load-proof` 仅表示宿主后续应执行的检查步骤，不是已经完成关闭、取得证明或允许写入的结论；这份诊断本身不能替代恢复流程的排空证明。

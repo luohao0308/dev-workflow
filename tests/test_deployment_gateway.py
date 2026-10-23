@@ -99,6 +99,72 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(self.gate.validate_proof(self.gate.close_generation(GEN)))
         self.assertEqual(json.loads(proof.to_json())['payload']['generation'], GEN)
 
+    def test_diagnose_is_read_only_redacted_and_never_issues_proof(self):
+        _, attempt = self.prepared()
+
+        def diagnose(expected):
+            directory = self.root / GEN
+            before = {path.name: path.read_bytes() for path in directory.iterdir()}
+            proofs = dict(self.gate._proofs)
+            result = self.gate.diagnose_generation(GEN)
+            self.assertEqual({path.name: path.read_bytes() for path in directory.iterdir()}, before)
+            self.assertEqual(self.gate._proofs, proofs)
+            for key, value in expected.items():
+                self.assertEqual(result[key], value)
+            self.assertIs(result['authorityGranted'], False)
+            encoded = json.dumps(result)
+            for secret in (GEN, H, CERT, attempt.ref, CREATE, BODY.decode(), KEY.decode()):
+                self.assertNotIn(secret, encoded)
+            return result
+
+        diagnose(dict(closed=False, pending=0, unknown=0, done=0,
+                      blocker='generation-open', nextStep='close-generation'))
+        ticket = self.admit(attempt)
+        diagnose(dict(closed=False, pending=1, unknown=0, done=0,
+                      blocker='upstream-write-pending', nextStep='await-original-writer-completion'))
+        with self.assertRaises(gateway.GateError):
+            self.gate.close_generation(GEN)
+        diagnose(dict(closed=True, pending=1, blocker='upstream-write-pending'))
+        self.gate.finish(ticket, definitive=True, response_hash=H)
+        diagnose(dict(closed=True, pending=0, done=1, blocker=None, nextStep='close-generation'))
+        self.gate.close_generation(GEN)
+        diagnose(dict(closed=True, done=1, blocker=None, nextStep='load-proof'))
+
+    def test_diagnose_unknown_remains_blocked_after_restart(self):
+        _, attempt = self.prepared()
+        ticket = self.admit(attempt)
+        self.gate.finish(ticket, definitive=False, response_hash=None)
+        restarted = gateway.FileWriterGate(policy(), self.root, key=KEY)
+        result = restarted.diagnose_generation(GEN)
+        self.assertEqual(result['unknown'], 1)
+        self.assertEqual(result['pending'], 0)
+        self.assertEqual(result['done'], 0)
+        self.assertEqual(result['blocker'], 'upstream-outcome-unknown')
+        self.assertEqual(result['nextStep'], 'investigate-upstream-outcome')
+        self.assertFalse(result['closed'])
+        with self.assertRaises(gateway.GateError):
+            restarted.load_proof(GEN)
+
+    def test_diagnose_rejects_tampered_signed_state(self):
+        self.open()
+        record = self.root / GEN / '00000000.json'
+        value = json.loads(record.read_text())
+        value['unexpected'] = 'secret-raw-diagnostic-value'
+        record.write_text(json.dumps(value))
+        with self.assertRaises(gateway.GateError) as caught:
+            self.gate.diagnose_generation(GEN)
+        self.assertNotIn('secret-raw-diagnostic-value', str(caught.exception))
+
+    def test_diagnose_reports_pending_and_unknown_together(self):
+        session = self.open((('POST', CREATE, sha(BODY)), ('POST', STOP, sha(b''))))
+        first = self.admit(session.prepare_attempt('POST', CREATE, BODY))
+        self.gate.finish(first, definitive=False, response_hash=None)
+        self.admit(session.prepare_attempt('POST', STOP, b''), body=b'')
+        result = self.gate.diagnose_generation(GEN)
+        self.assertEqual((result['pending'], result['unknown'], result['done']), (1, 1, 0))
+        self.assertEqual(result['blocker'], 'upstream-outcome-unknown')
+        self.assertFalse(result['authorityGranted'])
+
     def test_close_prepared_but_unadmitted_denies_delayed_old_http(self):
         session, attempt = self.prepared()
         proof = self.gate.close_generation(GEN)

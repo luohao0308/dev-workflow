@@ -93,7 +93,12 @@ jobs:
     if: ${{ !inputs.real_authority }}
     strategy:
       matrix:
-        crash_after: ['1', '3']
+        include:
+          - {crash_after: '1', recovery_crash_after: '0'}
+          - {crash_after: '3', recovery_crash_after: '0'}
+          - {crash_after: '3', recovery_crash_after: '1'}
+          - {crash_after: '3', recovery_crash_after: '2'}
+          - {crash_after: '3', recovery_crash_after: '3'}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -104,12 +109,14 @@ jobs:
       - name: Actual Docker crash and recovery with explicit synthetic authority
         env:
           P15_CRASH_AFTER: ${{ matrix.crash_after }}
+          P15_RECOVERY_CRASH_AFTER: ${{ matrix.recovery_crash_after }}
+          P15_REAL_AUTHORITY: 'false'
           PYTHONDONTWRITEBYTECODE: '1'
         run: python3 -I -B tests/support/p15_recovery_live.py
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: p15-crash-results-${{ matrix.crash_after }}
+          name: p15-crash-results-${{ matrix.crash_after }}-recovery-${{ matrix.recovery_crash_after }}
           path: p15-results/
           retention-days: 7
   python-and-bash:

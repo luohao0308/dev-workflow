@@ -37,6 +37,58 @@ class RecoveryError(ValueError):
     """Fixed diagnostic; never includes raw inspect, recipe or response data."""
 
 
+def explain_failure(error):
+    """Explain a known failure without inspecting, fencing or granting authority.
+
+    Arbitrary exception text is never reflected: it can contain private host
+    paths, Docker bodies, credentials or user-controlled configuration.
+    """
+    guidance = {
+        'writer-not-quiescent': (
+            'gateway', '旧写入尚未证明结束。',
+            '由可信宿主调用 diagnose_generation 核对 pending/unknown；保留网关记录，不能用超时或重启强制排空。'),
+        'producer-alive-or-unknown': (
+            'owner', '原执行进程仍存活，或无法证明它已退出。',
+            '在原宿主核对进程身份和存活状态；保留锁，不并发启动恢复。'),
+        'unattested-or-live-core-owner': (
+            'owner', 'Core 锁所有者未获签名日志证明，或仍可能存活。',
+            '核对完整 owner 与原签名日志及进程状态；不得手删锁或修改 owner。'),
+        'unknown-core-recovery-guard': (
+            'owner', '存在无法核验的恢复 guard。',
+            '保留 guard 和日志，由原宿主核对恢复进程及锁来源；不得直接解锁。'),
+        'unreadable-core-owner': (
+            'owner', '无法安全读取 Core 锁所有者。',
+            '核对原宿主私有目录和访问权限，保留原始锁文件；不得补造 owner。'),
+        'core-owner-identity-changed': (
+            'owner', '读取期间 Core 锁文件身份发生变化。',
+            '停止并发操作，在原宿主核对文件身份与进程；不得重试写入。'),
+        'unproven-empty-selected-state': (
+            'evidence', '选中组件为空，缺少可验证的恢复清理证据。',
+            '核对签名恢复授权、准确候选删除及网关完成记录；不能仅凭容器缺失重新创建。'),
+        'journal-authentication-failed': (
+            'evidence', '恢复日志无法通过完整性验证。',
+            '保留原文件并核对宿主密钥、存储身份及可信备份；不得编辑日志或重新签名绕过。'),
+        'unselected-runtime-drift': (
+            'runtime', '未选中组件的现场已变化。',
+            '核对完整环境映射及其他操作来源；旧恢复请求不能用于变化后的现场。'),
+        'recovery-state-changed': (
+            'runtime', '恢复现场或证据已偏离已准备的请求。',
+            '保留操作日志并重新核对现场；仅在受支持状态下生成新请求并独立审批。'),
+        'historical-catalog-or-recipe-changed': (
+            'evidence', '保留历史与当前可信镜像或配方不兼容。',
+            '在原宿主核对历史目录和准确旧配方；不得用推测配方替代。'),
+    }
+    code = error.args[0] if type(error) in (RecoveryError, gateway.GateError) and len(error.args) == 1 else None
+    if type(code) is not str or code not in guidance:
+        code = 'unclassified-recovery-failure'
+        category, summary, next_step = ('unknown', '恢复未完成，原因尚未分类。',
+            '在可信宿主保留日志并核对故障；不输出原始异常，不自动重试或修改现场。')
+    else:
+        category, summary, next_step = guidance[code]
+    return dict(status='blocked', code=code, category=category, summary=summary,
+                nextStep=next_step, automaticRetry=False, authorityGranted=False)
+
+
 def _require(value, code):
     if not value:
         raise RecoveryError(code)
@@ -660,7 +712,7 @@ class HostCoordinator:
             from deployment_verify import TrustedProbeVerifier
             TrustedProbeVerifier.bind(executor.verifier, b['component'], old_spec)
             TrustedProbeVerifier.bind(executor.verifier, b['component'], new_spec)
-        forwarded = set()
+        forwarded, removed_successfully = set(), set()
         for event in events:
             if event['kind'] == 'attempt':
                 with self.gate._locked():
@@ -669,6 +721,11 @@ class HostCoordinator:
                        event['data']['path'], event['data']['bodyHash']]
                        for ref, value in state['admissions'].items()):
                     forwarded.add(event['data']['generation'])
+                if any(value['status'] == 'done'
+                       and value.get('response_hash') == hashlib.sha256(b'204\0').hexdigest()
+                       and state['attempts'][ref] == [event['data']['method'], event['data']['path'], event['data']['bodyHash']]
+                       for ref, value in state['admissions'].items()):
+                    removed_successfully.add(event['data']['generation'])
         def attempted(method, suffix, body=None):
             return any(e['kind'] == 'attempt' and e['data']['generation'] in forwarded
                        and e['data']['method'] == method
@@ -722,8 +779,27 @@ class HostCoordinator:
                 if not running:
                     actions.append(dict(action='start', ref=restored['Id']))
             else:
-                _require(candidate is not None, 'unsupported-empty-selected-state')
-                state = 'old-absent-candidate-stopped'
+                if candidate is None:
+                    # Empty inventory alone is not evidence of our cleanup. The
+                    # last attempted write must be an independently authorized
+                    # recovery removal of the exact known candidate, and its
+                    # gateway admission must have definitively completed.
+                    attempts = [(i, e['data']) for i, e in enumerate(events) if e['kind'] == 'attempt']
+                    last_index, last = attempts[-1] if attempts else (-1, {})
+                    auth = self._last(events[:last_index], 'recovery-authorization')
+                    known = last.get('known', {})
+                    removed = [cid for cid, value in known.items() if value['name'] == candidate_name]
+                    _require(len(removed) == 1 and auth is not None
+                             and last.get('generation') in removed_successfully
+                             and last.get('method') == 'DELETE'
+                             and last.get('path') == '/v1.45/containers/' + removed[0] + '?force=false&v=false'
+                             and last.get('bodyHash') == hashlib.sha256(b'').hexdigest()
+                             and dict(action='remove', ref=removed[0]) in
+                                 json.loads(auth['request']['actions_json']),
+                             'unproven-empty-selected-state')
+                    state = 'candidate-cleaned-old-absent'
+                else:
+                    state = 'old-absent-candidate-stopped'
                 actions.extend((dict(action='create', ref=restore_name), dict(action='start', ref=restore_name)))
         return dict(state=state, operationId=oid, journalHash=_hash(self._seal(events[-1])),
                     partialHash=_hash(current), fenceHash=fence, coreOwnerHash=_hash(owner), actions=actions)
