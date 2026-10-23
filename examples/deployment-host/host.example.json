@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "endpoint": "https://localhost:2376",
+    "server_certificate_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "daemon_id": "fixture-daemon",
+    "repository": "fixture/example",
+    "environment": "staging",
+    "target": "fixture",
+    "production": false,
+    "project": "fixture",
+    "components": [
+      "web"
+    ],
+    "catalog_json": "{\"schemaVersion\": 1, \"images\": [{\"component\": \"web\", \"imageId\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"repository\": \"fixture/example\", \"sourceSha\": \"cccccccccccccccccccccccccccccccccccccccc\", \"version\": \"1.2.3\", \"os\": \"linux\", \"architecture\": \"amd64\", \"artifact\": {\"kind\": \"local-build\", \"imageId\": \"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"buildSourceSha\": \"cccccccccccccccccccccccccccccccccccccccc\"}, \"migration\": {\"mode\": \"none\", \"version\": null}}]}",
+    "maximum_age": 60,
+    "capture_deadline": 30,
+    "specifications_json": "{\"kind\":\"docker-spec-catalog\",\"schemaVersion\":1,\"specifications\":[{\"component\":\"web\",\"config\":{\"Cmd\":[\"serve\",\"--port\",\"8080\"],\"Entrypoint\":[\"/app/server\"],\"Env\":[\"PATH=/usr/local/bin:/usr/bin:/bin\",\"TOKEN=PRIVATE-TOKEN-NOT-EVIDENCE\"],\"ExposedPorts\":{\"8080/tcp\":{}},\"Labels\":{\"org.opencontainers.image.title\":\"fixture\"},\"User\":\"1000:1000\",\"WorkingDir\":\"/app\"},\"hostConfig\":{\"AutoRemove\":false,\"CapDrop\":[\"ALL\"],\"NetworkMode\":\"bridge\",\"PortBindings\":{},\"ReadonlyRootfs\":true,\"RestartPolicy\":{\"MaximumRetryCount\":0,\"Name\":\"no\"},\"SecurityOpt\":[\"no-new-privileges:true\"],\"ShmSize\":67108864},\"imageId\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}"
+  },
+  "execution": {
+    "writer_certificate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "stop_timeout": 10,
+    "execution_deadline": 180,
+    "verification_policy_hash": null,
+    "history_policy_hash": "012f7a42d4b66586ce4110cd04ed5e25a3451ff9f08b23252cc9502e57d8e1a0",
+    "gateway_policy_hash": "8a608f6b2afdfc3ae34b086c035daa83e9b0d3fd5eb22779c2baa8343ea55c2e"
+  },
+  "probe": null,
+  "store": {
+    "repository_id": 42,
+    "store_id": "host-store",
+    "key_id": "host-key"
+  },
+  "gate": {
+    "store_id": "host-store",
+    "key_id": "host-key",
+    "scope_hash": "ae924e3e2f7036aa1b4f723107f8657fe0a0bc26bbd16d67a4b43bc9a247d696",
+    "writer_certificate_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "distribution_commit": "4a0b0bf622ba750d819b1bfe368345d16ba3126f",
+  "github": {
+    "host_repository": "example/trusted-host",
+    "host_repository_id": 43,
+    "workflow_ref": "example/trusted-host/.github/workflows/deploy.yml@refs/heads/main",
+    "workflow_sha": "0000000000000000000000000000000000000000",
+    "run_id": 1,
+    "environment": "caller",
+    "reviewer_ids": [
+      1
+    ],
+    "ledger_repository": "example/authority-ledger",
+    "ledger_repository_id": 44,
+    "ledger_sha": "0000000000000000000000000000000000000000",
+    "expires_at": "2030-01-01T00:00:00Z",
+    "prevent_self_review": true,
+    "credential_file": "/srv/host-private/github-token",
+    "deploy_approval_environment": "deploy-review",
+    "rollback_approval_environment": "rollback-review",
+    "recovery_approval_environment": "recovery-review"
+  },
+  "candidate_root": "/srv/candidate",
+  "store_root": "/srv/host-store",
+  "gate_root": "/srv/host-gate",
+  "store_key_file": "/srv/host-private/store_key_file",
+  "gate_key_file": "/srv/host-private/gate_key_file",
+  "ca_file": "/srv/host-private/ca_file",
+  "reader_cert_file": "/srv/host-private/reader_cert_file",
+  "reader_key_file": "/srv/host-private/reader_key_file",
+  "writer_cert_file": "/srv/host-private/writer_cert_file",
+  "writer_key_file": "/srv/host-private/writer_key_file"
+}

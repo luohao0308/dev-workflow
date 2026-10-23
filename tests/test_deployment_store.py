@@ -86,6 +86,240 @@ class StoreTests(unittest.TestCase):
             process.kill()
         process.communicate(timeout=10)
 
+    def test_retirement_fences_existing_and_fresh_history(self):
+        import deployment_maintenance_state as state
+        old, ref, before = self.capture()
+        history = self.load(ref, before)
+        binding = state._binding(self.root, self.policy.identity_hash(), KEY, 'store')
+        with self.s.history_lock():
+            state._transition(binding, 'a' * 64, 'retired')
+        for action in (history.snapshot, lambda: self.load(ref, before),
+                       lambda: self.s.capture_history(self.c, before),
+                       lambda: store.HostStore(self.policy, self.root, key=KEY)):
+            with self.assertRaises(store.StoreError):
+                action()
+        (self.root / 'maintenance.json').unlink()
+        with self.assertRaises(store.StoreError):
+            store.HostStore(self.policy, self.root, key=KEY)
+        # Offline signature verification remains independent of retired authority.
+        self.assertEqual(store.authenticate_history((self.root / ref).read_bytes(), self.policy, KEY, ref)['observation'], old.to_dict())
+
+    @unittest.skipUnless(os.name == 'posix', 'directory-relative filesystem handles are POSIX')
+    def test_maintenance_write_pins_directory_during_parent_swap(self):
+        import deployment_maintenance_state as state
+        moved = self.root.parent / 'moved-host'
+        replace_file = os.replace
+        def swap_before_replace(source, destination, **kwargs):
+            self.root.rename(moved)
+            self.root.mkdir(mode=0o700)
+            return replace_file(source, destination, **kwargs)
+        with mock.patch.object(state.os, 'replace', side_effect=swap_before_replace):
+            with self.assertRaises(state.MaintenanceStateError):
+                state._write(self.root, 'evidence.json', b'private evidence')
+        self.assertFalse((self.root / 'evidence.json').exists())
+        self.assertEqual((moved / 'evidence.json').read_bytes(), b'private evidence')
+
+    def test_waiting_fresh_process_observes_retirement_after_history_lock(self):
+        import deployment_maintenance_state as state
+        binding = state._binding(self.root, self.policy.identity_hash(), KEY, 'store')
+        code = """
+import sys
+from pathlib import Path
+from tests.test_deployment_store import fixture, store, KEY
+collector, _, _, _ = fixture()
+print('ready', flush=True)
+store.HostStore(store.StorePolicy(42, 'host', 'key-v1', collector.policy), Path(sys.argv[1]), key=KEY)
+print('issued', flush=True)
+"""
+        with self.s.history_lock():
+            child = subprocess.Popen([sys.executable, '-B', '-c', code, str(self.root)],
+                                     cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(self.cleanup_child, child)
+            self.assertEqual(child.stdout.readline().strip(), 'ready')
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.communicate(timeout=0.2)
+            state._transition(binding, 'a' * 64, 'retired')
+        output, error = child.communicate(timeout=15)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertNotIn('issued', output)
+        self.assertIn('maintenance authority unavailable', error)
+
+    def test_pending_publication_never_replaces_concurrent_empty_directory(self):
+        import deployment_maintenance_state as state
+        root = self.root.parent / 'destination'
+        publish = state._publish_pending
+        identity = []
+        def race(parent, directory, source, destination):
+            root.mkdir(mode=0o700)
+            identity.append(state._identity(root, True))
+            return publish(parent, directory, source, destination)
+        with mock.patch.object(state, '_publish_pending', side_effect=race):
+            with self.assertRaises(state.MaintenanceStateError):
+                state._initialize_pending(root, self.policy, KEY, 'store', 'a' * 64)
+        self.assertEqual(state._identity(root, True), identity[0])
+        self.assertEqual(list(root.iterdir()), [])
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX native rename capability detection')
+    def test_pending_publication_fails_closed_on_unsupported_platform(self):
+        import deployment_maintenance_state as state
+        root = self.root.parent / 'destination'
+        with mock.patch.object(state.sys, 'platform', 'unsupported'):
+            with self.assertRaises(state.MaintenanceStateError):
+                state._initialize_pending(root, self.policy, KEY, 'store', 'a' * 64)
+        self.assertFalse(root.exists())
+
+    def test_pending_each_durable_write_is_inert_and_crash_stays_unpublished(self):
+        import deployment_maintenance_state as state
+        for boundary in (1, 2):
+            with self.subTest(boundary=boundary):
+                root = self.root.parent / ('destination-' + str(boundary))
+                write = state._write
+                count = []
+                def crash_after_write(directory, name, value):
+                    write(directory, name, value)
+                    count.append(name)
+                    self.assertFalse(root.exists())
+                    with self.assertRaises(store.StoreError):
+                        store.HostStore(self.policy, directory, key=KEY)
+                    if len(count) == boundary:
+                        raise OSError('injected crash')
+                with mock.patch.object(state, '_write', side_effect=crash_after_write):
+                    with self.assertRaises(OSError):
+                        state._initialize_pending(root, self.policy, KEY, 'store', 'a' * 64)
+                self.assertFalse(root.exists())
+
+    def test_maintenance_transition_requires_current_thread_kernel_holder(self):
+        import deployment_maintenance_state as state
+        import threading
+        binding = state._binding(self.root, self.policy.identity_hash(), KEY, 'store')
+        with self.assertRaises(state.MaintenanceStateError):
+            state._transition(binding, 'a' * 64, 'retired')
+        failures = []
+        def wrong_thread():
+            try:
+                state._transition(binding, 'a' * 64, 'retired')
+            except state.MaintenanceStateError:
+                failures.append('rejected')
+        with self.s.history_lock():
+            thread = threading.Thread(target=wrong_thread)
+            thread.start()
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(failures, ['rejected'])
+            # The mutex must never be reopened for latch I/O while locked:
+            # Windows byte-range locks apply across distinct file handles.
+            original_open = state.os.open
+            def checked_open(path, *args, **kwargs):
+                if str(path) == str(self.root / 'history.lock') or str(path) == 'history.lock':
+                    self.fail('opened a second mutex handle while held')
+                return original_open(path, *args, **kwargs)
+            with mock.patch.object(state.os, 'open', side_effect=checked_open):
+                state._transition(binding, 'a' * 64, 'retired')
+                self.assertEqual(state._read(binding)['phase'], 'retired')
+        # Corrupting the persistent latch cannot expose legacy-active mode.
+        (self.root / 'history.lock').write_bytes(b'')
+        with self.assertRaises(store.StoreError):
+            store.HostStore(self.policy, self.root, key=KEY)
+
+    def test_retirement_latch_crash_is_closed_and_exact_resume_can_retire(self):
+        import deployment_maintenance_state as state
+        binding = state._binding(self.root, self.policy.identity_hash(), KEY, 'store')
+        with state._locked_binding(binding):
+            with mock.patch.object(state, '_write', side_effect=OSError('synthetic crash')):
+                with self.assertRaises(OSError):
+                    state._transition(binding, 'a' * 64, 'retired')
+        with self.assertRaises(store.StoreError):
+            store.HostStore(self.policy, self.root, key=KEY)
+        with state._locked_binding(binding):
+            self.assertEqual(state._complete_latched_retirement(binding, 'a' * 64)['phase'], 'retired')
+            with self.assertRaises(state.MaintenanceStateError):
+                state._complete_latched_retirement(binding, 'b' * 64)
+        child = self.child('load', 'history-' + 'a' * 64 + '.json')
+        _, error = child.communicate(timeout=10)
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn('maintenance authority unavailable', error)
+
+    def test_pending_import_activates_without_source_key_and_keeps_provenance(self):
+        import deployment_maintenance_state as state
+        old, ref, before = self.capture()
+        source = self.s._read(ref)
+        identity = dict(storeId=source['storeId'], keyId=source['keyId'],
+                        storePolicyHash=source['storePolicyHash'], recordHash=runtime.digest(source))
+        policy = replace(self.policy, store_id='new-store', key_id='new-key')
+        key = b'x' * 32
+        root = self.root.parent / 'imported'
+        binding = state._initialize_pending(root, policy, key, 'store', 'b' * 64)
+        with self.assertRaises(store.StoreError):
+            store.HostStore(policy, root, key=key)
+        imported = store.imported_history_record(source, identity, 'c' * 64, policy, ref, before.captured_at)
+        raw = runtime.canonical(dict(record=imported, signature=__import__('hmac').new(
+            key, store._DOMAIN + runtime.canonical(imported).encode(), __import__('hashlib').sha256).hexdigest())).encode()
+        state._write(root, ref, raw)
+        with state._locked_binding(binding):
+            state._transition(binding, 'b' * 64, 'active')
+        destination = store.HostStore(policy, root, key=key)
+        self.assertEqual(destination.load_history(ref, collector=self.c, before=before).to_dict(), old.to_dict())
+        self.assertEqual(imported['capturedAt'], source['capturedAt'])
+        # Fresh interpreter has only destination signing key, and can issue
+        # history against a newly collected baseline without source storage.
+        import shutil
+        shutil.rmtree(self.root)
+        code = """
+import sys
+from pathlib import Path
+from tests.test_deployment_store import fixture, store
+collector, _, _, _ = fixture()
+policy = store.StorePolicy(42, 'new-store', 'new-key', collector.policy)
+destination = store.HostStore(policy, Path(sys.argv[1]), key=b'x'*32)
+print(destination.load_history(sys.argv[2], collector=collector, before=collector.collect()).evidence_hash)
+"""
+        child = subprocess.run([sys.executable, '-B', '-c', code, str(root), ref],
+                               cwd=ROOT, capture_output=True, text=True, timeout=15)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(child.stdout.strip(), old.evidence_hash)
+        identity2 = dict(storeId=imported['storeId'], keyId=imported['keyId'],
+                         storePolicyHash=imported['storePolicyHash'], recordHash=runtime.digest(imported))
+        second = store.imported_history_record(imported, identity2, 'd' * 64,
+                    replace(policy, store_id='third', key_id='third-key'), ref, before.captured_at)
+        self.assertEqual(second['provenance']['original'], identity)
+        self.assertEqual(set(second['provenance']), {'original', 'immediate', 'archiveHash', 'importedAt'})
+        with state._locked_binding(binding):
+            state._transition(binding, 'e' * 64, 'retired')
+            with self.assertRaises(state.MaintenanceStateError):
+                state._transition(binding, 'b' * 64, 'active')
+
+    def test_history_mutex_replacement_rejected(self):
+        mutex = self.root / 'history.lock'
+        mutex.rename(self.root / 'displaced-history.lock')
+        mutex.touch(mode=0o600)
+        with self.assertRaises(store.StoreError):
+            with self.s.history_lock():
+                self.fail('replaced history mutex accepted')
+
+    def test_target_lock_allows_history_capture_and_use(self):
+        # Coordinator owns target while capturing; history must remain distinct.
+        with self.s.target_lock():
+            old, ref, before = self.capture()
+            self.assertEqual(self.load(ref, before).evidence_hash, old.evidence_hash)
+
+    def test_history_mutex_serializes_instances(self):
+        import threading
+        other = store.HostStore(self.policy, self.root, key=KEY)
+        entered = threading.Event()
+        started = threading.Event()
+        def acquire():
+            started.set()
+            with other.history_lock():
+                entered.set()
+        with self.s.history_lock():
+            thread = threading.Thread(target=acquire, daemon=True)
+            thread.start()
+            self.assertTrue(started.wait(2))
+            self.assertFalse(entered.wait(0.1))
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(entered.is_set())
+
     def test_roundtrip_distinct_frozen_and_no_secrets(self):
         old, ref, before = self.capture()
         h = self.load(ref, before)

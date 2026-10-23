@@ -1,0 +1,181 @@
+name: Trusted host onboarding and maintenance
+on:
+  workflow_dispatch:
+    inputs:
+      real_authority:
+        description: Real GitHub approval for recovery after a synthetic-authority deployment crash
+        required: true
+        default: false
+        type: boolean
+      full_matrix:
+        description: Complete Linux, macOS, Windows and PowerShell validation
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+concurrency:
+  group: p15-recovery-validation-${{ inputs.real_authority }}-${{ inputs.full_matrix }}
+  cancel-in-progress: false
+jobs:
+  observer:
+    if: inputs.real_authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    environment: p15-observer
+    permissions:
+      contents: write
+      actions: read
+      deployments: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Crash isolated trusted child and prepare independent recovery
+        env:
+          P1_GITHUB_TOKEN: ${{ github.token }}
+          P15_REAL_AUTHORITY: 'true'
+          P15_CRASH_AFTER: '3'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          python3 - <<'PYTHON'
+          import subprocess,sys,time
+          from pathlib import Path
+          log=open('p15-observer.log','wb')
+          subprocess.Popen([sys.executable,'-I','-B','tests/support/p15_recovery_live.py'],stdout=log,stderr=log,start_new_session=True)
+          for _ in range(90):
+              if Path('p15-results/failure.json').exists():
+                  raise SystemExit(Path('p15-results/failure.json').read_text())
+              if Path('p15-results/recovery-preview.json').exists():
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Recovery preview timeout')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: p15-recovery-preview
+          path: p15-results/recovery-preview.json
+          retention-days: 7
+      - name: Await exact recovery authorization
+        run: |
+          python3 - <<'PYTHON'
+          import time
+          from pathlib import Path
+          for _ in range(450):
+              if Path('p15-results/failure.json').exists():
+                  raise SystemExit(Path('p15-results/failure.json').read_text())
+              if Path('p15-results/summary.json').exists():
+                  print(Path('p15-results/summary.json').read_text())
+                  break
+              time.sleep(5)
+          else:
+              raise SystemExit('Recovery review timeout')
+          PYTHON
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: p15-recovery-results
+          path: |
+            p15-results/
+            p15-observer.log
+          retention-days: 7
+  recovery-review:
+    if: inputs.real_authority
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: p15-recovery-approval
+    steps:
+      - run: echo 'Separate exact recovery approval recorded'
+  maintenance-live:
+    if: ${{ !inputs.real_authority }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Real Docker history maintenance and read-only host doctor
+        env:
+          P15_REAL_AUTHORITY: 'false'
+          P15_CRASH_AFTER: '3'
+          P15_RECOVERY_CRASH_AFTER: '0'
+          HOST_DOCTOR_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -I -B tests/support/host_maintenance_live.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: host-maintenance-results
+          path: host-maintenance-results/
+          retention-days: 7
+  docker-smoke:
+    if: ${{ !inputs.real_authority }}
+    strategy:
+      matrix:
+        include:
+          - {crash_after: '1', recovery_crash_after: '0'}
+          - {crash_after: '3', recovery_crash_after: '0'}
+          - {crash_after: '3', recovery_crash_after: '1'}
+          - {crash_after: '3', recovery_crash_after: '2'}
+          - {crash_after: '3', recovery_crash_after: '3'}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Actual Docker crash and recovery with explicit synthetic authority
+        env:
+          P15_CRASH_AFTER: ${{ matrix.crash_after }}
+          P15_RECOVERY_CRASH_AFTER: ${{ matrix.recovery_crash_after }}
+          P15_REAL_AUTHORITY: 'false'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -I -B tests/support/p15_recovery_live.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: p15-crash-results-${{ matrix.crash_after }}-recovery-${{ matrix.recovery_crash_after }}
+          path: p15-results/
+          retention-days: 7
+  python-and-bash:
+    if: inputs.full_matrix
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10', '3.13']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: bash scripts/check.sh
+  powershell-integration:
+    if: inputs.full_matrix
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Python workflow tools on Windows
+        shell: pwsh
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m unittest tests.test_workflow_config tests.test_release_prepare tests.test_release_execute tests.test_release_github tests.test_release_host tests.test_release_host_runner tests.test_release_offline tests.test_deployment_config tests.test_deployment_prepare tests.test_deployment_runtime tests.test_deployment_spec tests.test_deployment_execute tests.test_deployment_authorize tests.test_deployment_host tests.test_deployment_verify tests.test_deployment_verification tests.test_deployment_store tests.test_deployment_history tests.test_deployment_gateway tests.test_deployment_gateway_host tests.test_deployment_lookup tests.test_deployment_recover tests.test_deployment_recovery_host tests.test_deployment_operation tests.test_manage_skills tests.test_manifest_fixture tests.test_workflow_lock tests.test_upgrade_windows tests.test_deployment_host_config tests.test_deployment_host_doctor tests.test_deployment_host_doctor_tls tests.test_deployment_history_archive tests.test_deployment_maintenance tests.test_deployment_host_rotation
+      - name: PowerShell integration
+        shell: pwsh
+        run: ./tests/integration.ps1

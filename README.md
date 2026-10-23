@@ -180,6 +180,16 @@ P1-1/P1-2 提供可信采集/授权 SDK 与独立 GitHub Actions 授权宿主；
 
 实际宿主后端结果可为 `executionAvailable: true`、`executed-verified`，但 `productionReady: false`，未配置可选探针时健康/冒烟为 `unknown`；P1-4 可验证固定健康和业务响应，失败报告 `executed-unhealthy`，不会自动回滚。回滚用新鲜现场、新请求/授权和同一 collector 保留的较早证明重建旧镜像/规格，不保留旧容器及其日志/实例 ID，不倒用旧 permit。进程内授权不能从 JSON 恢复。P1-5 可用宿主私有签名存储保留历史，并在网关证明旧写入已结束后，通过新的独立授权恢复受支持的中断状态。固定可信源码、采集和授权边界见 [运行时采集与授权](packs/deployment/docs/operations/DEPLOYMENT-RUNTIME.md)，执行 API、失败停止及限制见 [部署执行](packs/deployment/docs/operations/DEPLOYMENT-EXECUTION.md)。真实 Docker/GitHub 验收须另附独立证据。可选能力的配置及限制见 [健康验收](packs/deployment/docs/operations/DEPLOYMENT-VERIFICATION.md) 和 [持久化／恢复](packs/deployment/docs/operations/DEPLOYMENT-RECOVERY.md)。
 
+可信宿主可使用分发侧 [配置模板与只读 doctor](packs/deployment/docs/operations/DEPLOYMENT-HOST.md) 检查源码固定、私有输入、TLS、真实运行状态和 GitHub 审批配置。默认离线，只有显式 `--online` 执行固定只读查询；检查通过不授予部署权限。
+
+```sh
+python3 -I /trusted/dev-workflow/scripts/deployment_host_doctor.py --config /private/host.json --json
+python3 -I /trusted/dev-workflow/scripts/deployment_host_doctor.py --config /private/host.json --online --json
+```
+
+[历史备份、恢复与离线密钥轮换](packs/deployment/docs/operations/DEPLOYMENT-MAINTENANCE.md) 由独立可信分发运行。历史归档不包含密钥或执行权限；恢复到新的私有存储后仍需新鲜运行状态和独立授权。健康宿主轮换先封闭旧网关，再退役旧存储，精确事务可在受支持的中断状态继续；未知写入、未完成日志或源数据漂移保持阻塞。上述宿主入口不会随 deployment 包安装到候选项目。
+
+
 ## 安装
 
 ### Windows PowerShell
