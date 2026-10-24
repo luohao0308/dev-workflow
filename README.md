@@ -189,6 +189,8 @@ python3 -I /trusted/dev-workflow/scripts/deployment_host_doctor.py --config /pri
 
 [历史备份、恢复与离线密钥轮换](packs/deployment/docs/operations/DEPLOYMENT-MAINTENANCE.md) 由独立可信分发运行。历史归档不包含密钥或执行权限；恢复到新的私有存储后仍需新鲜运行状态和独立授权。健康宿主轮换先封闭旧网关，再退役旧存储，精确事务可在受支持的中断状态继续；未知写入、未完成日志或源数据漂移保持阻塞。上述宿主入口不会随 deployment 包安装到候选项目。
 
+P2 的[限定画像与验收契约](packs/deployment/docs/operations/DEPLOYMENT-ACCEPTANCE.md)只记录一个 Linux Docker 无状态组件在指定目标和环境的证据，不授予执行权限；示例中的策略摘要与回滚引用均为占位值。
+
 
 ## 安装
 
