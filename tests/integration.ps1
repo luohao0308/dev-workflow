@@ -207,6 +207,20 @@ try {
         Assert-True ($existingPolicyHash -eq (Get-FileHash -LiteralPath $existingPolicyManifestPath -Algorithm SHA256).Hash) "rejected $($existingPolicyChange.Name) policy change preserves the manifest"
     }
 
+    $legacyOriginTarget = Join-Path $tempRoot 'legacy-policy-origin'
+    New-Item -ItemType Directory -Path $legacyOriginTarget | Out-Null
+    & $installScript -TargetPath $legacyOriginTarget | Out-Null
+    $legacyOriginManifestPath = Join-Path $legacyOriginTarget '.dev-workflow/manifest.json'
+    $legacyOriginManifest = Get-Content -LiteralPath $legacyOriginManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $legacyOriginManifest.gitPolicy.policyChangedBy = 'codex'
+    Write-Utf8NoBom -Path $legacyOriginManifestPath -Content (($legacyOriginManifest | ConvertTo-Json -Depth 8) + "`n")
+    & $installScript -TargetPath $legacyOriginTarget -DryRun | Out-Null
+    & $installScript -TargetPath $legacyOriginTarget | Out-Null
+    $legacyOriginAfter = Get-Content -LiteralPath $legacyOriginManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-True ([string]$legacyOriginAfter.gitPolicy.policyChangedBy -eq 'codex') 'legacy policy attribution survives reinstall'
+    & $powerShellExe -NoProfile -File $auditScript -TargetPath $legacyOriginTarget *> $null
+    Assert-True ($LASTEXITCODE -eq 2) 'legacy attribution remains pending rather than invalid'
+
     $invalidGitTarget = Join-Path $tempRoot 'invalid-git'
     New-Item -ItemType Directory -Path $invalidGitTarget | Out-Null
     $invalidGitFailed = $false

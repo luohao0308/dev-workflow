@@ -31,6 +31,7 @@ EXCLUDE_END = b'# END dev-workflow managed excludes'
 VERSION = re.compile(r'\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\Z')
 TRANSACTION = re.compile(r'[0-9a-f]{32}\Z')
 HASH = re.compile(r'[0-9a-f]{64}\Z')
+MAX_JOURNAL_BYTES = 256 * 1024 * 1024
 ACTIONS = {'created', 'preserved', 'legacy', 'appended', 'managed-block'}
 LOCAL = ('docs/project-memory/', 'docs/working-context/', 'docs/工作日志/', 'docs/development/ai/')
 DOCUMENTS = ('docs/architecture/', 'docs/design/', 'docs/contracts/', 'docs/development/', 'docs/operations/')
@@ -87,6 +88,12 @@ def object_at(path: Path) -> dict:
     if not isinstance(value, dict):
         raise ValueError('Expected a JSON object')
     return value
+
+
+def bounded_object_at(path: Path, limit: int) -> dict:
+    if path.stat().st_size > limit:
+        raise ValueError('Upgrade input exceeds the size limit')
+    return object_at(path)
 
 
 def version(root: Path) -> str:
@@ -193,6 +200,16 @@ def state_check(manifest: dict) -> None:
     snapshot = state.get('baselineSnapshot')
     if snapshot is not None and (not isinstance(snapshot, str) or not TRANSACTION.fullmatch(snapshot)):
         raise ValueError('Invalid baseline snapshot identity')
+    retained = state.get('reviewedRetainedGuard')
+    if retained is not None:
+        if (not isinstance(retained, dict) or set(retained) != {'path', 'installedSha256', 'distributionSha256', 'status'}
+                or retained['path'] != 'scripts/delivery_guard.py' or retained['status'] != 'reviewed-retained'
+                or any(not isinstance(retained[key], str) or not HASH.fullmatch(retained[key])
+                       for key in ('installedSha256', 'distributionSha256'))):
+            raise ValueError('Invalid reviewed delivery guard declaration')
+        guard = by_path.get(retained['path'])
+        if guard is None or guard['action'] != 'created' or guard['installedSha256'] != retained['installedSha256']:
+            raise ValueError('Reviewed delivery guard does not match installed ownership')
 
 
 def git(root: Path, *arguments: str) -> str | None:
@@ -487,7 +504,7 @@ def destination(root: Path, key: str, exclude: str | None) -> Path:
 
 def transact(root: Path, manifest: dict, payloads: dict[str, bytes], operation: str, transaction: str,
              snapshot: dict[str, tuple[str, bytes]] | None = None,
-             expected: dict[str, str | None] | None = None) -> dict:
+             expected: dict[str, str | None] | None = None, evidence: dict | None = None) -> dict:
     manifest = deepcopy(manifest)
     manifest['upgradeState']['lastTransaction'] = transaction
     if snapshot is not None:
@@ -511,7 +528,13 @@ def transact(root: Path, manifest: dict, payloads: dict[str, bytes], operation: 
                           after=base64.b64encode(after).decode('ascii'), beforeSha256=digest(before), afterSha256=digest(after), mode=mode))
     journal = dict(schemaVersion=1, target=str(root), transaction=transaction, operation=operation, createdAt=now(),
                    excludePath=str(info[0]) if info else None, status='prepared', items=items)
+    if evidence is not None:
+        journal['reviewEvidence'] = evidence
     journal_path = directory / 'journal.json'
+    # Later committed/interrupted/rollback status and timestamps add bytes.
+    # Reserve room so every journal image remains readable by rollback.
+    if len(encoded(journal)) > MAX_JOURNAL_BYTES - 4096:
+        raise ValueError('Transaction journal exceeds the size limit')
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     write_bytes(journal_path, encoded(journal))
     try:
@@ -562,12 +585,126 @@ def apply(root: Path, saved: dict) -> dict:
         return transact(root, manifest, payloads, 'upgrade', transaction, snapshot, expected)
 
 
+REVIEWED_CONFLICTS = {
+    'AGENTS.md': 'replace-core-block',
+    'docs/WORKFLOW-ADOPTION.md': 'replace-file',
+    'scripts/delivery_guard.py': 'retain',
+}
+
+
+def reviewed_plan(root: Path, original: dict, resolution: dict) -> tuple[dict, dict[str, bytes]]:
+    """Bind explicit human-reviewed bytes to one exact, still-current conflict plan."""
+    if original.get('target') != str(root) or original.get('source') != str(SOURCE) or original.get('kind') != 'workflow-upgrade-plan':
+        raise ValueError('Original plan identity mismatch')
+    fresh, automatic = build_plan(root, Path(original.get('baseline', '')).resolve())
+    if fresh != original or set(fresh['conflicts']) != set(REVIEWED_CONFLICTS) or len(fresh['conflicts']) != len(REVIEWED_CONFLICTS):
+        raise ValueError('Original conflict plan changed or contains unsupported conflicts')
+    if set(resolution) != {'schemaVersion', 'kind', 'entries'} or resolution['schemaVersion'] != 1 or resolution['kind'] != 'workflow-upgrade-resolution':
+        raise ValueError('Invalid reviewed resolution format')
+    choices = resolution['entries']
+    if not isinstance(choices, list) or len(choices) != len(REVIEWED_CONFLICTS):
+        raise ValueError('Resolution must cover each exact conflict once')
+    choices_by_name = {}
+    for choice in choices:
+        if not isinstance(choice, dict) or choice.get('path') not in REVIEWED_CONFLICTS or choice['path'] in choices_by_name:
+            raise ValueError('Unknown or duplicate reviewed conflict')
+        choices_by_name[choice['path']] = choice
+    if set(choices_by_name) != set(REVIEWED_CONFLICTS):
+        raise ValueError('Incomplete reviewed resolution')
+    resolved = deepcopy(fresh)
+    payloads = dict(automatic)
+    inventory_new = inventory(SOURCE, load(root)['installedPacks'])
+    for row in resolved['entries']:
+        name = row['path']
+        if name not in REVIEWED_CONFLICTS:
+            continue
+        choice = choices_by_name[name]
+        fields = {'path', 'decision', 'beforeSha256', 'baselineSha256', 'nextBaselineSha256'}
+        if choice.get('decision') != REVIEWED_CONFLICTS[name]:
+            raise ValueError('Invalid reviewed decision for ' + name)
+        current = contents(path_at(root, name))
+        for field in ('beforeSha256', 'baselineSha256', 'nextBaselineSha256'):
+            if choice.get(field) != row[field]:
+                raise ValueError('Reviewed baseline changed: ' + name)
+        if name == 'scripts/delivery_guard.py':
+            if current is None or not isinstance(choice.get('resultSha256'), str) or not HASH.fullmatch(choice['resultSha256']):
+                raise ValueError('Reviewed delivery guard must be an existing regular file')
+            compile(current, name, 'exec')
+            if set(choice) != fields | {'resultSha256'} or choice['resultSha256'] != digest(current):
+                raise ValueError('Delivery guard must retain its exact current bytes')
+            row.update(action='keep', reason='Explicitly reviewed project customization retained', afterSha256=digest(current))
+            continue
+        if set(choice) != fields | {'resultBase64'} or not isinstance(choice['resultBase64'], str) or len(choice['resultBase64']) > 2 * 1024 * 1024:
+            raise ValueError('Invalid reviewed payload for ' + name)
+        try:
+            result = base64.b64decode(choice['resultBase64'], validate=True)
+        except (ValueError, base64.binascii.Error) as exc:
+            raise ValueError('Invalid reviewed payload encoding') from exc
+        if len(result) > 1024 * 1024 or not result:
+            raise ValueError('Reviewed payload exceeds the size limit or is empty')
+        result.decode('utf-8')
+        if name == 'AGENTS.md':
+            if current is None:
+                raise ValueError('Core file disappeared')
+            _, start, finish = block(current)
+            reviewed_block, reviewed_start, reviewed_finish = block(result)
+            if result[:reviewed_start] != current[:start] or result[reviewed_finish:] != current[finish:]:
+                raise ValueError('Reviewed Core result changed project-owned exterior bytes')
+            incoming_block = block(inventory_new[name][1])[0]
+            if reviewed_block != incoming_block:
+                raise ValueError('Reviewed Core result must adopt the exact new managed block')
+            row['coreBlock'] = dict(version=fresh['toVersion'], baselineSha256=digest(incoming_block),
+                                    installedSha256=digest(reviewed_block))
+        row.update(action='keep' if result == current else 'merge', reason='Explicit reviewed resolution', afterSha256=digest(result))
+        if result != current:
+            payloads[name] = result
+    resolved['conflicts'] = []
+    resolved['ready'] = True
+    return dict(schemaVersion=1, kind='workflow-upgrade-resolved-plan', originalPlan=fresh,
+                resolution=resolution, resultPlan=resolved), payloads
+
+
+def apply_resolved(root: Path, saved: dict) -> dict:
+    if set(saved) != {'schemaVersion', 'kind', 'originalPlan', 'resolution', 'resultPlan'} or saved['schemaVersion'] != 1 or saved['kind'] != 'workflow-upgrade-resolved-plan':
+        raise ValueError('Invalid resolved plan')
+    transaction = uuid.uuid4().hex
+    with LifecycleLock(root, 'upgrade', transaction=transaction), configuration_lock(root, transaction):
+        fresh, payloads = reviewed_plan(root, saved['originalPlan'], saved['resolution'])
+        if fresh != saved:
+            raise ValueError('Resolved upgrade plan is stale or modified')
+        plan = fresh['resultPlan']
+        manifest = after_manifest(load(root), plan)
+        # The reviewed guard stays byte-for-byte project-customized. Record those
+        # installed bytes; claiming the new distribution hash would fail audit.
+        # A later upgrade still sees an unproven baseline and requires review.
+        retained_guard = next(row for row in plan['entries'] if row['path'] == 'scripts/delivery_guard.py')
+        guard_entry = next(entry for entry in manifest['files'] if entry['path'] == 'scripts/delivery_guard.py')
+        if guard_entry['action'] == 'created':
+            guard_entry['installedSha256'] = retained_guard['afterSha256']
+            manifest['upgradeState']['reviewedRetainedGuard'] = dict(
+                path='scripts/delivery_guard.py', installedSha256=retained_guard['afterSha256'],
+                distributionSha256=retained_guard['nextBaselineSha256'], status='reviewed-retained')
+        state_check(manifest)
+        snapshot = inventory(SOURCE, manifest['installedPacks'])
+        if version(SOURCE) != plan['toVersion'] or any(digest(snapshot[row['path']][1]) != row['nextBaselineSha256'] for row in plan['entries'] if row['path'] in snapshot):
+            raise ValueError('Distribution changed during preparation')
+        if digest(contents(path_at(root, 'workflow.config.json'))) != plan['configurationSha256']:
+            raise ValueError('Project configuration changed during preparation')
+        expected = {row['path']: row['beforeSha256'] for row in plan['entries']}
+        expected[MANIFEST] = plan['manifestSha256']
+        if plan['gitExclude']:
+            expected['@git-exclude'] = plan['gitExclude']['sha256']
+        evidence = dict(originalConflictPlanSha256=digest(encoded(fresh['originalPlan'])),
+                        reviewedResolutionSha256=digest(encoded(fresh['resolution'])))
+        return transact(root, manifest, payloads, 'upgrade-resolved', transaction, snapshot, expected, evidence)
+
+
 def rollback(root: Path, transaction: str) -> dict:
     if not TRANSACTION.fullmatch(transaction):
         raise ValueError('Invalid transaction ID')
     with LifecycleLock(root, 'rollback', transaction=transaction, recover=True), configuration_lock(root, transaction, recover=True):
         journal_path = path_at(root, '.dev-workflow/upgrades/' + transaction + '/journal.json')
-        record = object_at(journal_path)
+        record = bounded_object_at(journal_path, MAX_JOURNAL_BYTES)
         if record.get('schemaVersion') != 1 or record.get('target') != str(root) or record.get('transaction') != transaction:
             raise ValueError('Rollback journal identity mismatch')
         if record.get('status') == 'rolled-back':
@@ -657,11 +794,12 @@ def transfer(root: Path, names: list[str], dry_run: bool) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('plan', 'apply', 'rollback', 'transfer', 'check', 'state', 'project-paths'))
+    parser.add_argument('action', choices=('plan', 'apply', 'resolve-plan', 'apply-resolved', 'rollback', 'transfer', 'check', 'state', 'project-paths'))
     parser.add_argument('--target', type=Path, required=True)
     parser.add_argument('--baseline', type=Path)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--plan', type=Path)
+    parser.add_argument('--resolution', type=Path)
     parser.add_argument('--transaction')
     parser.add_argument('--paths', nargs='+')
     parser.add_argument('--operation', choices=('install', 'audit', 'uninstall'))
@@ -686,7 +824,23 @@ def main() -> int:
         elif args.action == 'apply':
             if not args.plan:
                 raise ValueError('apply requires --plan')
-            result = apply(root, object_at(args.plan))
+            result = apply(root, bounded_object_at(args.plan, 4 * 1024 * 1024))
+        elif args.action == 'resolve-plan':
+            if not args.plan or not args.resolution or not args.output:
+                raise ValueError('resolve-plan requires --plan, --resolution and --output')
+            result, _ = reviewed_plan(root, bounded_object_at(args.plan, 4 * 1024 * 1024),
+                                      bounded_object_at(args.resolution, 4 * 1024 * 1024))
+            output = args.output.absolute()
+            if any(output.resolve().is_relative_to(directory) for directory in (root, SOURCE, Path(result['originalPlan']['baseline']))):
+                raise ValueError('Save reviewed plans outside target, source and baseline directories')
+            if any(linked(p) for p in (output, *output.parents)):
+                raise ValueError('Resolved plan output contains a linked path')
+            with output.open('xb') as stream:
+                stream.write(encoded(result))
+        elif args.action == 'apply-resolved':
+            if not args.plan:
+                raise ValueError('apply-resolved requires --plan')
+            result = apply_resolved(root, bounded_object_at(args.plan, 8 * 1024 * 1024))
         elif args.action == 'rollback':
             if not args.transaction:
                 raise ValueError('rollback requires --transaction')

@@ -314,7 +314,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                         Add-Error $errors 'manifest gitPolicy.policyChangedAt must be a valid timestamp.'
                     }
                 }
-                if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { Add-Error $errors 'manifest gitPolicy.policyChangedBy is invalid.' }
+                if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration', 'codex')) { Add-Error $errors 'manifest gitPolicy.policyChangedBy is invalid.' }
             }
         }
 
@@ -377,6 +377,44 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             }
         }
 
+        $reviewedGuardValid = $false
+        $reviewedGuardProperty = if ($null -ne $manifest.upgradeState) { $manifest.upgradeState.PSObject.Properties['reviewedRetainedGuard'] } else { $null }
+        if ($null -ne $reviewedGuardProperty) {
+            $marker = $reviewedGuardProperty.Value
+            $guardPath = 'scripts/delivery_guard.py'
+            $markerNames = if ($null -ne $marker) { @($marker.PSObject.Properties.Name) } else { @() }
+            if (
+                $markerNames.Count -ne 4 -or
+                @($markerNames | Where-Object { $_ -cnotin @('path', 'installedSha256', 'distributionSha256', 'status') }).Count -gt 0 -or
+                $marker.path -cne $guardPath -or
+                $marker.status -cne 'reviewed-retained' -or
+                $marker.installedSha256 -isnot [string] -or
+                $marker.distributionSha256 -isnot [string] -or
+                $marker.installedSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                $marker.distributionSha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                -not $inventoryPaths.ContainsKey($guardPath) -or
+                $inventoryPaths[$guardPath] -ne 'core' -or
+                $inventoryActions[$guardPath] -ne 'created' -or
+                $inventoryHashes[$guardPath] -cne $marker.installedSha256
+            ) {
+                Add-Error $errors 'manifest reviewedRetainedGuard is invalid or does not match installed Core guard ownership.'
+            } else {
+                $guardSourcePath = Join-Path $sourceRoot 'core/scripts/delivery_guard.py'
+                $guardTargetPath = Join-Path $targetRoot $guardPath
+                if (
+                    -not (Test-Path -LiteralPath $guardSourcePath -PathType Leaf) -or
+                    -not (Test-Path -LiteralPath $guardTargetPath -PathType Leaf) -or
+                    (Get-FileHash -LiteralPath $guardSourcePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $marker.distributionSha256 -or
+                    (Get-FileHash -LiteralPath $guardTargetPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $marker.installedSha256
+                ) {
+                    Add-Error $errors 'manifest reviewedRetainedGuard source or installed guard hash has changed.'
+                } else {
+                    $reviewedGuardValid = $true
+                    Add-Warning $warnings 'Core delivery guard was explicitly reviewed and its customization retained.'
+                }
+            }
+        }
+
         $packNames = @()
         $installedPacksProperty = $manifest.PSObject.Properties['installedPacks']
         if ($null -eq $installedPacksProperty) {
@@ -412,7 +450,11 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
                     $manifest.workflowVersion -eq $sourceVersion
                 ) {
                     $sourceHash = (Get-FileHash -LiteralPath (Join-Path $ownerRoot $entryPath) -Algorithm SHA256).Hash.ToLowerInvariant()
-                    if ($inventoryHashes[$entryPath] -ne $sourceHash) {
+                    if ($entryPath -eq 'scripts/delivery_guard.py' -and $reviewedGuardValid) {
+                        if ($sourceHash -cne $marker.distributionSha256) {
+                            Add-Error $errors "Manifest reviewedRetainedGuard source hash does not match workflow source for '$entryPath'."
+                        }
+                    } elseif ($inventoryHashes[$entryPath] -ne $sourceHash) {
                         Add-Error $errors "Manifest created-file hash does not match workflow source for '$entryPath'."
                     }
                 }

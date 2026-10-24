@@ -355,7 +355,8 @@ function Read-ManagedManifest([string]$Path) {
             }
             if ([string]$manifest.gitPolicy.privilegedOperationsDefault -ne 'deny') { throw "Manifest gitPolicy.privilegedOperationsDefault must be deny: $Path" }
             if ([string]::IsNullOrWhiteSpace([string]$manifest.gitPolicy.policyChangedAt)) { throw "Manifest gitPolicy.policyChangedAt is required: $Path" }
-            if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration')) { throw "Manifest gitPolicy.policyChangedBy is invalid: $Path" }
+            # Existing Codex attribution is historical; new policy edits still record user.
+            if ([string]$manifest.gitPolicy.policyChangedBy -notin @('default', 'user', 'migration', 'codex')) { throw "Manifest gitPolicy.policyChangedBy is invalid: $Path" }
         }
     } elseif ($schemaVersion -in @('4', '5')) {
         throw "Schema 4 manifest is missing gitPolicy: $Path"

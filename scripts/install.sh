@@ -873,7 +873,8 @@ if [[ -f "$manifest_path" ]]; then
       [[ "$(git_policy_boolean_field forcePushAllowed "$manifest_path")" == "false" ]] || { echo "manifest gitPolicy.forcePushAllowed 必须为 false。" >&2; exit 1; }
       [[ "$(git_policy_string_field privilegedOperationsDefault "$manifest_path")" == "deny" ]] || { echo "manifest gitPolicy.privilegedOperationsDefault 必须为 deny。" >&2; exit 1; }
       [[ -n "$existing_policy_changed_at" ]] || { echo "manifest gitPolicy.policyChangedAt 缺失。" >&2; exit 1; }
-      case "$existing_policy_changed_by" in default|user|migration) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
+      # Preserve legacy provenance; new installs and policy edits never emit codex.
+      case "$existing_policy_changed_by" in default|user|migration|codex) ;; *) echo "manifest gitPolicy.policyChangedBy 无效。" >&2; exit 1 ;; esac
     fi
   fi
   if [[ ( "$existing_schema_version" == "4" || "$existing_schema_version" == "5" ) && "$existing_git_policy" -eq 0 ]]; then

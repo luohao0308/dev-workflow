@@ -246,6 +246,23 @@ set -e
 [[ "$existing_policy_change_code" -ne 0 ]] || fail "non-interactive install cannot change an existing actor"
 [[ "$(sha256_file "$existing_policy_manifest")" == "$existing_policy_hash" ]] || fail "rejected existing policy change leaves the manifest unchanged"
 
+legacy_origin_target="$temp_root/legacy-policy-origin"
+mkdir -p "$legacy_origin_target"
+bash "$install_script" --target "$legacy_origin_target" --non-interactive >/dev/null
+legacy_origin_manifest="$legacy_origin_target/.dev-workflow/manifest.json"
+sed -E 's/"policyChangedBy"[[:space:]]*:[[:space:]]*"default"/"policyChangedBy": "codex"/' \
+  "$legacy_origin_manifest" > "$legacy_origin_manifest.tmp"
+mv -- "$legacy_origin_manifest.tmp" "$legacy_origin_manifest"
+bash "$install_script" --target "$legacy_origin_target" --non-interactive --dry-run >/dev/null
+bash "$install_script" --target "$legacy_origin_target" --non-interactive >/dev/null
+assert_json_string "$legacy_origin_manifest" policyChangedBy codex "legacy policy attribution is preserved without changing permissions"
+set +e
+bash "$audit_script" --target "$legacy_origin_target" > "$temp_root/legacy-origin-audit.log" 2>&1
+legacy_origin_audit_code=$?
+set -e
+[[ "$legacy_origin_audit_code" -eq 2 ]] || fail "legacy attribution audit remains pending rather than invalid"
+! grep -q 'policyChangedBy 无效' "$temp_root/legacy-origin-audit.log" || fail "legacy attribution is accepted by audit"
+
 policy_narrowing_tmp="$existing_policy_manifest.auto"
 sed -E \
   -e 's/"pushMode"[[:space:]]*:[[:space:]]*"manual"/"pushMode": "auto"/' \
