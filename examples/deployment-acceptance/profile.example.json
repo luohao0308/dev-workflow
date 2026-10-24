@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "kind": "deployment-acceptance-profile",
+  "profileName": "example-staging-web",
+  "repositoryId": 42,
+  "environment": "staging",
+  "target": "example-target",
+  "component": "web",
+  "runtimePolicyHash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "executionPolicyHash": "2222222222222222222222222222222222222222222222222222222222222222",
+  "verificationPolicyHash": "3333333333333333333333333333333333333333333333333333333333333333",
+  "storePolicyHash": "4444444444444444444444444444444444444444444444444444444444444444",
+  "gatePolicyHash": "5555555555555555555555555555555555555555555555555555555555555555",
+  "allowInterruption": true,
+  "requireHealth": true,
+  "requireSmoke": true,
+  "rollbackRef": "example-signed-history-reference",
+  "platform": "linux",
+  "adapter": "docker",
+  "state": "stateless",
+  "readOnly": true,
+  "mounts": []
+}

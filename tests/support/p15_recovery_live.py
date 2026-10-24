@@ -193,7 +193,7 @@ def actual_approval(config, request, output):
     return authority.GitHubRecoveryApproval(gh, token, [request], policy)
 
 
-def exercise(state, after_recovery=None):
+def exercise(state, after_recovery=None, recovery_runner=None):
     import ssl
     directory, metadata = state['directory'], state['metadata']
     if (metadata['targetRepository'] != 'luohao0308/dev-workflow-p0-target-20261022'
@@ -310,7 +310,8 @@ def exercise(state, after_recovery=None):
             return current
         execution.DockerExecutor._inventory = diagnostic_inventory
         try:
-            result = coordinator.recover(request, approval)
+            result, recovery_stage = (recovery_runner(coordinator, collector, executor, config, state,
+                request, approval) if recovery_runner is not None else (coordinator.recover(request, approval), None))
         finally:
             execution.DockerExecutor._inventory = original_inventory
         observation = result.pop('observation')
@@ -332,6 +333,9 @@ def exercise(state, after_recovery=None):
         else:
             raise AssertionError('Recovery request replay succeeded')
         if after_recovery is not None:
+            # A trusted same-process continuation can inspect the actual recovery
+            # request, provider and SDK result without re-importing audit JSON.
+            state['recovery_evidence'] = recovery_stage
             after_recovery(coordinator, collector, executor, config, state)
         provision.save(output / 'summary.json', dict(result='passed', realDocker=True, realMTLS=True,
             actualChildCrash=True, crashAfterCompletedWrite=crash_after, staleCoreOwnerReclaimed=True,
