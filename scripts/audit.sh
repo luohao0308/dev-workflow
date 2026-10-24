@@ -408,6 +408,29 @@ read_manifest_files() {
   [[ "$count" -gt 0 ]]
 }
 
+read_reviewed_guard_marker() {
+  python3 -B - "$1" <<'PY'
+import json
+import re
+import sys
+
+try:
+    with open(sys.argv[1], encoding='utf-8') as stream:
+        manifest = json.load(stream)
+    marker = manifest['upgradeState']['reviewedRetainedGuard']
+    if set(marker) != {'path', 'installedSha256', 'distributionSha256', 'status'}:
+        raise ValueError('unexpected marker fields')
+    if marker['path'] != 'scripts/delivery_guard.py' or marker['status'] != 'reviewed-retained':
+        raise ValueError('unexpected marker target or status')
+    if any(not isinstance(marker[name], str) or not re.fullmatch(r'[0-9a-f]{64}', marker[name])
+           for name in ('installedSha256', 'distributionSha256')):
+        raise ValueError('invalid marker hashes')
+    print('|'.join((marker['path'], marker['installedSha256'], marker['distributionSha256'])))
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+PY
+}
+
 target=""
 strict=0
 
@@ -609,7 +632,7 @@ else
       policy_changed_at="$(git_policy_string_field policyChangedAt "$manifest_path")"
       policy_changed_by="$(git_policy_string_field policyChangedBy "$manifest_path")"
       [[ "$policy_changed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]] || add_error "manifest gitPolicy.policyChangedAt 无效：${policy_changed_at:-missing}"
-      case "$policy_changed_by" in default|user|migration) ;; *) add_error "manifest gitPolicy.policyChangedBy 无效：${policy_changed_by:-missing}" ;; esac
+      case "$policy_changed_by" in default|user|migration|codex) ;; *) add_error "manifest gitPolicy.policyChangedBy 无效：${policy_changed_by:-missing}" ;; esac
     fi
   fi
 
@@ -676,6 +699,30 @@ else
     fi
   fi
 
+  reviewed_guard_installed=""
+  reviewed_guard_distribution=""
+  if grep -q '"reviewedRetainedGuard"[[:space:]]*:' "$manifest_path"; then
+    reviewed_guard_output="$(read_reviewed_guard_marker "$manifest_path")" || add_error "manifest reviewedRetainedGuard 格式无效。"
+    if [[ -n "$reviewed_guard_output" ]]; then
+      IFS='|' read -r reviewed_guard_path reviewed_guard_installed reviewed_guard_distribution <<< "$reviewed_guard_output"
+      guard_index=""
+      for index in "${!inventory_paths[@]}"; do
+        [[ "${inventory_paths[$index]}" == "$reviewed_guard_path" ]] && guard_index="$index"
+      done
+      if [[ -z "$guard_index" || "${inventory_sources[$guard_index]}" != "core" || "${inventory_actions[$guard_index]}" != "created" || "${inventory_hashes[$guard_index]}" != "$reviewed_guard_installed" ]]; then
+        add_error "manifest reviewedRetainedGuard 与已安装 Core guard 不一致。"
+        reviewed_guard_installed=""
+      else
+        reviewed_guard_source_hash="$(sha256_file "$source_root/core/scripts/delivery_guard.py")" || reviewed_guard_source_hash=""
+        reviewed_guard_target_hash="$(sha256_file "$target_root/scripts/delivery_guard.py")" || reviewed_guard_target_hash=""
+        if [[ "$reviewed_guard_source_hash" != "$reviewed_guard_distribution" || "$reviewed_guard_target_hash" != "$reviewed_guard_installed" ]]; then
+          add_error "manifest reviewedRetainedGuard 的来源或已安装内容哈希不一致。"
+          reviewed_guard_installed=""
+        fi
+      fi
+    fi
+  fi
+
   source_version_path="$source_root/VERSION"
   if [[ ! -f "$source_version_path" ]]; then
     add_error "分发仓库缺少 VERSION 文件。"
@@ -698,7 +745,13 @@ else
           add_error "缺少 SHA-256 工具，无法验证 created 文件归属。"
           break
         }
-        if [[ "${inventory_hashes[$index]}" != "$source_hash" ]]; then
+        if [[ "${inventory_paths[$index]}" == "scripts/delivery_guard.py" && -n "$reviewed_guard_installed" ]]; then
+          if [[ "$source_hash" != "$reviewed_guard_distribution" ]]; then
+            add_error "reviewedRetainedGuard 流程源哈希不一致：${inventory_paths[$index]}"
+          else
+            add_warning "Core delivery guard 已明确审阅并保留定制内容。"
+          fi
+        elif [[ "${inventory_hashes[$index]}" != "$source_hash" ]]; then
           add_error "manifest created 文件哈希与流程源不一致：${inventory_paths[$index]}"
         fi
       fi

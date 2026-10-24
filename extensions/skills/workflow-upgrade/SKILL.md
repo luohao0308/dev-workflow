@@ -17,6 +17,8 @@ The source defaults to the distribution containing the script. Inspect the plan 
 
 Apply only when the user has authorized the concrete migration scope and the plan is conflict-free. Existing authorization for that scope is sufficient; installation, push permission and configuration do not grant upgrade authority. Re-plan if the inspected inputs change; do not bypass engine refusal or modify the plan to defeat its checks.
 
+When the exact three protected conflicts `AGENTS.md`, `docs/WORKFLOW-ADOPTION.md`, and `scripts/delivery_guard.py` occur together, a separate reviewed transaction is available. First inspect and prepare full replacement bytes for the new Core block (preserving the complete project-owned exterior) and adoption document; retain the current guard bytes exactly. Keep the resolution JSON and both plans outside the target, source, and baseline. After the user has approved this concrete conflict scope, run `resolve-plan --target ... --plan ... --resolution ... --output ...`, review its resolved actions, then run `apply-resolved --target ... --plan ...`. The original `apply` must continue to refuse the conflict plan. The reviewer must not manufacture an old Core baseline, weaken guard checks, change gitPolicy, or edit target files to make automatic planning pass. The reviewed guard remains a protected customization and will require review again at the next upgrade. Record the resulting transaction and audit warning; use the same `rollback` command if an explicitly requested rollback is needed.
+
 ```sh
 python3 /path/to/dev-workflow/scripts/upgrade.py apply --target /project --plan /tmp/upgrade-plan.json
 ```

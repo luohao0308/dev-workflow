@@ -13,6 +13,19 @@ python3 /new-dev-workflow/scripts/upgrade.py apply --target /project --plan /tmp
 
 计划文件必须是项目和新旧分发目录之外的新文件。审阅其中每个路径的动作、原因、冲突，以及相关旧版/当前/新版正文。计划只读取状态；apply 在锁内重新计算并核对整份计划，输入变化需重新生成。任何冲突都会拒绝整份应用，不留下部分合并正文。没有强制跳过基线或冲突的参数。
 
+### 受审阅冲突的独立解析事务
+
+`apply` 始终拒绝冲突。对于旧 Core 来源无法证明、项目接入记录文本重叠、定制 `delivery_guard.py` 必须原样保留这**三种同时出现**的冲突，维护者可在项目和分发目录之外准备审阅文件，再生成独立解析计划：
+
+```sh
+python3 /new-dev-workflow/scripts/upgrade.py resolve-plan --target /project --plan /outside/upgrade-plan.json --resolution /outside/reviewed-resolution.json --output /outside/resolved-plan.json
+python3 /new-dev-workflow/scripts/upgrade.py apply-resolved --target /project --plan /outside/resolved-plan.json
+```
+
+解析文件逐路径绑定原计划中的 `beforeSha256`、`baselineSha256`、`nextBaselineSha256`。`AGENTS.md` 的 `replace-core-block` 决策提供完整审阅结果：只采用新分发的准确 Core 区块，区块外项目字节完全保留，不把旧 Core 伪称为原始基线。`docs/WORKFLOW-ADOPTION.md` 的 `replace-file` 决策提供保留项目事实的完整文本；`scripts/delivery_guard.py` 的 `retain` 决策只允许保留当前存在、可编译、哈希准确的原文件。这三条以外的冲突、缺失文件或额外路径仍拒绝。解析 JSON 是审阅材料，本身不是审批或执行许可。
+
+`apply-resolved` 在原生命周期锁内重建原冲突计划、逐字核对全部输入，再调用同一事务日志、基线快照和路径级回退。日志记录冲突计划与解析文件摘要。经审阅保留的 guard 在 manifest 中记录实际文件和对应新版来源的双哈希；审计会明确提示，下一次升级仍要求重新审阅该定制。项目 `gitPolicy`、已启用能力、安装包清单和业务文件不由解析文件改变。必须先核对审阅内容、回退点和项目权限；不要编辑冲突文件以伪造干净基线，或直接修改计划绕过拒绝。
+
 - 工具只升级已安装的流程包；新增包继续通过显式安装选择。
 - 未改动文件更新到新版；可安全合并的文本保留项目修改；二进制冲突、基线缺失、上游删除和本地删除需人工处理。
 - `AGENTS.md` 只替换完整且唯一的受管 Core 区块，区块外项目规则保留。区块版本和哈希单独记录；未知旧区块拒绝自动合并。
