@@ -8,6 +8,7 @@ import ssl
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -160,25 +161,28 @@ class WorkerTests(unittest.TestCase):
             if len([p for p in calls if backend['Id'] in p])==1:result['State']['Health']['Status']='starting'
             return result
         session.producer._get.side_effect=get
+        fake_os=SimpleNamespace(**vars(os))
+        fake_os.open=Mock(return_value=55);fake_os.stat=Mock(return_value=Mock(st_ino=9))
+        fake_os.fstat=Mock(return_value=Mock(st_ino=9));fake_os.close=Mock()
+        fake_subprocess=SimpleNamespace(**vars(worker.subprocess))
+        fake_subprocess.run=Mock(return_value=Mock(stdout=b'{"success":true}'))
         with patch('deployment_compose_phase_guard_v3_host.protected_state_digest',side_effect=worker.canonical), \
-             patch.object(worker.time,'sleep') as sleep,patch.object(worker.os,'open',return_value=55), \
-             patch.object(worker.os,'stat',return_value=Mock(st_ino=9)),patch.object(worker.os,'fstat',return_value=Mock(st_ino=9)), \
-             patch.object(worker.os,'close') as close,patch.object(worker,'stop_probe_unit') as stop, \
-             patch.object(worker.subprocess,'run',return_value=Mock(stdout=b'{"success":true}')) as run:
+             patch.object(worker.time,'sleep') as sleep,patch.object(worker,'os',fake_os), \
+             patch.object(worker,'stop_probe_unit') as stop,patch.object(worker,'subprocess',fake_subprocess):
             self.assertTrue(worker.readiness(session,backend['Id']))
         sleep.assert_called_once()
-        self.assertEqual(sum(call.args==(55,) for call in close.call_args_list),1)
+        fake_os.close.assert_called_once_with(55)
         stop.assert_called_once()
-        cmd=run.call_args.args[0]
+        cmd=fake_subprocess.run.call_args.args[0]
         self.assertIn('--net=/proc/'+str(os.getpid())+'/fd/55',cmd)
         self.assertNotIn('--target',cmd)
         self.assertNotIn('123',cmd)
+        fake_os.stat=Mock(return_value=Mock(st_ino=10));fake_os.close.reset_mock();fake_subprocess.run.reset_mock()
         with patch('deployment_compose_phase_guard_v3_host.protected_state_digest',side_effect=worker.canonical), \
-             patch.object(worker.os,'open',return_value=55),patch.object(worker.os,'stat',return_value=Mock(st_ino=10)), \
-             patch.object(worker.os,'fstat',return_value=Mock(st_ino=9)),patch.object(worker.os,'close') as close, \
-             patch.object(worker,'stop_probe_unit') as stop,patch.object(worker.subprocess,'run') as run:
+             patch.object(worker,'os',fake_os),patch.object(worker,'stop_probe_unit') as stop, \
+             patch.object(worker,'subprocess',fake_subprocess):
             with self.assertRaises(ValueError):worker.readiness(session,backend['Id'])
-        run.assert_not_called();stop.assert_not_called();close.assert_called_once_with(55)
+        fake_subprocess.run.assert_not_called();stop.assert_not_called();fake_os.close.assert_called_once_with(55)
 
     def test_final_requires_outer_probe_shutdown_and_production_verification(self):
         payload=dict(result={'private':'result'},history={'private':'history'},success=True,cleanupCompleted=True)
