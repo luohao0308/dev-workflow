@@ -362,6 +362,13 @@ def create_gateway(policy, *, tls_context, docker_socket, listen=('127.0.0.1', 0
                 pass
             finally:
                 if wrapped is not None:
+                    # TLS wrapping transfers the fd from request, so the base
+                    # server cannot shut down its write side after this returns.
+                    # Match TCPServer.shutdown_request before releasing it.
+                    try:
+                        wrapped.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                     wrapped.close()
                 else:
                     request.close()

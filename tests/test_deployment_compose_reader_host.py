@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import deployment_compose_reader_host as host
@@ -295,6 +296,25 @@ class ReaderHostTests(unittest.TestCase):
         self.assertEqual(self.request('GET', '/v1.45/networks/' + 'f' * 64)[0], 403)
         self.assertEqual(self.request('GET', '/v1.45/volumes/other')[0], 403)
         self.assertEqual(self.request('GET', '/v1.45/info', cert='client')[0], 403)
+        self.assertFalse(self.calls)
+
+    def test_body_rejection_shuts_down_wrapped_write_side_before_close(self):
+        completed = threading.Event()
+        shutdowns = []
+        original = ssl.SSLSocket.shutdown
+        def shutdown(connection, how):
+            shutdowns.append((connection.fileno(), how))
+            try:
+                return original(connection, how)
+            finally:
+                completed.set()
+        with mock.patch.object(ssl.SSLSocket, 'shutdown', shutdown):
+            status, raw = self.request('GET', '/v1.45/info', body=b'{}')
+            self.assertEqual((status, json.loads(raw)), (403, {'error': 'reader-request-rejected'}))
+            self.assertTrue(completed.wait(1), 'wrapped socket never shut down its write side')
+        self.assertEqual(len(shutdowns), 1)
+        self.assertGreaterEqual(shutdowns[0][0], 0)
+        self.assertEqual(shutdowns[0][1], socket.SHUT_WR)
         self.assertFalse(self.calls)
 
     def test_cross_project_and_unknown_inventory_denied(self):
