@@ -1,5 +1,6 @@
 """Signed Store and real Gate reconstruction, without local progress authority."""
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -97,6 +98,23 @@ class HistoryTests(GateFixture, unittest.TestCase):
         result=self.history().capture().snapshot
         self.assertEqual(result['blocker'],'known-http-failure')
         self.assertEqual(len(result['knownPrefix']),0)
+
+    def test_authenticated_boolean_integer_substitution_rejected(self):
+        history=self.history()
+        envelope=self.current_gate._seal('event',{})
+        envelope['policy']['witness_required']=1
+        unsigned={k:v for k,v in envelope.items() if k!='mac'}
+        envelope['mac']=hmac.new(b'g'*32,canonical(unsigned),hashlib.sha256).hexdigest()
+        with self.assertRaises(ValueError):history._unseal(envelope,'event')
+        event=dict(generation=self.gen,directory=[1,2],previous='0'*64,kind='open',
+            data=dict(request_hash=self.req.digest(),receipt_hash=self.receipt,
+                operations=[list(op) for op in self.ops],source_binding_schema=True,
+                source_context_digest=self.source))
+        raw=canonical(self.current_gate._seal('event',event))
+        witness=dict(binding=self.binding,sequence=1,previousHead='0'*64,kind='open',data={},
+                     materialDigest=hashlib.sha256(raw).hexdigest())
+        self.client.append_event(expected_seq=0,expected_head='0'*64,event=witness,external_material=raw)
+        with self.assertRaises(ValueError):history.capture()
 
     def test_unexpected_2xx_stop_is_not_a_successful_prefix(self):
         self.finish(); self.receipts={'web':'a'*64}; self.index=1; self.open_scope()

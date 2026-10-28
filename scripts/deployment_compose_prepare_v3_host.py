@@ -153,7 +153,8 @@ class ComposePreparationHostV3:
                 _fail()
             self._whole.commitment(observation)
             captures.append((rows,pins))
-        if _encode(captures[0]) != _encode(captures[1]):
+        if (baseline_state_bytes(captures[0][0]) != baseline_state_bytes(captures[1][0])
+                or _encode(captures[0][1]) != _encode(captures[1][1])):
             _fail()
         return captures[0]
 

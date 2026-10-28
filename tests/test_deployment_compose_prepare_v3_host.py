@@ -85,6 +85,25 @@ def fixture():
 
 @unittest.skipUnless(os.name == 'posix', 'private recovery store requires POSIX semantics')
 class PreparationTests(unittest.TestCase):
+    def test_health_log_progress_does_not_rebase_stable_lifecycle(self):
+        kw, observation=fixture()
+        producer=kw['phase_state_producer'];original=producer.capture;calls=[]
+        def capture():
+            rows=original();calls.append(True)
+            for row in rows.values():
+                row['State']['Health']['Log']=[dict(Start=str(len(calls)),End=str(len(calls)),
+                                                  ExitCode=0,Output='healthy')]
+            return rows
+        producer.capture=capture
+        expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        prepared=host.ComposePreparationHostV3(**kw).prepare_intent(observation,observation,
+            operation_nonce='f'*64,expires_at=expiry)
+        raw=kw['recovery']._store.get(prepared['bundle'].to_dict()['baselineStateReference'])
+        self.assertGreaterEqual(len(calls),4)
+        self.assertNotIn(b'"Log"',raw)
+        self.assertEqual(json.loads(raw)['2'*64]['State']['Pid'],
+                         kw['whole_observer']._unit_rows['2'*64]['State']['Pid'])
+
     def test_engine_omitted_bind_fields_match_gateway_hmac_without_rewriting_baseline(self):
         kw, observation=fixture()
         protected=kw['whole_observer']._unit_rows['2'*64]
@@ -303,7 +322,7 @@ class PreparationTests(unittest.TestCase):
             result=original(path,**kwargs)
             if path.endswith('/'+ '2'*64 + '/json'):
                 calls.append(path)
-                if len(calls)>1:result['State']['Health']['Log']=['changed']
+                if len(calls)>1:result['RestartCount']+=1
             return result
         reader._get=drifting
         expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')

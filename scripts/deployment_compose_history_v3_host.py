@@ -99,7 +99,8 @@ class AuthenticatedHistoryV3:
         if (type(envelope) is not dict or set(envelope) != {'version','domain','policy','payload','mac'}
                 or type(envelope['version']) is not int or envelope['version'] != 1
                 or envelope['domain'] != 'dev-workflow.writer-gate.' + domain
-                or envelope['policy'] != self._policy._binding() or not hex_value(envelope['mac'])):
+                or canonical(envelope['policy']) != canonical(self._policy._binding())
+                or not hex_value(envelope['mac'])):
             reject()
         unsigned = {k:v for k,v in envelope.items() if k != 'mac'}
         expected = hmac.new(self._key, canonical(unsigned), hashlib.sha256).hexdigest()
@@ -223,7 +224,7 @@ class AuthenticatedHistoryV3:
                     expected = dict(request_hash=self._request.digest(), receipt_hash=self._receipt,
                         operations=[list(o) for o in desc['operations']], source_binding_schema=1,
                         source_context_digest=desc['source'])
-                    if data != expected:
+                    if canonical(data) != canonical(expected):
                         reject()
                 elif ordinal == 1:
                     if (type(data) is not dict or set(data) != {'ref','operation'}
