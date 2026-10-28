@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
 import sys
 import unittest
@@ -50,7 +51,88 @@ def seal(args):
     return args
 
 
+def retained_fixture():
+    from tests.test_deployment_compose_recovery_host import setup
+    from deployment_compose_recovery_host import ComposeRecoveryHost
+    from deployment_compose_private import MOUNT, commit
+    inputs, _, observed, _, store, _ = setup(supported=False)
+    args = fixture(); baseline = inputs['baseline'][0]
+    args['identity'].update(project='blog', service='web', daemonId=inputs['observer']._policy['daemonId'],
+        containerId=baseline.container_id, containerName=baseline.final_name, imageId=baseline.image_id)
+    args['raw'].update(Id=baseline.container_id, Name='/'+baseline.final_name, Image=baseline.image_id)
+    args['raw']['Config']['Labels'].update({'com.docker.compose.project':'blog', 'com.docker.compose.service':'web'})
+    old_artifact = inputs['observer']._baseline_artifacts.services[0]
+    args['raw']['Config']['Image'] = old_artifact.registry_digest
+    args['image']['RepoDigests'] = [old_artifact.registry_digest]
+    args['image']['Id'] = baseline.image_id
+    args['raw']['Mounts'] = [{**{k:None for k in MOUNT}, **m} for m in args['raw']['Mounts']]
+    projection = {k:deepcopy(args['raw'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
+    digest = commit('blog','web',projection,'inspect-key',KEY)['configHmac']
+    artifact = replace(old_artifact, config_key_id='inspect-key', config_hmac=digest)
+    args['artifact'] = artifact
+    args['image_commitment'] = commit_image_config(args['image'],'image-key',IMAGE_KEY)
+    observer = inputs['observer'];observer._baseline_artifacts = replace(observer._baseline_artifacts, services=(artifact,))
+    observed['serviceConfigHmacs']['web'] = digest
+    recovery = ComposeRecoveryHost(store=store,observer=observer,baseline=inputs['baseline'],
+        projections={'web':projection},private_keys={'inspect-key':KEY},recipes=None)
+    observation = observer.issue();reference = recovery.retain(observation)
+    seal(args)
+    options = {k:v for k,v in args.items() if k not in ('raw','artifact')}
+    return args, options, recovery, reference, observer, observation, store
+
+
+@unittest.skipIf(os.name == 'nt', 'private recovery store requires POSIX semantics')
+class RetainedRestoreTests(unittest.TestCase):
+    def test_candidate_matches_direct_and_binding_is_separate(self):
+        args, options, recovery, reference, observer, observation, _ = retained_fixture()
+        result = host.compile_retained_restore_body(recovery,reference,observer,observation,service='web',**options)
+        self.assertEqual(result['candidate'],host.compile_restore_body(**args))
+        binding = result['retentionBinding'];self.assertEqual(binding['archiveReference'],reference)
+        self.assertEqual(binding['compositionDigest'],result['candidate']['compositionDigest'])
+        self.assertNotIn('retentionBinding',result['candidate'])
+        material = {k:v for k,v in binding.items() if k!='bindingDigest'}
+        self.assertEqual(binding['bindingDigest'],hashlib.sha256(host.RETENTION_DOMAIN+_encode(material)).hexdigest())
+
+    def test_archive_replacement_during_compile_rejected(self):
+        _, options, recovery, reference, observer, observation, store = retained_fixture()
+        original = host.compile_restore_body
+        def substitute(*args, **kwargs):
+            value = original(*args, **kwargs)
+            store.get = lambda ref:b'{}'
+            return value
+        with patch.object(host,'compile_restore_body',side_effect=substitute), self.assertRaisesRegex(ValueError,'^retained-restore-body-rejected$'):
+            host.compile_retained_restore_body(recovery,reference,observer,observation,service='web',**options)
+
+    def test_observer_drift_during_compilation_rejected(self):
+        _, options, recovery, reference, observer, observation, _ = retained_fixture()
+        original = host.compile_restore_body
+        def drift(*args, **kwargs):
+            result = original(*args, **kwargs)
+            observer._policy['daemonId'] = 'changed-daemon'
+            return result
+        with patch.object(host,'compile_restore_body',side_effect=drift), self.assertRaises(ValueError):
+            host.compile_retained_restore_body(recovery,reference,observer,observation,service='web',**options)
+
+    def test_wrong_service_or_identity_or_archive_rejected(self):
+        _, options, recovery, reference, observer, observation, store = retained_fixture()
+        for field, value in [('service','other'),('containerId','a'*64),('project','other'),('hostId',True),('requestedApiVersion','1.46')]:
+            changed = deepcopy(options); changed['identity'][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                host.compile_retained_restore_body(recovery,reference,observer,observation,service='web',**changed)
+        other = store.put(b'{}')
+        with self.assertRaises(ValueError):
+            host.compile_retained_restore_body(recovery,other,observer,observation,service='web',**options)
+
+
 class RestoreBodyTests(unittest.TestCase):
+    def test_running_metadata_policy_is_explicit_and_separately_bound(self):
+        args = seal(fixture()); stopped = host.compile_restore_body(**args)
+        args['metadata_policy'] = host.RUNNING_METADATA_POLICY
+        running = host.compile_restore_body(**args)
+        self.assertEqual(running['body'], stopped['body'])
+        self.assertNotEqual(running['compositionDigest'], stopped['compositionDigest'])
+        self.assertFalse(running['productionReady'] or running['executionAvailable'])
+
     def test_complete_preservation_and_no_authority(self):
         args = seal(fixture()); before = deepcopy(args)
         result = host.compile_restore_body(**args)

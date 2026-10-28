@@ -2,6 +2,7 @@
 from copy import deepcopy
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 import sys
 import unittest
@@ -78,6 +79,122 @@ class RestoreProbeTests(unittest.TestCase):
         self.assertFalse(result['success']); self.assertTrue(result['unknownWriteResult'])
         self.assertEqual(result['cleanupFailureType'], 'TimeoutExpired')
         self.assertEqual(calls[-1], ('image', 'rm', 'sha256:'+'b'*64))
+
+
+class RunningRestoreTests(unittest.TestCase):
+    def baseline(self):
+        raw = fixture()[0]
+        raw['Id'] = 'old';raw['State'] = {'Running': True, 'StartedAt':'fixed'};raw['RestartCount'] = 0
+        return raw
+
+    def test_create_default_rule_is_exact_and_opt_in_only(self):
+        raw = fixture()[0]; restored = deepcopy(raw)
+        raw['HostConfig']['OomKillDisable'] = None
+        server = {'Version': '29.8.2', 'GitCommit': '8af9fe3', 'RequestedApiVersion': '1.45'}
+        body = {'HostConfig': deepcopy(raw['HostConfig'])}
+        for value in (False, 0, True):
+            restored['HostConfig']['OomKillDisable'] = value
+            comparison = probe.compare_created(raw, restored, body, server)
+            self.assertEqual(bool(comparison['acceptedCreateDefaultFields']), value is False)
+            self.assertEqual(comparison['exactConfigHostMountAndDeclarationMatch'], value is False)
+            self.assertFalse(probe.compare_restored(raw, restored)['exactConfigHostMountAndDeclarationMatch'])
+        restored['HostConfig']['OomKillDisable'] = False
+        for field, value in [('Version', '29.8.3'), ('GitCommit', 'other'), ('RequestedApiVersion', '1.46')]:
+            self.assertFalse(probe.compare_created(raw, restored, body, dict(server, **{field:value}))['exactConfigHostMountAndDeclarationMatch'])
+        body['HostConfig']['OomKillDisable'] = False
+        self.assertFalse(probe.compare_created(raw, restored, body, server)['exactConfigHostMountAndDeclarationMatch'])
+
+    def test_invalid_create_receipt_is_never_registered(self):
+        known = ['a' * 64]
+        for value in (None, [], {}, {'Id': True}, {'Id': 'b' * 63}, {'Id': 'a' * 64}):
+            with self.assertRaises(ValueError):probe.created_id(value, known)
+            self.assertEqual(known, ['a' * 64])
+        self.assertEqual(probe.created_id({'Id': 'b' * 64}, known), 'b' * 64)
+
+    def test_precheck_failure_has_no_old_stop(self):
+        target, start = Mock(), Mock()
+        with self.assertRaises(ValueError):
+            probe.switch_stopped_restore(target, 'old', 'new', lambda fn:fn(), start,
+                {'exactConfigHostMountAndDeclarationMatch':False}, baseline=self.baseline())
+        target.stop.assert_not_called(); start.assert_not_called()
+
+    def test_unknown_old_stop_never_starts_new(self):
+        target, start = Mock(), Mock()
+        target.stop.side_effect = subprocess.TimeoutExpired('stop', 10)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            probe.switch_stopped_restore(target, 'old', 'new', lambda fn:fn(), start,
+                {'exactConfigHostMountAndDeclarationMatch':True}, baseline=self.baseline())
+        target.run.assert_not_called();start.assert_not_called()
+
+    def test_stop_must_be_observed_and_new_health_failure_propagates(self):
+        target, start = Mock(), Mock()
+        target.run.return_value = json.dumps([{'Id':'old','State':{'Running':True}}])
+        with self.assertRaises(ValueError):
+            probe.switch_stopped_restore(target, 'old', 'new', lambda fn:fn(), start,
+                {'exactConfigHostMountAndDeclarationMatch':True}, baseline=self.baseline())
+        start.assert_not_called()
+        stopped = self.baseline();stopped['State']['Running'] = False
+        target.run.return_value = json.dumps([stopped])
+        start.side_effect = ValueError('runtime-container-unhealthy')
+        with self.assertRaisesRegex(ValueError,'runtime-container-unhealthy'):
+            probe.switch_stopped_restore(target, 'old', 'new', lambda fn:fn(), start,
+                {'exactConfigHostMountAndDeclarationMatch':True}, baseline=self.baseline())
+        start.assert_called_once_with('new')
+
+    def test_post_stop_restart_or_stable_configuration_drift_blocks_new_start(self):
+        baseline = self.baseline()
+        for mutate in (lambda c:c['State'].update(StartedAt='restarted'),
+                       lambda c:c.update(RestartCount=1),
+                       lambda c:c['Config'].update(Hostname='changed'),
+                       lambda c:c['HostConfig'].update(Memory=0),
+                       lambda c:c['Mounts'].clear()):
+            target, start = Mock(), Mock();stopped = deepcopy(baseline)
+            stopped['State']['Running'] = False;mutate(stopped)
+            target.run.return_value = json.dumps([stopped])
+            with self.assertRaisesRegex(ValueError, 'restore-old-lifecycle-or-configuration-drift-after-stop'):
+                probe.switch_stopped_restore(target, 'old', 'new', lambda fn:fn(), start,
+                    {'exactConfigHostMountAndDeclarationMatch':True}, baseline=baseline)
+            start.assert_not_called()
+
+    def test_host_sentinel_change_after_business_pass_never_reports_success(self):
+        for mode in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                sentinel = Path(directory) / 'sentinel.txt'
+                sentinel.write_text('expected\n')
+                business_passed = sentinel.read_text() == 'expected\n'
+                sentinel.write_text('host-modified-after-business\n')
+                sentinel_preserved = sentinel.read_text() == 'expected\n'
+            self.assertTrue(business_passed)
+            result = {'restoredBusinessProbe': {'health':True,'business':True},
+                      'comparison':{'exactConfigHostMountAndDeclarationMatch':True},
+                      'sentinelPreserved':sentinel_preserved,'baselineUnchanged':True,
+                      'cleanupComplete':True,'unknownWriteResult':False}
+            with self.assertRaises(ValueError):probe.complete_restore_validation(result, restore_running=mode)
+            self.assertFalse(probe.restore_succeeded(result, restore_running=mode))
+            result['sentinelPreserved'] = True
+            probe.complete_restore_validation(result, restore_running=mode)
+            self.assertTrue(probe.restore_succeeded(result, restore_running=mode))
+            result['sentinelPreserved'] = False
+            self.assertFalse(probe.restore_succeeded(result, restore_running=mode))
+            result['sentinelPreserved'] = True;result['failureType'] = 'ValueError'
+            self.assertFalse(probe.restore_succeeded(result, restore_running=mode))
+
+    def test_running_source_restart_identity_is_pinned_but_logs_can_change(self):
+        raw = fixture()[0]
+        raw.update(State={'Running': True, 'StartedAt': 'fixed', 'Health': {'Status':'healthy','Log':['old']}}, RestartCount=0)
+        current = deepcopy(raw);current['State']['Health']['Log'] = ['new']
+        probe.verify_running_source(raw, current)
+        for mutate in (lambda c:c['State'].update(StartedAt='changed'),
+                       lambda c:c.update(RestartCount=1),
+                       lambda c:c['State'].update(Running=False),
+                       lambda c:c['State']['Health'].update(Status='unhealthy')):
+            changed = deepcopy(current); mutate(changed)
+            with self.assertRaises(ValueError):probe.verify_running_source(raw, changed)
+
+    def test_health_logs_do_not_change_stable_snapshot(self):
+        raw = fixture()[0];raw['State'] = {'Health': {'Log': ['first']}}
+        changed = deepcopy(raw);changed['State']['Health']['Log'] = ['later', 'timestamp']
+        self.assertEqual(probe.stable_snapshot(raw), probe.stable_snapshot(changed))
 
 
 if __name__ == '__main__': unittest.main()

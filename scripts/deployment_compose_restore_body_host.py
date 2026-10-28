@@ -16,6 +16,7 @@ from deployment_compose_snapshot import _encode
 from deployment_compose_recipe import HEX, NAME
 
 METADATA_POLICY = 'retain-observed-baseline-for-stopped-diagnostic-only'
+RUNNING_METADATA_POLICY = 'retain-observed-baseline-for-isolated-restart-diagnostic-only'
 DOMAIN = b'dev-workflow:compose-restore-body-diagnostic:v1\0'
 
 
@@ -31,7 +32,7 @@ def compile_restore_body(raw, identity, artifact, private_key, network_ids, expe
     operation. Dynamic endpoint values and inferred origin claims are excluded.
     """
     try:
-        if (type(metadata_policy) is not str or metadata_policy != METADATA_POLICY
+        if (type(metadata_policy) is not str or metadata_policy not in (METADATA_POLICY, RUNNING_METADATA_POLICY)
                 or type(operation_nonce) is not str or not HEX.fullmatch(operation_nonce)):
             raise ValueError()
         (raw, identity, artifact, network_ids, expected_mounts, image, image_commitment,
@@ -88,3 +89,41 @@ def compile_restore_body(raw, identity, artifact, private_key, network_ids, expe
         return result
     except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, OverflowError):
         raise ValueError('compose-restore-body-diagnostic-rejected') from None
+
+
+RETENTION_DOMAIN = b'dev-workflow:compose-retained-restore-body:v1\0'
+
+
+def compile_retained_restore_body(recovery, reference, observer, observation, *, service, identity,
+                                  private_key, network_ids, expected_mounts, image, image_commitment,
+                                  image_key, declaration, declaration_proof, declaration_key,
+                                  expected_image_key_id, expected_declaration_key_id,
+                                  expected_declaration_hmac, expected_source_model_digest,
+                                  host_config_policy, metadata_policy, operation_nonce,
+                                  expected_observed_reference=None, reference_policy=None):
+    """Compose only an exact retained source, preserving its separate archive binding."""
+    from deployment_compose_recovery_host import ComposeRecoveryHost
+    try:
+        if type(recovery) is not ComposeRecoveryHost:
+            raise ValueError()
+        identity = deepcopy(identity)
+        raw, artifact = recovery.read_source(reference, observer, observation, service=service, identity=identity)
+        candidate = compile_restore_body(raw, identity, artifact, private_key, network_ids, expected_mounts,
+            image, image_commitment, image_key, declaration, declaration_proof, declaration_key,
+            expected_image_key_id=expected_image_key_id,
+            expected_declaration_key_id=expected_declaration_key_id,
+            expected_declaration_hmac=expected_declaration_hmac,
+            expected_source_model_digest=expected_source_model_digest,
+            host_config_policy=host_config_policy, metadata_policy=metadata_policy,
+            operation_nonce=operation_nonce, expected_observed_reference=expected_observed_reference,
+            reference_policy=reference_policy)
+        again, again_artifact = recovery.read_source(reference, observer, observation,
+                                                    service=service, identity=identity)
+        if _encode(again) != _encode(raw) or again_artifact != artifact:
+            raise ValueError()
+        binding = {'archiveReference': reference, 'compositionDigest': candidate['compositionDigest'],
+                   'bodySha256': candidate['bodySha256']}
+        binding['bindingDigest'] = hashlib.sha256(RETENTION_DOMAIN + _encode(binding)).hexdigest()
+        return {'candidate': candidate, 'retentionBinding': binding}
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, OverflowError):
+        raise ValueError('retained-restore-body-rejected') from None

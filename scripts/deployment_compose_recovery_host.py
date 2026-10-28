@@ -8,6 +8,8 @@ value subset; real Engine reconstruction remains unverified.
 from copy import deepcopy
 from dataclasses import asdict
 import hmac
+import json
+import re
 from pathlib import Path
 import sys
 
@@ -20,6 +22,9 @@ from deployment_compose_baseline_recipe import verify_baseline_recipe
 from deployment_compose_proof_host import canonical
 from deployment_compose_operations import BaselineContainer
 from deployment_compose_recovery_store import ComposeRecoveryStore
+from deployment_compose_snapshot import IDENTITY
+from deployment_compose_recipe import NAME
+from deployment_compose_artifacts import ServiceArtifact
 
 
 class ComposeRecoveryHost:
@@ -86,15 +91,58 @@ class ComposeRecoveryHost:
         self._observer.commitment(observation)
         return reference
 
-    def verify(self, reference, observer, observation, *, require_recipe_equivalence=False):
+    def _verified_payload(self, reference, observer, observation, *, require_recipe_equivalence=False):
         """Require retained bytes to still exist; never recreate a missing archive."""
         if require_recipe_equivalence and self._recipes is None:
             raise ValueError('verified-baseline-recipes-required')
         expected = self._payload(observer, observation)
-        if self._store.get(reference) != expected:
+        actual = self._store.get(reference)
+        if actual != expected:
             raise ValueError('recovery-archive-mismatch')
         observer.commitment(observation)
+        return actual
+
+    def verify(self, reference, observer, observation, *, require_recipe_equivalence=False):
+        self._verified_payload(reference, observer, observation,
+                               require_recipe_equivalence=require_recipe_equivalence)
         return reference
+
+    def read_source(self, reference, observer, observation, *, service, identity):
+        """Read the exact verified archive bytes; host supplies the closed identity."""
+        try:
+            identity = deepcopy(identity)
+            payload = json.loads(self._verified_payload(reference, observer, observation))
+            if (observer._policy.get('project') != self._project or observer._policy.get('daemonId') != self._daemon):
+                raise ValueError()
+            if (type(service) is not str or type(identity) is not dict or set(identity) != IDENTITY
+                    or type(identity['daemonId']) is not str
+                    or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}', identity['daemonId'])
+                    or type(identity['hostId']) is not str or not NAME.fullmatch(identity['hostId'])
+                    or type(identity['requestedApiVersion']) is not str or identity['requestedApiVersion'] != '1.45'
+                    or type(identity['engineVersion']) is not str or len(identity['engineVersion']) > 128
+                    or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9._-]+)?', identity['engineVersion'])):
+                raise ValueError()
+            containers = [row for row in payload['containers'] if row['service'] == service]
+            artifacts = [row for row in payload['artifacts']['services'] if row['service'] == service]
+            if len(containers) != 1 or len(artifacts) != 1:
+                raise ValueError()
+            container = containers[0]; artifact = ServiceArtifact(**artifacts[0])
+            expected = {'project': self._project, 'daemonId': self._daemon, 'service': service,
+                        'containerId': container['container_id'], 'containerName': container['final_name'],
+                        'imageId': container['image_id']}
+            if any(type(identity[k]) is not str or identity[k] != v for k, v in expected.items()):
+                raise ValueError()
+            projection = payload['privateProjections'][service]
+            if type(projection) is not dict or set(projection) != {'Config','HostConfig','NetworkSettings','Mounts'}:
+                raise ValueError()
+            raw = {'Id': container['container_id'], 'Name': '/' + container['final_name'],
+                   'Image': container['image_id'], **deepcopy(projection)}
+            observer.commitment(observation)
+            if observer._policy.get('project') != self._project or observer._policy.get('daemonId') != self._daemon:
+                raise ValueError()
+            return raw, artifact
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, OSError):
+            raise ValueError('recovery-source-rejected') from None
 
     def verify_target_configuration(self, target_recipes):
         """The first batch profile changes image identity only, not configuration."""

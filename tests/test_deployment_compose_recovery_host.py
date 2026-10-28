@@ -63,6 +63,48 @@ class RecoveryHostTests(unittest.TestCase):
         self.assertFalse(payload['executionAvailable'])
         self.assertEqual(inputs['recovery_host'].verify(reference, inputs['observer'], observation), reference)
 
+    def test_read_source_exact_verified_bytes_identity_and_copy(self):
+        import json
+        from copy import deepcopy
+        inputs, _, _, observation, store, projection = setup(supported=False)
+        recovery = inputs['recovery_host'];reference = inputs['recovery_reference'];baseline = inputs['baseline'][0]
+        identity = dict(project='blog', service='web', containerId=baseline.container_id,
+            containerName=baseline.final_name,imageId=baseline.image_id,daemonId=recovery._daemon,
+            hostId='host-one',requestedApiVersion='1.45',engineVersion='29.8.2')
+        saved = store.get(reference)
+        raw, artifact = recovery.read_source(reference,inputs['observer'],observation,service='web',identity=identity)
+        self.assertEqual(raw['Config'],projection['Config']);self.assertEqual(artifact.service,'web')
+        raw['Config']['Env'].append('MUTATED=local')
+        self.assertEqual(store.get(reference),saved)
+        self.assertEqual(recovery.verify(reference,inputs['observer'],observation),reference)
+        for field, value in [('service','other'),('containerId','f'*64),('imageId','sha256:'+'f'*64),
+            ('hostId',True),('requestedApiVersion','1.46'),('engineVersion',False),('extra','bad')]:
+            changed = dict(identity,**{field:value})
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError,'^recovery-source-rejected$'):
+                recovery.read_source(reference,inputs['observer'],observation,service='web',identity=changed)
+        unrelated = store.put(b'{}')
+        with self.assertRaises(ValueError):recovery.read_source(unrelated,inputs['observer'],observation,service='web',identity=identity)
+        for error in (None, FileNotFoundError('private/archive/path')):
+            options = {'return_value':b'{}'} if error is None else {'side_effect':error}
+            with mock.patch.object(store,'get',**options):
+                with self.assertRaisesRegex(ValueError,'^recovery-source-rejected$'):
+                    recovery.read_source(reference,inputs['observer'],observation,service='web',identity=identity)
+
+    def test_read_source_uses_single_verified_read_and_rejects_projection_identity_override(self):
+        inputs, _, _, observation, store, _ = setup(supported=False)
+        recovery = inputs['recovery_host'];reference = inputs['recovery_reference'];baseline = inputs['baseline'][0]
+        identity = dict(project='blog', service='web', containerId=baseline.container_id,
+            containerName=baseline.final_name,imageId=baseline.image_id,daemonId=recovery._daemon,
+            hostId='host-one',requestedApiVersion='1.45',engineVersion='29.8.2')
+        saved = store.get(reference)
+        with mock.patch.object(store,'get',side_effect=[saved,b'{}']) as get:
+            recovery.read_source(reference,inputs['observer'],observation,service='web',identity=identity)
+            self.assertEqual(get.call_count,1)
+        recovery._projections['web']['Id'] = 'f'*64
+        changed = store.put(recovery._payload(inputs['observer'],observation))
+        with self.assertRaises(ValueError):
+            recovery.read_source(changed,inputs['observer'],observation,service='web',identity=identity)
+
     def test_secret_config_mismatch_cannot_be_retained(self):
         inputs, _, _, _, store, projection = setup()
         projection['Config']['Env'] = ['TOKEN=wrong-secret']
