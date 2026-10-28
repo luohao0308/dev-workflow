@@ -95,9 +95,11 @@ class RollbackPreparationHostV3:
             reject()
         if 'observationScope' in value:
             scope = value['observationScope']
+            source_ids = sorted({b.container_id for b in containers}
+                                | {p['containerId'] for p in original['protectedContainers']})
             if (type(scope) is not dict or set(scope) != {'kind','containerIds','projectCompletenessVerified'}
                     or scope['kind'] != 'pinned-containers'
-                    or scope['containerIds'] != [b.container_id for b in containers]
+                    or scope['containerIds'] != source_ids
                     or scope['projectCompletenessVerified'] is not False):
                 reject()
         if value['recoveryRecipes'] is not None:

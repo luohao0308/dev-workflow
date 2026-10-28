@@ -163,12 +163,16 @@ class PreparationSession:
         self.resources.clear()
 
 
-def _observers(root, session, scope, artifacts, key):
-    directory = root/'profile3-tls'; directory.mkdir(mode=0o700)
+def _observers(root, session, scope, artifacts, key, *, purpose='initial'):
+    if purpose not in ('initial', 'rollback'):
+        raise ValueError('profile3-observer-purpose-rejected')
+    directory = root/('profile3-tls' if purpose == 'initial' else 'profile3-rollback-tls')
+    directory.mkdir(mode=0o700)
     def openssl(*args):
         subprocess.run(['openssl', *args], cwd=directory, capture_output=True, check=True, timeout=20)
     openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout','ca.key','-out','ca.pem','-days','1',
-            '-subj','/CN=Private preparation CA','-addext','basicConstraints=critical,CA:TRUE')
+            '-subj','/CN=Private preparation CA','-addext','basicConstraints=critical,CA:TRUE',
+            '-addext','keyUsage=critical,keyCertSign,cRLSign')
     for name in ('server','reader'):
         openssl('req','-newkey','rsa:2048','-nodes','-keyout',name+'.key','-out',name+'.csr','-subj','/CN='+name)
         (directory/(name+'.ext')).write_text('subjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage='+('serverAuth' if name=='server' else 'clientAuth')+'\n')
@@ -195,6 +199,58 @@ def _observers(root, session, scope, artifacts, key):
             ca_file=directory/'ca.pem',cert_file=directory/'reader.pem',key_file=directory/'reader.key',max_age_seconds=300)
         observers.append(observer)
     return tuple(observers)
+
+
+def _prepare_observed(session, *, root, rows, images, references, bodies, network_name,
+                      network, volume, bind, source_sha, host_id, expected_daemon_id,
+                      fresh, keys, policy_hash, environment, expiry_seconds, purpose):
+    """Shared host-only preparation; fixture provisioning has already ended."""
+    target, project = session.target, session.project
+    raw={k:deepcopy(rows['backend'][k]) for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
+    raw['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in raw['Mounts']]
+    projection={k:raw[k] for k in ('Config','HostConfig','NetworkSettings','Mounts')}
+    networks={network_name:network}
+    mounts={'/sample-data':dict(type='volume',source=volume,readOnly=False),'/sample-config':dict(type='bind',source=str(bind),readOnly=True)}
+    identity=dict(project=project,service='backend',containerId=raw['Id'],containerName=project+'-backend',imageId=images[0]['Id'],hostId=host_id,daemonId=expected_daemon_id,requestedApiVersion='1.45',engineVersion=fresh['ServerVersion'])
+    artifact=ServiceArtifact('backend',source_sha,references[0],images[0]['Id'],'linux',images[0]['Architecture'],'profile3-config',commit(project,'backend',projection,'profile3-config',keys['config'])['configHmac'],hashlib.sha256(b'').hexdigest(),'none')
+    peer_projection={k:deepcopy(rows['peer'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
+    peer_projection['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in peer_projection['Mounts']]
+    peer_hash=commit(project,'peer',peer_projection,'profile3-config',keys['config'])['configHmac']
+    scope=dict(project=project,daemonId=expected_daemon_id,selectedServices=['backend'],protectedServices=['peer'],protectedContainerIds={'peer':rows['peer']['Id']},protectedConfigHmacs={'peer':peer_hash},selectedContainerIds={'backend':raw['Id']},containerNames={s:project+'-'+s for s in rows},imageIds={s:rows[s]['Image'] for s in rows},baselineSourceShas={'backend':source_sha},networks=networks,volumes={volume:dict(driver='local',options={})},mounts={s:[dict(type=m['type'],source=m['source'],target=p,readOnly=m['readOnly']) for p,m in mounts.items()] for s in rows},networkAttachments={s:{network_name:rows[s]['NetworkSettings']['Networks'][network_name]['Aliases']} for s in rows})
+    session.whole_observer,session.retention_observer=_observers(root,session,scope,ComposeArtifacts(1,(artifact,)),keys['config'],purpose=purpose)
+    session.whole_observation=session.whole_observer.issue(); session.retention_observation=session.retention_observer.issue()
+    if session.whole_observation is None or session.retention_observation is None: raise ValueError('profile3-live-observation-not-issued')
+    if session.store is None:
+        archive=root/'profile3-archive'; archive.mkdir(mode=0o700)
+        session.store=ComposeRecoveryStore(archive,key=keys['archive'])
+    baseline=(BaselineContainer('backend',raw['Id'],identity['containerName'],images[0]['Id']),)
+    session.recovery=ComposeRecoveryHost(store=session.store,observer=session.retention_observer,baseline=baseline,projections={'backend':projection},private_keys={'profile3-config':keys['config']})
+    reference=session.recovery.retain(session.retention_observation)
+    snapshot=prepare_snapshot(raw,identity,artifact,keys['config'],networks,mounts)
+    model=dict(sourceSha=source_sha,command=fixture_command(project),createBodies=bodies)
+    model_digest=hashlib.sha256(_encode(model)).hexdigest()
+    declaration=dict(schemaVersion=1,identity=identity,sourceSha=source_sha,sourceModelDigest=model_digest,sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),networks={network_name:dict(id=network,aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],addressPolicy='dynamic-no-requested-addresses',requestedMac=None,ipamConfig=None,links=None,driverOpts=None)})
+    proof=commit_network_declaration(declaration,'profile3-declaration',keys['declaration'])
+    inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=SOURCE_HOST_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
+    targets=dict(image=images[1],commitment=commit_image_config(images[1],'profile3-target',keys['target']),key=keys['target'],expected_key_id='profile3-target',expected_image_id=images[1]['Id'],expected_registry_digest=references[1],expected_architecture=images[1]['Architecture'])
+    session.producer=TrustedPhaseStateProducerV3(socket_path=target.socket,project=project,daemon_id=expected_daemon_id,container_ids=tuple(sorted(r['Id'] for r in rows.values())))
+    session.preparer=ComposePreparationHostV3(whole_observer=session.whole_observer,retention_observer=session.retention_observer,recovery=session.recovery,baseline=baseline,source_inputs={'backend':inputs},target_inputs={'backend':targets},source=SourceIdentity('github.com','https://github.com/'+REPOSITORY+'.git',REPOSITORY_ID,REPOSITORY,source_sha),target=TargetIdentity('compose',project,environment),host_id=host_id,daemon_id=expected_daemon_id,environment=environment,policy_hash=policy_hash,dependencies={'backend':()},protected_names={'peer':project+'-peer'},protected_ids={'peer':rows['peer']['Id']},protected_hashes={'peer':peer_hash},archive_reference=reference,phase_state_producer=session.producer,protected_private_keys={'peer':('profile3-config',keys['config'])})
+    expires=(datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex
+    audit=dict(rawSource=raw,rawRows=rows,identity=identity,artifact=asdict(artifact),
+        sourceInputs={k:v for k,v in inputs.items() if type(v) is not bytes},
+        targetInputs={k:v for k,v in targets.items() if type(v) is not bytes},
+        scope=scope,sourceModel=model,operationNonce=operation_nonce,expiresAt=expires)
+    fd=os.open(root/('profile3-inputs.private.json' if purpose == 'initial' else 'profile3-rollback-inputs.private.json'),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'wb') as stream:stream.write(_encode(audit))
+    session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=operation_nonce,expires_at=expires)
+    version=session.producer._get('/v1.45/version')
+    version={k:version[k] for k in ('Version','GitCommit')}
+    pinned_rows=TrustedPhaseStateProducerV3.reload(session.store,session.prepared['bundle'],read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
+    session.guard=PhaseGuardV3(session.prepared['bundle'],pinned_rows,read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
+    session.raw_source,session.raw_rows,session.source_inputs,session.source_model=raw,rows,inputs,model
+    session.public=public_payload(session.prepared)
+    return session
 
 
 def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, keys, policy_hash,
@@ -248,50 +304,21 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
                 _, rows[service]=_complete_json_response(connection.getresponse())
             finally: connection.close()
         # Baseline fixture creation ends here. All subsequent Engine operations are GETs.
-        raw={k:deepcopy(rows['backend'][k]) for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
-        raw['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in raw['Mounts']]
-        projection={k:raw[k] for k in ('Config','HostConfig','NetworkSettings','Mounts')}
-        networks={network_name:network}
-        mounts={'/sample-data':dict(type='volume',source=volume,readOnly=False),'/sample-config':dict(type='bind',source=str(bind),readOnly=True)}
-        identity=dict(project=project,service='backend',containerId=raw['Id'],containerName=project+'-backend',imageId=images[0]['Id'],hostId=host_id,daemonId=expected_daemon_id,requestedApiVersion='1.45',engineVersion=fresh['ServerVersion'])
-        artifact=ServiceArtifact('backend',source_sha,references[0],images[0]['Id'],'linux',images[0]['Architecture'],'profile3-config',commit(project,'backend',projection,'profile3-config',keys['config'])['configHmac'],hashlib.sha256(b'').hexdigest(),'none')
-        peer_projection={k:deepcopy(rows['peer'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
-        peer_projection['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in peer_projection['Mounts']]
-        peer_hash=commit(project,'peer',peer_projection,'profile3-config',keys['config'])['configHmac']
-        scope=dict(project=project,daemonId=expected_daemon_id,selectedServices=['backend'],protectedServices=['peer'],protectedContainerIds={'peer':rows['peer']['Id']},protectedConfigHmacs={'peer':peer_hash},selectedContainerIds={'backend':raw['Id']},containerNames={s:project+'-'+s for s in rows},imageIds={s:images[0]['Id'] for s in rows},baselineSourceShas={'backend':source_sha},networks=networks,volumes={volume:dict(driver='local',options={})},mounts={s:[dict(type=m['type'],source=m['source'],target=p,readOnly=m['readOnly']) for p,m in mounts.items()] for s in rows},networkAttachments={s:{network_name:rows[s]['NetworkSettings']['Networks'][network_name]['Aliases']} for s in rows})
-        session.whole_observer,session.retention_observer=_observers(root,session,scope,ComposeArtifacts(1,(artifact,)),keys['config'])
-        session.whole_observation=session.whole_observer.issue(); session.retention_observation=session.retention_observer.issue()
-        if session.whole_observation is None or session.retention_observation is None: raise ValueError('profile3-live-observation-not-issued')
-        archive=root/'profile3-archive'; archive.mkdir(mode=0o700)
-        session.store=ComposeRecoveryStore(archive,key=keys['archive'])
-        baseline=(BaselineContainer('backend',raw['Id'],identity['containerName'],images[0]['Id']),)
-        session.recovery=ComposeRecoveryHost(store=session.store,observer=session.retention_observer,baseline=baseline,projections={'backend':projection},private_keys={'profile3-config':keys['config']})
-        reference=session.recovery.retain(session.retention_observation)
-        snapshot=prepare_snapshot(raw,identity,artifact,keys['config'],networks,mounts)
-        model=dict(sourceSha=source_sha,command=fixture_command(project),createBodies=bodies)
-        model_digest=hashlib.sha256(_encode(model)).hexdigest()
-        declaration=dict(schemaVersion=1,identity=identity,sourceSha=source_sha,sourceModelDigest=model_digest,sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),networks={network_name:dict(id=network,aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],addressPolicy='dynamic-no-requested-addresses',requestedMac=None,ipamConfig=None,links=None,driverOpts=None)})
-        proof=commit_network_declaration(declaration,'profile3-declaration',keys['declaration'])
-        inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=SOURCE_HOST_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
-        targets=dict(image=images[1],commitment=commit_image_config(images[1],'profile3-target',keys['target']),key=keys['target'],expected_key_id='profile3-target',expected_image_id=images[1]['Id'],expected_registry_digest=references[1],expected_architecture=images[1]['Architecture'])
-        session.producer=TrustedPhaseStateProducerV3(socket_path=target.socket,project=project,daemon_id=expected_daemon_id,container_ids=tuple(sorted(r['Id'] for r in rows.values())))
-        session.preparer=ComposePreparationHostV3(whole_observer=session.whole_observer,retention_observer=session.retention_observer,recovery=session.recovery,baseline=baseline,source_inputs={'backend':inputs},target_inputs={'backend':targets},source=SourceIdentity('github.com','https://github.com/'+REPOSITORY+'.git',REPOSITORY_ID,REPOSITORY,source_sha),target=TargetIdentity('compose',project,environment),host_id=host_id,daemon_id=expected_daemon_id,environment=environment,policy_hash=policy_hash,dependencies={'backend':()},protected_names={'peer':project+'-peer'},protected_ids={'peer':rows['peer']['Id']},protected_hashes={'peer':peer_hash},archive_reference=reference,phase_state_producer=session.producer,protected_private_keys={'peer':('profile3-config',keys['config'])})
-        expires=(datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex
-        audit=dict(rawSource=raw,rawRows=rows,identity=identity,artifact=asdict(artifact),
-            sourceInputs={k:v for k,v in inputs.items() if type(v) is not bytes},
-            targetInputs={k:v for k,v in targets.items() if type(v) is not bytes},
-            scope=scope,sourceModel=model,operationNonce=operation_nonce,expiresAt=expires)
-        fd=os.open(root/'profile3-inputs.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-        with os.fdopen(fd,'wb') as stream:stream.write(_encode(audit))
-        session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=operation_nonce,expires_at=expires)
-        version=json.loads(target.run('version','--format','{{json .Server}}'))
-        version={k:version[k] for k in ('Version','GitCommit')}
-        pinned_rows=TrustedPhaseStateProducerV3.reload(session.store,session.prepared['bundle'],read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
-        session.guard=PhaseGuardV3(session.prepared['bundle'],pinned_rows,read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
-        session.raw_source,session.raw_rows,session.source_inputs,session.source_model=raw,rows,inputs,model
-        session.public=public_payload(session.prepared)
-        return session
+        session.enrolled_images=deepcopy(images)
+        session.enrolled_references=tuple(references)
+        session.root=root
+        result=_prepare_observed(session,root=root,rows=rows,images=images,references=references,
+            bodies=bodies,network_name=network_name,network=network,volume=volume,bind=bind,
+            source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
+            fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
+            expiry_seconds=expiry_seconds,purpose='initial')
+        session.deployment_context=dict(preparer=session.preparer,prepared=session.prepared,
+            bundle=session.prepared['bundle'],request=session.prepared['request'],
+            whole_observer=session.whole_observer,retention_observer=session.retention_observer,
+            guard=session.guard,producer=session.producer,raw_rows=deepcopy(rows),
+            source_model=deepcopy(session.source_model),source_inputs=session.source_inputs,
+            whole_observation=session.whole_observation,retention_observation=session.retention_observation)
+        return result
     except Exception as error:
         # Caller retains ownership and may clean up only confirmed receipts.
         chain=[];cause=error
@@ -307,3 +334,107 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
             pass  # Preserve the original failure and its cleanup ownership.
         error.preparation_session=session
         raise
+
+
+def prepare_current_profile3(session, *, original_bundle, original_request,
+                             authenticated_history, keys, source_sha, host_id,
+                             policy_hash, environment='staging', expiry_seconds=600):
+    """Build private current-baseline preparation from signed completed receipts.
+
+    This host-only path shares the initial CAS and cleanup owner, but never uses
+    the stopped baseline's observers. It issues only Engine GET requests.
+    """
+    from deployment_compose_history_v3_host import AuthenticatedHistoryV3
+    from deployment_compose_bundle_v3 import ExecutionBundleV3
+    from deployment_contract_v2 import RequestV2
+    from deployment_compose_coordinator_v3_host import canonical
+    from deployment_compose_phase_guard_v3_host import protected_state_digest
+    if (type(original_bundle) is not ExecutionBundleV3
+            or type(original_request) is not RequestV2
+            or type(authenticated_history) is not AuthenticatedHistoryV3
+            or original_request.operation != 'deploy'
+            or original_request.plan_hash != original_bundle.digest
+            or authenticated_history._bundle.canonical_bytes != original_bundle.canonical_bytes
+            or authenticated_history._request.digest() != original_request.digest()
+            or source_sha != original_request.source.source_sha
+            or host_id != original_request.host_id or policy_hash != original_request.policy_hash
+            or type(expiry_seconds) is not int or not 1 <= expiry_seconds <= 900
+            or type(keys) is not dict or set(keys) != {'config','image','declaration','archive','target'}
+            or any(type(k) is not bytes or not 32 <= len(k) <= 4096 for k in keys.values())
+            or session.unknown_write_result):
+        raise ValueError('profile3-current-input-rejected')
+    context=session.deployment_context
+    if (session.target.socket != context['producer']._socket_path
+            or session.target.socket != str(session.root/'docker.sock')
+            or keys['config'] != context['source_inputs']['private_key']):
+        raise ValueError('profile3-current-private-boundary-rejected')
+    if (context['prepared']['bundle'].canonical_bytes != original_bundle.canonical_bytes
+            or context['prepared']['request'].digest() != original_request.digest()):
+        raise ValueError('profile3-current-deployment-rejected')
+    signed=authenticated_history.capture()
+    value=json.loads(signed.canonical)
+    original=original_bundle.to_dict()
+    receipts=value['receiptMap']
+    expected=[op for op in original_bundle.resolve_operations(receipts) if op['method'] != 'GET']
+    if (value['bundleDigest'] != original_bundle.digest
+            or value['originalRequestHash'] != original_request.digest()
+            or value['sourceArchiveRef'] != original['archiveReference']
+            or value['blocker'] is not None or value['pending'] is not None
+            or value['closedTail'] is None or len(expected) != 5
+            or set(receipts) != {'backend'}
+            or canonical(value['knownPrefix']) != canonical(expected)
+            or len(value['scopes']) != 5):
+        raise ValueError('profile3-current-history-rejected')
+    # Validate the approved target and unchanged protected pin against fresh GETs.
+    # The original guard reads its immutable CAS baseline, never old observers.
+    guard=context['guard']
+    done=original_bundle.resolve_operations(receipts)
+    first=guard._capture(done,receipts)
+    if canonical(first) != canonical(guard._capture(done,receipts)):
+        raise ValueError('profile3-current-drift')
+    producer=TrustedPhaseStateProducerV3(socket_path=session.target.socket,project=session.project,
+        daemon_id=original['identity']['daemonId'],
+        container_ids=tuple(sorted([receipts['backend']]+[p['containerId'] for p in original['protectedContainers']])))
+    current=producer.capture()
+    peer=original['protectedContainers']
+    if (len(peer) != 1 or peer[0]['containerId'] != context['raw_rows']['peer']['Id']):
+        raise ValueError('profile3-current-peer-rejected')
+    if protected_state_digest(current[peer[0]['containerId']]) != peer[0]['staticConfigDigest']:
+        raise ValueError('profile3-current-peer-rejected')
+    rows={'backend':current[receipts['backend']],'peer':current[peer[0]['containerId']]}
+    images=deepcopy(session.enrolled_images[::-1])
+    for image in images:
+        fresh_image=producer._get('/v1.45/images/'+image['Id']+'/json')
+        if canonical(fresh_image) != canonical(image):
+            raise ValueError('profile3-current-image-drift')
+    service=original['services'][0]
+    if (len(original['services']) != 1 or service['name'] != 'backend'
+            or images[0]['Id'] != service['targetImageId']
+            or images[1]['Id'] != service['baselineImageId']):
+        raise ValueError('profile3-current-image-rejected')
+    bodies={'backend':deepcopy(service['targetCreateBody']),
+            'peer':deepcopy(context['source_model']['createBodies']['peer'])}
+    inputs=context['source_inputs']
+    network_name,network=next(iter(inputs['network_ids'].items()))
+    mounts=inputs['expected_mounts']
+    child=PreparationSession(session.target,session.project)
+    child.listeners=session.listeners
+    child.store=session.store
+    fresh=producer._get('/v1.45/info')
+    references=list(session.enrolled_references[::-1])
+    _prepare_observed(child,root=session.root,rows=rows,images=images,references=references,
+        bodies=bodies,network_name=network_name,network=network,
+        volume=mounts['/sample-data']['source'],bind=Path(mounts['/sample-config']['source']),
+        source_sha=source_sha,host_id=host_id,expected_daemon_id=original['identity']['daemonId'],
+        fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
+        expiry_seconds=expiry_seconds,purpose='rollback')
+    for old,new in zip(original['services'],child.prepared['bundle'].to_dict()['services']):
+        if (canonical(new['baselineCreateBody']) != canonical(old['targetCreateBody'])
+                or canonical(new['targetCreateBody']) != canonical(old['baselineCreateBody'])):
+            raise ValueError('profile3-current-inverse-rejected')
+    if authenticated_history.capture().canonical != signed.canonical:
+        raise ValueError('profile3-current-history-changed')
+    return dict(preparer=child.preparer,whole_observation=child.whole_observation,
+        retention_observation=child.retention_observation,guard=child.guard,
+        prepared=child.prepared,producer=child.producer,private_session=child,
+        authenticated_history_snapshot=signed)
