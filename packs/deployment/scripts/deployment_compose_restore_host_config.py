@@ -10,6 +10,7 @@ from deployment_compose_host_config import REQUIRED
 from deployment_compose_snapshot import _encode, prepare_snapshot
 
 POLICY = 'compose-sample-host-config-v1'
+OOM_ENABLED_POLICY = 'compose-sample-host-config-oom-enabled-v1'
 DOMAIN = b'dev-workflow:compose-restore-host-config-fragment:v1\0'
 MASKED_PATHS = ('/proc/acpi', '/proc/asound', '/proc/interrupts', '/proc/kcore',
                 '/proc/keys', '/proc/latency_stats', '/proc/sched_debug', '/proc/scsi',
@@ -21,7 +22,9 @@ def _fail():
     raise ValueError('invalid-compose-restore-host-config-fragment')
 
 
-def _fixed_policy():
+def _fixed_policy(*, policy=POLICY):
+    if type(policy) is not str or policy not in (POLICY, OOM_ENABLED_POLICY):
+        _fail()
     # Independent closed policy: do not generate these groups from the mapper.
     # A future mapper field must also receive an explicit policy here.
     fixed = {k: False for k in ('AutoRemove', 'Privileged', 'PublishAllPorts')}
@@ -42,6 +45,8 @@ def _fixed_policy():
                  Tmpfs={'/tmp': 'size=4m'},
                  LogConfig={'Type': 'json-file', 'Config': {'max-file': '3', 'max-size': '10m'}},
                  RestartPolicy={'Name': 'unless-stopped', 'MaximumRetryCount': 0})
+    if policy == OOM_ENABLED_POLICY:
+        fixed['OomKillDisable'] = False
     return fixed
 
 
@@ -53,12 +58,12 @@ def compile_restore_host_config(raw, identity, artifact, private_key, network_id
     This does not authenticate their origin or grant execution authority.
     """
     try:
-        if type(policy) is not str or policy != POLICY:
+        if type(policy) is not str or policy not in (POLICY, OOM_ENABLED_POLICY):
             _fail()
         snapshot = prepare_snapshot(raw, identity, artifact, private_key,
                                     network_ids, expected_mounts)
         host = snapshot['hostConfig']['rawHostConfig']
-        fixed = _fixed_policy()
+        fixed = _fixed_policy(policy=policy)
         if set(fixed) | {'NetworkMode'} != REQUIRED or set(fixed) & {'NetworkMode'}:
             _fail()
         # Canonical comparison preserves exact types: False != 0, null != [].

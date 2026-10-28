@@ -147,5 +147,28 @@ class RestoreHostConfigTests(unittest.TestCase):
         self.assertEqual(first['policyDigest'], second['policyDigest'])
 
 
+    def test_oom_enabled_policy_is_explicit_and_preserves_null_policy(self):
+        original = fixture()
+        with self.assertRaises(ValueError):
+            build(original, policy=restore.OOM_ENABLED_POLICY)
+        raw, identity, artifact, networks, mounts = fixture()
+        raw['HostConfig']['OomKillDisable'] = False
+        changed = (raw, identity, rebind(raw, identity, artifact), networks, mounts)
+        with self.assertRaises(ValueError):
+            build(changed)
+        accepted = build(changed, policy=restore.OOM_ENABLED_POLICY)
+        self.assertIs(accepted['hostConfigFragment']['OomKillDisable'], False)
+        self.assertNotEqual(accepted['policyDigest'], build(original)['policyDigest'])
+        self.assertIsNone(restore._fixed_policy()['OomKillDisable'])
+        old = restore._fixed_policy(); new = restore._fixed_policy(policy=restore.OOM_ENABLED_POLICY)
+        old.pop('OomKillDisable'); new.pop('OomKillDisable')
+        self.assertEqual(old, new)
+        for value in (True, 0, 1, None):
+            raw['HostConfig']['OomKillDisable'] = value
+            rejected = (raw, identity, rebind(raw, identity, artifact), networks, mounts)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                build(rejected, policy=restore.OOM_ENABLED_POLICY)
+
+
 if __name__ == '__main__':
     unittest.main()
