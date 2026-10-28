@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import base64
 import hashlib
 import hmac
 import json
@@ -30,6 +31,7 @@ import threading
 
 import deployment_maintenance_state as _maintenance
 from deployment_gate_witness import OnlineWitnessClient, opening_scope
+from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
 
 _HEX = re.compile(r'[0-9a-f]{64}')
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
@@ -72,8 +74,13 @@ class GatePolicy:
     witness_required: bool = False
     witness_scope_hash: str | None = None
     witness_key_sha256: str | None = None
+    operation_profile: str = 'legacy'
 
     def __post_init__(self):
+        if (type(self.operation_profile) is not str
+                or self.operation_profile not in ('legacy', 'compose-v3')
+                or self.operation_profile == 'compose-v3' and self.witness_required is not True):
+            raise GateError('invalid-operation-profile')
         if (not all(type(x) is str and _ID.fullmatch(x) for x in (self.store_id, self.key_id))
                 or not _hex(self.scope_hash) or not _hex(self.writer_certificate_sha256)):
             raise GateError('invalid-gate-policy')
@@ -91,6 +98,11 @@ class GatePolicy:
         if self.witness_required:
             value.update(witness_binding_schema=1,witness_required=True,
                          witness_scope_hash=self.witness_scope_hash,witness_key_sha256=self.witness_key_sha256)
+        if self.operation_profile != 'legacy':
+            # The opening preimage and exact witness binding pin this per-generation
+            # scope. The chain policy identity stays stable across successors.
+            value.pop('witness_scope_hash')
+            value.update(operation_profile=self.operation_profile)
         return value
 
 
@@ -153,15 +165,26 @@ class WriterSession(_Issued):
 
 
 def _operation(method, path, body_hash):
+    return _profile_operation('legacy', method, path, body_hash)
+
+
+def _profile_operation(profile, method, path, body_hash):
     if type(method) is not str or type(path) is not str or not _hex(body_hash):
         raise GateError('writer-operation-rejected')
     prefix = r'/v1\.45/containers/'
+    if profile not in ('legacy', 'compose-v3'):
+        raise GateError('writer-operation-rejected')
+    create = (r'(?:dwf-[0-9a-f]{64}|dev-workflow-[a-z0-9][a-z0-9_.-]{0,127})'
+              if profile == 'legacy' else r'dwc-[0-9a-f]{24}-[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
     allowed = ((method == 'POST' and re.fullmatch(
-        prefix + r'create\?name=(?:dwf-[0-9a-f]{64}|dev-workflow-[a-z0-9][a-z0-9_.-]{0,127})', path))
+        prefix + r'create\?name=' + create, path))
         or (method == 'POST' and re.fullmatch(
             prefix + r'[0-9a-f]{64}/(?:start|stop\?t=(?:[1-9]|[1-5][0-9]|60))', path))
         or (method == 'DELETE' and re.fullmatch(
             prefix + r'[0-9a-f]{64}\?force=false&v=false', path)))
+    if profile == 'compose-v3' and method == 'POST':
+        allowed = allowed or re.fullmatch(
+            prefix + r'[0-9a-f]{64}/rename\?name=[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', path)
     if not allowed or ('/create?' not in path and body_hash != hashlib.sha256(b'').hexdigest()):
         raise GateError('writer-operation-rejected')
     return (method, path, body_hash)
@@ -178,7 +201,8 @@ class FileWriterGate:
         if type(policy) is not GatePolicy or type(key) is not bytes or len(key) < 32:
             raise GateError('invalid-gate-policy')
         if policy.witness_required:
-            if (type(witness) is not OnlineWitnessClient or witness.binding['scopeHash']!=policy.witness_scope_hash
+            expected_witness = GateOperationWitnessAdapterV3 if policy.operation_profile == 'compose-v3' else OnlineWitnessClient
+            if (type(witness) is not expected_witness or witness.binding['scopeHash']!=policy.witness_scope_hash
                     or witness.binding['policyHash']!=policy.identity_hash() or witness.key_hash!=policy.witness_key_sha256):
                 raise GateError('online-witness-required')
         elif witness is not None:
@@ -606,7 +630,9 @@ class FileWriterGate:
                 if set(data) == sourced and (type(data['source_binding_schema']) is not int
                         or data['source_binding_schema'] != 1 or not _hex(data['source_context_digest'])):
                     self._fail()
-                state['operations'] = self._operations(tuple(tuple(x) for x in data['operations']))
+                if self.policy.operation_profile == 'compose-v3' and set(data) != sourced:
+                    self._fail()
+                state['operations'] = self._approved_operations(tuple(tuple(x) for x in data['operations']))
                 if self.policy.witness_required and opening_scope(generation,data['request_hash'],data['receipt_hash'],
                         state['operations'],data.get('source_context_digest'))!=self.policy.witness_scope_hash:
                     raise GateError('witness-opening-scope-mismatch')
@@ -624,7 +650,11 @@ class FileWriterGate:
                     self._fail()
                 state['admissions'][data] = dict(status='pending', head=_digest(event))
             elif kind == 'finish':
-                if (type(data) is not dict or set(data) != {'ref', 'definitive', 'response_hash'}
+                if self.policy.operation_profile == 'compose-v3':
+                    self._response_data(data)
+                expected_fields = ({'ref', 'definitive', 'response_hash', 'response_binding_schema', 'status', 'bodyBase64'}
+                                   if self.policy.operation_profile == 'compose-v3' else {'ref', 'definitive', 'response_hash'})
+                if (type(data) is not dict or set(data) != expected_fields
                         or data['ref'] not in state['admissions']
                         or state['admissions'][data['ref']]['status'] != 'pending'
                         or type(data['definitive']) is not bool
@@ -659,21 +689,35 @@ class FileWriterGate:
         self._directory(generation)
         event = dict(generation=generation, directory=list(self._generation_ids[generation]),
                      previous=state['head'], kind=kind, data=data)
-        if self._witness is not None:
+        if (self.policy.operation_profile == 'compose-v3' and
+                any(type(n) is not int or not 0 <= n <= 2**64 - 1 for n in event['directory'])):
+            raise GateError('unsupported-directory-identity')
+        envelope = self._seal('event', event)
+        if self.policy.operation_profile == 'compose-v3':
+            self._witness.reserve_event(generation, state['count'], state['head'], event, _canonical(envelope))
+        elif self._witness is not None:
             self._witness.reserve(generation,state['count'],state['head'],_digest(event))
         self._write(self._directory(generation) / f'{state["count"]:08d}.json',
-                    self._seal('event', event))
+                    envelope)
         return _digest(event)
 
+    def _operation(self, method, path, body_hash):
+        return _profile_operation(self.policy.operation_profile, method, path, body_hash)
+
+    def _approved_operations(self, operations):
+        return self._operations(operations, self.policy.operation_profile)
+
     @staticmethod
-    def _operations(operations):
+    def _operations(operations, profile='legacy'):
         if type(operations) is not tuple or not 1 <= len(operations) <= 256:
             raise GateError('approved-operations-required')
         result = []
         for item in operations:
             if type(item) is not tuple or len(item) != 3:
                 raise GateError('approved-operations-required')
-            result.append(_operation(*item))
+            result.append(_profile_operation(profile, *item))
+        if profile == 'compose-v3' and len(result) != 1:
+            raise GateError('single-approved-operation-required')
         if len(set(result)) != len(result):
             raise GateError('duplicate-approved-operation')
         return tuple(result)
@@ -681,8 +725,9 @@ class FileWriterGate:
     def open_generation(self, *, generation: str, request_hash: str, receipt_hash: str,
                         operations: tuple[tuple[str, str, str], ...],
                         source_context_digest: str | None = None) -> WriterSession:
-        approved = self._operations(operations)
-        if source_context_digest is not None and not _hex(source_context_digest):
+        approved = self._approved_operations(operations)
+        if (self.policy.operation_profile == 'compose-v3' and source_context_digest is None
+                or source_context_digest is not None and not _hex(source_context_digest)):
             raise GateError('invalid-source-context')
         if not all(_hex(x) for x in (generation, request_hash, receipt_hash)):
             raise GateError('invalid-generation')
@@ -712,7 +757,7 @@ class FileWriterGate:
             raise GateError('unissued-session')
         if type(body) is not bytes or len(body) > 1024 * 1024:
             raise GateError('writer-body-rejected')
-        operation = _operation(method, path, hashlib.sha256(body).hexdigest())
+        operation = self._operation(method, path, hashlib.sha256(body).hexdigest())
         with self._locked():
             state = self._state(session.generation)
             self._witness_next_operation(state,operation)
@@ -731,7 +776,7 @@ class FileWriterGate:
         if (not _hex(attempt_ref) or type(body) is not bytes or len(body) > 1024 * 1024
                 or writer_certificate_sha256 != self.policy.writer_certificate_sha256):
             raise GateError('writer-admission-rejected')
-        operation = _operation(method, path, hashlib.sha256(body).hexdigest())
+        operation = self._operation(method, path, hashlib.sha256(body).hexdigest())
         with self._locked():
             state = self._state(generation)
             self._witness_next_operation(state,operation)
@@ -755,6 +800,8 @@ class FileWriterGate:
             raise GateError('witness-operation-order-required')
 
     def finish(self, ticket, *, definitive: bool, response_hash: str | None):
+        if self.policy.operation_profile != 'legacy':
+            raise GateError('full-response-required')
         if (type(ticket) is not AdmissionTicket
                 or self._tickets.get((ticket.generation, ticket.attempt_ref)) is not ticket
                 or type(definitive) is not bool
@@ -768,6 +815,45 @@ class FileWriterGate:
                 raise GateError('admission-already-finished')
             self._append(ticket.generation, state, 'finish',
                          dict(ref=ticket.attempt_ref, definitive=definitive, response_hash=response_hash))
+
+    @staticmethod
+    def _response_data(data):
+        try:
+            if (type(data) is not dict or set(data) != {'ref', 'definitive', 'response_hash',
+                    'response_binding_schema', 'status', 'bodyBase64'}
+                    or type(data['response_binding_schema']) is not int or data['response_binding_schema'] != 1
+                    or not _hex(data['ref']) or type(data['definitive']) is not bool
+                    or type(data['status']) is not int or type(data['bodyBase64']) is not str):
+                raise ValueError
+            body = base64.b64decode(data['bodyBase64'], validate=True)
+            if len(body) > 65536 or base64.b64encode(body).decode('ascii') != data['bodyBase64']:
+                raise ValueError
+            if data['definitive']:
+                if not 100 <= data['status'] <= 599 or data['response_hash'] != hashlib.sha256(
+                        str(data['status']).encode('ascii') + b'\0' + body).hexdigest():
+                    raise ValueError
+            elif data['status'] != 0 or body != b'' or data['response_hash'] is not None:
+                raise ValueError
+        except Exception:
+            raise GateError('invalid-response') from None
+
+    def finish_response(self, ticket, *, definitive, status, body: bytes):
+        if self.policy.operation_profile != 'compose-v3':
+            raise GateError('unexpected-full-response')
+        if type(body) is not bytes or len(body) > 4096 or type(status) is not int:
+            raise GateError('invalid-response')
+        if type(ticket) is not AdmissionTicket or self._tickets.get((ticket.generation, ticket.attempt_ref)) is not ticket:
+            raise GateError('unissued-admission-ticket')
+        data = dict(ref=ticket.attempt_ref, definitive=definitive, status=status,
+                    bodyBase64=base64.b64encode(body).decode('ascii'), response_binding_schema=1,
+                    response_hash=hashlib.sha256(str(status).encode('ascii') + b'\0' + body).hexdigest() if definitive else None)
+        self._response_data(data)
+        with self._locked():
+            state = self._state(ticket.generation)
+            admission = state['admissions'].get(ticket.attempt_ref)
+            if admission is None or admission['head'] != ticket.admitted_head or admission['status'] != 'pending':
+                raise GateError('admission-already-finished')
+            self._append(ticket.generation, state, 'finish', data)
 
     def generation_evidence(self, generation):
         """Fresh authenticated diagnostic values; never a capability or anchor.
@@ -816,6 +902,8 @@ class FileWriterGate:
     def close_generation(self, generation) -> QuiescenceProof:
         with self._locked():
             state = self._state(generation)
+            if self.policy.operation_profile == 'compose-v3' and any(x['status'] != 'done' for x in state['admissions'].values()):
+                raise GateError('writer-not-quiescent')
             if not state['closed']:
                 self._append(generation, state, 'close', None)
                 state = self._state(generation)
