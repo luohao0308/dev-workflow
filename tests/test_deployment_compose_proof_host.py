@@ -134,7 +134,9 @@ class ProofTests(unittest.TestCase):
         helper = approval_tests.ComposeApprovalTests()
         helper.policy = inputs['policy']
         client = helper.client_for([request])
-        verifier = lambda _: dict(claims(inputs['policy']), aud=AUDIENCE)
+        token_claims = dict(claims(inputs['policy']), aud=AUDIENCE)
+        # One signed token has immutable times across every authority recheck.
+        verifier = lambda _: deepcopy(token_claims)
         receipt = issuer.consume_approval(request, observation, operation_nonce='9' * 64,
                    proofs=proofs, client=client, oidc_token='signed', verifier=verifier)
         self.assertEqual(receipt.request_hash, request.digest())
@@ -154,7 +156,9 @@ class ProofTests(unittest.TestCase):
         helper = approval_tests.ComposeApprovalTests()
         helper.policy = inputs['policy']
         client = helper.client_for([request])
-        verifier = lambda _: dict(claims(inputs['policy']), aud=AUDIENCE)
+        token_claims = dict(claims(inputs['policy']), aud=AUDIENCE)
+        # One signed token has immutable times across every authority recheck.
+        verifier = lambda _: deepcopy(token_claims)
         consume = GitHubComposeApproval.consume
         def consumed(approval, grant, reviewed):
             receipt = consume(approval, grant, reviewed)
