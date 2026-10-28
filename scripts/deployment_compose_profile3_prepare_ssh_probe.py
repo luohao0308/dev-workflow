@@ -34,6 +34,7 @@ MAX_SOURCE=16*1024*1024
 MAX_STDERR=1024*1024
 KEY_NAMES=('config','image','declaration','archive','target')
 ENTRYPOINT='deployment_compose_profile3_prepare_ssh_probe._remote_main'
+EXTRA_SCRIPTS=frozenset({'scripts/deployment_gateway_host.py'})
 
 
 def reject(): raise ValueError('profile3-prepare-ssh-rejected')
@@ -48,7 +49,8 @@ def _allowed(name):
     if path.is_absolute() or '..' in path.parts or path.suffix!='.py':return False
     return (name.startswith('core/scripts/') or name.startswith('packs/deployment/scripts/')
         or name.startswith('packs/release/scripts/') or name.startswith('tests/support/')
-        or name.startswith('scripts/deployment_compose_') and len(path.parts)==2)
+        or name.startswith('scripts/deployment_compose_') and len(path.parts)==2
+        or name in EXTRA_SCRIPTS)
 
 
 def _check_local_source(source_sha):
@@ -65,7 +67,8 @@ def _published_archive(source_sha):
     names=_git('ls-tree','-r','--name-only','-z',source_sha).decode().split('\0')
     names=sorted(name for name in names if name and _allowed(name))
     required={'scripts/deployment_compose_profile3_prepare_ssh_probe.py',
-              'scripts/deployment_compose_isolated_daemon_probe.py','tests/support/compose_profile3_prepare_fixture.py'}
+              'scripts/deployment_compose_isolated_daemon_probe.py','tests/support/compose_profile3_prepare_fixture.py',
+              *EXTRA_SCRIPTS}
     if not required.issubset(names) or len(names)>1024:reject()
     archive=io.BytesIO();total=0
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as zipped:
@@ -146,6 +149,12 @@ def _prepare_session(*args,**kwargs):
     return prepare_profile3(*args,**kwargs)
 
 
+def _prepare_dependencies():
+    # Validate the packaged import closure before provisioning an Engine.
+    from compose_profile3_prepare_fixture import prepare_profile3
+    return prepare_profile3
+
+
 def _probe(workload):
     from deployment_compose_isolated_daemon_probe import probe
     return probe(workload,storage_driver='overlayfs',workload_lifetime_seconds=3600)
@@ -196,6 +205,7 @@ def _remote_main(config):
             or not re.fullmatch('[0-9a-f]{64}',config['archiveDigest'])
             or not re.fullmatch('[0-9a-f]{64}',config['channelNonce'])
             or not re.fullmatch('[0-9a-f]{64}',config['policyHash'])):reject()
+    _prepare_dependencies()
     result=_probe(lambda root,info:_workload(root,info,config))
     root=Path(result['root'])
     summary=dict(success=result.get('completed') is True,remoteRoot=str(root),sourceSha=config['sourceSha'],

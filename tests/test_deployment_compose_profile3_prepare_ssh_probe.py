@@ -23,6 +23,7 @@ import deployment_compose_profile3_prepare_ssh_probe as host
 
 SHA='b'*40
 NAMES=['scripts/deployment_compose_profile3_prepare_ssh_probe.py',
+       'scripts/deployment_gateway_host.py',
        'scripts/deployment_compose_isolated_daemon_probe.py','tests/support/compose_profile3_prepare_fixture.py',
        'core/scripts/published.py','packs/deployment/scripts/kept.py','packs/release/scripts/kept.py',
        'scripts/arbitrary.py','tests/test_not_support.py','untracked.py','README.md']
@@ -84,6 +85,29 @@ write_frame(sys.stdout.buffer,dict(channelNonce=config['channelNonce'],result=re
         self.assertIn(hashlib.sha256(archive).hexdigest(),code)
         self.assertNotIn(base64.b64encode(archive).decode(),code)
         with patch.object(host,'_git',self.git),patch.object(host,'MAX_ARCHIVE',1),self.assertRaises(ValueError):host._published_archive(SHA)
+
+    def test_actual_packaged_fixture_dependency_closure(self):
+        names=sorted(str(p.relative_to(ROOT)) for p in ROOT.rglob('*.py')
+                     if host._allowed(str(p.relative_to(ROOT))))
+        def git(*args):
+            if args[0]=='ls-tree':return ('\0'.join(names)+'\0').encode()
+            if args[0]=='show':return (ROOT/args[1].split(':',1)[1]).read_bytes()
+            return self.git(*args)
+        with patch.object(host,'_git',git):archive=host._published_archive(SHA)
+        with tempfile.TemporaryDirectory() as directory:
+            package=Path(directory)
+            zipfile.ZipFile(io.BytesIO(archive)).extractall(package)
+            paths=[str(package/name) for name in ('scripts','core/scripts','packs/deployment/scripts',
+                                                  'packs/release/scripts','tests/support')]
+            code='import sys;sys.path[:0]='+repr(paths)+';from deployment_compose_profile3_prepare_ssh_probe import _prepare_dependencies;assert callable(_prepare_dependencies())'
+            result=subprocess.run([sys.executable,'-I','-c',code],capture_output=True,timeout=30)
+            self.assertEqual(result.returncode,0,result.stderr.decode())
+
+    def test_missing_dependency_blocks_before_daemon_provision(self):
+        with patch.object(host,'_prepare_dependencies',side_effect=ModuleNotFoundError('missing')), \
+             patch.object(host,'_probe') as provision:
+            with self.assertRaises(ModuleNotFoundError):host._remote_main(self.config())
+            provision.assert_not_called()
 
     def test_wrong_source_dirty_code_origin_alias_and_root_before_spawn(self):
         with patch.object(host,'_spawn') as spawn,patch.object(host,'_git',self.git):
