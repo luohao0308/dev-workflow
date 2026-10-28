@@ -131,7 +131,8 @@ def compare_restored(source, restored):
 
 
 def run_restore(root, info, *, restore_running=False, source_host_config_policy=HOST_POLICY,
-                retain_archive=False, archive_fault=None):
+                retain_archive=False, archive_fault=None, archive_transport='test-seam',
+                registry_enrollment=None):
     target = PrivateDaemon(root, info)
     project = 'dw-restore-' + uuid.uuid4().hex[:24]
     network_name, volume = project + '-net', project + '-data'
@@ -143,6 +144,8 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
               'freshnessVerified': False, 'sourceProvenanceVerified': False,
               'cleanup': [], 'createdIds': [], 'switchEntered': False}
     recovery_store = None
+    gateway_close = whole_check = None
+    registered_reference = None
     recovery = observer = observation = None
     archive_reference = None
     initial_retention_binding = None
@@ -199,6 +202,11 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
     try:
         if type(restore_running) is not bool or type(retain_archive) is not bool:
             raise ValueError('restore-mode-not-boolean')
+        if archive_transport not in ('test-seam','mtls-source') or archive_transport=='mtls-source' and not retain_archive:
+            raise ValueError('invalid-archive-observation-transport')
+        if registry_enrollment is not None:
+            from deployment_compose_registry_enrollment_probe import registry_settings
+            registered_reference,_,_ = registry_settings(registry_enrollment)
         if retain_archive and not restore_running:
             raise ValueError('retained-restore-requires-running-diagnostic')
         allowed_faults = {None, *(mode+'-before-'+stage for mode in ('missing','tampered','swapped') for stage in ('create','switch'))}
@@ -217,6 +225,12 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         if len(imported) != 1 or any(_encode(imported[0].get(k)) != _encode(image.get(k))
                                     for k in ('Id', 'Os', 'Architecture', 'Config', 'RootFS')):
             raise ValueError('restore-imported-image-drift')
+        if registry_enrollment is not None:
+            from deployment_compose_registry_enrollment_probe import enroll_image
+            phase = 'registry-enrollment'
+            image, result['registryEnrollment'] = write(lambda: enroll_image(root,target,image,registry=registry_enrollment))
+        artifact_reference = registered_reference or 'docker.io/library/' + IMAGE
+        observed_reference = registered_reference or IMAGE
         phase = 'network-create'
         def make_network():
             receipt = target.run('network', 'create', '--internal', '--driver=bridge',
@@ -226,7 +240,19 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         network = write(make_network)
         phase = 'volume-create'
         def make_volume():
-            if target.run('volume', 'create', '--driver=local',
+            if archive_transport=='mtls-source':
+                connection=target.connection()
+                try:
+                    connection.request('POST','/v1.45/volumes/create',_encode({'Name':volume,'Driver':'local',
+                        'DriverOpts':{},'Labels':{'com.docker.compose.project':project}}),{'Content-Type':'application/json'})
+                    response=connection.getresponse();data=response.read(65537)
+                    if response.status!=201 or len(data)>65536:
+                        raise ValueError('unknown-restore-volume')
+                    value=json.loads(data)
+                    if value.get('Name')!=volume or value.get('Driver')!='local' or value.get('Labels',{}).get('com.docker.compose.project')!=project:
+                        raise ValueError('unknown-restore-volume')
+                finally:connection.close()
+            elif target.run('volume', 'create', '--driver=local',
                           '--label=com.docker.compose.project=' + project, volume).strip() != volume:
                 raise ValueError('unknown-restore-volume')
         write(make_volume); volume_created = True
@@ -271,7 +297,7 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         key, image_key, declaration_key = (os.urandom(32) for _ in range(3))
         projection = {k: raw[k] for k in ('Config', 'HostConfig', 'NetworkSettings')}
         projection['Mounts'] = [{**{k: None for k in MOUNT}, **m} for m in raw['Mounts']]
-        artifact = ServiceArtifact('backend', 'a'*40, 'docker.io/library/' + IMAGE,
+        artifact = ServiceArtifact('backend', 'a'*40, artifact_reference,
             image['Id'], 'linux', image['Architecture'], 'restore-test-key',
             commit(project, 'backend', projection, 'restore-test-key', key)['configHmac'], 'd'*64, 'none')
         networks = {network_name: network}
@@ -280,7 +306,7 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         evidence = root/'restore-source.private.json'
         evidence.write_text(json.dumps({'raw': raw, 'identity': identity, 'artifact': asdict(artifact),
             'networkIds': networks, 'expectedMounts': mounts, 'image': image, 'fixturePrivateKeyHex': key.hex(),
-            'engineRaw': engine_raw, 'archiveProjectionRepresentation': retain_archive},indent=2))
+            'engineRaw': engine_raw, 'volumeInfo':volume_info,'archiveProjectionRepresentation': retain_archive},indent=2))
         evidence.chmod(0o600)
         phase = 'authenticated-composition'
         snapshot = prepare_snapshot(raw, identity, artifact, key, networks, mounts)
@@ -301,7 +327,7 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
             host_config_policy=source_host_config_policy,
             metadata_policy=RUNNING_METADATA_POLICY if restore_running else METADATA_POLICY,
             operation_nonce=project[len('dw-restore-'):] + '0'*40,
-            expected_observed_reference=IMAGE, reference_policy=REFERENCE_POLICY)
+            expected_observed_reference=observed_reference, reference_policy=REFERENCE_POLICY)
         def corrupt_archive(stage):
             nonlocal archive_reference
             if archive_fault is None or not archive_fault.endswith('-before-'+stage):
@@ -309,7 +335,7 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
             control = retained_candidate()
             if initial_retention_binding is not None and _encode(control['retentionBinding']) != _encode(initial_retention_binding):
                 raise ValueError('archive-fault-control-binding-drift')
-            observer.commitment(observation)
+            observer.retention_commitment(observation)
             result['archiveControlValidBeforeFault'] = True
             result['archiveFaultInjected'] = archive_fault
             entry = archive_root/archive_reference
@@ -326,8 +352,19 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
             from deployment_compose_recovery_store import ComposeRecoveryStore
             from deployment_compose_operations import BaselineContainer
             phase = 'archive-retain'
-            observer, observation = archive_observer(target, identity, artifact, key, image,
-                image_proof, image_key, expected_image_key_id='restore-image-test', expected_observed_reference=IMAGE)
+            if archive_transport == 'mtls-source':
+                from compose_restore_tls_fixture import source_observer
+                observer, observation, gateway_close, tls_evidence, whole_check = source_observer(
+                    root,target,identity,artifact,key,raw,networks,mounts)
+                result.update(tls_evidence)
+                try: observer.commitment(observation)
+                except ValueError as error:
+                    if str(error) != 'whole-project-observation-required': raise
+                    result['sourceAuthorityCommitmentDenied'] = True
+                else: raise ValueError('source-view-authority-must-be-denied')
+            else:
+                observer, observation = archive_observer(target, identity, artifact, key, image,
+                    image_proof, image_key, expected_image_key_id='restore-image-test', expected_observed_reference=observed_reference)
             archive_root = root/'restore-archive'; archive_root.mkdir(mode=0o700)
             archive_key = os.urandom(32)
             keyfile = root/'restore-archive-test.key'; keyfile.write_bytes(archive_key); keyfile.chmod(0o600)
@@ -337,7 +374,8 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
                 projections={'backend': projection}, private_keys={'restore-test-key': key})
             archive_reference = recovery.retain(observation)
             result.update(archiveReference=archive_reference,
-                archiveObservationKind='test-seam-with-live-private-daemon-reads',
+                archiveObservationKind=('real-mtls-pinned-container-source' if archive_transport=='mtls-source'
+                                        else 'test-seam-with-live-private-daemon-reads'),
                 archiveSnapshotRepresentation='private-projection-complete-mount-fields-v1')
             corrupt_archive('create'); phase = 'archive-compile'
             retained = retained_candidate(); candidate = retained['candidate']
@@ -352,6 +390,8 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         phase = 'restored-create'
         restored_id = write(lambda: create(candidate['path'], candidate['body']))
         restored = inspect(restored_id)
+        if whole_check is not None:
+            result['wholeInventoryRejectedAdditionalCandidate'] = whole_check(403)
         # The mapper's complete original snapshot defines the bounded network set.
         restored_raw = {k: deepcopy(restored[k]) for k in raw}
         if retain_archive:
@@ -378,6 +418,10 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
                         or _encode(checked['candidate']) != _encode(candidate)):
                     raise ValueError('retained-restore-pre-switch-drift')
                 result['archiveReverifiedBeforeSwitch'] = True
+                if archive_transport=='mtls-source':
+                    if _encode(observer._reader.gateway_info()) != _encode(result['bootInfo']):
+                        raise ValueError('source-tls-gateway-restarted')
+                    result['sourceGatewayStableAcrossCandidate'] = True
             phase = 'running-switch'
             def start_replacement(receipt):
                 result['switchBaselineStopped'] = True
@@ -390,6 +434,10 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
             result['restoredBusinessProbe'] = business(restored_id, new_ip)
             result['createComparison'] = comparison
             comparison = compare_restored(raw, archive_snapshot(replacement) if retain_archive else stable_snapshot(replacement))
+            if archive_transport=='mtls-source':
+                result['sourceObservationInvalidAfterOldStop'] = observer.recheck(observation) is False
+                if result['sourceObservationInvalidAfterOldStop'] is not True:
+                    raise ValueError('stopped-source-observation-must-expire')
         else:
             comparison = compare_restored(raw, restored_raw)
         result['comparison'] = comparison
@@ -404,7 +452,7 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
         if type(error) is ValueError: result['failureReason'] = str(error)
         if result.get('archiveFaultInjected') is not None:
             try:
-                observer.commitment(observation)
+                observer.retention_commitment(observation)
                 result['archiveObservationStillValidAfterFault'] = True
                 if archive_fault.startswith('swapped-'):
                     value = recovery_store.get(archive_reference)
@@ -430,7 +478,15 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
                     write(lambda receipt=receipt: delete(target, receipt)); result['cleanup'].append('container')
                 if volume_created: write(lambda: target.run('volume', 'rm', volume)); result['cleanup'].append('volume')
                 if network: write(lambda: target.run('network', 'rm', network)); result['cleanup'].append('network')
-                if loaded: write(lambda: target.run('image', 'rm', image['Id'])); result['cleanup'].append('image')
+                if loaded:
+                    if registered_reference is None:
+                        write(lambda: target.run('image','rm',image['Id']))
+                    else:
+                        write(lambda: target.run('image','rm',registered_reference))
+                        remaining=set(target.run('images','-aq','--no-trunc').split())
+                        if remaining-{image['Id']}:raise ValueError('unknown-image-during-cleanup')
+                        if remaining:write(lambda: target.run('image','rm',image['Id']))
+                    result['cleanup'].append('image')
                 if bind.exists(): shutil.rmtree(bind)
                 if (target.run('ps', '-aq').strip() or target.run('images', '-aq').strip()
                         or target.run('volume', 'ls', '-q').strip()
@@ -439,6 +495,9 @@ def run_restore(root, info, *, restore_running=False, source_host_config_policy=
                 result['cleanupComplete'] = True
             except Exception as error:
                 result['cleanupFailureType'] = type(error).__name__
+        if gateway_close is not None:
+            try: gateway_close(); result['sourceGatewayStopped'] = True
+            except Exception as error: result['cleanupFailureType'] = type(error).__name__
         if recovery_store is not None:
             try: recovery_store.close()
             except OSError as error: result['cleanupFailureType'] = type(error).__name__

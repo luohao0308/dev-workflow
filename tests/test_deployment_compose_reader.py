@@ -24,6 +24,29 @@ class ComposeReaderTests(unittest.TestCase):
         self.client = reader.ComposeDockerReader(self.policy, ca_file=Path('unused'), cert_file=Path('unused'),
                                                   key_file=Path('unused'), transport=transport)
 
+    def test_source_policy_and_gateway_view_are_exact(self):
+        from dataclasses import replace
+        pins = ('1' * 64, '2' * 64)
+        base = replace(self.policy, gateway_policy_hash='b' * 64, private_key_id='key')
+        for ids in (list(pins), (pins[0], pins[0]), tuple(reversed(pins)), ('short',)):
+            with self.assertRaises(reader.ComposeReadError):
+                replace(base, source_container_ids=ids)
+        for changes in ({'gateway_policy_hash': None, 'private_key_id': None},
+                        {'private_key_id': None}):
+            with self.assertRaises(reader.ComposeReadError):
+                replace(base, source_container_ids=pins, **changes)
+        source = replace(base, source_container_ids=pins)
+        payload = {'bootId': 'c' * 32, 'policyHash': base.gateway_policy_hash}
+        client = reader.ComposeDockerReader(source, ca_file=Path('unused'), cert_file=Path('unused'),
+            key_file=Path('unused'), transport=lambda path: json.dumps(payload).encode())
+        with self.assertRaises(reader.ComposeReadError):
+            client.gateway_info()
+        payload.update(viewKind='pinned-containers', containerIds=list(pins))
+        self.assertEqual(client.gateway_info()['containerIds'], list(pins))
+        payload['containerIds'].reverse()
+        with self.assertRaises(reader.ComposeReadError):
+            client.gateway_info()
+
     def test_image_defaults_optin_and_exact_response(self):
         path = '/v1.45/workflow/private-image/sha256:' + 'c' * 64
         with self.assertRaises(reader.ComposeReadError):

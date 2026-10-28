@@ -71,6 +71,24 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
         self.assertEqual(c['bridge'],'none')
         self.assertEqual(c['cgroup-parent'],'/system.slice/'+root.name+'.service')
 
+
+    @unittest.skipUnless(os.name=='posix','private POSIX evidence files')
+    def test_firewall_raw_evidence_is_private_exclusive_and_same_read_as_hash(self):
+        root=Path('/var/tmp')/('dw-engine-'+uuid.uuid4().hex[:16]);root.mkdir(mode=0o700)
+        self.addCleanup(lambda:shutil.rmtree(root,ignore_errors=True))
+        raw=b'# Generated now\n:INPUT ACCEPT [1:2]\n-A INPUT -j ACCEPT\n'
+        destination=root/'firewall-before.private.json'
+        with patch.object(probe.shutil,'which',return_value='/fixture'),patch.object(probe,'run',return_value=raw):
+            hashes=probe.firewall_digest(evidence_path=destination)
+            import json,hashlib
+            captured=json.loads(destination.read_text())
+            self.assertEqual(captured['iptables-save'],raw.decode())
+            expected=hashlib.sha256(b':INPUT ACCEPT [COUNTERS]\n-A INPUT -j ACCEPT').hexdigest()
+            self.assertEqual(hashes['iptables-save'],expected)
+            self.assertEqual(destination.stat().st_mode & 0o777,0o600)
+            with self.assertRaises(FileExistsError):probe.firewall_digest(evidence_path=destination)
+            with self.assertRaises(ValueError):probe.firewall_digest(evidence_path=root/'not-private-evidence.json')
+
     def test_matching_containerd_backend_is_explicit_and_keeps_private_socket(self):
         root=Path('/var/tmp/dw-engine-'+'a'*16)
         c=probe.configuration(root,root.name+'.service',storage_driver='overlayfs')

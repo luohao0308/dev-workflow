@@ -46,7 +46,8 @@ class ComposePreparationHostV2:
                  dependencies, source, target_identity, host_id, daemon_id, environment,
                  production, policy_hash, protected_names):
         try:
-            if (type(observer) is not ComposeObservationHost or type(target) is not ComposeTargetArtifactsV2
+            if (type(observer) is not ComposeObservationHost or observer.scope_kind != 'whole-project'
+                    or type(target) is not ComposeTargetArtifactsV2
                     or type(source) is not SourceIdentity or type(target_identity) is not TargetIdentity
                     or target_identity.runtime != 'compose' or type(baseline) is not tuple
                     or not 1 <= len(baseline) <= 32 or any(type(x) is not BaselineContainer for x in baseline)

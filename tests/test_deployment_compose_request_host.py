@@ -112,5 +112,16 @@ class RequestHostTests(unittest.TestCase):
                                                 expires_at=deadline())
 
 
+    def test_retention_source_view_cannot_prepare_authorization(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0,str(Path(__file__).parent/'support'))
+        from compose_observation_scope_fixture import source_view
+        inputs,reader,live=setup()
+        inputs['observer']=source_view(inputs['observer'],reader,live)
+        with self.assertRaisesRegex(ValueError,'deploy-host-policy-required'):
+            ComposeRequestHost(**inputs)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -27,7 +27,7 @@ class ComposeRequestHost:
     def __init__(self, *, policy, observer, candidate, baseline, target, recipes,
                  recipe_keys, dependencies, proof_host, recovery_host=None, recovery_reference=None):
         if (type(policy) is not ComposeApprovalPolicy or policy.operation != 'deploy'
-                or type(observer) is not ComposeObservationHost):
+                or type(observer) is not ComposeObservationHost or observer.scope_kind != 'whole-project'):
             raise ValueError('deploy-host-policy-required')
         if type(proof_host) is not ComposeProofHost:
             raise ValueError('proof-host-required')

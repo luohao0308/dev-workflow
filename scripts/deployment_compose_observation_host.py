@@ -30,9 +30,9 @@ _TEST_SEAM = object()
 
 class ComposeObservation:
     """An opaque same-process snapshot, deliberately not JSON-serializable."""
-    __slots__ = ('_issuer', '_boot', '_structure', '_private', '_instance', '_catalog', '_bind', '_expires', '__weakref__')
+    __slots__ = ('_issuer', '_boot', '_structure', '_private', '_instance', '_catalog', '_bind', '_expires', '_scope_kind', '_source_container_ids', '__weakref__')
 
-    def __init__(self, issuer, boot, structure, private, instance, catalog, bind, expires, *, _token=None):
+    def __init__(self, issuer, boot, structure, private, instance, catalog, bind, expires, *, scope_kind='whole-project', source_container_ids=(), _token=None):
         if _token is not _TEST_SEAM:
             raise TypeError('host observation cannot be constructed externally')
         for key, value in (('_issuer', issuer), ('_boot', boot), ('_structure', structure),
@@ -40,6 +40,8 @@ class ComposeObservation:
             object.__setattr__(self, key, value)
         object.__setattr__(self, '_catalog', catalog)
         object.__setattr__(self, '_bind', bind)
+        object.__setattr__(self, '_scope_kind', scope_kind)
+        object.__setattr__(self, '_source_container_ids', source_container_ids)
 
     def __setattr__(self, key, value):
         raise TypeError('host observation is immutable')
@@ -84,6 +86,32 @@ def _protected_ids_valid(policy, live=None):
 
 class ComposeObservationHost:
     """Issue and recheck read snapshots from a pinned GET-only host gateway."""
+
+    @property
+    def scope_kind(self):
+        return 'pinned-containers' if self.source_container_ids else 'whole-project'
+
+    @property
+    def source_container_ids(self):
+        return self._source_container_ids
+
+    @staticmethod
+    def _validate_source_scope(scope_policy, ids):
+        if (type(ids) is not tuple or len(ids) > 128
+                or any(type(cid) is not str or not _HEX.fullmatch(cid) for cid in ids)
+                or ids != tuple(sorted(set(ids)))):
+            raise ValueError('reader-source-scope-mismatch')
+        if not ids:
+            return
+        selected = scope_policy.get('selectedContainerIds')
+        protected = scope_policy.get('protectedContainerIds')
+        if (type(selected) is not dict or type(protected) is not dict
+                or set(selected) != set(scope_policy.get('selectedServices', []))
+                or set(protected) != set(scope_policy.get('protectedServices', []))
+                or any(type(cid) is not str or not _HEX.fullmatch(cid)
+                       for cid in list(selected.values()) + list(protected.values()))
+                or tuple(sorted(list(selected.values()) + list(protected.values()))) != ids):
+            raise ValueError('reader-source-scope-mismatch')
 
     def __init__(self, *, reader_policy: ComposeReadPolicy, scope_policy: dict,
                  baseline_artifacts: ComposeArtifacts, ca_file: Path, cert_file: Path, key_file: Path,
@@ -157,6 +185,8 @@ class ComposeObservationHost:
                     or any(mount.get('readOnly') is not True for service in selected
                            for mount in mounts[service] if mount.get('type') == 'bind')):
                 raise ValueError('host-bind-scope-mismatch')
+        self._validate_source_scope(scope_policy, reader_policy.source_container_ids)
+        self._source_container_ids = reader_policy.source_container_ids
         self._policy = deepcopy(scope_policy)
         self._baseline_artifacts = baseline_artifacts
         self._reader = ComposeDockerReader(reader_policy, ca_file=ca_file,
@@ -169,12 +199,14 @@ class ComposeObservationHost:
         self._issued = weakref.WeakKeyDictionary()
 
     @classmethod
-    def _test_host(cls, reader, scope_policy, collector, baseline_artifacts, *, _token=None):
+    def _test_host(cls, reader, scope_policy, collector, baseline_artifacts, *, source_container_ids=(), _token=None):
         if _token is not _TEST_SEAM:
             raise TypeError('test seam is private')
         if not _protected_ids_valid(scope_policy):
             raise ValueError('invalid-host-protected-container-ids')
+        cls._validate_source_scope(scope_policy, source_container_ids)
         host = object.__new__(cls)
+        host._source_container_ids = source_container_ids
         host._reader, host._policy, host._collect, host._max_age = reader, deepcopy(scope_policy), collector, 30
         host._bind_count = 0
         host._baseline_artifacts = baseline_artifacts
@@ -184,7 +216,9 @@ class ComposeObservationHost:
 
     def _read(self, deadline):
         if not self._test_only and (type(self._reader) is not ComposeDockerReader or
-                                    self._reader._transport is not None or self._reader._context is None):
+                                    self._reader._transport is not None or self._reader._context is None
+                                    or type(self._reader.policy) is not ComposeReadPolicy
+                                    or self._reader.policy.source_container_ids != self.source_container_ids):
             return None
         try:
             remaining = deadline - time.monotonic()
@@ -286,13 +320,17 @@ class ComposeObservationHost:
         evidence = self._read(expires)
         if evidence is None:
             return None
-        observation = ComposeObservation(self, *evidence, expires, _token=_TEST_SEAM)
+        observation = ComposeObservation(self, *evidence, expires, scope_kind=self.scope_kind,
+                                         source_container_ids=self.source_container_ids, _token=_TEST_SEAM)
         self._issued[observation] = (*evidence, expires)
         return observation
 
     def recheck(self, observation):
         """Fail closed on expiry, issuer mismatch, gateway restart or any drift."""
         if type(observation) is not ComposeObservation or observation._issuer is not self:
+            return False
+        if (observation._scope_kind != self.scope_kind or
+                observation._source_container_ids != self.source_container_ids):
             return False
         issued = self._issued.get(observation)
         if (issued is None or issued != (observation._boot, observation._structure,
@@ -305,6 +343,8 @@ class ComposeObservationHost:
 
     def commitment(self, observation):
         """Return a request binding only after rechecking a host-issued snapshot."""
+        if self.scope_kind != 'whole-project':
+            raise ValueError('whole-project-observation-required')
         if not self.recheck(observation):
             raise ValueError('fresh-issued-observation-required')
         evidence = self._issued[observation]
@@ -313,3 +353,18 @@ class ComposeObservationHost:
                  'catalog': evidence[4], 'bind': evidence[5]}
         raw = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
         return hashlib.sha256(b'dev-workflow:compose-host-observation:v1\0' + raw).hexdigest()
+
+    def retention_commitment(self, observation):
+        """Bind pinned source evidence solely for retaining its existing resources."""
+        if self.scope_kind == 'whole-project':
+            return self.commitment(observation)
+        if not self.recheck(observation):
+            raise ValueError('fresh-issued-observation-required')
+        evidence = self._issued[observation]
+        value = {'boot': evidence[0], 'structure': evidence[1],
+                 'private': evidence[2], 'instance': evidence[3],
+                 'catalog': evidence[4], 'bind': evidence[5],
+                 'scopeKind': self.scope_kind, 'containerIds': list(self.source_container_ids),
+                 'projectCompletenessVerified': False}
+        raw = json.dumps(value, sort_keys=True, separators=(',', ':')).encode('ascii')
+        return hashlib.sha256(b'dev-workflow:compose-source-retention:v1\0' + raw).hexdigest()

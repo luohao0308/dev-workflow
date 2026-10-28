@@ -196,5 +196,16 @@ class RecoveryV3HostTests(unittest.TestCase):
                     expires_at=deadline(), recovery=substitute, reference=reference)
 
 
+    def test_retention_source_view_cannot_enter_v3_recipe_equivalence(self):
+        import sys
+        sys.path.insert(0,str(Path(__file__).parent/'support'))
+        from compose_observation_scope_fixture import source_view
+        inputs,reader,live=setup()
+        source=source_view(inputs['observer'],reader,live)
+        with self.assertRaisesRegex(ValueError,'compose-v3-recovery-rejected'):
+            ComposeRecoveryHostV3(store=None,observer=source,baseline=inputs['baseline'],
+                projections={},private_keys={},recipes={})
+
+
 if __name__ == '__main__':
     unittest.main()

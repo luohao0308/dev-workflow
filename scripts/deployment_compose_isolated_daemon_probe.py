@@ -38,18 +38,29 @@ def configuration(root, unit, *, storage_driver="vfs"):
             'cgroup-parent': '/system.slice/' + unit}
 
 
-def firewall_digest():
-    result={}
+def firewall_digest(*, evidence_path=None):
+    result={};captured={}
     for tool in ('iptables-save','ip6tables-save'):
         if shutil.which(tool):
-            lines=run(tool).splitlines()
+            raw=run(tool)
+            if evidence_path is not None:captured[tool]=raw.decode('utf-8')
+            lines=raw.splitlines()
             material=b'\n'.join(x for x in lines if x and not x.startswith(b'#'))
             material=re.sub(rb'(?m)^(:[^\n]+ )\[[0-9]+:[0-9]+\]$',rb'\1[COUNTERS]',material)
             result[tool]=hashlib.sha256(material).hexdigest()
+    if evidence_path is not None:
+        path=Path(evidence_path);root=path.parent
+        if (root.parent!=Path('/var/tmp') or not re.fullmatch(r'dw-engine-[a-f0-9]{16}',root.name)
+                or path.name not in ('firewall-before.private.json','firewall-after.private.json')
+                or root.is_symlink() or root.stat().st_uid!=os.getuid()
+                or root.stat().st_mode & 0o777 != 0o700):
+            raise ValueError('invalid-private-firewall-evidence-path')
+        fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'w') as output:json.dump(captured,output)
     return result
 
 
-def production_snapshot():
+def production_snapshot(*, firewall_evidence=None):
     prefix = ['docker', '--host', 'unix:///var/run/docker.sock']
     ids = run(*prefix, 'ps', '-aq', '--no-trunc').decode().split()
     items = json.loads(run(*prefix, 'inspect', *ids)) if ids else []
@@ -61,7 +72,7 @@ def production_snapshot():
             'volumes': sorted(run(*prefix, 'volume', 'ls', '-q').decode().split()),
             'routes': run('ip', '-json', 'route', 'show').decode(),
             'ipForward': Path('/proc/sys/net/ipv4/ip_forward').read_text(),
-            'netns': os.readlink('/proc/self/ns/net'), 'mountns': os.readlink('/proc/self/ns/mnt'), 'firewallDigest':firewall_digest()}
+            'netns': os.readlink('/proc/self/ns/net'), 'mountns': os.readlink('/proc/self/ns/mnt'), 'firewallDigest':firewall_digest(evidence_path=firewall_evidence)}
 
 
 def cgroup_empty(group):
@@ -127,7 +138,7 @@ finally:
   except subprocess.TimeoutExpired:child.kill();child.wait(timeout=5)
 """)
     supervisor.chmod(0o600)
-    before = production_snapshot()
+    before = production_snapshot(firewall_evidence=root/'firewall-before.private.json')
     result = {'kind': 'shared-host-isolated-daemon-startup', 'root':str(root), 'unit':unit,
               'independentMachine':False,'productionReady':False,'before':before,'config':cfg,
               'completed':False,'startupReady':False,'stopped':False,'unitCreationOutcomeUnknown':False,
@@ -218,7 +229,7 @@ finally:
             except Exception as error:
                 result['cleanupFailureType']=type(error).__name__
         try:
-            result['after']=production_snapshot()
+            result['after']=production_snapshot(firewall_evidence=root/'firewall-after.private.json')
             result['productionSnapshotUnchanged']=result['after']==before
         except Exception as error:
             result['afterSnapshotFailureType']=type(error).__name__

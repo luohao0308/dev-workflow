@@ -75,6 +75,43 @@ def host(result=None):
 
 
 class ObservationHostTests(unittest.TestCase):
+    def test_source_retention_binding_and_drift(self):
+        pins = ('1' * 64, '2' * 64)
+        policy = dict(scope(), selectedContainerIds={'web': pins[0]},
+                      protectedContainerIds={'db': pins[1]})
+        result = dict(evidence(), serviceContainerIds={'web': pins[0], 'db': pins[1]})
+        reader = Reader()
+        issuer = ComposeObservationHost._test_host(reader, policy,
+            lambda reader, policy, max_seconds: copy.deepcopy(result), artifacts(),
+            source_container_ids=pins, _token=_TEST_SEAM)
+        self.assertEqual(issuer.scope_kind, 'pinned-containers')
+        self.assertEqual(issuer.source_container_ids, pins)
+        with self.assertRaises(AttributeError):
+            issuer.scope_kind = 'whole-project'
+        observation = issuer.issue()
+        self.assertIsNotNone(observation)
+        commitment = issuer.retention_commitment(observation)
+        self.assertEqual(commitment, issuer.retention_commitment(observation))
+        with mock.patch.object(issuer, 'recheck', side_effect=AssertionError('must deny first')):
+            with self.assertRaisesRegex(ValueError, 'whole-project-observation-required'):
+                issuer.commitment(observation)
+        for field, value in (('instanceDigest', 'f' * 64),
+                             ('serviceState', {'web': {'running': False, 'health': 'healthy'}}),
+                             ('serviceContainerIds', {'web': '3' * 64, 'db': pins[1]})):
+            old = result[field]
+            result[field] = value
+            self.assertFalse(issuer.recheck(observation))
+            result[field] = old
+        reader.gateway_boot_id = 'f' * 32
+        self.assertFalse(issuer.recheck(observation))
+        for bad in (dict(policy, selectedContainerIds={}),
+                    dict(policy, protectedContainerIds={})):
+            with self.assertRaises(ValueError):
+                ComposeObservationHost._test_host(reader, bad, lambda *args: result, artifacts(),
+                    source_container_ids=pins, _token=_TEST_SEAM)
+        whole, _, _ = host()
+        self.assertEqual(whole.retention_commitment(whole.issue()), whole.commitment(whole.issue()))
+
     def test_issue_and_recheck_do_not_grant_authority(self):
         issuer, reader, result = host()
         observation = issuer.issue()

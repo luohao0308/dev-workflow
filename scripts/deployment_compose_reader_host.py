@@ -49,6 +49,7 @@ class ComposeReaderHostPolicy:
     private_key_id: str | None = None
     bind_paths: tuple[str, ...] = ()
     image_defaults_enabled: bool = False
+    source_view: bool = False
 
     def __post_init__(self):
         groups = ((self.services, NAME), (self.container_ids, HEX),
@@ -79,8 +80,16 @@ class ComposeReaderHostPolicy:
                 or (self.image_defaults_enabled and self.private_key_id is None)):
             raise ReaderHostError('reader-host-policy-rejected')
 
+        if (type(self.source_view) is not bool or (self.source_view and
+                (not self.container_ids or self.container_ids != tuple(sorted(self.container_ids))
+                 or self.private_key_id is None))):
+            raise ReaderHostError('reader-host-policy-rejected')
+
     def digest(self):
-        raw = json.dumps(self.__dict__, sort_keys=True, separators=(',', ':')).encode()
+        value = dict(self.__dict__)
+        if not self.source_view:
+            value.pop("source_view")
+        raw = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
         return hashlib.sha256(raw).hexdigest()
 
 
@@ -185,7 +194,10 @@ def create_gateway(policy, *, tls_context, docker_socket, listen=('127.0.0.1', 0
             or (private_hmac_key is not None and
                 (type(private_hmac_key) is not bytes or len(private_hmac_key) < 32))):
         raise ReaderHostError('reader-host-policy-rejected')
-    filters = json.dumps({'label': ['com.docker.compose.project=' + policy.project]},
+    filter_values = {'label': ['com.docker.compose.project=' + policy.project]}
+    if policy.source_view:
+        filter_values['id'] = list(policy.container_ids)
+    filters = json.dumps(filter_values,
                          sort_keys=True, separators=(',', ':'))
     list_path = '/v1.45/containers/json?' + urlencode({'all': '1', 'filters': filters})
     boot_id = uuid.uuid4().hex
@@ -198,13 +210,16 @@ def create_gateway(policy, *, tls_context, docker_socket, listen=('127.0.0.1', 0
         if path == '/v1.45/info':
             return type(value) is dict and value.get('ID') == policy.daemon_id
         if path == list_path:
-            return type(value) is list and all(
+            return (type(value) is list and (not policy.source_view or
+                    (len(value) == len(policy.container_ids) and
+                     all(type(item) is dict and type(item.get('Id')) is str for item in value) and
+                     sorted(item['Id'] for item in value) == list(policy.container_ids))) and all(
                 type(item) is dict and item.get('Id') in policy.container_ids
                 and item.get('ImageID') in policy.image_ids
                 and type(item.get('Labels')) is dict
                 and item['Labels'].get('com.docker.compose.project') == policy.project
                 and item['Labels'].get('com.docker.compose.service') in policy.services
-                for item in value)
+                for item in value))
         container = re.fullmatch(r'/v1\.45/containers/([0-9a-f]{64})/json', path)
         if container:
             labels = value.get('Config', {}).get('Labels', {}) if type(value) is dict else {}
@@ -262,7 +277,10 @@ def create_gateway(policy, *, tls_context, docker_socket, listen=('127.0.0.1', 0
                 self.deny()
                 return
             if self.path == '/v1.45/workflow/reader-info':
-                self.reply(200, json.dumps({'bootId': boot_id, 'policyHash': policy.digest()},
+                info = {'bootId': boot_id, 'policyHash': policy.digest()}
+                if policy.source_view:
+                    info.update(viewKind='pinned-containers', containerIds=list(policy.container_ids))
+                self.reply(200, json.dumps(info,
                                            sort_keys=True, separators=(',', ':')).encode())
                 return
             bind_match = re.fullmatch(r'/v1\.45/workflow/binds/(0|[1-9]|[12][0-9]|3[01])', self.path)

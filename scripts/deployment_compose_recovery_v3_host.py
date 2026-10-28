@@ -27,6 +27,8 @@ def canonical(value):
 class ComposeRecoveryHostV3:
     def __init__(self, *, store, observer, baseline, projections, private_keys, recipes):
         try:
+            if observer.scope_kind != 'whole-project':
+                fail()
             # Existing host verifies full original private HMACs before copying.
             original = ComposeRecoveryHost(store=store, observer=observer, baseline=baseline,
                 projections=projections, private_keys=private_keys, recipes=None)

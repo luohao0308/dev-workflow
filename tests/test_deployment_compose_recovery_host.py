@@ -167,5 +167,34 @@ class RecoveryHostTests(unittest.TestCase):
             inputs['recovery_host'].verify(inputs['recovery_reference'], inputs['observer'], observation)
 
 
+    def test_source_view_is_retention_only_and_explicit_in_archive(self):
+        import json,sys
+        from copy import deepcopy
+        sys.path.insert(0,str(Path(__file__).parent/'support'))
+        from compose_observation_scope_fixture import source_view
+        inputs,reader,live,_,store,projection=setup()
+        observer=source_view(inputs['observer'],reader,live)
+        recovery=ComposeRecoveryHost(store=store,observer=observer,baseline=inputs['baseline'],
+            projections={'web':projection},private_keys={'host-key-1':PRIVATE_KEY})
+        observation=observer.issue();self.assertIsNotNone(observation)
+        with self.assertRaisesRegex(ValueError,'whole-project-observation-required'):
+            observer.commitment(observation)
+        reference=recovery.retain(observation);payload=json.loads(store.get(reference))
+        self.assertEqual(payload['observationScope'],{'kind':'pinned-containers',
+            'containerIds':['1'*64,'2'*64],'projectCompletenessVerified':False})
+        self.assertEqual(recovery.verify(reference,observer,observation),reference)
+        identity=dict(project='blog',daemonId='daemon-1',service='web',containerId='1'*64,
+            containerName='blog-web-1',imageId=inputs['baseline'][0].image_id,
+            hostId='host-one',requestedApiVersion='1.45',engineVersion='29.8.2')
+        raw,_=recovery.read_source(reference,observer,observation,service='web',identity=identity)
+        self.assertEqual(raw['Config'],projection['Config'])
+        with self.assertRaises(ValueError):recovery.verify(reference,observer,observation,require_recipe_equivalence=True)
+        with self.assertRaisesRegex(ValueError,'whole-project-observation-required'):
+            recovery.verify_target_configuration(inputs['recipes'])
+        with self.assertRaisesRegex(ValueError,'whole-project-observation-required'):
+            ComposeRecoveryHost(store=store,observer=observer,baseline=inputs['baseline'],
+                projections={'web':projection},private_keys={'host-key-1':PRIVATE_KEY},recipes=inputs['recipes'])
+
+
 if __name__ == '__main__':
     unittest.main()

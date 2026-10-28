@@ -70,6 +70,7 @@ class ComposeReadPolicy:
     private_key_id: str | None = None
     bind_count: int = 0
     image_defaults_enabled: bool = False
+    source_container_ids: tuple[str, ...] = ()
 
     def __post_init__(self):
         try:
@@ -108,6 +109,13 @@ class ComposeReadPolicy:
                     (self.private_key_id is None or self.gateway_policy_hash is None))):
             raise ComposeReadError('invalid-policy')
 
+        if (type(self.source_container_ids) is not tuple or len(self.source_container_ids) > 128
+                or any(type(cid) is not str or not HEX.fullmatch(cid) for cid in self.source_container_ids)
+                or self.source_container_ids != tuple(sorted(set(self.source_container_ids)))
+                or (self.source_container_ids and
+                    (self.gateway_policy_hash is None or self.private_key_id is None))):
+            raise ComposeReadError('invalid-policy')
+
 
 class ComposeDockerReader:
     """Fixed-route API v1.45 GET reader; injected transport accepts path, returns bytes.
@@ -136,7 +144,10 @@ class ComposeDockerReader:
                 self._context = context
             except (OSError, ValueError, ssl.SSLError):
                 raise ComposeReadError('transport-unavailable') from None
-        filters = json.dumps({'label': ['com.docker.compose.project=' + policy.project]},
+        filter_values = {'label': ['com.docker.compose.project=' + policy.project]}
+        if policy.source_container_ids:
+            filter_values['id'] = list(policy.source_container_ids)
+        filters = json.dumps(filter_values,
                              sort_keys=True, separators=(',', ':'))
         self.list_path = '/v1.45/containers/json?' + urlencode({'all': '1', 'filters': filters})
 
@@ -150,6 +161,11 @@ class ComposeDockerReader:
             if path == '/v1.45/info' and (type(value) is not dict or value.get('ID') != self.policy.daemon_id):
                 raise ComposeReadError('daemon-mismatch')
             if path == self.list_path and type(value) is not list:
+                raise ComposeReadError('inventory-shape')
+            if path == self.list_path and self.policy.source_container_ids and (
+                    len(value) != len(self.policy.source_container_ids)
+                    or any(type(row) is not dict or type(row.get('Id')) is not str for row in value)
+                    or sorted(row['Id'] for row in value) != list(self.policy.source_container_ids)):
                 raise ComposeReadError('inventory-shape')
             if path.startswith('/v1.45/workflow/private/') and (
                     type(value) is not dict or set(value) != {'schemaVersion', 'keyId', 'configHmac', 'authorityGranted'}
@@ -186,7 +202,13 @@ class ComposeDockerReader:
             raw = self._request(GATEWAY_INFO_PATH, deadline=deadline)
             value = json.loads(raw.decode('utf-8'), object_pairs_hook=self._unique,
                                parse_constant=lambda _: self._invalid_number())
-            if (type(value) is not dict or set(value) != {'bootId', 'policyHash'}
+            expected_fields = {'bootId', 'policyHash'}
+            if self.policy.source_container_ids:
+                expected_fields.update(('viewKind', 'containerIds'))
+            if (type(value) is not dict or set(value) != expected_fields
+                    or (self.policy.source_container_ids and
+                        (value.get('viewKind') != 'pinned-containers' or
+                         value.get('containerIds') != list(self.policy.source_container_ids)))
                     or type(value['bootId']) is not str or not BOOT_ID.fullmatch(value['bootId'])
                     or value['policyHash'] != self.policy.gateway_policy_hash):
                 raise ComposeReadError('gateway-mismatch')

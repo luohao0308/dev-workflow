@@ -1,4 +1,5 @@
 """Real loopback mTLS against a synthetic Unix Docker endpoint."""
+from dataclasses import replace
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler
@@ -125,6 +126,53 @@ class ReaderHostTests(unittest.TestCase):
             return response.status, response.read()
         finally:
             conn.close()
+
+    def test_source_view_real_mtls_exact_filters_and_inventory(self):
+        legacy = dict(self.policy.__dict__)
+        legacy.pop('source_view')
+        self.assertEqual(self.policy.digest(), hashlib.sha256(json.dumps(
+            legacy, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+        self.gateway.shutdown()
+        policy = replace(self.policy, source_view=True, private_key_id='source-key')
+        self.gateway = host.create_gateway(policy, tls_context=self.context,
+            docker_socket=self.root / 'docker.sock', private_hmac_key=b'x' * 32)
+        threading.Thread(target=self.gateway.serve_forever, daemon=True).start()
+        self.addCleanup(self.gateway.server_close)
+        self.addCleanup(self.gateway.shutdown)
+        reader_policy = ComposeReadPolicy('https://localhost:' + str(self.gateway.server_port),
+            hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.directory / 'server.pem').read_text())).hexdigest(),
+            'daemon-1', 'blog', gateway_policy_hash=policy.digest(), private_key_id='source-key',
+            source_container_ids=(self.container,))
+        client = ComposeDockerReader(reader_policy, ca_file=self.directory / 'ca.pem',
+            cert_file=self.directory / 'reader.pem', key_file=self.directory / 'reader.key')
+        self.assertEqual(client.gateway_info()['containerIds'], [self.container])
+        from urllib.parse import parse_qs, urlsplit
+        filters = json.loads(parse_qs(urlsplit(client.list_path).query)['filters'][0])
+        self.assertEqual(filters, {'id': [self.container], 'label': ['com.docker.compose.project=blog']})
+        row = {'Id': self.container, 'ImageID': self.image, 'Labels': {
+            'com.docker.compose.project': 'blog', 'com.docker.compose.service': 'web'}}
+        self.value = [row]
+        self.assertEqual(client.get(client.list_path), [row])
+        self.assertEqual(self.calls[-1], ('GET', client.list_path))
+        for rows in ([], [row, row], [row, dict(row, Id='d' * 64)],
+                     [dict(row, ImageID='sha256:' + 'd' * 64)],
+                     [dict(row, Labels={'com.docker.compose.project': 'other'})]):
+            self.value = rows
+            self.assertEqual(self.request('GET', client.list_path)[0], 403)
+        before = len(self.calls)
+        for path in (self.list_path, client.list_path + '&extra=1'):
+            self.assertEqual(self.request('GET', path)[0], 403)
+        self.assertEqual(len(self.calls), before)
+        whole = ComposeDockerReader(replace(reader_policy, source_container_ids=()),
+            ca_file=self.directory / 'ca.pem', cert_file=self.directory / 'reader.pem',
+            key_file=self.directory / 'reader.key')
+        with self.assertRaises(ValueError):
+            whole.gateway_info()
+        changed = ComposeDockerReader(replace(reader_policy, source_container_ids=('d' * 64,)),
+            ca_file=self.directory / 'ca.pem', cert_file=self.directory / 'reader.pem',
+            key_file=self.directory / 'reader.key')
+        with self.assertRaises(ValueError):
+            changed.gateway_info()
 
     def test_info_and_exact_get(self):
         status, raw = self.request('GET', '/v1.45/workflow/reader-info')

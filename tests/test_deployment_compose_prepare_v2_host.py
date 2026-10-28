@@ -246,5 +246,16 @@ class PreparationV2Tests(unittest.TestCase):
         self.assertEqual(typed.profile_id, PROFILE)
 
 
+    def test_retention_source_view_cannot_prepare_profile2(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0,str(Path(__file__).parent/'support'))
+        from compose_observation_scope_fixture import source_view
+        inputs,reader,live=setup()
+        inputs['observer']=source_view(inputs['observer'],reader,live)
+        with self.assertRaisesRegex(ValueError,'compose-preparation-v2-rejected'):
+            ComposePreparationHostV2(**inputs)
+
+
 if __name__ == '__main__':
     unittest.main()

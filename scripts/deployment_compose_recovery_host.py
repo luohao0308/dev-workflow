@@ -34,6 +34,8 @@ class ComposeRecoveryHost:
                 or any(type(x) is not BaselineContainer for x in baseline)
                 or type(projections) is not dict or type(private_keys) is not dict):
             raise ValueError('invalid-recovery-host')
+        if observer.scope_kind != 'whole-project' and recipes is not None:
+            raise ValueError('whole-project-observation-required')
         names = tuple(x.service for x in baseline)
         artifacts = observer._baseline_artifacts
         scope = observer._policy
@@ -72,15 +74,21 @@ class ComposeRecoveryHost:
     def _payload(self, observer, observation):
         if observer is not self._observer or observer._baseline_artifacts != self._artifacts:
             raise ValueError('recovery-observer-mismatch')
-        observation_hash = observer.commitment(observation)
-        return canonical({'schemaVersion': 1, 'kind': 'compose-committed-baseline',
+        observation_hash = observer.retention_commitment(observation)
+        if observer.scope_kind != 'whole-project' and self._recipes is not None:
+            raise ValueError('whole-project-observation-required')
+        payload = {'schemaVersion': 1, 'kind': 'compose-committed-baseline',
             'project': self._project, 'daemonId': self._daemon,
             'observationHash': observation_hash, 'baselineDigest': self._artifacts.digest(),
             'artifacts': asdict(self._artifacts),
             'containers': [asdict(x) for x in self._baseline],
             'privateProjections': self._projections, 'recoveryRecipes': self._recipes,
             'recipeEquivalenceVerified': self._recipes is not None,
-            'reconstructionValidated': False, 'executionAvailable': False})
+            'reconstructionValidated': False, 'executionAvailable': False}
+        if observer.scope_kind != 'whole-project':
+            payload['observationScope'] = {'kind': observer.scope_kind,
+                'containerIds': list(observer.source_container_ids), 'projectCompletenessVerified': False}
+        return canonical(payload)
 
     def retain(self, observation):
         """Persist old private specs; return only an authenticated archive reference."""
@@ -88,7 +96,7 @@ class ComposeRecoveryHost:
         reference = self._store.put(payload)
         if self._store.get(reference) != payload:
             raise ValueError('recovery-archive-mismatch')
-        self._observer.commitment(observation)
+        self._observer.retention_commitment(observation)
         return reference
 
     def _verified_payload(self, reference, observer, observation, *, require_recipe_equivalence=False):
@@ -99,7 +107,7 @@ class ComposeRecoveryHost:
         actual = self._store.get(reference)
         if actual != expected:
             raise ValueError('recovery-archive-mismatch')
-        observer.commitment(observation)
+        observer.retention_commitment(observation)
         return actual
 
     def verify(self, reference, observer, observation, *, require_recipe_equivalence=False):
@@ -137,7 +145,7 @@ class ComposeRecoveryHost:
                 raise ValueError()
             raw = {'Id': container['container_id'], 'Name': '/' + container['final_name'],
                    'Image': container['image_id'], **deepcopy(projection)}
-            observer.commitment(observation)
+            observer.retention_commitment(observation)
             if observer._policy.get('project') != self._project or observer._policy.get('daemonId') != self._daemon:
                 raise ValueError()
             return raw, artifact
@@ -146,6 +154,8 @@ class ComposeRecoveryHost:
 
     def verify_target_configuration(self, target_recipes):
         """The first batch profile changes image identity only, not configuration."""
+        if self._observer.scope_kind != 'whole-project':
+            raise ValueError('whole-project-observation-required')
         if (self._recipes is None or type(target_recipes) is not dict
                 or set(target_recipes) != set(self._recipes)):
             raise ValueError('verified-baseline-recipes-required')
