@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 import json
+import http.client
+import io
 import os
 from unittest.mock import patch, Mock
 
@@ -90,6 +92,53 @@ class ControllerBoundaryTests(unittest.TestCase):
         self.assertEqual(set(public),{'request','review'})
         self.assertNotIn('SECRET',json.dumps(public))
         bundle.to_dict.assert_not_called()
+
+    def test_strict_http_receipts_reject_ambiguous_ownership(self):
+        # Parse real HTTP framing over synthetic bytes; no Engine is involved.
+        class Socket:
+            def __init__(self, raw): self.raw=raw
+            def makefile(self, mode): return io.BytesIO(self.raw)
+        for kind, field in (('container','Id'),('network','Id'),('volume','Name')):
+            value='1'*64 if field=='Id' else 'dw-owned-data'
+            valid=json.dumps({field:value}).encode()
+            duplicate=('{"%s":"%s","%s":"%s"}'%(field,value,field,value)).encode()
+            for body, length, status in ((valid,len(valid)+5,201),
+                                         (duplicate,len(duplicate),201),
+                                         (b'{"Id":NaN}',10,201),
+                                         (valid,len(valid),200)):
+                with self.subTest(kind=kind,body=body,status=status):
+                    wire=('HTTP/1.1 %d Test\r\nContent-Length: %d\r\n\r\n'%(status,length)).encode()+body
+                    response=http.client.HTTPResponse(Socket(wire));response.begin()
+                    target=Mock();target.connection.return_value.getresponse.return_value=response
+                    session=fixture.PreparationSession(target,'dw-owned')
+                    server,thread,store=Mock(),Mock(),Mock()
+                    thread.is_alive.return_value=False
+                    session.listeners=[(server,thread)];session.store=store
+                    with self.assertRaises(ValueError):
+                        session.write(lambda: session.create('/synthetic-create',{},kind=kind,expected=value))
+                    self.assertEqual(session.created_ids,[])
+                    self.assertEqual(session.resources,[])
+                    self.assertTrue(session.unknown_write_result)
+                    target.reset_mock()
+                    with patch.object(fixture,'delete') as delete:
+                        with self.assertRaisesRegex(ValueError,'blocked-after-unknown'):session.cleanup()
+                        delete.assert_not_called()
+                    self.assertEqual(target.mock_calls,[])
+                    server.shutdown.assert_called_once_with()
+                    server.server_close.assert_called_once_with()
+                    store.close.assert_called_once_with()
+
+    def test_complete_created_http_receipt_registers_confirmed_id(self):
+        class Socket:
+            def makefile(self, mode):
+                body=json.dumps({'Id':'1'*64}).encode()
+                return io.BytesIO(('HTTP/1.1 201 Created\r\nContent-Length: %d\r\n\r\n'%len(body)).encode()+body)
+        response=http.client.HTTPResponse(Socket());response.begin()
+        target=Mock();target.connection.return_value.getresponse.return_value=response
+        session=fixture.PreparationSession(target,'dw-owned')
+        self.assertEqual(session.write(lambda: session.create('/synthetic-create',{})),'1'*64)
+        self.assertEqual(session.created_ids,['1'*64])
+        self.assertFalse(session.unknown_write_result)
 
     def test_command_reports_actual_python_version(self):
         command=fixture.fixture_command('dw-restore-'+'1'*24)

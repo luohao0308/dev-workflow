@@ -155,7 +155,8 @@ class ReviewContractTests(unittest.TestCase):
 
     def test_workflow_contract(self):
         text = (ROOT / '.github/workflows/compose-protected-review.yml').read_text()
-        for expected in ['branches: [feat/compose-validation-20261028]', 'options: [launch, review]',
+        self.assertNotIn('  push:',text)
+        for expected in ['options: [launch, review]',
                          'environment: compose-review', 'id-token: write', 'artifact-ids:',
                          'ref: ${{ github.sha }}', 'run: sleep 300', 'retention-days: 1',
                          'dev-workflow approve %s', 'inputs: {mode: \'review\'}']:

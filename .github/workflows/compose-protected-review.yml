@@ -1,7 +1,5 @@
 name: Compose protected authorization review
 on:
-  push:
-    branches: [feat/compose-validation-20261028]
   workflow_dispatch:
     inputs:
       mode:
@@ -13,7 +11,7 @@ permissions:
   contents: read
 jobs:
   launch:
-    if: github.run_attempt == 1 && (github.event_name == 'push' || inputs.mode == 'launch')
+    if: github.run_attempt == 1 && github.event_name == 'workflow_dispatch' && inputs.mode == 'launch'
     runs-on: ubuntu-latest
     permissions:
       contents: read

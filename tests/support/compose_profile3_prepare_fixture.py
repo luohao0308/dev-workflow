@@ -27,7 +27,8 @@ from deployment_compose_artifacts import ServiceArtifact, ComposeArtifacts
 from deployment_compose_image_defaults import commit_image_config
 from deployment_compose_network_declaration import commit_network_declaration
 from deployment_compose_snapshot import prepare_snapshot, _encode
-from deployment_compose_reader_host import ComposeReaderHostPolicy, create_gateway
+from deployment_compose_reader_host import ComposeReaderHostPolicy, create_gateway, _complete_json_response
+from deployment_compose_write_gateway_v3_host import _complete_response
 from deployment_compose_reader import ComposeReadPolicy
 from deployment_compose_observation_host import ComposeObservationHost
 from deployment_compose_recovery_host import ComposeRecoveryHost
@@ -61,6 +62,23 @@ def validate_controller(root, info, *, source_sha, host_id, expected_daemon_id, 
     return target
 
 
+def _created_json(response):
+    raw = _complete_response(response)
+    if response.status != 201:
+        raise ValueError('profile3-create-receipt-rejected')
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value: raise ValueError('profile3-duplicate-receipt-field')
+            value[key] = item
+        return value
+    def constant(value):
+        raise ValueError('profile3-invalid-receipt-constant')
+    value = json.loads(raw.decode('utf-8'), object_pairs_hook=unique, parse_constant=constant)
+    if type(value) is not dict: raise ValueError('profile3-create-receipt-rejected')
+    return value
+
+
 def fixture_command(project):
     # Same code in both images reports the actual Python runtime version.
     return server_code(project).replace('import errno,json\n', 'import errno,json,sys\n', 1).replace("'version': 'same-image'", "'version': sys.version")
@@ -85,6 +103,31 @@ class PreparationSession:
         value = fn()
         self.unknown_write_result = False
         return value
+
+    def create(self, path, body, *, kind='container', expected=None):
+        connection = self.target.connection()
+        try:
+            connection.request('POST', path, _encode(body), {'Content-Type':'application/json'})
+            value = _created_json(connection.getresponse())
+            if kind == 'volume':
+                if (value.get('Name') != expected or
+                        value.get('Labels', {}).get('com.docker.compose.project') != self.project):
+                    raise ValueError('profile3-volume-receipt-rejected')
+                self.resources.append(('volume', expected))
+                return value
+            receipt = value.get('Id')
+            if (type(receipt) is not str or not ID.fullmatch(receipt)
+                    or receipt in self.created_ids or ('network', receipt) in self.resources):
+                raise ValueError('profile3-create-receipt-rejected')
+            if kind == 'network':
+                self.resources.append(('network', receipt))
+            elif kind == 'container':
+                self.created_ids.append(receipt)
+            else:
+                raise ValueError('profile3-create-kind-rejected')
+            return receipt
+        finally:
+            connection.close()
 
     def cleanup(self):
         # Local read resources must close even when Engine writes are blocked.
@@ -176,34 +219,8 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
             images.append(image)
             session.resources.append(('image', enrolled_ref))
         network_name=project+'-net'; volume=project+'-data'
-        def make_network():
-            connection=target.connection()
-            try:
-                connection.request('POST','/v1.45/networks/create',_encode(dict(Name=network_name,Driver='bridge',Internal=True,Labels={'com.docker.compose.project':project})),{'Content-Type':'application/json'})
-                response=connection.getresponse(); raw=response.read(65537)
-                if response.status != 201 or len(raw)>65536: raise ValueError('profile3-network-receipt-rejected')
-                receipt=json.loads(raw).get('Id')
-                if type(receipt) is not str or not ID.fullmatch(receipt): raise ValueError('profile3-network-receipt-rejected')
-                session.resources.append(('network',receipt))
-                return receipt
-            finally: connection.close()
-        network=session.write(make_network)
-        def create(path, body, expected=None):
-            connection=target.connection()
-            try:
-                connection.request('POST',path,_encode(body),{'Content-Type':'application/json'})
-                response=connection.getresponse(); raw=response.read(1048577)
-                if response.status != 201 or len(raw)>1048576: raise ValueError('profile3-create-receipt-rejected')
-                value=json.loads(raw)
-                if expected is not None:
-                    if value.get('Name') != expected or value.get('Labels',{}).get('com.docker.compose.project') != project:
-                        raise ValueError('profile3-volume-receipt-rejected')
-                    session.resources.append(('volume',expected)); return value
-                cid=value.get('Id')
-                if type(cid) is not str or not ID.fullmatch(cid) or cid in session.created_ids: raise ValueError('profile3-container-receipt-rejected')
-                session.created_ids.append(cid); return cid
-            finally: connection.close()
-        session.write(lambda: create('/v1.45/volumes/create',dict(Name=volume,Driver='local',DriverOpts={},Labels={'com.docker.compose.project':project}),volume))
+        network=session.write(lambda: session.create('/v1.45/networks/create',dict(Name=network_name,Driver='bridge',Internal=True,Labels={'com.docker.compose.project':project}),kind='network'))
+        session.write(lambda: session.create('/v1.45/volumes/create',dict(Name=volume,Driver='local',DriverOpts={},Labels={'com.docker.compose.project':project}),kind='volume',expected=volume))
         volume_info=json.loads(target.run('volume','inspect',volume))[0]
         mountpoint=Path(volume_info['Mountpoint'])
         if mountpoint != root/'data/volumes'/volume/'_data' or any(mountpoint.iterdir()): raise ValueError('profile3-volume-ownership-drift')
@@ -220,16 +237,14 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
             own=deepcopy(body); own['Labels']={'com.docker.compose.project':project,'com.docker.compose.service':service}
             own['NetworkingConfig']['EndpointsConfig'][network_name]['Aliases']=[service]
             bodies[service]=deepcopy(own)
-            cid=session.write(lambda service=service,own=own: create('/v1.45/containers/create?name='+project+'-'+service,own))
+            cid=session.write(lambda service=service,own=own: session.create('/v1.45/containers/create?name='+project+'-'+service,own))
             if session.write(lambda cid=cid: target.run('container','start',cid).strip()) != cid:
                 session.unknown_write_result=True; raise ValueError('profile3-start-receipt-rejected')
             wait_healthy(target.run,cid)
             connection=target.connection()
             try:
                 connection.request('GET','/v1.45/containers/'+cid+'/json')
-                response=connection.getresponse(); raw=response.read(8388609)
-                if response.status!=200 or len(raw)>8388608: raise ValueError('profile3-raw-get-rejected')
-                rows[service]=json.loads(raw)
+                _, rows[service]=_complete_json_response(connection.getresponse())
             finally: connection.close()
         # Baseline fixture creation ends here. All subsequent Engine operations are GETs.
         raw={k:deepcopy(rows['backend'][k]) for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
