@@ -8,8 +8,11 @@ An interrupted admission or unknown upstream outcome blocks recovery forever;
 there is deliberately no PID, lease, timeout, retry or administrative drain API.
 Windows requires host-protected ACLs: stdlib has no directory-relative handles.
 Checks detect replacement at operation boundaries, not a malicious same-UID/admin
-copy or rollback of authority records (including the entire directory). Host exclusion of such writers
-and filesystem rename/power-loss guarantees remain provisioning duties.
+copy of authority records. Default mode does not detect whole-directory rollback.
+An explicitly required online witness checks one externally registered generation;
+trusted startup policy/code/key and witness state must remain outside that rollback
+set. Active root bypass and witness rollback remain excluded. Host provisioning
+and filesystem rename/power-loss guarantees remain duties.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ import stat
 import threading
 
 import deployment_maintenance_state as _maintenance
+from deployment_gate_witness import OnlineWitnessClient, opening_scope
 
 _HEX = re.compile(r'[0-9a-f]{64}')
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
@@ -65,18 +69,29 @@ class GatePolicy:
     key_id: str
     scope_hash: str
     writer_certificate_sha256: str
+    witness_required: bool = False
+    witness_scope_hash: str | None = None
+    witness_key_sha256: str | None = None
 
     def __post_init__(self):
         if (not all(type(x) is str and _ID.fullmatch(x) for x in (self.store_id, self.key_id))
                 or not _hex(self.scope_hash) or not _hex(self.writer_certificate_sha256)):
             raise GateError('invalid-gate-policy')
+        if (type(self.witness_required) is not bool
+                or self.witness_required and not all(_hex(v) for v in (self.witness_scope_hash,self.witness_key_sha256))
+                or not self.witness_required and (self.witness_scope_hash is not None or self.witness_key_sha256 is not None)):
+            raise GateError('invalid-gate-witness-policy')
 
     def identity_hash(self):
         return _digest(self._binding())
 
     def _binding(self):
-        return dict(store_id=self.store_id, key_id=self.key_id, scope_hash=self.scope_hash,
-                    writer_certificate_sha256=self.writer_certificate_sha256)
+        value=dict(store_id=self.store_id, key_id=self.key_id, scope_hash=self.scope_hash,
+                   writer_certificate_sha256=self.writer_certificate_sha256)
+        if self.witness_required:
+            value.update(witness_binding_schema=1,witness_required=True,
+                         witness_scope_hash=self.witness_scope_hash,witness_key_sha256=self.witness_key_sha256)
+        return value
 
 
 class _Issued:
@@ -159,9 +174,16 @@ class FileWriterGate:
     trusted host embeddings; opening a generation does not itself verify an SDK
     receipt. The embedding MUST verify it first. Kernel locks are never stolen.
     """
-    def __init__(self, policy, root: Path, *, key: bytes):
+    def __init__(self, policy, root: Path, *, key: bytes, witness=None):
         if type(policy) is not GatePolicy or type(key) is not bytes or len(key) < 32:
             raise GateError('invalid-gate-policy')
+        if policy.witness_required:
+            if (type(witness) is not OnlineWitnessClient or witness.binding['scopeHash']!=policy.witness_scope_hash
+                    or witness.binding['policyHash']!=policy.identity_hash() or witness.key_hash!=policy.witness_key_sha256):
+                raise GateError('online-witness-required')
+        elif witness is not None:
+            raise GateError('unexpected-online-witness')
+        self._witness=witness
         if not isinstance(root, Path) or not root.is_absolute() or '..' in root.parts:
             raise GateError('private-root-required')
         self.policy, self.root, self._key = policy, root, key
@@ -575,11 +597,19 @@ class FileWriterGate:
                 self._fail()
             kind, data = event['kind'], event['data']
             if index == 0:
+                basic = {'request_hash', 'receipt_hash', 'operations'}
+                sourced = basic | {'source_binding_schema', 'source_context_digest'}
                 if (kind != 'open' or type(data) is not dict
-                        or set(data) != {'request_hash', 'receipt_hash', 'operations'}
+                        or set(data) not in (basic, sourced)
                         or not _hex(data['request_hash']) or not _hex(data['receipt_hash'])):
                     self._fail()
+                if set(data) == sourced and (type(data['source_binding_schema']) is not int
+                        or data['source_binding_schema'] != 1 or not _hex(data['source_context_digest'])):
+                    self._fail()
                 state['operations'] = self._operations(tuple(tuple(x) for x in data['operations']))
+                if self.policy.witness_required and opening_scope(generation,data['request_hash'],data['receipt_hash'],
+                        state['operations'],data.get('source_context_digest'))!=self.policy.witness_scope_hash:
+                    raise GateError('witness-opening-scope-mismatch')
             elif kind == 'prepare':
                 if (state['closed'] or type(data) is not dict
                         or set(data) != {'ref', 'operation'} or not _hex(data['ref'])
@@ -621,12 +651,16 @@ class FileWriterGate:
         for name in markers:
             if self._read(directory / name, 'admission') != dict(generation=generation, ref=name[9:]):
                 self._fail()
+        if self._witness is not None:
+            self._witness.check(generation,state['count'],state['head'])
         return state
 
     def _append(self, generation, state, kind, data):
         self._directory(generation)
         event = dict(generation=generation, directory=list(self._generation_ids[generation]),
                      previous=state['head'], kind=kind, data=data)
+        if self._witness is not None:
+            self._witness.reserve(generation,state['count'],state['head'],_digest(event))
         self._write(self._directory(generation) / f'{state["count"]:08d}.json',
                     self._seal('event', event))
         return _digest(event)
@@ -645,10 +679,16 @@ class FileWriterGate:
         return tuple(result)
 
     def open_generation(self, *, generation: str, request_hash: str, receipt_hash: str,
-                        operations: tuple[tuple[str, str, str], ...]) -> WriterSession:
+                        operations: tuple[tuple[str, str, str], ...],
+                        source_context_digest: str | None = None) -> WriterSession:
         approved = self._operations(operations)
+        if source_context_digest is not None and not _hex(source_context_digest):
+            raise GateError('invalid-source-context')
         if not all(_hex(x) for x in (generation, request_hash, receipt_hash)):
             raise GateError('invalid-generation')
+        if self.policy.witness_required and (generation!=self._witness.binding['generation']
+                or opening_scope(generation,request_hash,receipt_hash,approved,source_context_digest)!=self.policy.witness_scope_hash):
+            raise GateError('witness-opening-scope-mismatch')
         with self._locked():
             directory = self.root / generation
             try:
@@ -659,8 +699,10 @@ class FileWriterGate:
             except FileExistsError:
                 raise GateError('generation-already-used') from None
             self._sync_parent(self.root, self._root_fd)
-            self._append(generation, dict(head=_ZERO, count=0), 'open',
-                         dict(request_hash=request_hash, receipt_hash=receipt_hash, operations=approved))
+            opening = dict(request_hash=request_hash, receipt_hash=receipt_hash, operations=approved)
+            if source_context_digest is not None:
+                opening.update(source_binding_schema=1, source_context_digest=source_context_digest)
+            self._append(generation, dict(head=_ZERO, count=0), 'open', opening)
             session = WriterSession(generation, self)
             self._sessions[generation] = session
             return session
@@ -673,6 +715,7 @@ class FileWriterGate:
         operation = _operation(method, path, hashlib.sha256(body).hexdigest())
         with self._locked():
             state = self._state(session.generation)
+            self._witness_next_operation(state,operation)
             if state['closed'] or operation not in state['operations']:
                 raise GateError('writer-operation-rejected')
             if list(operation) in state['attempts'].values():
@@ -691,6 +734,7 @@ class FileWriterGate:
         operation = _operation(method, path, hashlib.sha256(body).hexdigest())
         with self._locked():
             state = self._state(generation)
+            self._witness_next_operation(state,operation)
             if (state['closed'] or state['attempts'].get(attempt_ref) != list(operation)
                     or attempt_ref in state['admissions']):
                 raise GateError('writer-admission-rejected')
@@ -700,6 +744,15 @@ class FileWriterGate:
             ticket = AdmissionTicket(generation, attempt_ref, head)
             self._tickets[(generation, attempt_ref)] = ticket
             return ticket
+
+    def _witness_next_operation(self,state,operation):
+        if not self.policy.witness_required:
+            return
+        if any(item['status']!='done' for item in state['admissions'].values()):
+            raise GateError('witness-prior-write-unresolved')
+        index=len(state['admissions'])
+        if index>=len(state['operations']) or operation!=state['operations'][index]:
+            raise GateError('witness-operation-order-required')
 
     def finish(self, ticket, *, definitive: bool, response_hash: str | None):
         if (type(ticket) is not AdmissionTicket
@@ -715,6 +768,23 @@ class FileWriterGate:
                 raise GateError('admission-already-finished')
             self._append(ticket.generation, state, 'finish',
                          dict(ref=ticket.attempt_ref, definitive=definitive, response_hash=response_hash))
+
+    def generation_evidence(self, generation):
+        """Fresh authenticated diagnostic values; never a capability or anchor.
+
+        The lock covers validation and extraction. Returned values become stale
+        immediately after return; restoring this entire authority remains outside
+        the filesystem threat boundary.
+        """
+        with self._locked():
+            state = self._state(generation)
+            directory = self._directory(generation)
+            events = [self._read(directory / f'{i:08d}.json', 'event')
+                      for i in range(state['count'])]
+            return dict(generation=generation, head=state['head'],
+                        binding=events[0]['data'],
+                        events=[dict(kind=e['kind'], data=e['data']) for e in events[1:]],
+                        closed=state['closed'], authorityGranted=False)
 
     def diagnose_generation(self, generation):
         """Read verified state without fencing writers or issuing authority.

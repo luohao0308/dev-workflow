@@ -1,0 +1,96 @@
+name: Compose Engine sample (disposable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      python_image:
+        description: 'Official Python image with immutable sha256 digest (python:3.13-alpine@sha256:...)'
+        required: true
+        type: string
+      export_private_sample:
+        description: 'Export full fixture inspect (private data) as a short-lived Actions artifact'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      COMPOSE_SAMPLE_IMAGE: ${{ inputs.python_image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard disposable environment and prepare private paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTIONS" = true
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$(uname -s)" = Linux
+          test -z "${DOCKER_HOST:-}"
+          test -z "${DOCKER_CONTEXT:-}"
+          test "$(docker context show)" = default
+          python3 scripts/deployment_compose_engine_sample.py preflight --image "$COMPOSE_SAMPLE_IMAGE"
+          docker compose version
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import uuid
+          project = 'dw-compose-sample-' + uuid.uuid4().hex[:24]
+          root = Path(os.environ['RUNNER_TEMP']) / project
+          root.mkdir(mode=0o700)
+          config = root / 'config'
+          config.mkdir(mode=0o700)
+          (config / 'sample.txt').write_text('disposable-compose-config-v1\n')
+          output = root / 'capture'
+          output.mkdir(mode=0o700)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('COMPOSE_PROJECT_NAME=' + project + '\n')
+              stream.write('COMPOSE_SAMPLE_CONFIG_DIR=' + str(config) + '\n')
+              stream.write('COMPOSE_SAMPLE_OUTPUT=' + str(output) + '\n')
+          PY
+      - name: Create isolated fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose -f tests/support/compose_engine_sample.compose.yml pull
+          docker compose -f tests/support/compose_engine_sample.compose.yml up -d --wait --wait-timeout 120
+      - name: Probe service DNS and retained sentinel, then capture read-only sample
+        shell: bash
+        run: |
+          set -euo pipefail
+          guard_before="$(docker compose -f tests/support/compose_engine_sample.compose.yml ps -q guard)"
+          test -n "$guard_before"
+          docker compose -f tests/support/compose_engine_sample.compose.yml exec -T frontend python -c 'import json, pathlib, urllib.request; value=json.load(urllib.request.urlopen("http://backend:8080/probe",timeout=5)); assert value=={"role":"backend","version":"v1","path":"/probe"}; assert pathlib.Path("/sample-data/sentinel.txt").read_text().startswith("compose-engine-sample-sentinel-v1"); assert pathlib.Path("/sample-config/sample.txt").read_text()=="disposable-compose-config-v1\n"'
+          docker compose -f tests/support/compose_engine_sample.compose.yml exec -T backend python -c 'import json,urllib.request; value=json.load(urllib.request.urlopen("http://frontend:8080/probe",timeout=5)); assert value=={"role":"frontend","version":"v1","path":"/probe"}'
+          test "$guard_before" = "$(docker compose -f tests/support/compose_engine_sample.compose.yml ps -q guard)"
+          python3 scripts/deployment_compose_engine_sample.py capture --image "$COMPOSE_SAMPLE_IMAGE" --project "$COMPOSE_PROJECT_NAME" --output "$COMPOSE_SAMPLE_OUTPUT"
+      - name: Upload field-only diagnostic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-engine-field-report
+          path: ${{ env.COMPOSE_SAMPLE_OUTPUT }}/report.json
+          if-no-files-found: error
+          retention-days: 3
+      - name: Export private fixture inspect only when explicitly selected
+        if: ${{ inputs.export_private_sample }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-engine-private-sample
+          path: ${{ env.COMPOSE_SAMPLE_OUTPUT }}/sample.private.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Remove disposable fixture
+        if: ${{ always() && env.COMPOSE_PROJECT_NAME != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test -z "${DOCKER_HOST:-}"
+          test -z "${DOCKER_CONTEXT:-}"
+          test "$(docker context show)" = default
+          docker compose -f tests/support/compose_engine_sample.compose.yml down --volumes --remove-orphans --timeout 10

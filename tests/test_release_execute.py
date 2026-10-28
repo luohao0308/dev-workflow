@@ -703,6 +703,13 @@ class ReleaseExecuteTests(unittest.TestCase):
         status = json.loads(result.stdout)
         self.assertFalse(status['executionAvailable'])
         self.assertEqual(status['mode'], 'preparation-only')
+        self.assertEqual([(adapter['platform'], adapter['tagRelease']) for adapter in status['adapters']],
+                         [('github.com', 'implemented'), ('gitlab', 'unsupported'), ('local', 'unsupported')])
+        self.assertTrue(all(not adapter['localExecutionAvailable'] for adapter in status['adapters']))
+        self.assertEqual([(adapter['implementation'], adapter['validation'], adapter['availability'])
+                          for adapter in status['adapters']],
+                         [('implemented', 'scope-specific', 'trusted-host-required'),
+                          ('unsupported', 'none', 'unsupported'), ('unsupported', 'none', 'unsupported')])
 
 
 if __name__ == '__main__':

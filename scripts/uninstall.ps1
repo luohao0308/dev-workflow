@@ -10,6 +10,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Test-DistributionBytecode {
+    param([string]$RelativePath)
+    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$'
+}
+
 function Resolve-FullPath([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "Target directory does not exist: $Path"
@@ -316,6 +321,7 @@ function Get-Inventory([object]$Manifest, [string]$SourceRoot, [string]$TargetRo
         $prefix = $overlay.Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         foreach ($file in Get-ChildItem -LiteralPath $overlay.Root -Recurse -File | Sort-Object FullName) {
             $relative = $file.FullName.Substring($prefix.Length).Replace('\', '/')
+            if (Test-DistributionBytecode $relative) { continue }
             if ($seen.ContainsKey($relative)) {
                 throw "Workflow overlays contain a duplicate path: $relative"
             }

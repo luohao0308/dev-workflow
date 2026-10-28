@@ -1,0 +1,131 @@
+import importlib.util
+from pathlib import Path
+import unittest
+import os
+from unittest.mock import patch
+from unittest.mock import Mock
+import shutil
+import subprocess
+import uuid
+import tempfile
+import ast
+import pathlib
+import signal
+import sys
+
+path=Path(__file__).resolve().parents[1]/'scripts/deployment_compose_isolated_daemon_probe.py'
+spec=importlib.util.spec_from_file_location('isolated_probe',path)
+probe=importlib.util.module_from_spec(spec);spec.loader.exec_module(probe)
+
+
+class IsolatedDaemonConfigTests(unittest.TestCase):
+    @unittest.skipUnless(os.name=='posix','POSIX controller simulation')
+    def test_embedded_supervisor_controller_guards_and_owned_write(self):
+        token=uuid.uuid4();root=Path('/var/tmp')/('dw-engine-'+token.hex[:16])
+        self.addCleanup(lambda:shutil.rmtree(root,ignore_errors=True))
+        with patch.object(probe.os,'getuid',return_value=0),patch.object(probe.uuid,'uuid4',return_value=token), \
+             patch.object(probe,'production_snapshot',return_value={'netns':'host','mountns':'host'}), \
+             patch.object(probe,'run',side_effect=[b'not-found\n',b'valid',b'created']), \
+             patch.object(probe.time,'monotonic',side_effect=[0,61]), \
+             patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)):
+            probe.probe()
+        source=(root/'supervisor.py').read_text();(root/'containerd.sock').touch()
+        for case in ('wrong-member','populated','missing-controller','swap-not-capped','missing-swap','success'):
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
+                base=Path(directory);groups=base/'system.slice';group=groups/(root.name+'.service')
+                (group/'supervisor').mkdir(parents=True)
+                (base/'membership').write_text('0::/system.slice/'+root.name+'.service/supervisor' if case!='wrong-member' else '0::/elsewhere')
+                (group/'cgroup.procs').write_text('123' if case=='populated' else '')
+                (group/'memory.swap.max').write_text('max' if case=='swap-not-capped' else '0')
+                (group/'cgroup.controllers').write_text('cpu pids' if case=='missing-controller' else 'cpu memory pids')
+                (group/'cgroup.subtree_control').write_text('')
+                if case!='missing-swap':(group/'supervisor/memory.swap.max').write_text('max')
+                def mapped(value):
+                    if value=='/proc/self/cgroup':return base/'membership'
+                    if value=='/sys/fs/cgroup/system.slice':return groups
+                    return Path(value)
+                child=Mock();child.poll.return_value=0;child.wait.return_value=0
+                with patch.object(pathlib,'Path',side_effect=mapped),patch.object(sys,'argv',['supervisor',str(root)]), \
+                     patch.object(signal,'signal'),patch.object(subprocess,'Popen',return_value=child) as launch:
+                    if case=='success':
+                        with self.assertRaises(SystemExit) as done:exec(compile(source,'supervisor','exec'),{})
+                        self.assertEqual(done.exception.code,0);self.assertEqual(launch.call_count,2)
+                    else:
+                        with self.assertRaises(RuntimeError):exec(compile(source,'supervisor','exec'),{})
+                        launch.assert_not_called()
+                written=(group/'cgroup.subtree_control').read_text()
+                self.assertEqual(written,'+cpu +memory +pids' if case in ('missing-swap','success') else '')
+    def test_all_daemon_paths_are_dedicated_and_network_defaults_disabled(self):
+        root=Path('/var/tmp/dw-engine-'+'a'*16)
+        c=probe.configuration(root,root.name+'.service')
+        for field in ('data-root','exec-root','pidfile'):
+            self.assertTrue(c[field].startswith(str(root)+'/'))
+        self.assertEqual(c['hosts'],['unix://'+str(root/'docker.sock')])
+        self.assertEqual(c['containerd'],str(root/'containerd.sock'))
+        self.assertEqual(c['containerd-namespace'],root.name)
+        self.assertEqual(c['storage-driver'],'vfs')
+        self.assertIs(c['features']['containerd-snapshotter'],False)
+        for field in ('iptables','ip6tables','ip-forward','ip-masq','userland-proxy'):
+            self.assertIs(c[field],False)
+        self.assertEqual(c['bridge'],'none')
+        self.assertEqual(c['cgroup-parent'],'/system.slice/'+root.name+'.service')
+
+    def test_matching_containerd_backend_is_explicit_and_keeps_private_socket(self):
+        root=Path('/var/tmp/dw-engine-'+'a'*16)
+        c=probe.configuration(root,root.name+'.service',storage_driver='overlayfs')
+        self.assertIs(c['features']['containerd-snapshotter'],True)
+        self.assertEqual(c['containerd'],str(root/'containerd.sock'))
+        with self.assertRaises(ValueError):probe.configuration(root,root.name+'.service',storage_driver='unknown')
+
+    def test_arbitrary_roots_and_units_rejected(self):
+        for root in (Path('/var/lib/docker'),Path('/tmp/dw-engine-'+'a'*16),Path('/var/tmp/dw-engine-../bad')):
+            with self.assertRaises(ValueError):probe.configuration(root,root.name+'.service')
+        root=Path('/var/tmp/dw-engine-'+'a'*16)
+        with self.assertRaises(ValueError):probe.configuration(root,'docker.service')
+
+    def test_firewall_normalization_ignores_only_chain_counters(self):
+        with patch.object(probe.shutil,'which',return_value='/stub'),patch.object(probe,'run') as read:
+            read.return_value=b'# Generated now\n:INPUT ACCEPT [1:2]\n-A INPUT --comment "[1:2]"\n'
+            first=probe.firewall_digest()
+            read.return_value=b'# Generated later\n:INPUT ACCEPT [3:4]\n-A INPUT --comment "[1:2]"\n'
+            self.assertEqual(first,probe.firewall_digest())
+            read.return_value=b':INPUT ACCEPT [3:4]\n-A INPUT --comment "[3:4]"\n'
+            self.assertNotEqual(first,probe.firewall_digest())
+
+    def test_empty_parent_does_not_hide_populated_descendant_cgroup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            group=Path(directory)
+            (group/'cgroup.procs').write_text('')
+            (group/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+            self.assertFalse(probe.cgroup_empty(group))
+            (group/'cgroup.events').write_text('populated 0\nfrozen 0\n')
+            self.assertTrue(probe.cgroup_empty(group))
+            (group/'cgroup.events').unlink()
+            self.assertFalse(probe.cgroup_empty(group))
+
+    @unittest.skipUnless(os.name=='posix','POSIX namespace diagnostic')
+    def test_cleanup_timeout_persists_failure_and_unit_has_autonomous_deadline(self):
+        token=uuid.uuid4()
+        root=Path('/var/tmp')/('dw-engine-'+token.hex[:16])
+        self.addCleanup(lambda:shutil.rmtree(root,ignore_errors=True))
+        with patch.object(probe.os,'getuid',return_value=0),patch.object(probe.uuid,'uuid4',return_value=token), \
+             patch.object(probe,'production_snapshot',return_value={'netns':'host','mountns':'host'}), \
+             patch.object(probe,'run',side_effect=[b'not-found\n',b'valid',b'created']) as commands, \
+             patch.object(probe.time,'monotonic',side_effect=[0,61]), \
+             patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)):
+            result=probe.probe()
+        self.assertFalse(result['completed'])
+        self.assertFalse(result['stopped'])
+        self.assertEqual(result['cleanupFailureType'],'TimeoutExpired')
+        self.assertTrue((root/'report.private.json').is_file())
+        ast.parse((root/'supervisor.py').read_text())
+        self.assertIn('--property=MemorySwapMax=0',commands.call_args_list[2].args)
+        command=commands.call_args_list[2].args
+        self.assertIn('--property=RuntimeMaxSec=120',command)
+        self.assertIn('--property=TimeoutStopSec=30',command)
+        self.assertIn('--property=KillMode=control-group',command)
+        self.assertIn('--mount',command)
+        self.assertIn('--net',command)
+
+
+if __name__=='__main__':unittest.main()

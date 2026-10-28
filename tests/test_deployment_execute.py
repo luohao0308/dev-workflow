@@ -584,7 +584,16 @@ class DeploymentExecuteTests(unittest.TestCase):
             result = subprocess.run([sys.executable, '-I', '-B', str(Path(backend.__file__)), action],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, code, result.stderr)
-            self.assertFalse(json.loads(result.stdout)['executionAvailable'])
+            status = json.loads(result.stdout)
+            self.assertFalse(status['executionAvailable'])
+            self.assertFalse(status['productionReady'])
+            self.assertEqual([(adapter['target'], adapter['execution']) for adapter in status['adapters']],
+                             [('linux-docker-single-container', 'implemented'),
+                              ('docker-compose', 'unsupported'), ('local-deployment', 'unsupported')])
+            self.assertEqual([(adapter['implementation'], adapter['validation'], adapter['availability'])
+                              for adapter in status['adapters']],
+                             [('implemented', 'scope-specific', 'trusted-host-required'),
+                              ('unsupported', 'none', 'unsupported'), ('unsupported', 'none', 'unsupported')])
 
 
 @unittest.skipUnless(shutil.which('openssl'), 'openssl required for local mTLS fixture')
@@ -705,6 +714,24 @@ class LocalMutationTLSTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertLess(time.monotonic() - started[0], 2)
         self.assertEqual(len(self.http_calls), 1)
+
+
+class ComposeCapabilityBoundaryTests(unittest.TestCase):
+    def test_status_reports_preparation_without_opening_execution(self):
+        import contextlib
+        import io
+        import json
+        import deployment_execute
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            code = deployment_execute.main(['status'])
+        value = json.loads(stream.getvalue())
+        compose = next(x for x in value['adapters'] if x['target'] == 'docker-compose')
+        self.assertEqual(code, 0)
+        self.assertEqual(compose['preparation'], 'local-foundations')
+        self.assertEqual(compose['execution'], 'unsupported')
+        self.assertIn('restricted-writer-and-recovery-required', compose['blockers'])
+        self.assertFalse(value['executionAvailable'] or compose['productionReady'])
 
 
 if __name__ == '__main__':

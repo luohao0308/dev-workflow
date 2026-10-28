@@ -8,6 +8,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Test-DistributionBytecode {
+    param([string]$RelativePath)
+    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$'
+}
+
 function Resolve-FullPath([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "Target directory does not exist: $Path"
@@ -487,6 +492,7 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
             $overlayPrefix = $packRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
             foreach ($sourceFile in Get-ChildItem -LiteralPath $packRoot -Recurse -File) {
                 $relativePath = $sourceFile.FullName.Substring($overlayPrefix.Length).Replace('\', '/')
+                if (Test-DistributionBytecode $relativePath) { continue }
                 if (-not (Test-Path -LiteralPath (Join-Path $targetRoot $relativePath) -PathType Leaf)) {
                     Add-Error $errors "Workflow pack $pack is missing file: $relativePath"
                 }

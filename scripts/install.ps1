@@ -36,6 +36,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Classify paths relative to their distribution root; ancestors may be named __pycache__.
+function Test-DistributionBytecode {
+    param([string]$RelativePath)
+    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$'
+}
+
 function Resolve-FullPath([string]$Path) {
     if ([IO.Path]::IsPathRooted($Path)) {
         return [IO.Path]::GetFullPath($Path)
@@ -849,6 +855,7 @@ if ($isLegacyManifest) {
         $legacyPrefix = $legacyPackRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         foreach ($file in Get-ChildItem -LiteralPath $legacyPackRoot -Recurse -File | Sort-Object FullName) {
             $relativePath = $file.FullName.Substring($legacyPrefix.Length).Replace('\', '/')
+            if (Test-DistributionBytecode $relativePath) { continue }
             if ($inventoryByPath.ContainsKey($relativePath)) {
                 throw "Legacy workflow pack ownership collision for '$relativePath'."
             }
@@ -906,6 +913,7 @@ foreach ($overlay in $overlays) {
 
     foreach ($file in $files) {
         $relativePath = $file.FullName.Substring($overlayPrefix.Length).Replace('\', '/')
+        if (Test-DistributionBytecode $relativePath) { continue }
         if ($seenPaths.ContainsKey($relativePath)) {
             throw "Overlay collision for '$relativePath': $($seenPaths[$relativePath]) and $($overlay.Name)"
         }

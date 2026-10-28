@@ -727,7 +727,7 @@ else
       action="legacy"
       [[ "$relative_path" == "AGENTS.md" ]] && action="managed-block"
       set_inventory "$relative_path" "$overlay_name" "$action" ""
-    done < <(find "$overlay_root" -type f | LC_ALL=C sort)
+    done < <(find "$overlay_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print | LC_ALL=C sort)
   done
 fi
 
