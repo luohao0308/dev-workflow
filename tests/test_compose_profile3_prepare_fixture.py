@@ -18,6 +18,20 @@ import compose_profile3_prepare_fixture as fixture
 
 @unittest.skipUnless(os.name == 'posix', 'private Linux preparation fixture')
 class ControllerBoundaryTests(unittest.TestCase):
+    def test_running_null_oom_observation_uses_exact_existing_policy(self):
+        from copy import deepcopy
+        from tests.test_deployment_compose_restore_body_host import fixture as source_fixture
+        from deployment_compose_restore_host_config import compile_restore_host_config, OOM_ENABLED_POLICY
+        args=source_fixture()
+        common=[args[k] for k in ('raw','identity','artifact','private_key','network_ids','expected_mounts')]
+        before=deepcopy(args['raw'])
+        self.assertIsNone(args['raw']['HostConfig']['OomKillDisable'])
+        result=compile_restore_host_config(*common,policy=fixture.SOURCE_HOST_POLICY)
+        self.assertIsNone(result['hostConfigFragment']['OomKillDisable'])
+        self.assertEqual(args['raw'],before)
+        with self.assertRaises(ValueError):
+            compile_restore_host_config(*common,policy=OOM_ENABLED_POLICY)
+
     def args(self):
         return dict(source_sha='b'*40,host_id='controller-host',expected_daemon_id='expected',
             keys={k:b'k'*32 for k in ('config','image','declaration','archive','target')},

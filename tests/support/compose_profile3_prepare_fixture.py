@@ -15,12 +15,13 @@ import re
 import ssl
 import subprocess
 import threading
+import traceback
 import uuid
 
 from deployment_compose_namespaced_runtime_probe import PrivateDaemon, transfer_image, ensure_capacity
 from deployment_compose_namespaced_transition_probe import source_image, V2, delete
 from deployment_compose_log_probe import IMAGE, ID
-from deployment_compose_restore_host_config import _fixed_policy, OOM_ENABLED_POLICY
+from deployment_compose_restore_host_config import _fixed_policy, POLICY as SOURCE_HOST_POLICY
 from deployment_compose_restore_body_host import RUNNING_METADATA_POLICY
 from deployment_compose_private import commit, MOUNT
 from deployment_compose_artifacts import ServiceArtifact, ComposeArtifacts
@@ -226,7 +227,7 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
         if mountpoint != root/'data/volumes'/volume/'_data' or any(mountpoint.iterdir()): raise ValueError('profile3-volume-ownership-drift')
         (mountpoint/'sentinel.txt').write_text(project+'\n')
         bind=root/'profile3-config'; bind.mkdir(mode=0o700); (bind/'config.txt').write_text(project+'\n')
-        host=_fixed_policy(policy=OOM_ENABLED_POLICY)
+        host=_fixed_policy(policy=SOURCE_HOST_POLICY)
         host.update(NetworkMode=network_name,Mounts=[dict(Type='volume',Source=volume,Target='/sample-data',ReadOnly=False,VolumeOptions={'NoCopy':True}),dict(Type='bind',Source=str(bind),Target='/sample-config',ReadOnly=True)])
         body=dict(Image=images[0]['Id'],Hostname='profile3',WorkingDir='/tmp',Cmd=['/usr/local/bin/python3','-c',fixture_command(project)],Entrypoint=None,
             Env=deepcopy(images[0]['Config']['Env']),Labels={},Healthcheck=dict(Test=['CMD','/usr/local/bin/python3','-c',"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read()"],Interval=1000000000,Timeout=20000000000,StartPeriod=1000000000,Retries=3),
@@ -271,12 +272,19 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
         model_digest=hashlib.sha256(_encode(model)).hexdigest()
         declaration=dict(schemaVersion=1,identity=identity,sourceSha=source_sha,sourceModelDigest=model_digest,sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),networks={network_name:dict(id=network,aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],addressPolicy='dynamic-no-requested-addresses',requestedMac=None,ipamConfig=None,links=None,driverOpts=None)})
         proof=commit_network_declaration(declaration,'profile3-declaration',keys['declaration'])
-        inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=OOM_ENABLED_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
+        inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=SOURCE_HOST_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
         targets=dict(image=images[1],commitment=commit_image_config(images[1],'profile3-target',keys['target']),key=keys['target'],expected_key_id='profile3-target',expected_image_id=images[1]['Id'],expected_registry_digest=references[1],expected_architecture=images[1]['Architecture'])
         session.producer=TrustedPhaseStateProducerV3(socket_path=target.socket,project=project,daemon_id=expected_daemon_id,container_ids=tuple(sorted(r['Id'] for r in rows.values())))
         session.preparer=ComposePreparationHostV3(whole_observer=session.whole_observer,retention_observer=session.retention_observer,recovery=session.recovery,baseline=baseline,source_inputs={'backend':inputs},target_inputs={'backend':targets},source=SourceIdentity('github.com','https://github.com/'+REPOSITORY+'.git',REPOSITORY_ID,REPOSITORY,source_sha),target=TargetIdentity('compose',project,environment),host_id=host_id,daemon_id=expected_daemon_id,environment=environment,policy_hash=policy_hash,dependencies={'backend':()},protected_names={'peer':project+'-peer'},protected_ids={'peer':rows['peer']['Id']},protected_hashes={'peer':peer_hash},archive_reference=reference,phase_state_producer=session.producer,protected_private_keys={'peer':('profile3-config',keys['config'])})
         expires=(datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
-        session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex,expires_at=expires)
+        operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex
+        audit=dict(rawSource=raw,rawRows=rows,identity=identity,artifact=asdict(artifact),
+            sourceInputs={k:v for k,v in inputs.items() if type(v) is not bytes},
+            targetInputs={k:v for k,v in targets.items() if type(v) is not bytes},
+            scope=scope,sourceModel=model,operationNonce=operation_nonce,expiresAt=expires)
+        fd=os.open(root/'profile3-inputs.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,'wb') as stream:stream.write(_encode(audit))
+        session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=operation_nonce,expires_at=expires)
         version=json.loads(target.run('version','--format','{{json .Server}}'))
         version={k:version[k] for k in ('Version','GitCommit')}
         pinned_rows=TrustedPhaseStateProducerV3.reload(session.store,session.prepared['bundle'],read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
@@ -286,5 +294,16 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
         return session
     except Exception as error:
         # Caller retains ownership and may clean up only confirmed receipts.
+        chain=[];cause=error
+        while cause is not None and len(chain)<16:
+            chain.append(dict(type=type(cause).__name__,message=str(cause),
+                frames=[dict(file=Path(f.filename).name,line=f.lineno,function=f.name)
+                        for f in traceback.extract_tb(cause.__traceback__)]))
+            cause=cause.__context__
+        try:
+            fd=os.open(root/'profile3-preparation-failure.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as stream:stream.write(_encode(dict(chain=chain)))
+        except OSError:
+            pass  # Preserve the original failure and its cleanup ownership.
         error.preparation_session=session
         raise
