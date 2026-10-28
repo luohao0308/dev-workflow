@@ -82,7 +82,7 @@ class ComposeEngineSampleFixtureTest(unittest.TestCase):
                 compile(command[3], '<sample-server>', 'exec')
                 with patch.dict(os.environ, {'SAMPLE_ROLE': role}), patch('http.server.HTTPServer') as server:
                     namespace = {}
-                    code = command[3].replace('/sample-data/sentinel.txt', str(Path(directory) / 'sentinel.txt'))
+                    code = command[3].replace(repr('/sample-data/sentinel.txt'), repr(str(Path(directory) / 'sentinel.txt')))
                     exec(code, namespace)
                     server.assert_called_once_with(('0.0.0.0', 8080), namespace['Handler'])
                     server.return_value.serve_forever.assert_called_once_with()

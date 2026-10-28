@@ -30,6 +30,7 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
              patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)):
             probe.probe()
         source=(root/'supervisor.py').read_text();(root/'containerd.sock').touch()
+        concrete_path=type(root)
         for case in ('wrong-member','populated','missing-controller','swap-not-capped','missing-swap','success'):
             with self.subTest(case=case),tempfile.TemporaryDirectory() as directory:
                 base=Path(directory);groups=base/'system.slice';group=groups/(root.name+'.service')
@@ -43,7 +44,7 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
                 def mapped(value):
                     if value=='/proc/self/cgroup':return base/'membership'
                     if value=='/sys/fs/cgroup/system.slice':return groups
-                    return Path(value)
+                    return concrete_path(value)
                 child=Mock();child.poll.return_value=0;child.wait.return_value=0
                 with patch.object(pathlib,'Path',side_effect=mapped),patch.object(sys,'argv',['supervisor',str(root)]), \
                      patch.object(signal,'signal'),patch.object(subprocess,'Popen',return_value=child) as launch:
@@ -59,7 +60,7 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
         root=Path('/var/tmp/dw-engine-'+'a'*16)
         c=probe.configuration(root,root.name+'.service')
         for field in ('data-root','exec-root','pidfile'):
-            self.assertTrue(c[field].startswith(str(root)+'/'))
+            self.assertEqual(Path(c[field]).parent, root)
         self.assertEqual(c['hosts'],['unix://'+str(root/'docker.sock')])
         self.assertEqual(c['containerd'],str(root/'containerd.sock'))
         self.assertEqual(c['containerd-namespace'],root.name)

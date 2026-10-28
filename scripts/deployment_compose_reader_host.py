@@ -114,7 +114,14 @@ def _complete_json_response(response, *, allow_404=False):
             break
         raw.extend(chunk)
     if (len(raw) > MAX_RESPONSE or (lengths and len(raw) != int(lengths[0]))
-            or response.length not in (None, 0) or not response.isclosed()):
+            or response.length not in (None, 0)):
+        raise ReaderHostError('reader-upstream-unknown')
+    # Older HTTPResponse.read1 leaves its file open at an exact Content-Length
+    # boundary. Only close after both the byte count and remaining length prove
+    # completion; chunked responses still have to consume their final chunk.
+    if lengths and response.length == 0:
+        response.close()
+    if not response.isclosed():
         raise ReaderHostError('reader-upstream-unknown')
     if response.status == 404 and not raw:
         return b'', None

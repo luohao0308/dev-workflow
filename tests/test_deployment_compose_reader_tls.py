@@ -40,9 +40,12 @@ class ComposeReaderLoopbackTLSTests(unittest.TestCase):
                 body = b'{"ID":"fixture-daemon"}' if self.path == '/v1.45/info' else b'[]'
                 try:
                     self.send_response(200)
-                    self.send_header('Content-Length', str(len(body)))
+                    self.send_header('Content-Length', str(len(body) + (behavior == 'slow-body')))
                     self.end_headers()
                     self.wfile.write(body)
+                    if behavior == 'slow-body':
+                        self.wfile.flush()
+                        time.sleep(2)
                 except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
                     pass
             def log_message(self, *args):
@@ -114,6 +117,24 @@ class ComposeReaderLoopbackTLSTests(unittest.TestCase):
                 with self.assertRaises(reader.ComposeReadError) as caught:
                     self.client(policy, timeout=timeout).get('/v1.45/info')
                 self.assertEqual(caught.exception.code, expected)
+                self.assertEqual(len(calls), 1)
+                self.assertNotIn(str(self.directory), str(caught.exception))
+                self.assertIsNone(caught.exception.__cause__)
+
+    def test_watchdog_shutdown_before_socket_timeout_is_deadline_exceeded(self):
+        original = reader.http.client.HTTPSConnection.getresponse
+        def wait_for_watchdog(connection):
+            # Isolate the timer path from the competing socket timeout. A timer
+            # shutdown produces RemoteDisconnected rather than socket.timeout.
+            connection.sock.settimeout(4)
+            return original(connection)
+        for behavior in ('slow', 'slow-body'):
+            with self.subTest(behavior=behavior):
+                policy, calls = self.start_server(behavior=behavior)
+                with mock.patch.object(reader.http.client.HTTPSConnection, 'getresponse', wait_for_watchdog):
+                    with self.assertRaises(reader.ComposeReadError) as caught:
+                        self.client(policy, timeout=1).get('/v1.45/info')
+                self.assertEqual(caught.exception.code, 'deadline-exceeded')
                 self.assertEqual(len(calls), 1)
                 self.assertNotIn(str(self.directory), str(caught.exception))
                 self.assertIsNone(caught.exception.__cause__)

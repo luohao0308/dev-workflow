@@ -225,6 +225,7 @@ class ComposeDockerReader:
 
     def _request(self, path, *, deadline):
         connection = response = watchdog = None
+        watchdog_expired = threading.Event()
         try:
             remaining = self.timeout if deadline is None else min(self.timeout, deadline - time.monotonic())
             if remaining <= 0:
@@ -247,6 +248,7 @@ class ComposeDockerReader:
                 raise ComposeReadError('pin-mismatch')
             read_deadline = min(deadline if deadline is not None else float('inf'), time.monotonic() + self.timeout)
             def abort():
+                watchdog_expired.set()
                 try:
                     peer.shutdown(socket.SHUT_RDWR)
                 except OSError:
@@ -256,6 +258,8 @@ class ComposeDockerReader:
             watchdog.start()
             connection.request('GET', path, headers={'Accept': 'application/json'})
             response = connection.getresponse()
+            if watchdog_expired.is_set() or time.monotonic() >= read_deadline:
+                raise ComposeReadError('deadline-exceeded')
             if response.status == 404 and path not in ('/v1.45/info', self.list_path, GATEWAY_INFO_PATH):
                 raise ComposeNotFound()
             if response.status != 200:
@@ -271,6 +275,8 @@ class ComposeDockerReader:
                 if not chunk:
                     break
                 raw.extend(chunk)
+            if watchdog_expired.is_set() or time.monotonic() >= read_deadline:
+                raise ComposeReadError('deadline-exceeded')
             if len(raw) > MAX_RESPONSE:
                 raise ComposeReadError('response-too-large')
             return bytes(raw)
@@ -283,6 +289,8 @@ class ComposeDockerReader:
         except (TimeoutError, socket.timeout):
             raise ComposeReadError('deadline-exceeded') from None
         except Exception:
+            if watchdog_expired.is_set():
+                raise ComposeReadError('deadline-exceeded') from None
             raise ComposeReadError('transport-unavailable') from None
         finally:
             if watchdog is not None:

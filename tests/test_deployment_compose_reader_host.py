@@ -402,6 +402,21 @@ class ReaderHostTests(unittest.TestCase):
 
 
 class ResponseFramingTests(unittest.TestCase):
+    def test_content_length_complete_when_read1_does_not_auto_close(self):
+        class Peer:
+            def makefile(self, *args):
+                return BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}')
+        class LegacyResponse(http.client.HTTPResponse):
+            def read1(self, size=-1):
+                # Python 3.10-3.13 do not close the file at length == 0.
+                data = self.fp.read1(min(size, self.length))
+                self.length -= len(data)
+                return data
+        response = LegacyResponse(Peer())
+        response.begin()
+        self.assertEqual(host._complete_json_response(response), (b'{}', {}))
+        self.assertTrue(response.isclosed())
+
     def test_distribution_gateway_imports_in_isolated_python(self):
         path = Path(__file__).resolve().parents[1] / 'scripts/deployment_compose_reader_host.py'
         result = subprocess.run([sys.executable, '-I', '-B', '-c',

@@ -55,28 +55,28 @@ class BytecodeInstallTests(unittest.TestCase):
                                    capture_output=True, text=True, env=dict(os.environ, LC_ALL='C'))
             self.assertEqual(audit.returncode, 2, audit.stdout + audit.stderr)
             self.assertNotIn('[error]', audit.stdout)
-            inventory = json.loads((target / '.dev-workflow/manifest.json').read_text())['files']
+            inventory = json.loads((target / '.dev-workflow/manifest.json').read_text(encoding="utf-8"))['files']
             for relative in excluded:
                 self.assertFalse((target / relative).exists(), relative)
                 self.assertNotIn(relative, [entry['path'] for entry in inventory])
             self.assertEqual(user_cache.read_bytes(), b'user owned')
-            self.assertEqual((target / 'docs/__pycache__').read_text(), 'ordinary file, not a cache directory')
+            self.assertEqual((target / 'docs/__pycache__').read_text(encoding="utf-8"), 'ordinary file, not a cache directory')
             for source in ('core_source.py', 'packs_release_source.py'):
                 self.assertTrue((target / 'scripts' / source).is_file())
                 self.assertIn('scripts/' + source, [entry['path'] for entry in inventory])
 
     def test_powershell_filters_relative_paths_before_inventory_and_copy(self):
-        source = (ROOT / 'scripts/install.ps1').read_text()
+        source = (ROOT / 'scripts/install.ps1').read_text(encoding="utf-8")
         self.assertIn("$RelativePath -cmatch '(^|/)__pycache__/|\\.py[co]$'", source)
         pattern = re.search(r"-cmatch '([^']+)'", source).group(1)
         self.assertIsNone(re.search(pattern, 'docs/__pycache__'))
         self.assertIsNotNone(re.search(pattern, 'scripts/__pycache__/module.pyc'))
         self.assertEqual(source.count('if (Test-DistributionBytecode $relativePath) { continue }'), 2)
         for name, variable in (('audit', 'relativePath'), ('uninstall', 'relative')):
-            source = (ROOT / 'scripts' / (name + '.ps1')).read_text()
+            source = (ROOT / 'scripts' / (name + '.ps1')).read_text(encoding="utf-8")
             self.assertIn("$RelativePath -cmatch '(^|/)__pycache__/|\\.py[co]$'", source)
             self.assertIn('if (Test-DistributionBytecode $' + variable + ') { continue }', source)
-            shell = (ROOT / 'scripts' / (name + '.sh')).read_text()
+            shell = (ROOT / 'scripts' / (name + '.sh')).read_text(encoding="utf-8")
             self.assertIn("-type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print", shell)
 
 
