@@ -3,7 +3,9 @@
 
 Workflow validation proves public shape and workflow scope only. The host MUST
 call verify_prepared_review against its private prepared intent before consuming
-approval; a caller's self-declared bundle/review hash is not host authentication.
+approval; a caller's self-declared bundle/review hash or historical source SHA
+is not host authentication. Rollback/recovery history must also be authenticated
+by the trusted host fence before admission.
 """
 from __future__ import annotations
 
@@ -154,12 +156,13 @@ def _values(payload,env,now):
             or request.environment!='staging' or request.max_uses!=1
             or request.source.provider_id!='github.com' or request.source.project_path!=REPOSITORY
             or request.source.origin!='https://github.com/'+REPOSITORY+'.git'
-            or request.source.project_id!=REPOSITORY_ID or request.source.source_sha!=env['GITHUB_SHA']):
+            or request.source.project_id!=REPOSITORY_ID
+            or (request.operation=='deploy' and request.source.source_sha!=env['GITHUB_SHA'])):
         raise ValueError('Unsupported public request scope')
     request.ensure_fresh(now,maximum_seconds=1800)
     _validate_review(payload['review'],request)
     policy=FullBodyApprovalPolicyV3(**identity,expires_at=request.expires_at,approval_environment='compose-review',
-        operation=request.operation,profile_version='3',source_sha=env['GITHUB_SHA'],target=request.target,
+        operation=request.operation,profile_version='3',source_sha=request.source.source_sha,target=request.target,
         deployment_environment='staging',production=False,daemon_id=request.daemon_id,host_id=request.host_id,
         components=request.components,protected_components=request.protected_components,policy_hash=request.policy_hash,
         bundle_hash=request.plan_hash,expected_history_hash=request.history_hash)
@@ -213,7 +216,7 @@ def summary(raw,env):
         +'Immutable image changes (original -> target):\n\n'+images+'\n\n'
         +'Phase counts: '+', '.join(phase+'='+str(count) for phase,count in counts.items())+'.\n\n'
         +'Phase order: '+order+'.\n\n'
-        +'Source: '+request.source.source_sha+'; operation: '+request.operation+'; request expiry: '+request.expires_at+'; maximum uses: 1.\n\n'
+        +'Application source SHA: '+request.source.source_sha+'; review workflow SHA: '+env['GITHUB_SHA']+'; operation: '+request.operation+'; request expiry: '+request.expires_at+'; maximum uses: 1.\n\n'
         +'Approving grants intent consent for the trusted host to perform this listed staging operation. Fresh runtime guards, phase checks, and host admission remain required.\n\n'
         +'Exact new human approval comment: `dev-workflow approve '+approval_hash+'`\n\n'
         +'This workflow itself does not execute Docker or SSH. Private prepared bodies remain on the trusted host.\n')

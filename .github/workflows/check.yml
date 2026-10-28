@@ -42,7 +42,7 @@ jobs:
         run: |
           python -m unittest discover -s tests -p '*v3*.py'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest tests.test_deployment_compose_full_body_review_contract
+          python -m unittest tests.test_deployment_compose_full_body_review_contract tests.test_compose_profile3_prepare_fixture
       - name: Run PowerShell integration tests
         shell: pwsh
         run: ./tests/integration.ps1

@@ -85,6 +85,22 @@ def fixture():
 
 @unittest.skipUnless(os.name == 'posix', 'private recovery store requires POSIX semantics')
 class PreparationTests(unittest.TestCase):
+    def test_engine_omitted_bind_fields_match_gateway_hmac_without_rewriting_baseline(self):
+        kw, observation=fixture()
+        protected=kw['whole_observer']._unit_rows['2'*64]
+        binds=[m for m in protected['Mounts'] if m['Type']=='bind']
+        self.assertTrue(binds)
+        for mount in binds:
+            self.assertIsNone(mount.pop('Name'))
+            self.assertIsNone(mount.pop('Driver'))
+        expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        prepared=host.ComposePreparationHostV3(**kw).prepare_intent(observation,observation,
+            operation_nonce='f'*64,expires_at=expiry)
+        retained=json.loads(kw['recovery']._store.get(prepared['bundle'].to_dict()['baselineStateReference']))
+        archived=next(m for m in retained['2'*64]['Mounts'] if m['Type']=='bind')
+        self.assertNotIn('Name',archived)
+        self.assertNotIn('Driver',archived)
+
     def test_full_body_image_only_and_safe_review(self):
         kw, observation=fixture(); prep=host.ComposePreparationHostV3(**kw)
         expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')

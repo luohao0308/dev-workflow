@@ -19,6 +19,39 @@ probe=importlib.util.module_from_spec(spec);spec.loader.exec_module(probe)
 
 
 class IsolatedDaemonConfigTests(unittest.TestCase):
+    def test_unsupported_hold_lifetime_rejected_before_host_access(self):
+        for seconds in (True, 0, 599, 601, 3601, '3600', None):
+            with self.subTest(seconds=seconds), patch.object(probe.uuid,'uuid4') as allocate:
+                with self.assertRaises(ValueError):
+                    probe.probe(lambda *_: {'success': True},workload_lifetime_seconds=seconds)
+                allocate.assert_not_called()
+        with self.assertRaises(ValueError):
+            probe.probe(workload_lifetime_seconds=3600)
+
+    @unittest.skipUnless(os.name=='posix','POSIX bounded hold controller simulation')
+    def test_explicit_approval_hold_keeps_limits_and_autonomous_cleanup(self):
+        token=uuid.uuid4();root=Path('/var/tmp')/('dw-engine-'+token.hex[:16])
+        self.addCleanup(lambda:shutil.rmtree(root,ignore_errors=True))
+        original_read=Path.read_text
+        def read(path,*args,**kwargs):
+            if str(path)=='/proc/meminfo':
+                return 'MemAvailable: 2097152 kB\n'
+            return original_read(path,*args,**kwargs)
+        with patch.object(Path,'read_text',autospec=True,side_effect=read), \
+             patch.object(probe.os,'getuid',return_value=0),patch.object(probe.uuid,'uuid4',return_value=token), \
+             patch.object(probe,'production_snapshot',return_value={'netns':'host','mountns':'host'}), \
+             patch.object(probe,'run',side_effect=[b'not-found\n',b'valid',b'created']) as commands, \
+             patch.object(probe.time,'monotonic',side_effect=[0,61]), \
+             patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)):
+            result=probe.probe(lambda *_: {'success': True},workload_lifetime_seconds=3600)
+        command=commands.call_args_list[2].args
+        for option in ('--property=RuntimeMaxSec=3600','--property=MemoryMax=768M',
+                       '--property=MemorySwapMax=0','--property=KillMode=control-group',
+                       '--property=TimeoutStopSec=30'):
+            self.assertIn(option,command)
+        self.assertFalse(result['completed'])
+        self.assertEqual(result['cleanupFailureType'],'TimeoutExpired')
+
     @unittest.skipUnless(os.name=='posix','POSIX controller simulation')
     def test_embedded_supervisor_controller_guards_and_owned_write(self):
         token=uuid.uuid4();root=Path('/var/tmp')/('dw-engine-'+token.hex[:16])

@@ -22,7 +22,7 @@ from deployment_compose_observation_host import ComposeObservationHost
 from deployment_compose_recovery_host import ComposeRecoveryHost
 from deployment_compose_operations import BaselineContainer, _topological
 from deployment_compose_restore_body_host import compile_retained_restore_body
-from deployment_compose_private import commit
+from deployment_compose_private import commit, MOUNT
 from deployment_compose_phase_guard_v3_host import PhaseGuardV3, protected_state_digest, baseline_state_bytes, baseline_state_digest
 from deployment_compose_phase_state_v3_host import TrustedPhaseStateProducerV3
 
@@ -138,6 +138,10 @@ class ComposePreparationHostV3:
                 instances[cid] = (row['State']['Pid'],row['State']['StartedAt'],row['RestartCount'])
                 if service in self._ids:
                     projection = {k:row[k] for k in ('Config','HostConfig','Mounts','NetworkSettings')}
+                    # Match the authenticated gateway's commitment projection;
+                    # keep the original raw rows unchanged for lifecycle retention.
+                    projection['Mounts'] = [{**{k:None for k in MOUNT}, **mount}
+                                            for mount in row['Mounts']]
                     key_id, key = self._protected_keys[service]
                     actual = commit(self._target.namespace,service,projection,key_id,key)['configHmac']
                     if not hmac.compare_digest(actual,self._hashes[service]):

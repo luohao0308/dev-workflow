@@ -85,9 +85,13 @@ def cgroup_empty(group):
         return not group.exists()
 
 
-def probe(workload=None, *, storage_driver="vfs"):
+def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600):
     if workload is not None and not callable(workload):
         raise ValueError('trusted-diagnostic-callback-required')
+    if (type(workload_lifetime_seconds) is not int
+            or workload_lifetime_seconds not in (600, 3600)
+            or workload is None and workload_lifetime_seconds != 600):
+        raise ValueError('bounded-workload-lifetime-required')
     if os.getuid() != 0:
         raise ValueError('root-required-for-bounded-namespace-probe')
     if workload is not None:
@@ -152,7 +156,7 @@ finally:
         # explicitly selected diagnostic callback workload.
         memory='768M' if workload is not None else '512M'
         tasks='384' if workload is not None else '256'
-        lifetime='600' if workload is not None else '120'
+        lifetime=str(workload_lifetime_seconds) if workload is not None else '120'
         result['unitCreationOutcomeUnknown']=True
         run('systemd-run', '--unit='+unit, '--collect', '--service-type=exec',
             '--property=MemoryMax='+memory, '--property=MemorySwapMax=0', '--property=CPUQuota=50%', '--property=TasksMax='+tasks,

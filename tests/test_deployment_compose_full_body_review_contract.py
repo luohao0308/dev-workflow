@@ -16,7 +16,7 @@ from tests.test_deployment_compose_bundle_v3 import fixture, bind_baseline
 from tests.test_deployment_compose_approval_v3_host import request
 from tests.test_deployment_compose_github_review_contract import environment
 from deployment_contract_v2 import SourceIdentity, TargetIdentity
-from deployment_compose_bundle_v3 import ExecutionBundleV3
+from deployment_compose_bundle_v3 import ExecutionBundleV3, FIELDS
 import deployment_compose_full_body_review_contract as contract
 from release_host import bundle_digest
 
@@ -36,6 +36,7 @@ class FullBodyReviewTests(unittest.TestCase):
             for field in ('baselineCreateBody','targetCreateBody'):
                 service[field]['Labels']['com.docker.compose.project']='dw-review'
         bind_baseline(value)
+        self.defaults=defaults
         self.bundle=ExecutionBundleV3(value,authenticated_image_defaults=defaults)
         self.request=request(source=source,target=TargetIdentity('compose','dw-review','stack'),
             components=('web',),protected_components=('db',),plan_hash=self.bundle.digest,
@@ -114,6 +115,37 @@ class FullBodyReviewTests(unittest.TestCase):
             artifact=contract.prepare(contract.canonical(payload),self.env,self.now)
             _,policy,_=self.verify(artifact)
             self.assertEqual(policy.expected_history_hash,'c'*64)
+
+    def test_historical_source_sha_is_separate_from_review_workflow_sha(self):
+        old_source=replace(self.request.source,source_sha='b'*40)
+        value={key:item for key,item in self.bundle.to_dict().items() if key in FIELDS}
+        value['identity']['sourceIdentity']=contract.canonical(asdict(old_source))
+        historical_bundle=ExecutionBundleV3(value,authenticated_image_defaults=self.defaults)
+        for operation in ('rollback','recovery'):
+            original=replace(self.request,operation=operation,source=old_source,
+                plan_hash=historical_bundle.digest,history_hash='c'*64)
+            payload=dict(request=asdict(original),review=historical_bundle.public_review())
+            artifact=contract.prepare(contract.canonical(payload),self.env,self.now)
+            req,policy,_=contract.verify_prepared_review(contract.canonical(artifact),self.env,
+                historical_bundle,original,self.now)
+            self.assertEqual(req.source.source_sha,'b'*40)
+            self.assertEqual(policy.source_sha,'b'*40)
+            self.assertEqual(policy.workflow_sha,self.env['GITHUB_SHA'])
+            self.assertEqual(policy.expected_history_hash,original.history_hash)
+            summary=contract.summary(contract.canonical(artifact),self.env)
+            self.assertIn('Application source SHA: '+'b'*40,summary)
+            self.assertIn('review workflow SHA: '+self.env['GITHUB_SHA'],summary)
+            forged=deepcopy(payload)
+            forged['request']['source']['source_sha']='d'*40
+            forged['review']['identity']['sourceIdentity']=contract.canonical(forged['request']['source'])
+            rehashed=contract.prepare(contract.canonical(forged),self.env,self.now)
+            with self.subTest(operation=operation),self.assertRaises(ValueError):
+                contract.verify_prepared_review(contract.canonical(rehashed),self.env,
+                    historical_bundle,original,self.now)
+        deploy=replace(self.request,source=old_source,plan_hash=historical_bundle.digest)
+        with self.assertRaises(ValueError):
+            contract.prepare(contract.canonical(dict(request=asdict(deploy),review=historical_bundle.public_review())),
+                             self.env,self.now)
 
     def test_runner_identity_canonical_size_duplicate_and_expiry_guards(self):
         for field,bad in [('GITHUB_RUN_ATTEMPT','2'),('GITHUB_REPOSITORY_ID','2'),('GITHUB_EVENT_NAME','push'),
