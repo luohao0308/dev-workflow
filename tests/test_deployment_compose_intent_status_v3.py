@@ -13,7 +13,7 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'packs/deployment/scripts'))
-from deployment_compose_intent_status_v3 import IntentStatusClientV3, issue_intent_status, encode, NAMESPACE, ERROR
+from deployment_compose_intent_status_v3 import IntentStatusClientV3, issue_intent_status, encode, NAMESPACE, ERROR, IntentStatusRejected
 from tests.test_deployment_compose_approval_v3_host import ComposeApprovalTests, request
 
 
@@ -95,6 +95,23 @@ class IntentStatusTests(unittest.TestCase):
         clock.time.side_effect = [issued-3]
         with patch.object(module, 'time', clock): self.denied()
         clock.sleep.assert_not_called()
+
+    def test_private_diagnostic_stage_does_not_expose_payload(self):
+        self.consume()
+        for changes, stage in ((dict(rpcNonce='0'*64), 'response-binding'),
+                               (dict(issuedAt=int(time.time())+20), 'time-validity'),
+                               (dict(extra='private-secret'), 'payload-shape')):
+            self.edit = lambda p, changes=changes: dict(p, **changes)
+            with self.subTest(stage=stage):
+                with self.assertRaises(IntentStatusRejected) as caught:
+                    self.client.check_consumed_intent(self.req)
+                self.assertEqual(caught.exception.stage, stage)
+                self.assertEqual(str(caught.exception), ERROR)
+        self.edit = lambda p: p
+        self.client._transport = lambda rpc: {'payload': {}, 'signature': 'private-secret'}
+        with self.assertRaises(IntentStatusRejected) as caught:
+            self.client.check_consumed_intent(self.req)
+        self.assertEqual(caught.exception.stage, 'payload-shape')
 
     def test_exact_request_profiles_and_production(self):
         for req in (replace(self.req, plan_hash='0'*64), replace(self.req, host_id='other')):

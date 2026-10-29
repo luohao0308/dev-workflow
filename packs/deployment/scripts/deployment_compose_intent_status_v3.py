@@ -29,6 +29,13 @@ RESPONSE_FIELDS = REQUEST_FIELDS | {'issuedAt', 'expiresAt', 'consumed', 'author
 HEX = re.compile(r'[0-9a-f]{64}\Z')
 
 
+class IntentStatusRejected(ValueError):
+    """Fixed, non-sensitive verification stage for private host diagnostics."""
+    def __init__(self, stage):
+        super().__init__(ERROR)
+        self.stage = stage
+
+
 def fail():
     raise ValueError(ERROR)
 
@@ -108,16 +115,21 @@ class IntentStatusClientV3:
                     bootNonce=self._boot, rpcNonce=secrets.token_hex(32))
 
     def check_consumed_intent(self, request):
+        stage = 'request'
         try:
             if type(request) is not RequestV2 or request != self._expected:
                 fail()
             rpc = self._request()
+            stage = 'transport'
             response = self._transport(deepcopy(rpc))  # One attempt, no cached status.
+            stage = 'response-shape'
             if type(response) is not dict or set(response) != {'payload', 'signature'}:
                 fail()
+            stage = 'payload-shape'
             payload = response['payload']
             if type(payload) is not dict or set(payload) != RESPONSE_FIELDS:
                 fail()
+            stage = 'signature-encoding'
             material = encode(payload)
             encoded = response['signature']
             if type(encoded) is not str or len(encoded) > 8192:
@@ -125,6 +137,7 @@ class IntentStatusClientV3:
             signature = base64.b64decode(encoded, validate=True)
             if len(signature) > 4096:
                 fail()
+            stage = 'signature-verification'
             with tempfile.TemporaryDirectory(prefix='dw-intent-status-verify-') as directory:
                 root = Path(directory)
                 signers, sig = root / 'signers', root / 'response.sig'
@@ -136,11 +149,13 @@ class IntentStatusClientV3:
                                           '-n', NAMESPACE, '-s', str(sig)], input=material, capture_output=True, timeout=10)
                 if checked.returncode:
                     fail()
+            stage = 'response-binding'
             expected = dict(rpc, purpose='consumed-intent-status-v3', issuedAt=payload['issuedAt'],
                             expiresAt=payload['expiresAt'], consumed=True, authorityGranted=False,
                             runtimePermit=False, productionReady=False)
             if material != encode(expected):
                 fail()
+            stage = 'time-validity'
             issued, expiry = payload['issuedAt'], payload['expiresAt']
             current = time.time()
             # A verified fresh nonce can arrive just ahead of the receiver's
@@ -154,4 +169,4 @@ class IntentStatusClientV3:
                     or not issued <= current < expiry <= min(issued + 30, request_expiry)):
                 fail()
         except Exception:
-            raise ValueError(ERROR) from None
+            raise IntentStatusRejected(stage) from None
