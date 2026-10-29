@@ -60,7 +60,8 @@ def ssh_argv(alias, archive_digest, source_sha):
     if type(alias) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', alias):
         reject()
     return ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
-            '-o', 'ConnectTimeout=10', '-o', 'ClearAllForwardings=yes',
+            '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15',
+            '-o', 'ServerAliveCountMax=3', '-o', 'ClearAllForwardings=yes',
             '-o', 'ForwardAgent=no', '-o', 'ForwardX11=no', '-o',
             'PermitLocalCommand=no', '-T', alias,
             'exec python3 -I -u -c ' + shlex.quote(live_bootstrap(archive_digest, source_sha))]

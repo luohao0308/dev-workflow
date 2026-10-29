@@ -25,7 +25,8 @@ class LoaderTests(unittest.TestCase):
     def test_strict_transport_and_alias(self):
         argv=live.ssh_argv('linux-test','a'*64,'b'*40)
         for option in ('StrictHostKeyChecking=yes','ForwardAgent=no','ForwardX11=no',
-                       'ClearAllForwardings=yes','PermitLocalCommand=no','BatchMode=yes'):
+                       'ClearAllForwardings=yes','PermitLocalCommand=no','BatchMode=yes',
+                       'ServerAliveInterval=15','ServerAliveCountMax=3'):
             self.assertIn(option,argv)
         for alias in ('-oProxyCommand=x','host; echo secret','host x',''):
             with self.assertRaises(ValueError):live.ssh_argv(alias,'a'*64,'b'*40)
