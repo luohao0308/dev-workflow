@@ -426,7 +426,7 @@ def run(config, stdin, stdout):
                     or policy.operation_profile!='compose-v3' or policy.witness_scope_hash!='0'*64
                     or policy.witness_key_sha256!=hashlib.sha256(key_material(public)).hexdigest()): reject()
             session=prepare_profile3(root,info,source_sha=config['sourceSha'],host_id=config['hostId'],
-                expected_daemon_id=info['ID'],keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=600)
+                expected_daemon_id=info['ID'],keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=900)
             bundle=session.prepared['bundle']; request=session.prepared['request']
             tracker=FixtureOwnershipTrackerV3(project=session.project,daemon_id=info['ID'],policy_hash=policy.identity_hash(),
                 witness_pub_hash=policy.witness_key_sha256,epoch=setup['epoch'],initial_confirmed_ids=session.created_ids,
@@ -437,7 +437,7 @@ def run(config, stdin, stdout):
             snapshot=history.capture()
             channel.emit('deployed',result=result,history=json.loads(snapshot.canonical))
             current=prepare_current_profile3(session,original_bundle=bundle,original_request=request,authenticated_history=history,
-                keys=keys,source_sha=config['sourceSha'],host_id=config['hostId'],policy_hash=policy.identity_hash())
+                keys=keys,source_sha=config['sourceSha'],host_id=config['hostId'],policy_hash=policy.identity_hash(),expiry_seconds=900)
             rollback=RollbackPreparationHostV3(original_bundle=bundle,original_request=request,original_history=history,
                 original_archive_store=session.store,original_private_keys={'profile3-config':keys['config']},current_preparation=current['preparer'])
             prepared=rollback.prepare_intent(current['whole_observation'],current['retention_observation'],
