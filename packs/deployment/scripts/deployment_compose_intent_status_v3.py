@@ -143,6 +143,12 @@ class IntentStatusClientV3:
                 fail()
             issued, expiry = payload['issuedAt'], payload['expiresAt']
             current = time.time()
+            # A verified fresh nonce can arrive just ahead of the receiver's
+            # wall clock. Wait at most two seconds; keep strict validity checks
+            # and never retry the RPC or accept a future/expired statement.
+            if type(issued) is int and 0 < issued - current <= 2:
+                time.sleep(issued - current)
+                current = time.time()
             request_expiry = datetime.strptime(request.expires_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp()
             if (type(issued) is not int or type(expiry) is not int
                     or not issued <= current < expiry <= min(issued + 30, request_expiry)):

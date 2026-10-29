@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'packs/deployment/scripts'))
@@ -74,6 +76,25 @@ class IntentStatusTests(unittest.TestCase):
             self.edit = lambda p, changes=changes: dict(p, **changes)
             with self.subTest(changes=changes):
                 self.denied()
+
+    def test_small_receiver_clock_lag_waits_without_accepting_future(self):
+        issued = int(time.time())
+        def transport(rpc):
+            return self.sign(dict(rpc, purpose='consumed-intent-status-v3',
+                issuedAt=issued, expiresAt=issued+20, consumed=True,
+                authorityGranted=False, runtimePermit=False, productionReady=False))
+        self.client._transport = transport
+        import deployment_compose_intent_status_v3 as module
+        clock = SimpleNamespace(time=Mock(side_effect=[issued-.5, issued+.01]), sleep=Mock())
+        with patch.object(module, 'time', clock):
+            self.client.check_consumed_intent(self.req)
+        clock.sleep.assert_called_once_with(.5)
+        clock.time.side_effect = [issued-.5, issued-.1]
+        with patch.object(module, 'time', clock): self.denied()
+        clock.sleep.reset_mock()
+        clock.time.side_effect = [issued-3]
+        with patch.object(module, 'time', clock): self.denied()
+        clock.sleep.assert_not_called()
 
     def test_exact_request_profiles_and_production(self):
         for req in (replace(self.req, plan_hash='0'*64), replace(self.req, host_id='other')):
