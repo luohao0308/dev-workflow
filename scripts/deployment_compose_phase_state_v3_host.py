@@ -4,11 +4,14 @@ The embedding supplies the trusted local Unix socket and pinned identity. This
 object is never attached to the TLS reader gateway: its output contains secrets.
 Exact types enforce the embedding contract; they do not authenticate a machine.
 """
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 import re
 import json
 import hashlib
+import time
+import deployment_runtime as runtime
 
 from deployment_compose_reader_host import _UnixDocker, _complete_json_response
 from deployment_compose_phase_guard_v3_host import PhaseGuardV3, protected_state_digest, baseline_state_bytes
@@ -26,13 +29,33 @@ class TrustedPhaseStateProducerV3:
             raise ValueError('compose-phase-state-v3-rejected')
         self.project, self.daemon_id, self.container_ids = project, daemon_id, container_ids
         self._socket_path, self._timeout = socket_path, timeout
+        self._deadline = None
+
+    @contextmanager
+    def operation_scope(self, deadline):
+        if (self._deadline is not None or type(deadline) not in (int, float)
+                or not time.monotonic() < deadline <= time.monotonic()+180):
+            raise ValueError('compose-phase-state-v3-rejected')
+        self._deadline = deadline
+        try:
+            yield
+        finally:
+            self._deadline = None
 
     def _get(self, path):
-        connection = _UnixDocker(self._socket_path, self._timeout)
+        deadline = time.monotonic()+self._timeout
+        if self._deadline is not None: deadline = min(deadline,self._deadline)
+        remaining = deadline-time.monotonic()
+        if remaining <= 0: raise ValueError('compose-phase-state-v3-rejected')
+        connection = _UnixDocker(self._socket_path, remaining)
+        watchdog = None
         try:
+            connection.connect()
+            watchdog = runtime.deadline_watchdog(connection.sock, deadline)
             connection.request('GET', path, headers={'Accept': 'application/json'})
             return _complete_json_response(connection.getresponse())[1]
         finally:
+            if watchdog is not None: watchdog.cancel()
             connection.close()
 
     def capture(self):

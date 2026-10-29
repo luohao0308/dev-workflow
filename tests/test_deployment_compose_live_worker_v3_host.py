@@ -7,6 +7,8 @@ from pathlib import Path
 import ssl
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -59,6 +61,48 @@ class WorkerTests(unittest.TestCase):
         with patch.object(worker,'write_frame') as output,self.assertRaises(ValueError):
             channel.rpc('witness','read',{})
         output.assert_not_called();self.assertTrue(channel.failed)
+
+    def test_rpc_transaction_is_serialized_with_local_reply_id(self):
+        channel=worker.Channel(config(),Mock(),Mock())
+        entered=threading.Event();release=threading.Event();started=threading.Event()
+        frames=[];results=[];errors=[];second_sent=threading.Event()
+        def output(stream,value,**kwargs):
+            frames.append(value)
+            if len(frames)>1:second_sent.set()
+        def input_frame(*args,**kwargs):
+            if len(frames)==1:
+                entered.set()
+                if not release.wait(3):raise TimeoutError()
+            frame=frames[-1]
+            return dict(kind='reply',channelNonce=config()['channelNonce'],rpcId=frame['rpcId'],response=frame['rpcId'])
+        def call():
+            try:results.append(channel.rpc('witness','read',{}))
+            except BaseException as error:errors.append(error)
+        def second():started.set();call()
+        with patch.object(worker,'write_frame',side_effect=output),patch.object(worker,'read_frame',side_effect=input_frame):
+            first=threading.Thread(target=call);other=threading.Thread(target=second)
+            first.start()
+            try:
+                self.assertTrue(entered.wait(3));other.start();self.assertTrue(started.wait(3))
+                self.assertFalse(second_sent.wait(.1))
+                self.assertEqual(channel.count,1)
+                self.assertEqual(len(frames),1)
+            finally:
+                release.set();first.join(3)
+                if other.ident is not None:other.join(3)
+        self.assertFalse(first.is_alive());self.assertFalse(other.is_alive())
+        self.assertEqual(errors,[]);self.assertEqual(sorted(results),[1,2])
+
+    def test_rpc_deadline_is_shared_and_failure_never_retries(self):
+        channel=worker.Channel(config(),Mock(),Mock())
+        with channel.operation_scope(time.monotonic()+2):
+            with patch.object(worker,'write_frame') as output,patch.object(worker,'read_frame',side_effect=TimeoutError()) as read:
+                with self.assertRaises(TimeoutError):channel.rpc('witness','read',{})
+                self.assertLessEqual(output.call_args.kwargs['timeout'],2)
+                self.assertLessEqual(read.call_args.kwargs['timeout'],output.call_args.kwargs['timeout'])
+                with self.assertRaises(ValueError):channel.rpc('witness','read',{})
+                self.assertEqual(output.call_count,1);self.assertEqual(read.call_count,1)
+        self.assertIsNone(channel._step_deadline);self.assertTrue(channel.failed)
 
     def test_no_consent_has_zero_executor_or_product_io(self):
         channel=Mock();channel.receive.side_effect=EOFError('no consent')
@@ -328,8 +372,10 @@ class WorkerIntegrationTests(unittest.TestCase):
                 harness.client.data['/repos/'+request.source.project_path]=dict(id=request.source.project_id,full_name=request.source.project_path)
                 authority=harness.approval([request])
                 return authority,authority.consume(authority.validate(request),request)
-            class LocalChannel:
-                def __init__(self):self.next=None;self.consumptions=0;self.calls=[];self.config=config();self.frames=[]
+            class LocalChannel(worker.Channel):
+                def __init__(self):
+                    super().__init__(config(),None,None)
+                    self.next=None;self.consumptions=0;self.calls=[];self.frames=[]
                 def emit(self,kind,**payload):self.frames.append(dict(kind=kind,**payload))
                 def receive(self,kind):
                     self.assert_kind=kind
@@ -400,6 +446,7 @@ class WorkerIntegrationTests(unittest.TestCase):
                 fence=Profile3StartupFenceV3(original_history=history,reviewed_history=snapshot,
                     quiesce_writer=lambda:history.capture().canonical==snapshot.canonical)
                 h.session.guard=current['guard']
+                h.session.producer=current['private_session'].producer
                 result,child=worker.execute_operation(channel,h.session,fresh,h.policy,b'g'*32,h.public[0],h.public[1],h.tls,tracker,
                     parent=history,reviewed=snapshot,fence=fence)
                 self.assertEqual(result['receipts'],{'backend':'b'*64})

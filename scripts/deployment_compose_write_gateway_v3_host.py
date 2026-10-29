@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import hashlib
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import re
 import socket
 import ssl
 import time
+import threading
 
 from deployment_gateway_host import _UnixDocker, GatewayHostError
 from deployment_gateway import FileWriterGate
@@ -44,7 +45,7 @@ def _complete_response(response):
 
 
 def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
-                      listen=('127.0.0.1', 0), timeout=10):
+                      listen=('127.0.0.1', 0), timeout=10, control_timeout=180, control_deadline=None):
     """Return an unstarted server. Only the trusted coordinator opens generations.
 
     pre_dispatch(method, path, body, generation, attempt_ref) must raise on a
@@ -56,8 +57,14 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             or tls_context.verify_mode != ssl.CERT_REQUIRED
             or not isinstance(docker_socket, Path) or not docker_socket.is_absolute()
             or not callable(pre_dispatch) or type(timeout) not in (int, float)
-            or not 1 <= timeout <= 180 or not hasattr(socket, 'AF_UNIX')):
+            or not 1 <= timeout <= 180 or type(control_timeout) not in (int, float)
+            or not 1 <= control_timeout <= 180
+            or control_deadline is not None and (type(control_deadline) not in (int, float)
+                or not time.monotonic() < control_deadline <= time.monotonic()+180)
+            or not hasattr(socket, 'AF_UNIX')):
         raise GatewayHostError('gateway-host-policy-rejected')
+
+    deadline = time.monotonic()+control_timeout if control_deadline is None else control_deadline
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -106,14 +113,22 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
                 if len(body) != int(lengths[0]):
                     self._deny()
                     return
+                self.server.check_live()
                 pre_dispatch(self.command, self.path, body, generations[0], attempts[0])
+                self.server.check_live()
                 ticket = FileWriterGate.admit(gate, generations[0], attempts[0],
                     method=self.command, path=self.path, body=body, writer_certificate_sha256=peer)
-                connection = _UnixDocker(docker_socket, timeout)
-                connection.connect()
-                watchdog = runtime.deadline_watchdog(connection.sock, time.monotonic() + timeout)
-                connection.request(self.command, self.path, body=body,
-                    headers={'Content-Type': 'application/json', 'Connection': 'close'})
+                # Cancellation and the final forwarding decision share one lock.
+                # The serving thread remains owned until it is drained, even if
+                # forwarding wins the race and its result becomes unknown.
+                with self.server.dispatch_lock:
+                    self.server.check_live()
+                    connection = _UnixDocker(docker_socket, min(timeout, deadline-time.monotonic()))
+                    connection.connect()
+                    self.server.check_live()
+                    watchdog = runtime.deadline_watchdog(connection.sock, min(deadline,time.monotonic()+timeout))
+                    connection.request(self.command, self.path, body=body,
+                        headers={'Content-Type': 'application/json', 'Connection': 'close'})
                 response = connection.getresponse()
                 raw = _complete_response(response)
                 FileWriterGate.finish_response(gate, ticket, definitive=True, status=response.status, body=raw)
@@ -143,8 +158,44 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
 
         do_POST = do_DELETE = do_GET = do_PUT = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _handle
 
-    class WriterServer(ThreadingHTTPServer):
-        daemon_threads = True
+    class WriterServer(HTTPServer):
+        # A private per-step listener has exactly one serving owner. Shutdown
+        # waits for that actual handler, not merely an accept-loop thread.
+        def __init__(self, *args):
+            self.dispatch_lock = threading.Lock()
+            self.cancelled = threading.Event()
+            self.lifecycle_lock = threading.Lock()
+            self.serving = False
+            self.closing = False
+            self.owner = None
+            super().__init__(*args)
+
+        def check_live(self):
+            if self.cancelled.is_set() or time.monotonic() >= deadline:
+                raise GatewayHostError('gateway-control-expired-or-cancelled')
+
+        def cancel(self):
+            with self.dispatch_lock:
+                self.cancelled.set()
+
+        def serve_forever(self, *args, **kwargs):
+            with self.lifecycle_lock:
+                if self.closing: return
+                self.serving = True
+                self.owner = threading.get_ident()
+            try:
+                super().serve_forever(*args, **kwargs)
+            finally:
+                with self.lifecycle_lock:
+                    self.serving = False
+
+        def server_close(self):
+            self.cancel()
+            with self.lifecycle_lock:
+                self.closing = True
+                drain = self.serving and self.owner != threading.get_ident()
+            if drain: self.shutdown()
+            super().server_close()
 
         def finish_request(self, request, client_address):
             request.settimeout(min(timeout, 5))

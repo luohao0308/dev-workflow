@@ -13,6 +13,7 @@ is emitted after the outer probe confirms daemon shutdown and the unchanged
 production snapshot; the controller must also require a successful worker exit.
 """
 import base64
+from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 import ipaddress
@@ -24,6 +25,7 @@ import ssl
 import subprocess
 import sys
 import time
+import threading
 import uuid
 
 from deployment_compose_v3_channel_worker import read_frame, write_frame
@@ -34,6 +36,7 @@ from deployment_compose_history_v3_host import AuthenticatedHistoryV3
 from deployment_gateway import GatePolicy
 
 ENTRYPOINT = 'deployment_compose_live_worker_v3_host.run'
+RPC_TIMEOUT = 90
 KEYS = {'config','image','declaration','archive','target'}
 
 
@@ -60,9 +63,12 @@ class Channel:
         self.deadline = time.monotonic()+3600
         self.count = 0
         self.failed = False
+        self._rpc_lock = threading.Lock()
+        self._step_deadline = None
 
     def timeout(self):
-        left=self.deadline-time.monotonic()
+        deadline=min(self.deadline,self._step_deadline) if self._step_deadline is not None else self.deadline
+        left=deadline-time.monotonic()
         if self.failed or left <= 0: reject()
         return min(900,left)
 
@@ -81,14 +87,42 @@ class Channel:
             self.failed=True
             raise
 
+    @contextmanager
+    def operation_scope(self, deadline):
+        with self._rpc_lock:
+            if self._step_deadline is not None or deadline <= time.monotonic(): reject()
+            self._step_deadline = deadline
+        try:
+            yield
+        finally:
+            with self._rpc_lock:
+                self._step_deadline = None
+
     def rpc(self, service, method, request):
-        if self.count >= 4096: self.failed=True; reject()
-        self.count+=1
-        self.emit('rpc',rpcId=self.count,service=service,method=method,request=request)
-        reply=self.receive('reply')
-        if set(reply) != {'rpcId','response'} or reply['rpcId'] != self.count:
-            self.failed=True; reject()
-        return reply['response']
+        acquired = False
+        try:
+            deadline = time.monotonic() + min(RPC_TIMEOUT, self.timeout())
+            acquired = self._rpc_lock.acquire(timeout=max(0, deadline-time.monotonic()))
+            if not acquired: reject()
+            def remaining():
+                left = min(deadline-time.monotonic(), self.timeout())
+                if left <= 0: reject()
+                return left
+            if self.count >= 4096: reject()
+            self.count += 1
+            rpc_id = self.count
+            write_frame(self.stdout,private_json(dict(kind='rpc',channelNonce=self.config['channelNonce'],
+                rpcId=rpc_id,service=service,method=method,request=request)),timeout=remaining())
+            reply=read_frame(self.stdin,timeout=remaining())
+            if (type(reply) is not dict or set(reply)!={'kind','channelNonce','rpcId','response'}
+                    or reply['kind']!='reply' or reply['channelNonce']!=self.config['channelNonce']
+                    or type(reply['rpcId']) is not int or reply['rpcId']!=rpc_id): reject()
+            return reply['response']
+        except BaseException:
+            self.failed = True
+            raise
+        finally:
+            if acquired: self._rpc_lock.release()
 
 
 def writer_tls(root):
@@ -274,6 +308,10 @@ def execute_operation(channel, session, prepared, policy, gate_key, public, stat
     history=AuthenticatedHistoryV3(bundle,request,gate_policy=policy,gate_key=gate_key,
         consumption_receipt_hash=consumed['receiptHash'],witness_client=factory(binding),witness_client_factory=factory,
         parent_history=parent,reviewed_parent_snapshot=reviewed)
+    @contextmanager
+    def operation_scope(deadline):
+        with channel.operation_scope(deadline), session.producer.operation_scope(deadline):
+            yield
     server,client,pin,_=tls
     session.unknown_write_result=True; tracker.mark_product_pending()
     try:
@@ -281,7 +319,7 @@ def execute_operation(channel, session, prepared, policy, gate_key, public, stat
             gate_root=session.root/('live-gate-'+request.digest()),gate_key=gate_key,gate_policy=policy,
             consumption_receipt_hash=consumed['receiptHash'],witness_client_factory=factory,
             registered_binding=binding,tls_server_context=server,tls_client_context=client,
-            server_certificate_sha256=pin,docker_socket=Path(session.target.socket),startup_fence=fence)
+            server_certificate_sha256=pin,docker_socket=Path(session.target.socket),startup_fence=fence,operation_scope=operation_scope)
         def verify(receipts):
             done=bundle.creation_operations()
             op=bundle.resolve_operations(dict(receipts))[len(done)]
@@ -414,6 +452,7 @@ def run(config, stdin, stdout):
                 return history.capture().canonical==snapshot.canonical
             fence=Profile3StartupFenceV3(original_history=history,reviewed_history=snapshot,quiesce_writer=quiesce)
             session.guard=current['guard']
+            session.producer=current['private_session'].producer
             result,child=execute_operation(channel,session,prepared,policy,gate_key,public,status,tls,tracker,
                 parent=history,reviewed=snapshot,fence=fence)
             final_history=json.loads(child.capture().canonical)

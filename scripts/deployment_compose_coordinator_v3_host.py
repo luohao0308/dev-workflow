@@ -4,6 +4,7 @@ The embedding owns authenticated source/HMAC construction, startup/session lifec
 consumption receipt validation and the initial independent witness registration.
 Private results contain Engine response bodies; never publish them as review output.
 """
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
@@ -12,6 +13,7 @@ import json
 from pathlib import Path
 import ssl
 import threading
+import time
 from types import MappingProxyType
 
 from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3
@@ -23,6 +25,7 @@ from deployment_contract_v2 import RequestV2
 from deployment_gateway import FileWriterGate, GatePolicy
 from deployment_gate_witness import opening_scope
 from deployment_compose_write_gateway_v3_host import create_gateway_v3, _complete_response
+import deployment_runtime as runtime
 from deployment_compose_operation_witness_v3 import MAX_EVENTS, MAX_SCOPES
 
 
@@ -60,7 +63,7 @@ class Profile3StepExecutor:
                  gate_root, gate_key, gate_policy, consumption_receipt_hash,
                  witness_client_factory, registered_binding, tls_server_context,
                  tls_client_context, server_certificate_sha256, docker_socket, timeout=10,
-                 startup_fence=None):
+                 startup_fence=None, control_timeout=180, operation_scope=None):
         if (type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
                 or type(intent_authority) not in (GitHubFullBodyApprovalV3, IntentStatusClientV3)
                 or not callable(phase_guard) or not callable(witness_client_factory)
@@ -72,7 +75,9 @@ class Profile3StepExecutor:
                 or not isinstance(tls_server_context, ssl.SSLContext)
                 or tls_server_context.verify_mode != ssl.CERT_REQUIRED
                 or not isinstance(docker_socket, Path) or not docker_socket.is_absolute()
-                or not 1 <= timeout <= 180):
+                or type(control_timeout) not in (int, float) or not 1 <= control_timeout <= 180
+                or operation_scope is not None and not callable(operation_scope)
+                or type(timeout) not in (int, float) or not 1 <= timeout <= 180):
             reject()
         check_witness_capacity(bundle)
         v = bundle.to_dict(); identity = v['identity']
@@ -98,6 +103,8 @@ class Profile3StepExecutor:
         self._resume = None
         self._lock = threading.Lock()
         self._evidence = []
+        self._control_timeout = control_timeout
+        self._operation_scope = operation_scope or (lambda deadline: nullcontext())
         from deployment_compose_witness_budget_v3_host import check_witness_byte_capacity
         if request.operation == 'deploy':
             check_witness_byte_capacity(bundle, request, gate_policy, self._receipt,
@@ -140,90 +147,104 @@ class Profile3StepExecutor:
 
     def execute(self, operation, *, phase_index, receipts, completed_operations):
         with self._lock:
-            if self._blocked:
-                reject()
-            self._blocked = True  # Every exceptional exit permanently quarantines this object.
-            operation = deepcopy(operation); receipts = deepcopy(receipts)
-            if phase_index != self._index or operation['method'] not in ('POST', 'DELETE'):
-                reject()
-            expected = (self.bundle.creation_operations() if operation['phase'] == 'create'
-                        else self.bundle.resolve_operations(receipts))
-            writes = [op for op in expected if op['method'] != 'GET']
-            if phase_index >= len(writes) or operation != writes[phase_index]:
-                reject()
-            body = b'' if operation['body'] is None else canonical(operation['body'])
-            if (hashlib.sha256(body).hexdigest() != operation['bodyDigest']
-                    or digest({k: operation[k] for k in ('method', 'path', 'bodyDigest')}) != operation['requestDigest']):
-                reject()
-            snapshot = immutable(dict(phase_index=phase_index, operation=operation, receipts=receipts,
-                                      completed_operations=deepcopy(completed_operations)))
-            def guard(*args):
-                self._authority.check_consumed_intent(self.request)
-                if self._guard(snapshot) is not True:
-                    reject()
-            guard()
-            desc = self.scope_descriptor(self.bundle, self.request, self._receipt, operation, phase_index, receipts)
-            binding = dict(self._binding, generation=desc['generation'], scopeHash=desc['scopeHash'])
-            policy = replace(self._policy, witness_scope_hash=desc['scopeHash'])
-            if binding['policyHash'] != policy.identity_hash():
-                reject()
-            if self._client is None:
-                if binding != self._binding:
-                    reject()
-            else:
-                parent = self._client.read()
-                if parent['phase'] != 'closed' or parent['seq'] != 6 or not parent['active']:
-                    reject()
-                self._client.transition_successor(expected_seq=6, expected_head=parent['head'], childBinding=binding)
-            client = self._factory(deepcopy(binding))
-            if type(client) is not OperationWitnessClientV3 or client.binding != binding:
-                reject()
-            empty = client.check(expected_seq=0, expected_head='0'*64)
-            if (empty['active'] is not True or empty['phase'] != 'empty'
-                    or (self.request.operation == 'deploy' and self._index == 0 and empty['lineage'])):
-                reject()
-            adapter = GateOperationWitnessAdapterV3(client)
-            gate = FileWriterGate(policy, self._root, key=self._key, witness=adapter)
-            server = create_gateway_v3(gate, tls_context=self._server_tls, docker_socket=self._socket,
-                                       pre_dispatch=guard, timeout=self._timeout)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            connection = None
+            if self._blocked: reject()
+            self._blocked = True
+            deadline = time.monotonic() + self._control_timeout
             try:
-                guard()
-                session = gate.open_generation(generation=desc['generation'], request_hash=self.request.digest(),
-                    receipt_hash=self._receipt, operations=desc['operations'], source_context_digest=desc['source'])
-                attempt = session.prepare_attempt(operation['method'], operation['path'], body)
-                headers = session.headers(attempt)
-                headers.update({'Content-Length': str(len(body)), 'Content-Type': 'application/json', 'Connection': 'close'})
-                thread.start()
-                connection = http.client.HTTPSConnection('localhost', server.server_port,
-                    context=self._client_tls, timeout=self._timeout)
-                connection.connect()
-                if hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest() != self._pin:
-                    reject()
-                connection.request(operation['method'], operation['path'], body=body, headers=headers)
-                response = connection.getresponse(); raw = _complete_response(response)
-                proof = gate.close_generation(desc['generation'])
-                evidence = gate.generation_evidence(desc['generation'])
-                # A gateway denial/unknown response cannot masquerade as a recorded Engine response.
-                finishes = [e['data'] for e in evidence['events'] if e['kind'] == 'finish']
-                import base64
-                if len(finishes) != 1 or not finishes[0]['definitive'] or finishes[0]['status'] != response.status or base64.b64decode(finishes[0]['bodyBase64']) != raw:
-                    reject()
-                result = dict(status=response.status, body=raw, closure=proof.to_json(),
-                              gateEvidence=evidence, witness=adapter.authenticated_material_after(),
-                              binding=binding, productionReady=False, fullTrust=False)
-                self._evidence.append(deepcopy(result))
-                if response.status != operation['expectedStatus']:
-                    reject()
-                self._client = client; self._binding = binding; self._index += 1; self._blocked = False
-                return result
-            finally:
-                if connection is not None:
-                    connection.close()
-                if thread.is_alive():
-                    server.shutdown(); thread.join()
-                server.server_close()
+                with self._operation_scope(deadline):
+                    return self._execute(operation, phase_index=phase_index, receipts=receipts,
+                                         completed_operations=completed_operations, deadline=deadline)
+            except BaseException:
+                self._blocked = True
+                raise
+
+    def _execute(self, operation, *, phase_index, receipts, completed_operations, deadline):
+        operation = deepcopy(operation); receipts = deepcopy(receipts)
+        if phase_index != self._index or operation['method'] not in ('POST', 'DELETE'):
+            reject()
+        expected = (self.bundle.creation_operations() if operation['phase'] == 'create'
+                    else self.bundle.resolve_operations(receipts))
+        writes = [op for op in expected if op['method'] != 'GET']
+        if phase_index >= len(writes) or operation != writes[phase_index]:
+            reject()
+        body = b'' if operation['body'] is None else canonical(operation['body'])
+        if (hashlib.sha256(body).hexdigest() != operation['bodyDigest']
+                or digest({k: operation[k] for k in ('method', 'path', 'bodyDigest')}) != operation['requestDigest']):
+            reject()
+        snapshot = immutable(dict(phase_index=phase_index, operation=operation, receipts=receipts,
+                                  completed_operations=deepcopy(completed_operations)))
+        def guard(*args):
+            if time.monotonic() >= deadline: reject()
+            self._authority.check_consumed_intent(self.request)
+            if time.monotonic() >= deadline: reject()
+            if self._guard(snapshot) is not True or time.monotonic() >= deadline:
+                reject()
+        guard()
+        desc = self.scope_descriptor(self.bundle, self.request, self._receipt, operation, phase_index, receipts)
+        binding = dict(self._binding, generation=desc['generation'], scopeHash=desc['scopeHash'])
+        policy = replace(self._policy, witness_scope_hash=desc['scopeHash'])
+        if binding['policyHash'] != policy.identity_hash():
+            reject()
+        if self._client is None:
+            if binding != self._binding:
+                reject()
+        else:
+            parent = self._client.read()
+            if parent['phase'] != 'closed' or parent['seq'] != 6 or not parent['active']:
+                reject()
+            self._client.transition_successor(expected_seq=6, expected_head=parent['head'], childBinding=binding)
+        client = self._factory(deepcopy(binding))
+        if type(client) is not OperationWitnessClientV3 or client.binding != binding:
+            reject()
+        empty = client.check(expected_seq=0, expected_head='0'*64)
+        if (empty['active'] is not True or empty['phase'] != 'empty'
+                or (self.request.operation == 'deploy' and self._index == 0 and empty['lineage'])):
+            reject()
+        adapter = GateOperationWitnessAdapterV3(client)
+        gate = FileWriterGate(policy, self._root, key=self._key, witness=adapter)
+        server = create_gateway_v3(gate, tls_context=self._server_tls, docker_socket=self._socket,
+                                   pre_dispatch=guard, timeout=self._timeout, control_deadline=deadline)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        connection = watchdog = None
+        try:
+            guard()
+            session = gate.open_generation(generation=desc['generation'], request_hash=self.request.digest(),
+                receipt_hash=self._receipt, operations=desc['operations'], source_context_digest=desc['source'])
+            attempt = session.prepare_attempt(operation['method'], operation['path'], body)
+            headers = session.headers(attempt)
+            headers.update({'Content-Length': str(len(body)), 'Content-Type': 'application/json', 'Connection': 'close'})
+            thread.start()
+            connection = http.client.HTTPSConnection('localhost', server.server_port,
+                context=self._client_tls, timeout=max(.001,deadline-time.monotonic()))
+            connection.connect()
+            watchdog = runtime.deadline_watchdog(connection.sock, deadline)
+            if hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest() != self._pin:
+                reject()
+            connection.request(operation['method'], operation['path'], body=body, headers=headers)
+            response = connection.getresponse(); raw = _complete_response(response)
+            proof = gate.close_generation(desc['generation'])
+            evidence = gate.generation_evidence(desc['generation'])
+            # A gateway denial/unknown response cannot masquerade as a recorded Engine response.
+            finishes = [e['data'] for e in evidence['events'] if e['kind'] == 'finish']
+            import base64
+            if len(finishes) != 1 or not finishes[0]['definitive'] or finishes[0]['status'] != response.status or base64.b64decode(finishes[0]['bodyBase64']) != raw:
+                reject()
+            result = dict(status=response.status, body=raw, closure=proof.to_json(),
+                          gateEvidence=evidence, witness=adapter.authenticated_material_after(),
+                          binding=binding, productionReady=False, fullTrust=False)
+            self._evidence.append(deepcopy(result))
+            if response.status != operation['expectedStatus']:
+                reject()
+            self._client = client; self._binding = binding; self._index += 1; self._blocked = False
+            return result
+        finally:
+            server.cancel()
+            if watchdog is not None: watchdog.cancel()
+            if connection is not None:
+                connection.close()
+            if thread.is_alive():
+                server.shutdown(); thread.join()
+            server.server_close()
 
     def private_evidence(self):
         return deepcopy(self._evidence)
