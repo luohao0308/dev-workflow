@@ -17,7 +17,7 @@ from deployment_compose_full_body_review_contract import (
 from deployment_compose_bundle_v3 import ExecutionBundleV3
 from deployment_contract_v2 import RequestV2
 from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3
-from release_github import GitHubClient
+from release_github import GitHubClient, GitHubUnavailable
 
 CONFIG = dict(DW_AUTH_LEDGER_REPOSITORY='luohao0308/dev-workflow-authority-ledger',
               DW_AUTH_LEDGER_ID='1436718662',
@@ -67,7 +67,15 @@ class GitHubLiveReviewV3:
         return GitHubFullBodyApprovalV3(self.client, token, [request], policy)
 
     def _get(self, suffix):
-        return self.client.request('GET', '/repos/' + REPOSITORY + suffix)[0]
+        # Read-only polling may tolerate transient transport failures. Mutations
+        # and approval consumption deliberately do not use this retry loop.
+        for attempt in range(3):
+            try:
+                return self.client.request('GET', '/repos/' + REPOSITORY + suffix)[0]
+            except GitHubUnavailable:
+                if attempt == 2:
+                    raise
+                time.sleep(attempt + 1)
 
     def _environment(self):
         repo = self._get('')

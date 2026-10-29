@@ -38,6 +38,20 @@ class LiveReviewTests(unittest.TestCase):
         with self.assertRaises(live.LiveReviewBlocked):
             live._private(live.REPO_ROOT, 0o700, True)
 
+    def test_read_only_transport_retry_is_bounded(self):
+        self.host.client.request.side_effect = [live.GitHubUnavailable('offline'), ({'ok': True}, {})]
+        with patch.object(live.time, 'sleep') as sleep:
+            self.assertEqual(self.host._get('/approvals'), {'ok': True})
+        self.assertEqual(self.host.client.request.call_count, 2)
+        self.assertTrue(all(c.args[0] == 'GET' for c in self.host.client.request.call_args_list))
+        sleep.assert_called_once_with(1)
+        self.host.client.request.reset_mock()
+        self.host.client.request.side_effect = live.GitHubUnavailable('offline')
+        with patch.object(live.time, 'sleep') as sleep:
+            with self.assertRaises(live.GitHubUnavailable): self.host._get('/approvals')
+        self.assertEqual(self.host.client.request.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_approval_uses_default_verifier(self):
         with patch.object(live, 'GitHubFullBodyApprovalV3') as approval:
             self.host._approval('a.b.c', 'request', 'policy')
