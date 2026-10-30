@@ -40,6 +40,12 @@ class ProbeTests(unittest.TestCase):
             if process.poll() is None:process.kill();process.wait(timeout=3)
             process.stdin.close();process.stdout.close();process.stderr.close()
 
+    def test_clock_lag_beyond_budget_reports_fixed_case_and_remains_rejected(self):
+        code = probe.REMOTE.replace("1 if case=='lag-one-second'", "3 if case=='lag-one-second'")
+        self.assertNotEqual(code, probe.REMOTE)
+        with self.assertRaisesRegex(ValueError, '^matrix-failed:lag-one-second$'):
+            probe._run([sys.executable, '-I', '-u', '-c', code])
+
     def test_transport_pins_and_alias_rejection(self):
         with patch.object(probe,'_run',return_value={}) as run:
             probe.run_probe('xterminal-server')

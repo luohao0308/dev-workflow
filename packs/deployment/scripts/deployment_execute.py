@@ -741,11 +741,11 @@ def main(argv=None):
                            validation='scope-specific', availability='trusted-host-required', productionReady=False),
                       dict(target='docker-compose', execution='unsupported', implementation='unsupported',
                            preparation='local-foundations', validation='none', availability='unsupported',
-                           blockers=['trusted-report-producers-required', 'real-linux-engine-sample-required',
+                           blockers=['trusted-report-producers-required',
                                      'engine-reconstruction-validation-required',
-                                     'independent-anchor-and-writer-gate-required',
-                                     'restricted-writer-and-recovery-required',
-                                     'remote-windows-ci-required'], productionReady=False),
+                                     'product-writer-deploy-rollback-validation-required',
+                                     'phase-crash-recovery-validation-required',
+                                     'production-trust-enrollment-required'], productionReady=False),
                       dict(target='local-deployment', execution='unsupported', implementation='unsupported',
                            validation='none', availability='unsupported', productionReady=False)])
     if args.action == 'execute':

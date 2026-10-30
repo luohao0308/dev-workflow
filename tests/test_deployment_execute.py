@@ -730,7 +730,15 @@ class ComposeCapabilityBoundaryTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(compose['preparation'], 'local-foundations')
         self.assertEqual(compose['execution'], 'unsupported')
-        self.assertIn('restricted-writer-and-recovery-required', compose['blockers'])
+        self.assertEqual(compose['blockers'], [
+            'trusted-report-producers-required',
+            'engine-reconstruction-validation-required',
+            'product-writer-deploy-rollback-validation-required',
+            'phase-crash-recovery-validation-required',
+            'production-trust-enrollment-required'])
+        self.assertEqual(compose['implementation'], 'unsupported')
+        self.assertEqual(compose['availability'], 'unsupported')
+        self.assertEqual(compose['validation'], 'none')
         self.assertFalse(value['executionAvailable'] or compose['productionReady'])
 
 

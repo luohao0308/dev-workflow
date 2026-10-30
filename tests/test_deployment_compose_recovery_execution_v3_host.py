@@ -33,7 +33,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     setUpClass = classmethod(tls_fixture.WriteGatewayTests.setUpClass.__func__)
     tearDownClass = classmethod(tls_fixture.WriteGatewayTests.tearDownClass.__func__)
 
-    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False):
+    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None):
         kw, observation = prepare_fixture.fixture()
         kw['source'] = approval_fixture.request().source
         prepared = ComposePreparationHostV3(**kw).prepare_intent(observation, observation,
@@ -135,27 +135,32 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         h.policy=replace(h.policy,writer_certificate_sha256=cert)
         h.binding=dict(h.binding,policyHash=h.policy.identity_hash())
         # Each historical write is genuinely signed, consumed and closed by FileWriterGate.
-        for index,op in enumerate(write_operations[:count]):
-            h.index=index
-            # The shared one-service helper assumes all receipts after create one.
-            # Build the same real scope explicitly for a partial multi-create prefix.
-            if 0 < len(h.receipts) < len(services):
-                from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
-                h.op=op
-                descriptor=Profile3StepExecutor.scope_descriptor(bundle,request,h.receipt,op,index,h.receipts)
-                next_binding=dict(h.binding,generation=descriptor['generation'],scopeHash=descriptor['scopeHash'])
-                view=h.client.read()
-                h.client.transition_successor(expected_seq=view['seq'],expected_head=view['head'],childBinding=next_binding)
-                h.binding=next_binding;h.client=h.factory(next_binding)
-                h.adapter=GateOperationWitnessAdapterV3(h.client)
-                h.policy=replace(h.policy,witness_scope_hash=descriptor['scopeHash'])
-                h.gen=descriptor['generation'];h.request=request.digest();h.source=descriptor['source'];h.ops=descriptor['operations']
-                h.body=b'' if op['body'] is None else canonical(op['body']);h.current_gate=h.gate()
-            else:
-                h.open_scope()
-            body=apply(op)
-            h.finish(status=201 if op['phase']=='create' else 204,body=body)
-            if op['phase']=='create': h.receipts[op['service']]=receipts[op['service']]
+        quiesce_writer = lambda: True
+        if prefix_runner is not None:
+            quiesce_writer = prefix_runner(h, write_operations[:count], socket_path, writes, store, bundle)
+            writes.clear()
+        else:
+            for index,op in enumerate(write_operations[:count]):
+                h.index=index
+                # The shared one-service helper assumes all receipts after create one.
+                # Build the same real scope explicitly for a partial multi-create prefix.
+                if 0 < len(h.receipts) < len(services):
+                    from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
+                    h.op=op
+                    descriptor=Profile3StepExecutor.scope_descriptor(bundle,request,h.receipt,op,index,h.receipts)
+                    next_binding=dict(h.binding,generation=descriptor['generation'],scopeHash=descriptor['scopeHash'])
+                    view=h.client.read()
+                    h.client.transition_successor(expected_seq=view['seq'],expected_head=view['head'],childBinding=next_binding)
+                    h.binding=next_binding;h.client=h.factory(next_binding)
+                    h.adapter=GateOperationWitnessAdapterV3(h.client)
+                    h.policy=replace(h.policy,witness_scope_hash=descriptor['scopeHash'])
+                    h.gen=descriptor['generation'];h.request=request.digest();h.source=descriptor['source'];h.ops=descriptor['operations']
+                    h.body=b'' if op['body'] is None else canonical(op['body']);h.current_gate=h.gate()
+                else:
+                    h.open_scope()
+                body=apply(op)
+                h.finish(status=201 if op['phase']=='create' else 204,body=body)
+                if op['phase']=='create': h.receipts[op['service']]=receipts[op['service']]
         parent=h.history()
         prep=RecoveryPreparationHostV3(original_history=parent,store=store,phase_guard=guard,readiness=readiness)
         recovery=prep.prepare_intent(operation_nonce='e'*64,expires_at=recovery_fixture.expiry())
@@ -178,7 +183,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         client_tls=ssl.create_default_context(cafile=self.directory/'ca.pem')
         client_tls.load_cert_chain(self.directory/'client.pem',self.directory/'client.key')
         fence=Profile3RecoveryFenceV3(preparation=prep,context_reference=recovery['recovery_context_reference'],
-            reviewed_history=reviewed,quiesce_writer=lambda:True)
+            reviewed_history=reviewed,quiesce_writer=quiesce_writer)
         args=dict(intent_authority=authority,phase_guard=guard,gate_root=self.root/'recovery-gate',
             gate_key=b'g'*32,gate_policy=gate_policy,consumption_receipt_hash=receipt,
             witness_client_factory=h.factory,registered_binding=binding,tls_server_context=server_tls,
@@ -203,6 +208,9 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         self.assertEqual(writes,write_operations[count:])
         self.assertEqual(result['initialWriteCount'],count)
         self.assertEqual(result['receipts'],receipts)
+        for protected in bundle.to_dict()['protectedContainers']:
+            cid = protected['containerId']
+            self.assertEqual(rows[cid], baseline[cid])
         child_client=h.factory(executor._binding)
         from deployment_compose_history_v3_host import AuthenticatedHistoryV3
         child=AuthenticatedHistoryV3(bundle,req,gate_policy=gate_policy,gate_key=b'g'*32,

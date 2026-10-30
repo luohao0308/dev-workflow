@@ -145,8 +145,12 @@ def _run(argv):
             if type(result) is not dict or result.get('kind')!='result' or len(result.get('cases',[]))!=len(CASES):raise ValueError('unexpected-result')
             expected={'valid':None,'lag-one-second':None,'future':'time-validity','expired':'time-validity',
                       'bad-signature':'signature-verification','wrong-nonce':'response-binding','wrong-hash':'response-binding'}
-            for case,row in zip(CASES,result['cases']):
-                if row['case']!=case or row['stage']!=expected[case] or row['outcome']!=('accepted' if expected[case] is None else 'rejected'):raise ValueError('matrix-failed')
+            failed_cases = [case for case, row in zip(CASES, result['cases'])
+                            if row['case'] != case or row['stage'] != expected[case]
+                            or row['outcome'] != ('accepted' if expected[case] is None else 'rejected')]
+            if failed_cases:
+                # Only fixed local case names enter errors, never remote text.
+                raise ValueError('matrix-failed:' + ','.join(failed_cases))
             process.stdin.close();process.wait(timeout=10)
             if process.returncode:raise ValueError('worker-failed')
             return dict(success=True,diagnosticOnly=True,authorityGranted=False,dockerWrites=0,productionReady=False,
