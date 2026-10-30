@@ -18,7 +18,7 @@ from tests import test_deployment_compose_approval_v3_host as approvals
 from tests.test_release_host import claims
 from deployment_compose_bundle_v3 import ExecutionBundleV3,FIELDS
 from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3,AUDIENCE
-from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3
+from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3, LiveAdmissionRejected
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
 from deployment_compose_operation_witness_client_v3 import OperationWitnessClientV3
 from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
@@ -201,6 +201,43 @@ class AdmissionTests(unittest.TestCase):
         self.assertFalse((directory/'state.json').exists())
         self.assertIsNone(host._current)
         self.assertEqual(host._bindings,{})
+
+    def test_consumed_registration_retries_read_without_reconsuming(self):
+        from deployment_compose_live_review_v3_host import _ReadRetryGitHubClient as ReadRetryGitHubClient
+        directory=self.root/'retry-witness';directory.mkdir(mode=0o700)
+        store=OperationWitnessStoreV3(directory,key=b'z'*32);self.addCleanup(store.close)
+        host=MacLiveAdmissionV3(store=store,gate_policy=self.policy,gate_key=self.gate_key,
+            witness_signer=self.signers[0],witness_public_key=self.public[0],
+            intent_signer=self.signers[1],intent_public_key=self.public[1])
+        original=self.approval.client;posts=original.posts;methods=[]
+        def transport(method,path,payload):
+            methods.append(method)
+            if len(methods)==1:raise OSError('transient synthetic failure')
+            value,headers=original.request(method,path,payload)
+            return 200,headers,value
+        self.approval.client=ReadRetryGitHubClient('synthetic-test-only',transport=transport)
+        with patch('deployment_compose_live_review_v3_host.time.sleep'):
+            binding=host.register_intent(self.bundle,self.request,self.approval,self.consumption)
+        self.assertEqual(store.read(binding)['seq'],0)
+        self.assertEqual(original.posts,posts)
+        self.assertTrue(all(method=='GET' for method in methods))
+        self.assertGreater(len(methods),1)
+
+    def test_registration_network_failure_has_private_stage_and_no_state(self):
+        from release_github import GitHubUnavailable
+        directory=self.root/'network-witness';directory.mkdir(mode=0o700)
+        store=OperationWitnessStoreV3(directory,key=b'z'*32);self.addCleanup(store.close)
+        host=MacLiveAdmissionV3(store=store,gate_policy=self.policy,gate_key=self.gate_key,
+            witness_signer=self.signers[0],witness_public_key=self.public[0],
+            intent_signer=self.signers[1],intent_public_key=self.public[1])
+        with patch.object(self.approval,'check_consumed_intent',side_effect=GitHubUnavailable('private-secret')):
+            with self.assertRaises(LiveAdmissionRejected) as caught:
+                host.register_intent(self.bundle,self.request,self.approval,self.consumption)
+        self.assertEqual(caught.exception.stage,'consent')
+        self.assertEqual(caught.exception.cause_type,'GitHubUnavailable')
+        self.assertNotIn('private-secret',str(caught.exception))
+        self.assertFalse((directory/'state.json').exists())
+        self.assertIsNone(host._current)
 
     def test_registration_capacity_fails_before_register_once(self):
         directory=self.root/'second-witness';directory.mkdir(mode=0o700)

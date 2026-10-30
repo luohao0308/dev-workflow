@@ -38,6 +38,14 @@ ROOT=Path(__file__).resolve().parents[1]
 SSH_KEYGEN='/usr/bin/ssh-keygen'
 
 
+class LiveAdmissionRejected(ValueError):
+    """Private fixed-stage diagnostics; never includes provider payloads."""
+    def __init__(self, stage, cause_type):
+        super().__init__('compose-live-admission-v3-rejected')
+        self.stage = stage
+        self.cause_type = cause_type
+
+
 def reject():
     raise ValueError('compose-live-admission-v3-rejected') from None
 
@@ -132,6 +140,7 @@ class MacLiveAdmissionV3:
     def register_intent(self,bundle,request,approval,consumption,reviewed_parent=None):
         """Controller-only registration after trusted preparation and real consume."""
         with self._lock:
+            stage = 'identity'
             try:
                 if (type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
                         or type(approval) is not GitHubFullBodyApprovalV3
@@ -145,23 +154,31 @@ class MacLiveAdmissionV3:
                         or len(request.protected_components)!=len(bundle.to_dict()['protectedContainers'])
                         or request.after_hash!=_digest({s['name']:s['targetCreateBody'] for s in bundle.to_dict()['services']})):
                     reject()
+                stage = 'consumption-time'
                 when=datetime.fromisoformat(consumption.consumed_at)
                 if when.tzinfo is None or when>datetime.now(timezone.utc):reject()
                 entry=dict(bundle=bundle,request=request,approval=approval,consumption=consumption,
                     receiptHash=_digest(asdict(consumption)),parentHistory=None,parentSnapshot=None)
+                stage = 'consent'
                 self._consent(entry)
+                stage = 'scope'
                 scope=self._scope(entry,0,{})
                 entry['first']=scope['binding']
                 # Constructor validates full RequestV2/bundle identity, even before a read.
+                stage = 'history'
                 self._history(entry)
                 if request.operation=='deploy':
                     if self._root is not None or self._current is not None or reviewed_parent is not None:reject()
+                    stage = 'capacity'
                     check_witness_byte_capacity(bundle,request,self._policy,entry['receiptHash'],entry['first'])
+                    stage = 'consent'
                     self._consent(entry)
+                    stage = 'register'
                     self._store.register_once(entry['first'])
                     self._root=self._current=entry
                     self._bindings[canonical(entry['first'])]=scope
                 else:
+                    stage = 'parent-history'
                     if (self._root is None or self._current is not self._root or self._pending is not None
                             or type(reviewed_parent) is not AuthenticatedHistorySnapshotV3):reject()
                     history=self._history(self._root);fresh=history.capture()
@@ -171,14 +188,21 @@ class MacLiveAdmissionV3:
                             or value['schemaVersion']!=1 or value['blocker'] is not None or value['pending'] is not None
                             or len(value['knownPrefix'])!=total or len(value['scopes'])!=total
                             or value['chainStatus']['activePhase']!='closed'):reject()
+                    stage = 'inverse'
                     self._inverse(entry,self._root,fresh)
                     entry['parentHistory'],entry['parentSnapshot']=history,fresh
+                    stage = 'history'
                     self._history(entry)
+                    stage = 'capacity'
                     check_witness_byte_capacity(bundle,request,self._policy,entry['receiptHash'],entry['first'],fresh)
+                    stage = 'consent'
                     self._consent(entry)
                     self._pending=scope
                 return deepcopy(scope['binding'])
-            except Exception:reject()
+            except Exception as error:
+                name = type(error).__name__
+                category = name if name in ('GitHubUnavailable','AuthorizationUnavailable','ValueError','GateError','OSError') else 'Other'
+                raise LiveAdmissionRejected(stage, category) from None
 
     def _unseal(self,envelope,domain):
         if (type(envelope) is not dict or set(envelope)!={'version','domain','policy','payload','mac'}

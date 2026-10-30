@@ -30,6 +30,25 @@ class LiveReviewBlocked(ValueError):
     """No authority was returned; ambiguous dispatch/consumption must not retry."""
 
 
+class _ReadRetryGitHubClient(GitHubClient):
+    """Live-host reads only; mutation outcomes are never retried or cached."""
+    def request(self, method, path, payload=None, *, allow_missing=False, before_send=lambda: None):
+        attempts = 3 if method == 'GET' else 1
+        for attempt in range(attempts):
+            guard_passed = False
+            def guard():
+                nonlocal guard_passed
+                before_send()
+                guard_passed = True
+            try:
+                return super().request(method, path, payload, allow_missing=allow_missing,
+                                       before_send=guard)
+            except GitHubUnavailable:
+                if not guard_passed or attempt == attempts-1:
+                    raise
+                time.sleep(attempt+1)
+
+
 def _private(path, mode, directory=False):
     path = Path(path).absolute()
     if path.is_relative_to(REPO_ROOT) or path.resolve() != path:
@@ -60,22 +79,14 @@ class GitHubLiveReviewV3:
         result = self._command(['gh', 'auth', 'token', '--hostname', 'github.com'])
         if result.returncode:
             raise LiveReviewBlocked('GitHub credential unavailable')
-        return GitHubClient(result.stdout.decode('ascii').strip())
+        return _ReadRetryGitHubClient(result.stdout.decode('ascii').strip())
 
     def _approval(self, token, request, policy):
         # Deliberately no verifier override: real issuer/JWKS verification is mandatory.
         return GitHubFullBodyApprovalV3(self.client, token, [request], policy)
 
     def _get(self, suffix):
-        # Read-only polling may tolerate transient transport failures. Mutations
-        # and approval consumption deliberately do not use this retry loop.
-        for attempt in range(3):
-            try:
-                return self.client.request('GET', '/repos/' + REPOSITORY + suffix)[0]
-            except GitHubUnavailable:
-                if attempt == 2:
-                    raise
-                time.sleep(attempt + 1)
+        return self.client.request('GET', '/repos/' + REPOSITORY + suffix)[0]
 
     def _environment(self):
         repo = self._get('')

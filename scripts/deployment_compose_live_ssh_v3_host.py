@@ -140,7 +140,7 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
     """
     from deployment_compose_profile3_prepare_ssh_probe import _private_root
     from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
-    from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3
+    from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3, LiveAdmissionRejected
     from deployment_contract_v2 import TargetIdentity
     from deployment_gateway import GatePolicy
     from deployment_gate_witness import key_material
@@ -249,7 +249,12 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                 elif supplied_history is not None:reject()
                 approval,consumption,metadata=review.consume_prepared(bundle,request,on_review)
                 if process.poll() is not None:reject()
-                binding=admission.register_intent(bundle,request,approval,consumption,reviewed_parent=parent)
+                try:
+                    binding=admission.register_intent(bundle,request,approval,consumption,reviewed_parent=parent)
+                except LiveAdmissionRejected as error:
+                    _write_private(case/'admission-failure.private.json',
+                        dict(stage=error.stage,causeType=error.cause_type,requestHash=request.digest()))
+                    raise
                 receipt_hash=digest(asdict(consumption))
                 _write_private(case/('review-'+str(intent_count)+'.private.json'),metadata)
                 send('consume-intent',requestHash=request.digest(),receiptHash=receipt_hash,firstBinding=binding)

@@ -13,6 +13,59 @@ sys.path[:0]=[str(ROOT/'scripts'),str(ROOT/'packs/deployment/scripts'),str(ROOT/
 import deployment_compose_live_review_v3_host as live
 
 
+class ReadRetryTests(unittest.TestCase):
+    def test_get_transport_failure_then_success_rechecks_guard_and_does_not_cache(self):
+        transport=Mock(side_effect=[OSError(), (200, {}, {'fresh': 1}), (200, {}, {'fresh': 2})])
+        client=live._ReadRetryGitHubClient('test-token', transport=transport)
+        guard=Mock()
+        with patch.object(live.time, 'sleep') as sleep:
+            self.assertEqual(client.request('GET', '/repos/sample/target', before_send=guard)[0], {'fresh': 1})
+            self.assertEqual(client.request('GET', '/repos/sample/target', before_send=guard)[0], {'fresh': 2})
+        self.assertEqual(transport.call_count, 3)
+        self.assertEqual(guard.call_count, 3)
+        sleep.assert_called_once_with(1)
+
+    def test_get_failure_is_bounded_without_nested_adapter_retries(self):
+        transport=Mock(side_effect=OSError())
+        client=live._ReadRetryGitHubClient('test-token', transport=transport)
+        host=object.__new__(live.GitHubLiveReviewV3);host.client=client
+        guard=Mock()
+        with patch.object(live.time, 'sleep') as sleep:
+            with self.assertRaises(live.GitHubUnavailable):
+                client.request('GET', '/repos/sample/target', before_send=guard)
+        self.assertEqual(transport.call_count, 3);self.assertEqual(guard.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+        transport.reset_mock()
+        with patch.object(live.time, 'sleep'):
+            with self.assertRaises(live.GitHubUnavailable): host._get('/approvals')
+        self.assertEqual(transport.call_count, 3)
+
+    def test_unknown_post_is_never_retried(self):
+        transport=Mock(side_effect=OSError())
+        client=live._ReadRetryGitHubClient('test-token', transport=transport)
+        guard=Mock()
+        with patch.object(live.time, 'sleep') as sleep:
+            with self.assertRaises(live.GitHubUnavailable):
+                client.request('POST', '/repos/sample/target/git/refs', {'ref': 'test'}, before_send=guard)
+        transport.assert_called_once();guard.assert_called_once();sleep.assert_not_called()
+
+    def test_guard_denial_propagates_before_transport(self):
+        transport=Mock();client=live._ReadRetryGitHubClient('test-token', transport=transport)
+        guard=Mock(side_effect=ValueError('denied'))
+        with patch.object(live.time, 'sleep') as sleep:
+            with self.assertRaisesRegex(ValueError, 'denied'):
+                client.request('GET', '/repos/sample/target', before_send=guard)
+        guard.assert_called_once();transport.assert_not_called();sleep.assert_not_called()
+
+    def test_unavailable_guard_is_not_retried_as_a_transport_error(self):
+        transport=Mock();client=live._ReadRetryGitHubClient('test-token', transport=transport)
+        guard=Mock(side_effect=live.GitHubUnavailable('authority unavailable'))
+        with patch.object(live.time, 'sleep') as sleep:
+            with self.assertRaises(live.GitHubUnavailable):
+                client.request('GET', '/repos/sample/target', before_send=guard)
+        guard.assert_called_once();transport.assert_not_called();sleep.assert_not_called()
+
+
 @unittest.skipUnless(os.name == 'posix', 'private POSIX host credentials and file permissions')
 class LiveReviewTests(unittest.TestCase):
     def setUp(self):
@@ -38,19 +91,19 @@ class LiveReviewTests(unittest.TestCase):
         with self.assertRaises(live.LiveReviewBlocked):
             live._private(live.REPO_ROOT, 0o700, True)
 
-    def test_read_only_transport_retry_is_bounded(self):
-        self.host.client.request.side_effect = [live.GitHubUnavailable('offline'), ({'ok': True}, {})]
-        with patch.object(live.time, 'sleep') as sleep:
+    def test_adapter_and_approval_share_read_retry_client(self):
+        with patch.object(self.host, '_command', return_value=Mock(returncode=0, stdout=b'test-token')):
+            client = self.host._client()
+        self.assertIsInstance(client, live._ReadRetryGitHubClient)
+        self.host.client = client
+        transport = Mock(side_effect=[OSError(), (200, {}, {'ok': True})])
+        client._transport = transport
+        with patch.object(live.time, 'sleep'):
             self.assertEqual(self.host._get('/approvals'), {'ok': True})
-        self.assertEqual(self.host.client.request.call_count, 2)
-        self.assertTrue(all(c.args[0] == 'GET' for c in self.host.client.request.call_args_list))
-        sleep.assert_called_once_with(1)
-        self.host.client.request.reset_mock()
-        self.host.client.request.side_effect = live.GitHubUnavailable('offline')
-        with patch.object(live.time, 'sleep') as sleep:
-            with self.assertRaises(live.GitHubUnavailable): self.host._get('/approvals')
-        self.assertEqual(self.host.client.request.call_count, 3)
-        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(transport.call_count, 2)
+        with patch.object(live, 'GitHubFullBodyApprovalV3') as approval:
+            self.host._approval('a.b.c', 'request', 'policy')
+        self.assertIs(approval.call_args.args[0], client)
 
     def test_approval_uses_default_verifier(self):
         with patch.object(live, 'GitHubFullBodyApprovalV3') as approval:
