@@ -62,7 +62,7 @@ class Profile3StepExecutor:
     def __init__(self, bundle, request, *, intent_authority, phase_guard,
                  gate_root, gate_key, gate_policy, consumption_receipt_hash,
                  witness_client_factory, registered_binding, tls_server_context,
-                 tls_client_context, server_certificate_sha256, docker_socket, timeout=10,
+                 tls_client_context, server_certificate_sha256, docker_socket, timeout=30,
                  startup_fence=None, control_timeout=180, operation_scope=None):
         if (type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
                 or type(intent_authority) not in (GitHubFullBodyApprovalV3, IntentStatusClientV3)
