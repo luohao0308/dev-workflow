@@ -42,6 +42,7 @@ class ProtocolTests(unittest.TestCase):
                 worker.Channel(changed,None,None)
         with self.assertRaises(ValueError):worker.live.Channel(config(),None,None)
 
+    @unittest.skipUnless(os.name == 'posix' and hasattr(os, 'get_blocking'), 'POSIX pipe framing required')
     def test_pipe_order_and_nonce_fail_closed(self):
         for frame in (dict(kind='configure',channelNonce='0'*64),
                       dict(kind='consume-intent',channelNonce='1'*64)):
