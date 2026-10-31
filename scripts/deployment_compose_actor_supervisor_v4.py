@@ -112,3 +112,20 @@ class ActorSupervisorV4:
         for handle, _, _, _ in list(self._actors.values()):
             self.stop_and_join(handle)
         self._closed = True
+
+
+def registered_supervisor(value):
+    """Closed host types only; protocol-shaped caller objects are not issuers."""
+    if type(value) is ActorSupervisorV4:
+        return True
+    from deployment_compose_remote_supervisor_v4 import RemoteActorSupervisorV4
+    return type(value) is RemoteActorSupervisorV4
+
+
+def verified_termination_digest(supervisor, actor, proof, session_hash, cursor):
+    if type(supervisor) is ActorSupervisorV4:
+        return supervisor.termination_digest(actor, proof, session_hash)
+    from deployment_compose_remote_supervisor_v4 import RemoteActorSupervisorV4
+    if type(supervisor) is RemoteActorSupervisorV4:
+        return supervisor.termination_digest(actor, proof, session_hash, expected_cursor=cursor)
+    raise ValueError('actor-supervisor-v4-rejected')

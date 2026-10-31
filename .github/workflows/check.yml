@@ -44,7 +44,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m unittest tests.test_deployment_compose_full_body_review_contract tests.test_compose_profile3_prepare_fixture tests.test_deployment_compose_profile3_prepare_ssh_probe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m unittest tests.test_deployment_compose_operation_witness_v4
+          python -m unittest tests.test_deployment_compose_operation_witness_v4 tests.test_deployment_compose_recovery_prepare_v4_host tests.test_deployment_compose_remote_supervisor_v4 tests.test_deployment_compose_remote_recovery_v4 tests.test_deployment_compose_intent_status_v4 tests.test_deployment_compose_approval_v4_host
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Run PowerShell integration tests
         shell: pwsh

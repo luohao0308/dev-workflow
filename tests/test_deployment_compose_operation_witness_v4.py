@@ -17,16 +17,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 from deployment_compose_actor_supervisor_v4 import ActorSupervisorV4, ActorHandle, ActorTermination
 from deployment_compose_operation_witness_v4 import OperationWitnessStoreV4, digest
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
+from deployment_compose_recovery_prepare_v4_host import RecoveryPreparationHostV4
+from deployment_compose_recovery_store import ComposeRecoveryStore
+from tests.test_deployment_compose_approval_v3_host import request as root_request
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX witness storage and process ownership')
 class WitnessV4Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name).resolve(); self.root.chmod(0o700)
+        self.root = Path(self.tmp.name).resolve()/'witness'; self.root.mkdir(mode=0o700)
+        cas = self.root.parent/'cas'; cas.mkdir(mode=0o700)
+        with patch('deployment_compose_recovery_store.sys.platform', 'linux'):
+            self.cas = ComposeRecoveryStore(cas, key=b'c'*32)
+        self.addCleanup(self.cas.close)
+        baseline_reference = self.cas.put(b'fixed baseline bytes')
+        self.root_request = root_request(profile_version='4')
         self.supervisor = ActorSupervisorV4(); self.addCleanup(self.supervisor.close)
-        self.session = dict(sessionHash='a'*64, bundleDigest='b'*64, policyHash='c'*64,
-                            baselineReference='d'*64, rootRequestHash='e'*64, supervisorBoot=self.supervisor.boot)
+        self.session = dict(sessionHash='a'*64, bundleDigest=self.root_request.plan_hash, policyHash=self.root_request.policy_hash,
+                            baselineReference=baseline_reference, rootRequestHash=self.root_request.digest(), supervisorBoot=self.supervisor.boot)
         self.session['sessionHash'] = digest({k:v for k,v in self.session.items() if k != 'sessionHash'})
         self.actor = self.supervisor.start_fixed_actor(self.session['sessionHash'])
         self.store = self.open()
@@ -40,18 +49,22 @@ class WitnessV4Tests(unittest.TestCase):
     def cursor(self):
         return {k:self.view[k] for k in ('sequence','head')}
 
+    def preparer(self):
+        return RecoveryPreparationHostV4(witness=self.store, root_request=self.root_request, baseline_store=self.cas,
+            supervisor=self.supervisor, actor=self.actor, termination=self.supervisor.stop_and_join(self.actor))
+
     def intent(self):
-        scope = self.view['scopes'][-1]
-        return dict(self.session, schemaVersion=4, profile='compose-recovery-v4', recoveryRequestHash='7'*64, recoveryContextDigest='8'*64, historyHead=self.view['head'], actorEpoch=scope['actorEpoch'],
-                    scopeOrdinal=scope['scopeOrdinal'], planWriteIndex=scope['planWriteIndex'], nonce='f'*64,
-                    expiresAt=(datetime.now(timezone.utc)+timedelta(seconds=300)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+        return self.preparer().prepare(operation_nonce='f'*64,
+            expires_at=(datetime.now(timezone.utc)+timedelta(seconds=300)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 
     def prepared(self):
         self.view = self.store.record_prepared(self.cursor(), supervisor=self.supervisor, actor=self.actor, attempt='9'*64)
 
     def abandon(self, **changes):
         args = dict(supervisor=self.supervisor, actor=self.actor,
-                    termination=self.supervisor.stop_and_join(self.actor), recovery_intent=self.intent())
+                    termination=self.supervisor.stop_and_join(self.actor))
+        if 'recovery_intent' not in changes:
+            args['recovery_intent'] = self.intent()
         args.update(changes)
         return self.store.abandon_and_reserve(self.cursor(), **args)
 
@@ -100,7 +113,7 @@ class WitnessV4Tests(unittest.TestCase):
         self.assertIn(self.store.read()['scopes'][-1]['phase'], ('admitted','pending-authorization'))
 
     def test_intent_binding_types_freshness_and_closed_fields(self):
-        original=self.intent()
+        original={'request':self.intent().request.canonical_json()}
         for field,value in [('bundleDigest','0'*64),('historyHead','0'*64),('actorEpoch','0'*64),
                             ('scopeOrdinal',False),('planWriteIndex',False),('schemaVersion',True),('profile','compose-v3'),
                             ('recoveryRequestHash','invalid'),('nonce','invalid'),

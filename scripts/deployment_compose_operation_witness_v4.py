@@ -13,7 +13,7 @@ import json
 import os
 
 from deployment_compose_witness_store import ComposeWitnessStore, MAX_BYTES, canonical, pairs, hex_value, fail
-from deployment_compose_actor_supervisor_v4 import ActorSupervisorV4
+from deployment_compose_actor_supervisor_v4 import registered_supervisor, verified_termination_digest
 
 DOMAIN = b'dev-workflow:compose-operation-witness:v4\0'
 SESSION_FIELDS = {'sessionHash', 'bundleDigest', 'policyHash', 'baselineReference', 'rootRequestHash', 'supervisorBoot'}
@@ -91,7 +91,7 @@ class OperationWitnessStoreV4(ComposeWitnessStore):
 
     def register_once(self, session, *, supervisor, actor):
         session = deepcopy(session)
-        if (type(supervisor) is not ActorSupervisorV4 or type(session) is not dict
+        if (not registered_supervisor(supervisor) or type(session) is not dict
                 or set(session) != SESSION_FIELDS or session['supervisorBoot'] != supervisor.boot):
             fail()
         if session['sessionHash'] != digest({k:v for k,v in session.items() if k != 'sessionHash'}): fail()
@@ -108,7 +108,7 @@ class OperationWitnessStoreV4(ComposeWitnessStore):
     def _match(state, cursor, supervisor, actor):
         if (type(cursor) is not dict or set(cursor) != {'sequence', 'head'}
                 or type(cursor['sequence']) is not int or cursor['sequence'] != state['sequence']
-                or cursor['head'] != state['head'] or type(supervisor) is not ActorSupervisorV4
+                or cursor['head'] != state['head'] or not registered_supervisor(supervisor)
                 or supervisor.boot != state['session']['supervisorBoot']
                 or supervisor.actor_identity(actor, state['session']['sessionHash']) != state['scopes'][-1]['actorEpoch']):
             fail()
@@ -138,9 +138,12 @@ class OperationWitnessStoreV4(ComposeWitnessStore):
             return self._write(state, 'admitted-observation')
 
     def abandon_and_reserve(self, cursor, *, supervisor, actor, termination, recovery_intent):
-        intent = deepcopy(recovery_intent)
+        from deployment_compose_recovery_prepare_v4_host import PreparedRecoveryV4, RecoveryPreparationHostV4
+        if (type(recovery_intent) is not PreparedRecoveryV4
+                or type(getattr(recovery_intent, '_issuer', None)) is not RecoveryPreparationHostV4): fail()
         with self._locked():
             state = self._read(); self._match(state, cursor, supervisor, actor)
+            intent = recovery_intent._issuer.verify_for_store(recovery_intent, self, state, supervisor, actor, termination)
             scope = state['scopes'][-1]
             if scope['phase'] not in ('open', 'prepared') or len(state['scopes']) >= 32: fail()
             if (type(intent) is not dict or set(intent) != INTENT_FIELDS
@@ -155,7 +158,8 @@ class OperationWitnessStoreV4(ComposeWitnessStore):
             if type(expires) is not str: fail()
             until = datetime.strptime(expires, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
             if until.strftime('%Y-%m-%dT%H:%M:%SZ') != expires or not 0 < (until-datetime.now(timezone.utc)).total_seconds() <= 900: fail()
-            termination_digest = supervisor.termination_digest(actor, termination, state['session']['sessionHash'])
+            termination_digest = verified_termination_digest(supervisor, actor, termination,
+                state['session']['sessionHash'], {'sequence': state['sequence'], 'head': state['head']})
             if any(s['certificate'] and s['certificate']['nonce'] == intent['nonce'] for s in state['scopes']): fail()
             successor = digest({'intent': intent, 'terminationDigest': termination_digest})
             scope.update(phase='abandoned', certificate=dict(oldHead=state['head'], terminationDigest=termination_digest,
