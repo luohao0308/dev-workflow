@@ -149,6 +149,7 @@ class RootActionPreparationV4:
 class CompositeActionAuthorizationV4:pass
 class CompleteActionResponseV4:pass
 class CompositeGoV4:pass
+class CompletedActionV4:pass
 
 
 class SingleActionHostV4:
@@ -163,6 +164,8 @@ class SingleActionHostV4:
                 or type(session_hash) is not str or len(session_hash)!=64 or any(c not in '0123456789abcdef' for c in session_hash)):reject()
         self._preparation,self._prepared,self._supervisor,self._witness=preparation,prepared,supervisor,witness
         self._root=preparation.resolve(prepared);self._guard=phase_guard;self._producer=preparation._producer
+        self._completion_self=self;self._completion_owner=os.getpid();self._completion_lock=threading.RLock()
+        self._dispatch_finished=False;self._completion_candidate=None;self._completion_records={}
         self._session=session_hash;self._used=False;self._authorizations={};self._responses={};self._go_tokens={}
         self._check_guard()
         action=self._root['action'];request=self._root['request'];raw=encode(action['operation']['body'])
@@ -223,7 +226,18 @@ class SingleActionHostV4:
         if time.monotonic()>=go['deadline']:reject()
         return deepcopy(go)
 
+    def _completion_owner_check(self):
+        if (type(self) is not SingleActionHostV4 or os.getpid()!=self._completion_owner
+                or self._completion_self is not self):reject()
+
     def dispatch(self,*,authority,receipt,status_client):
+        self._completion_owner_check()
+        with self._completion_lock:
+            if self._used:reject()
+            try:return self._dispatch(authority=authority,receipt=receipt,status_client=status_client)
+            finally:self._dispatch_finished=True
+
+    def _dispatch(self,*,authority,receipt,status_client):
         from deployment_compose_approval_v4_host import GitHubFullBodyApprovalV4
         from deployment_compose_intent_status_v4 import IntentStatusClientV4
         import base64,secrets,time
@@ -276,6 +290,16 @@ class SingleActionHostV4:
                     or response['kind']!='response-v4' or response['nonce']!=nonce):reject()
             body=base64.b64decode(response['bodyBase64'],validate=True)
             termination=self._supervisor.stop_and_join(self.actor)
+            # Retain observed facts before persistence; queries never reconstruct
+            # a lost response or mint termination from a PID after the fact.
+            self._completion_candidate=(self._supervisor,self.actor,self._witness,termination,
+                encode(self._binding),encode(self._cursor),encode(admitted),
+                encode(dict(status=response['status'],bodyBase64=base64.b64encode(body).decode('ascii'))),
+                encode(self._config),request.canonical_json(),request.policy_hash,
+                self._root['bundle'],self._root['bundle'].canonical_bytes,
+                tuple(sorted({r['baselineContainerId'] for r in self._root['bundle'].to_dict()['services']} |
+                    {r['containerId'] for r in self._root['bundle'].to_dict()['protectedContainers']})),
+                encode(self._root['action']),encode(self._root['context']))
             evidence=CompleteActionResponseV4()
             self._responses[evidence]=dict(termination=termination,cursor=deepcopy(admitted),
                 data=dict(status=response['status'],bodyBase64=base64.b64encode(body).decode('ascii')))
@@ -295,3 +319,59 @@ class SingleActionHostV4:
         finally:
             self._authorizations.clear();self._responses.clear();self._go_tokens.clear()
             self._supervisor.stop_and_join(self.actor)
+
+    def _completed_material(self):
+        import base64
+        from deployment_compose_action_actor_v4 import ActionActorSupervisorV4,WriterActorTerminationV4
+        from deployment_compose_action_witness_v4 import ActionWitnessStoreV4
+        candidate=self._completion_candidate
+        if not self._dispatch_finished or candidate is None:reject()
+        supervisor,actor,witness,termination,binding,prepared,admitted,response,config,request_bytes,policy,bundle,bundle_bytes,forbidden,action,context=candidate
+        if (type(supervisor) is not ActionActorSupervisorV4 or type(witness) is not ActionWitnessStoreV4
+                or type(termination) is not WriterActorTerminationV4
+                or supervisor is not self._supervisor or actor is not self.actor or witness is not self._witness
+                or encode(self._binding)!=binding or encode(self._config)!=config
+                or supervisor.boot!=self._binding['supervisorBoot']
+                or self._action_hash!=self._binding['actionDigest']
+                or self._root['request'].canonical_json()!=request_bytes
+                or self._root['bundle'] is not bundle or bundle.canonical_bytes!=bundle_bytes
+                or encode(self._root['action'])!=action or encode(self._root['context'])!=context):reject()
+        termination_digest=supervisor.termination_digest(actor,termination,self._session)
+        state=witness.read();events=state['events']
+        if (encode(state['binding'])!=binding or len(events)!=3
+                or events[0]['kind']!='prepared' or events[1]['kind']!='admitted' or events[2]['kind']!='response'
+                or encode(dict(seq=1,head=events[0]['head']))!=prepared
+                or encode(dict(seq=2,head=events[1]['head']))!=admitted
+                or encode(events[2]['data'])!=response):reject()
+        data=events[2]['data'];body=base64.b64decode(data['bodyBase64'],validate=True)
+        from deployment_compose_witness_store import pairs
+        value=json.loads(body,object_pairs_hook=pairs,parse_constant=lambda _:reject())
+        cid=value.get('Id') if type(value) is dict else None
+        if (data['status']!=201 or type(cid) is not str or len(cid)!=64
+                or any(c not in '0123456789abcdef' for c in cid) or cid in forbidden):reject()
+        return encode(dict(binding=json.loads(binding),policyHash=policy,
+            bodyDigest=json.loads(config)['bodyDigest'],responseDigest=hashlib.sha256(response).hexdigest(),
+            terminationDigest=termination_digest,cursor=dict(seq=3,head=events[2]['head']),candidateId=cid,
+            authorityGranted=False,runtimePermit=False,recoveryAuthorized=False,productionReady=False))
+
+    def capture_completed_action(self):
+        self._completion_owner_check()
+        if not self._dispatch_finished:reject()
+        with self._completion_lock:
+            try:material=self._completed_material()
+            except Exception:reject()
+            for record,stored in self._completion_records.items():
+                if stored==material:return record
+            record=CompletedActionV4();self._completion_records[record]=material
+            return record
+
+    def verify_completed_action(self,record):
+        self._completion_owner_check()
+        if not self._dispatch_finished:reject()
+        with self._completion_lock:
+            try:
+                if type(record) is not CompletedActionV4 or record not in self._completion_records:reject()
+                material=self._completed_material()
+                if material!=self._completion_records[record]:reject()
+                return json.loads(material)
+            except Exception:reject()

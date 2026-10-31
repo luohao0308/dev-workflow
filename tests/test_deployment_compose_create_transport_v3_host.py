@@ -37,6 +37,7 @@ class CodecTests(unittest.TestCase):
         self.addCleanup(lambda: process.poll() is None and process.kill())
         owned=object.__new__(transport.OwnedCreateTransportV3)
         owned._owner=os.getpid();owned._mutex=threading.RLock();owned._closed=False
+        owned._pending_terminal=owned._terminal=owned._response_fact=None
         owned._process=process;owned._go_sent=False;owned._process_proof=None
         owned._directory=None
         group=SimpleNamespace(close=unittest.mock.Mock(),kill_and_drain=unittest.mock.Mock(side_effect=AssertionError('unattached group')))
@@ -52,6 +53,7 @@ class CodecTests(unittest.TestCase):
         import deployment_compose_writer_cgroup_v3_host as groups
         owned=object.__new__(transport.OwnedCreateTransportV3)
         owned._owner=os.getpid();owned._mutex=threading.RLock();owned._closed=False
+        owned._pending_terminal=owned._terminal=owned._response_fact=None
         owned._used=False;owned._uid=65534;owned._gid=65534
         parent=unittest.mock.Mock()
         parent.resolve.return_value=parent
@@ -77,6 +79,7 @@ class CodecTests(unittest.TestCase):
     def test_expired_post_go_drain_still_revokes_group_without_proof(self):
         owned=object.__new__(transport.OwnedCreateTransportV3)
         owned._owner=os.getpid();owned._mutex=threading.RLock();owned._closed=False
+        owned._pending_terminal=owned._terminal=owned._response_fact=None
         owned._process=unittest.mock.Mock();owned._process.poll.return_value=None
         owned._go_sent=True;owned._process_proof=None;owned._directory=None
         owned._group=SimpleNamespace(kill_and_drain=unittest.mock.Mock(side_effect=ValueError('expired')),

@@ -232,6 +232,12 @@ class WriterCgroupV3:
             return True
         except Exception: reject()
 
+    @serialized
+    def capture_drain_facts(self, process, proof):
+        self.verify_drain(process, proof)
+        return (self.request_hash, self.scope_hash, self.actor_epoch,
+                tuple(self._identity), process.pid, process.returncode)
+
     def _dispose(self):
         if self._fd is not None:
             os.close(self._fd); self._fd = None

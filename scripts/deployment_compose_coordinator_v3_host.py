@@ -60,6 +60,11 @@ def check_witness_capacity(bundle):
         reject()
 
 
+class ClosedCreateDrainV3:
+    """Opaque same-live-executor fact, never a permit or recovery fence."""
+    __slots__ = ()
+
+
 class Profile3StepExecutor:
     """One-shot steps with live host guards; intent status is never a permit."""
     def __init__(self, bundle, request, *, intent_authority, phase_guard,
@@ -87,9 +92,13 @@ class Profile3StepExecutor:
             if type(owned_create_transport) is not OwnedCreateTransportV3 or request.operation != 'deploy':
                 reject()
         self._owner_pid = os.getpid()
+        self._owned_launch_transport = owned_create_transport
         self._owned_transport = owned_create_transport
         self._owned_gateway_token = None
         self._owned_gateway = None
+        self._closed_create_issuer = self
+        self._closed_create_records = {}
+        self._owned_launch_material = None
         check_witness_capacity(bundle)
         v = bundle.to_dict(); identity = v['identity']
         if (request.plan_hash != bundle.digest or request.profile_id != PROFILE
@@ -231,6 +240,7 @@ class Profile3StepExecutor:
             headers.update({'Content-Length': str(len(body)), 'Content-Type': 'application/json', 'Connection': 'close'})
             thread.start()
             if self._owned_transport is not None:
+                self._owned_launch_material=self._owned_binding_material()
                 status, raw = self._owned_transport.request(request_hash=self.request.digest(),
                     scope_hash=desc['scopeHash'], port=server.server_port, pin=self._pin,
                     operation=operation, body=body, headers=headers, docker_socket=self._socket,
@@ -312,6 +322,68 @@ class Profile3StepExecutor:
         if transport is not self._owned_transport or self._owned_gateway_token is None:
             reject()
         return self._owned_gateway_token
+
+    def _owned_binding_material(self):
+        return canonical(dict(request=self.request.canonical_json(),
+            bundle=self.bundle.canonical_bytes.decode('ascii'),receipt=self._receipt,
+            policy=asdict(self._policy),keyDigest=hashlib.sha256(self._key).hexdigest(),
+            binding=self._binding))
+
+    def _closed_create_material(self, history):
+        from deployment_compose_history_v3_host import AuthenticatedHistoryV3
+        if (type(history) is not AuthenticatedHistoryV3 or history._parent is not None
+                or self.request.operation != 'deploy' or self._owned_transport is None
+                or self._owned_gateway is not None or self._owned_gateway_token is None
+                or history._bundle.canonical_bytes != self.bundle.canonical_bytes
+                or history._request.canonical_json() != self.request.canonical_json()
+                or history._receipt != self._receipt or history._policy != self._policy
+                or history._key != self._key
+                or history._client.key_hash != self._policy.witness_key_sha256):reject()
+        if self._owned_launch_material is None or self._owned_binding_material()!=self._owned_launch_material:reject()
+        from deployment_compose_create_transport_v3_host import OwnedCreateTransportV3
+        if type(self._owned_transport) is not OwnedCreateTransportV3 or self._owned_transport is not self._owned_launch_transport:reject()
+        facts, response = self._owned_transport.terminal_facts()
+        op=self.bundle.creation_operations()[0]
+        desc=self.scope_descriptor(self.bundle,self.request,self._receipt,op,0,{})
+        if (facts[0] != self.request.digest() or facts[1] != desc['scopeHash']
+                or facts[2] != self._owned_transport._group.actor_epoch
+                or facts[5] is None or response is None or response[0] != 201):reject()
+        capture=history.capture()
+        v=json.loads(capture.canonical)
+        if (v['schemaVersion'] != 1 or v['pending'] is not None or v['blocker'] is not None
+                or v['knownPrefix'] != [op] or len(v['scopes']) != 1
+                or v['scopes'][0]['seq'] != 6 or v['closedTail'] != {k:v['scopes'][0][k] for k in ('binding','seq','head')}
+                or v['scopes'][0]['binding'] != self._binding
+                or v['chainStatus']['activePhase'] != 'closed'
+                or v['consumptionReceiptHash'] != self._receipt):reject()
+        records=history._client.events_after(seq=0,head='0'*64)
+        if len(records)!=6 or records[-1]['head']!=v['closedTail']['head']:reject()
+        import base64
+        body=base64.b64decode(records[3]['event']['data']['bodyBase64'],validate=True)
+        if hashlib.sha256(body).hexdigest()!=response[1]:reject()
+        cid=json.loads(body).get('Id')
+        if type(cid) is not str or len(cid)!=64 or any(c not in '0123456789abcdef' for c in cid) or v['receiptMap']!={op['service']:cid}:reject()
+        return canonical(dict(history=json.loads(capture.canonical),facts=facts,
+            response=response,request=self.request.canonical_json(),bundle=self.bundle.digest,
+            receipt=self._receipt,policy=asdict(self._policy)))
+
+    def capture_owned_closed_create(self, history):
+        if os.getpid()!=self._owner_pid or self._closed_create_issuer is not self:reject()
+        with self._lock:
+            material=self._closed_create_material(history)
+            record=ClosedCreateDrainV3()
+            self._closed_create_records[id(record)]=(record,material,self._owned_transport,self._owned_gateway_token)
+            return record
+
+    def verify_owned_closed_create(self, record, history):
+        if os.getpid()!=self._owner_pid or self._closed_create_issuer is not self:reject()
+        with self._lock:
+            stored=self._closed_create_records.get(id(record))
+            if type(record) is not ClosedCreateDrainV3 or stored is None or stored[0] is not record:reject()
+            if self._owned_transport is not stored[2] or self._owned_gateway_token is not stored[3]:reject()
+            if self._closed_create_material(history)!=stored[1]:reject()
+            return dict(digest=hashlib.sha256(stored[1]).hexdigest(),
+                authorityGranted=False,runtimePermit=False,recoveryAuthorized=False,productionReady=False)
 
     def private_evidence(self):
         return deepcopy(self._evidence)

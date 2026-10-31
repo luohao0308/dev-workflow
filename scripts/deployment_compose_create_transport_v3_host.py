@@ -152,6 +152,7 @@ class OwnedCreateTransportV3:
         self._pem=(ca_pem,client_cert_pem,client_key_pem)
         self._process=self._group=self._directory=None
         self._used=False;self._closed=False;self._process_proof=None;self._go_sent=False
+        self._pending_terminal=None;self._terminal=None;self._response_fact=None
 
     def _check(self):
         if os.getpid()!=self._owner or self._closed: reject()
@@ -208,6 +209,7 @@ class OwnedCreateTransportV3:
                     or type(result['status']) is not int or not 100<=result['status']<=599):reject()
             data=base64.b64decode(result['body'],validate=True)
             if len(data)>65536:reject()
+            self._response_fact=(result['status'],hashlib.sha256(data).hexdigest())
             return result['status'],data
         except Exception:
             reject()
@@ -227,8 +229,10 @@ class OwnedCreateTransportV3:
                     if self._process.poll() is None:self._process.kill()
                     self._process.wait(timeout=max(0,deadline-time.monotonic()))
                 elif self._group is not None:
-                    self._process_proof=self._group.kill_and_drain(self._process,deadline)
-                    if not self._group.verify_drain(self._process,self._process_proof):reject()
+                    if self._pending_terminal is None:
+                        self._process_proof=self._group.kill_and_drain(self._process,deadline)
+                        facts=self._group.capture_drain_facts(self._process,self._process_proof)
+                        self._pending_terminal=(facts,self._response_fact)
                 else:reject()
         except Exception as error:
             failure=error;self._process_proof=None
@@ -253,3 +257,10 @@ class OwnedCreateTransportV3:
             if failure is None:failure=error
         if failure is not None:reject()
         self._closed=True
+        if self._pending_terminal is not None and self._response_fact is not None:
+            self._terminal=self._pending_terminal
+
+    @serialized
+    def terminal_facts(self):
+        if not self._closed or self._terminal is None:reject()
+        return self._terminal
