@@ -148,6 +148,46 @@ class BytecodeInstallTests(unittest.TestCase):
                 self.assertEqual((target / relative).read_bytes(), data)
             self.assertFalse((target / 'docs/core-metadata/.DS_Store').exists())
 
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('pwsh'), 'Windows PowerShell runtime unavailable')
+    def test_windows_short_directory_alias_keeps_strict_uninstall_boundary(self):
+        import ctypes
+        from ctypes import wintypes
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / 'project'
+            target.mkdir()
+            get_short = ctypes.WinDLL('kernel32', use_last_error=True).GetShortPathNameW
+            get_short.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+            get_short.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_short(str(target), buffer, len(buffer))
+            self.assertGreater(length, 0)
+            self.assertLess(length, len(buffer))
+            short = buffer.value
+            if short.lower() == str(target).lower():
+                self.skipTest('Filesystem has no distinct 8.3 alias for the test directory')
+            source = (ROOT / 'scripts/uninstall.ps1').read_text(encoding='utf-8')
+            helper = root / 'boundary.ps1'
+            code = source.split('function Write-Utf8NoBom', 1)[0]
+            code += r'''
+$canonical = Resolve-FullPath $TargetPath
+$expected = [Environment]::GetEnvironmentVariable('DEV_WORKFLOW_TEST_LONG_ROOT')
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($canonical, $expected)) { throw 'Root alias was not expanded' }
+$inside = Resolve-TargetFile -Root $canonical -RelativePath 'AGENTS.md'
+if (-not (Test-IsWithin -Parent $canonical -Candidate $inside)) { throw 'Descendant rejected' }
+if (Test-IsWithin -Parent $canonical -Candidate ($canonical + '-sibling/AGENTS.md')) { throw 'Sibling boundary accepted' }
+foreach ($unsafe in @('../project-sibling/AGENTS.md', '../project/AGENTS.md', $canonical, ($canonical + '-sibling/AGENTS.md'))) {
+    $rejected = $false
+    try { Resolve-TargetFile -Root $canonical -RelativePath $unsafe | Out-Null } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Unsafe manifest path accepted' }
+}
+'''
+            helper.write_text(code, encoding='utf-8')
+            result = subprocess.run([shutil.which('pwsh'), '-NoProfile', '-File', str(helper), '-TargetPath', short],
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, DEV_WORKFLOW_TEST_LONG_ROOT=str(target)))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_powershell_filters_relative_paths_before_inventory_and_copy(self):
         source = (ROOT / 'scripts/install.ps1').read_text(encoding="utf-8")
         self.assertIn("$RelativePath -cmatch '(^|/)__pycache__/|\\.py[co]$'", source)
