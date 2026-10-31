@@ -239,6 +239,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                 if (type(result) is not dict or result.get('receipts') != snapshot.snapshot['receiptMap']
                         or type(result.get('initialWriteCount')) is not int
                         or result['initialWriteCount'] != 1 or result.get('productionReady') is not False):reject()
+                os.set_blocking(process.stdin.fileno(),False)
                 process.stdin.close()
                 if process.wait(timeout=remaining(30)) != 0:reject()
                 thread.join(timeout=remaining(5))
@@ -267,6 +268,10 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
             except Exception as error:cleanup_error = error
         stop_drain.set()
         if thread is not None:cleanup(lambda:thread.join(timeout=1))
+        # Buffered stdin.close() flushes. A descendant may retain the read end
+        # after this local child exits, so a full pipe must never block cleanup.
+        if process.stdin is not None and not process.stdin.closed:
+            cleanup(lambda:os.set_blocking(process.stdin.fileno(),False))
         for stream in (process.stdin,process.stdout,process.stderr):
             if stream is not None:cleanup(stream.close)
         if store is not None:cleanup(store.close)

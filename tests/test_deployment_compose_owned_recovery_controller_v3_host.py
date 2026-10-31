@@ -26,7 +26,7 @@ class ControllerTests(unittest.TestCase):
         engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
         self.addCleanup(lambda:shutil.rmtree(engine,ignore_errors=True))
         self.process=subprocess.Popen([sys.executable,str(ROOT/'tests/support/owned_recovery_controller_fixture.py'),attack,engine],
-            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=-1 if attack=='buffered-stderr' else 0,
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=-1 if attack in ('buffered-stderr','buffered-stdin') else 0,
             env=dict(os.environ,PYTHONDONTWRITEBYTECODE='1'))
         def reap():
             if self.process.poll() is None:self.process.kill();self.process.wait(timeout=5)
@@ -64,7 +64,16 @@ class ControllerTests(unittest.TestCase):
         original_admission=controller.MacLiveAdmissionV3
         original_completed=controller._completed_history
         def receive(*args):
-            frame=original_receive(*args);self.last_frame=frame;return frame
+            frame=original_receive(*args);self.last_frame=frame
+            if attack=='buffered-stdin' and frame.get('kind')=='final':
+                fd=self.process.stdin.fileno();os.set_blocking(fd,False)
+                try:
+                    while True:os.write(fd,b'x'*4096)
+                except BlockingIOError:pass
+                finally:os.set_blocking(fd,True)
+                self.process.stdin.write(b'buffered')
+                self.final_received_at=time.monotonic()
+            return frame
         def verify(candidate,**kwargs):
             self.verified_candidate=candidate;return original_verify(candidate,**kwargs)
         def admission(**kwargs):
@@ -164,6 +173,40 @@ class ControllerTests(unittest.TestCase):
     def test_local_exit_with_descendant_stderr_cannot_hang_or_prove_remote_stop(self):
         with self.assertRaises(ValueError):self.drive('held-stderr')
         self.assertIsNotNone(self.process.poll())
+        self.assertTrue(all(p.closed for p in (self.process.stdin,self.process.stdout,self.process.stderr)))
+
+    def test_buffered_stdin_cleanup_cannot_wait_for_descendant_reader(self):
+        code = ("import subprocess,sys,time; "
+                "subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'],"
+                "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+                "print('ready',flush=True); time.sleep(30)")
+        process = subprocess.Popen([sys.executable,'-c',code],stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.poll() is None and (process.kill(),process.wait()))
+        self.assertEqual(process.stdout.readline(),b'ready\n')
+        fd = process.stdin.fileno()
+        os.set_blocking(fd,False)
+        try:
+            while True:os.write(fd,b'x'*4096)
+        except BlockingIOError:
+            pass
+        finally:
+            os.set_blocking(fd,True)
+        process.stdin.write(b'buffered')
+        started = time.monotonic()
+        with self.assertRaises(ValueError):
+            controller._drive_recovery_protocol(None,process=process,channel_nonce=None,
+                source_sha=None,archive_digest=None,host_id=None,normalization_version=None,
+                review=SimpleNamespace(),on_review=lambda _:None,trusted_boot_id=None,
+                trusted_bind_digest=None,expected_root=None,expected_daemon_id=None,
+                expected_project=None,timeout=0)
+        self.assertLess(time.monotonic()-started,2.5)
+        self.assertIsNotNone(process.poll())
+        self.assertTrue(all(p.closed for p in (process.stdin,process.stdout,process.stderr)))
+
+    def test_final_stdin_flush_is_bounded_with_descendant_reader(self):
+        with self.assertRaises(BlockingIOError):self.drive('buffered-stdin')
+        self.assertLess(time.monotonic()-self.final_received_at,2.5)
         self.assertTrue(all(p.closed for p in (self.process.stdin,self.process.stdout,self.process.stderr)))
 
     def test_timeout_terminates_only_local_process(self):

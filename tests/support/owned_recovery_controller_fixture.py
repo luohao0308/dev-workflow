@@ -147,6 +147,9 @@ def run():
             client.transition_successor(expected_seq=view['seq'],expected_head=view['head'],childBinding=following)
             binding=following;finish(index,request,child_refs,binding)
         value=json.loads(child_history.capture().canonical)
+        if attack=='buffered-stdin':
+            import subprocess
+            subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         channel.emit('final',result=dict(receipts=receipts,initialWriteCount=1,productionReady=False),history=value,
             success=True,cleanupCompleted=True,daemonStopped=True,productionSnapshotUnchanged=True,productionReady=False)
         if attack=='nonzero':raise RuntimeError('fixed nonzero fixture')
