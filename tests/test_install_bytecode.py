@@ -11,6 +11,24 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def instrument_private_uninstaller(distribution):
+    """Failure-only Windows path evidence, confined to the disposable fixture."""
+    script = distribution / 'scripts/uninstall.ps1'
+    source = script.read_text(encoding='utf-8')
+    marker = '        throw "Manifest path escapes the target directory: $RelativePath"'
+    diagnostic = r'''        [Console]::Error.WriteLine(('uninstall-path-diagnostic: ' + (@{
+            Root = $Root
+            Resolved = $resolved
+            Prefix = ($Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar)
+            Location = (Get-Location).Path
+            ProcessDirectory = [Environment]::CurrentDirectory
+        } | ConvertTo-Json -Compress)))
+'''
+    if source.count(marker) != 1:
+        raise AssertionError('Uninstaller diagnostic hook must match exactly once')
+    script.write_text(source.replace(marker, diagnostic + marker), encoding='utf-8')
+
+
 class BytecodeInstallTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt' and not shutil.which('pwsh'), 'PowerShell runtime unavailable')
     def test_distribution_caches_are_excluded_and_user_cache_preserved(self):
@@ -22,6 +40,8 @@ class BytecodeInstallTests(unittest.TestCase):
                 shutil.copytree(ROOT / name, distribution / name,
                                 ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
             shutil.copy2(ROOT / 'VERSION', distribution / 'VERSION')
+            if os.name == 'nt':
+                instrument_private_uninstaller(distribution)
             excluded = ('scripts/__pycache__/sentinel.pyc',
                         'scripts/__pycache__/nested/source.py',
                         'scripts/standalone.pyc', 'scripts/standalone.pyo', '.DS_Store', 'docs/.DS_Store')
@@ -86,6 +106,8 @@ class BytecodeInstallTests(unittest.TestCase):
                 shutil.copytree(ROOT / name, distribution / name,
                                 ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
             shutil.copy2(ROOT / 'VERSION', distribution / 'VERSION')
+            if os.name == 'nt':
+                instrument_private_uninstaller(distribution)
             for overlay, nested in (('core', 'core-metadata'), ('packs/release', 'release-metadata')):
                 for relative in ('.DS_Store', 'docs/' + nested + '/.DS_Store'):
                     path = distribution / overlay / relative
