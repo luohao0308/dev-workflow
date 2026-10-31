@@ -5,6 +5,7 @@ closed-parent CAS fences competing coordinators; evidence alone grants no permit
 Partial recovery and unknown outcomes are deliberately outside this first lane.
 """
 import json
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -121,12 +122,20 @@ class Profile3StartupFenceV3:
 
 class Profile3RecoveryFenceV3:
     """Continue only a closed successful prefix with fresh reviewed context."""
-    def __init__(self, *, preparation, context_reference, reviewed_history, quiesce_writer):
+    def __init__(self, *, preparation, context_reference, reviewed_history, quiesce_writer=None,
+                 original_executor=None, closed_create_drain=None):
         from deployment_compose_recovery_prepare_v3_host import RecoveryPreparationHostV3
+        from deployment_compose_coordinator_v3_host import ClosedCreateDrainV3
+        typed = original_executor is not None or closed_create_drain is not None
+        if typed:
+            if quiesce_writer is not None or type(original_executor) is not Profile3StepExecutor or type(closed_create_drain) is not ClosedCreateDrainV3:reject()
+        elif not callable(quiesce_writer):reject()
         if (type(preparation) is not RecoveryPreparationHostV3
                 or type(reviewed_history) is not AuthenticatedHistorySnapshotV3
-                or not callable(quiesce_writer)):
+                ):
             reject()
+        self._owner_pid=os.getpid()
+        self._original_executor,self._closed_create_drain=original_executor,closed_create_drain
         self._preparation, self._reference = preparation, context_reference
         self._reviewed, self._quiesce = reviewed_history, quiesce_writer
         self._used = False
@@ -134,14 +143,18 @@ class Profile3RecoveryFenceV3:
 
     def activate(self, *, bundle, request, binding, intent_authority, phase_guard,
                  witness_client_factory, consumption_receipt_hash, gate_policy):
+        if os.getpid()!=self._owner_pid:reject()
         with self._lock:
             if self._used:
                 reject()
             self._used = True
             try:
                 request.ensure_fresh(datetime.now(timezone.utc))
-                if request.operation != 'recovery' or self._quiesce() is not True:
-                    reject()
+                if request.operation != 'recovery':reject()
+                if self._original_executor is not None:
+                    Profile3StepExecutor.verify_owned_closed_create(self._original_executor,
+                        self._closed_create_drain,self._preparation._history)
+                elif self._quiesce() is not True:reject()
                 context = self._preparation.verify_context(self._reference, request, self._reviewed)
                 history = self._preparation._history
                 if (bundle.canonical_bytes != history._bundle.canonical_bytes
@@ -151,6 +164,7 @@ class Profile3RecoveryFenceV3:
                 if live.canonical != self._reviewed.canonical:
                     reject()
                 value = json.loads(live.canonical)
+                if self._original_executor is not None and (len(value['scopes'])!=1 or canonical(value['knownPrefix'])!=canonical([bundle.creation_operations()[0]])):reject()
                 status, tail = value['chainStatus'], value['closedTail']
                 if (tail is None or status['activePhase'] != 'closed'
                         or tail != dict(binding=status['activeBinding'], seq=status['activeSeq'],

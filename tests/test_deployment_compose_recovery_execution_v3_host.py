@@ -33,7 +33,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     setUpClass = classmethod(tls_fixture.WriteGatewayTests.setUpClass.__func__)
     tearDownClass = classmethod(tls_fixture.WriteGatewayTests.tearDownClass.__func__)
 
-    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None):
+    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None):
         kw, observation = prepare_fixture.fixture()
         kw['source'] = approval_fixture.request().source
         prepared = ComposePreparationHostV3(**kw).prepare_intent(observation, observation,
@@ -41,6 +41,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         bundle = prepared['bundle']; rows = deepcopy(kw['whole_observer']._unit_rows)
         store = kw['recovery']._store
         request = replace(prepared['request'], expires_at='2020-01-01T00:00:00Z')
+        if initial_request_factory is not None:request=initial_request_factory(request)
         if two_services:
             value = bundle.to_dict()
             for key in ('operations','resolverRules','resolverContract','imageDefaultsDigests'): value.pop(key)
@@ -182,7 +183,8 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         server_tls.load_verify_locations(self.directory/'ca.pem');server_tls.verify_mode=ssl.CERT_REQUIRED
         client_tls=ssl.create_default_context(cafile=self.directory/'ca.pem')
         client_tls.load_cert_chain(self.directory/'client.pem',self.directory/'client.key')
-        fence=Profile3RecoveryFenceV3(preparation=prep,context_reference=recovery['recovery_context_reference'],
+        make_fence=fence_factory or Profile3RecoveryFenceV3
+        fence=make_fence(preparation=prep,context_reference=recovery['recovery_context_reference'],
             reviewed_history=reviewed,quiesce_writer=quiesce_writer)
         args=dict(intent_authority=authority,phase_guard=guard,gate_root=self.root/'recovery-gate',
             gate_key=b'g'*32,gate_policy=gate_policy,consumption_receipt_hash=receipt,
