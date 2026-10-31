@@ -29,6 +29,7 @@ from deployment_compose_operation_witness_client_v3 import (OperationWitnessClie
     validate_request, decode_material, encode, NAMESPACE)
 from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
 from deployment_compose_witness_budget_v3_host import check_witness_byte_capacity
+from deployment_compose_recovery_phase_capsule_v3_host import verify_captured_recovery_phase
 from deployment_compose_witness_store import canonical, hex_value, ZERO
 from deployment_contract_v2 import RequestV2
 from deployment_gate_witness import key_material
@@ -78,6 +79,7 @@ class MacLiveAdmissionV3:
                 self._signers.append(path);self._public.append(public)
             if (self._signers[0]==self._signers[1] or self._public[0]==self._public[1]
                     or hashlib.sha256(self._public[0]).hexdigest()!=gate_policy.witness_key_sha256):reject()
+            self._owner_pid=os.getpid();self._issuer=self
             self._lock=threading.RLock();self._seen=set();self._bindings={}
             self._current=None;self._pending=None;self._root=None;self._epoch=secrets.token_hex(32)
         except Exception:reject()
@@ -203,6 +205,72 @@ class MacLiveAdmissionV3:
                 name = type(error).__name__
                 category = name if name in ('GitHubUnavailable','AuthorizationUnavailable','ValueError','GateError','OSError') else 'Other'
                 raise LiveAdmissionRejected(stage, category) from None
+
+    def register_recovery(self,capsule_bytes,approval,consumption,*,baseline_bytes,expected_daemon_version):
+        """Register a pending index1 intent; static phase checks grant no runtime permit."""
+        # Reject a fork before touching its possibly inherited, held RLock. A copied
+        # issuer must not share the live issuer's dictionaries or signing identity.
+        if os.getpid()!=self._owner_pid or self._issuer is not self:
+            raise LiveAdmissionRejected('owner','ValueError')
+        with self._lock:
+            stage='parent-history'
+            try:
+                if self._root is None or self._current is not self._root or self._pending is not None:reject()
+                history=self._history(self._root)
+                original=self._root['request'];bundle=self._root['bundle']
+                stage='capsule'
+                verified=verify_captured_recovery_phase(capsule_bytes,original_history=history,
+                    baseline_bytes=baseline_bytes,expected_daemon_version=expected_daemon_version,
+                    expected_source=original.source,expected_host_id=original.host_id,
+                    expected_daemon_id=original.daemon_id,expected_target=original.target,
+                    expected_policy_hash=self._policy.identity_hash())
+                request=RequestV2.from_json(verified.request_bytes.decode('ascii'))
+                stage='identity'
+                if (type(approval) is not GitHubFullBodyApprovalV3
+                        or type(consumption) is not FullBodyConsumptionEvidenceV3
+                        or request.operation!='recovery' or request not in approval.requests
+                        or consumption.request_hash!=request.digest()
+                        or type(consumption.use_number) is not int or consumption.use_number!=1
+                        or consumption.grant_id!=approval.grant_namespace+':'+str(approval.policy.run_id)+':recovery'
+                        or request.plan_hash!=bundle.digest or request.policy_hash!=self._policy.identity_hash()
+                        or len(request.protected_components)!=len(bundle.to_dict()['protectedContainers'])
+                        or request.after_hash!=_digest({s['name']:s['targetCreateBody'] for s in bundle.to_dict()['services']})):
+                    reject()
+                stage='consumption-time'
+                when=datetime.fromisoformat(consumption.consumed_at)
+                if when.tzinfo is None or when>datetime.now(timezone.utc):reject()
+                entry=dict(bundle=bundle,request=request,approval=approval,consumption=consumption,
+                    receiptHash=_digest(asdict(consumption)),parentHistory=history,parentSnapshot=None)
+                stage='consent'
+                self._consent(entry)
+                stage='parent-history'
+                fresh=history.capture();value=json.loads(fresh.canonical,object_pairs_hook=pairs)
+                if (fresh.digest!=verified.history_digest or fresh.digest!=request.history_hash
+                        or value['schemaVersion']!=1 or value['blocker'] is not None or value['pending'] is not None
+                        or len(value['scopes'])!=1 or value['scopes'][0]['seq']!=6
+                        or value['chainStatus']['activePhase']!='closed' or value['chainStatus']['activeSeq']!=6
+                        or value['chainStatus']['lineage']
+                        or canonical(value['knownPrefix'])!=canonical([bundle.creation_operations()[0]])):reject()
+                entry['parentSnapshot']=fresh
+                stage='scope'
+                scope=self._scope(entry,1,value['receiptMap']);entry['first']=scope['binding']
+                stage='history'
+                self._history(entry)
+                stage='capacity'
+                check_witness_byte_capacity(bundle,request,self._policy,entry['receiptHash'],entry['first'],fresh)
+                stage='consent'
+                self._consent(entry)
+                stage='parent-history'
+                if history.capture().canonical!=fresh.canonical:reject()
+                stage='freshness'
+                request.ensure_fresh(datetime.now(timezone.utc))
+                binding=deepcopy(scope['binding'])
+                self._pending=scope
+                return binding
+            except Exception as error:
+                name=type(error).__name__
+                category=name if name in ('GitHubUnavailable','AuthorizationUnavailable','ValueError','GateError','OSError') else 'Other'
+                raise LiveAdmissionRejected(stage,category) from None
 
     def _unseal(self,envelope,domain):
         if (type(envelope) is not dict or set(envelope)!={'version','domain','policy','payload','mac'}
