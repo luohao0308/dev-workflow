@@ -10,8 +10,11 @@ from dataclasses import asdict, replace
 import hashlib
 import http.client
 import json
+import math
+import os
 from pathlib import Path
 import ssl
+import sys
 import threading
 import time
 from types import MappingProxyType
@@ -63,7 +66,7 @@ class Profile3StepExecutor:
                  gate_root, gate_key, gate_policy, consumption_receipt_hash,
                  witness_client_factory, registered_binding, tls_server_context,
                  tls_client_context, server_certificate_sha256, docker_socket, timeout=30,
-                 startup_fence=None, control_timeout=180, operation_scope=None):
+                 startup_fence=None, control_timeout=180, operation_scope=None, owned_create_transport=None):
         if (type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
                 or type(intent_authority) not in (GitHubFullBodyApprovalV3, IntentStatusClientV3)
                 or not callable(phase_guard) or not callable(witness_client_factory)
@@ -79,6 +82,14 @@ class Profile3StepExecutor:
                 or operation_scope is not None and not callable(operation_scope)
                 or type(timeout) not in (int, float) or not 1 <= timeout <= 180):
             reject()
+        if owned_create_transport is not None:
+            from deployment_compose_create_transport_v3_host import OwnedCreateTransportV3
+            if type(owned_create_transport) is not OwnedCreateTransportV3 or request.operation != 'deploy':
+                reject()
+        self._owner_pid = os.getpid()
+        self._owned_transport = owned_create_transport
+        self._owned_gateway_token = None
+        self._owned_gateway = None
         check_witness_capacity(bundle)
         v = bundle.to_dict(); identity = v['identity']
         if (request.plan_hash != bundle.digest or request.profile_id != PROFILE
@@ -146,6 +157,7 @@ class Profile3StepExecutor:
         return dict(generation=generation, source=source, operations=operations, scopeHash=scope)
 
     def execute(self, operation, *, phase_index, receipts, completed_operations):
+        if self._owned_transport is not None and os.getpid()!=self._owner_pid:reject()
         with self._lock:
             if self._blocked: reject()
             self._blocked = True
@@ -159,6 +171,8 @@ class Profile3StepExecutor:
                 raise
 
     def _execute(self, operation, *, phase_index, receipts, completed_operations, deadline):
+        if self._owned_transport is not None and (phase_index != 0 or receipts or completed_operations or operation.get('phase') != 'create'):
+            reject()
         operation = deepcopy(operation); receipts = deepcopy(receipts)
         if phase_index != self._index or operation['method'] not in ('POST', 'DELETE'):
             reject()
@@ -205,6 +219,8 @@ class Profile3StepExecutor:
         server = create_gateway_v3(gate, tls_context=self._server_tls, docker_socket=self._socket,
                                    pre_dispatch=guard, timeout=self._timeout, control_deadline=deadline)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
+        if self._owned_transport is not None:
+            self._owned_gateway = (server, thread)
         connection = watchdog = None
         try:
             guard()
@@ -214,37 +230,88 @@ class Profile3StepExecutor:
             headers = session.headers(attempt)
             headers.update({'Content-Length': str(len(body)), 'Content-Type': 'application/json', 'Connection': 'close'})
             thread.start()
-            connection = http.client.HTTPSConnection('localhost', server.server_port,
-                context=self._client_tls, timeout=max(.001,deadline-time.monotonic()))
-            connection.connect()
-            watchdog = runtime.deadline_watchdog(connection.sock, deadline)
-            if hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest() != self._pin:
-                reject()
-            connection.request(operation['method'], operation['path'], body=body, headers=headers)
-            response = connection.getresponse(); raw = _complete_response(response)
+            if self._owned_transport is not None:
+                status, raw = self._owned_transport.request(request_hash=self.request.digest(),
+                    scope_hash=desc['scopeHash'], port=server.server_port, pin=self._pin,
+                    operation=operation, body=body, headers=headers, docker_socket=self._socket,
+                    deadline=deadline)
+            else:
+                connection = http.client.HTTPSConnection('localhost', server.server_port,
+                    context=self._client_tls, timeout=max(.001,deadline-time.monotonic()))
+                connection.connect()
+                watchdog = runtime.deadline_watchdog(connection.sock, deadline)
+                if hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest() != self._pin:
+                    reject()
+                connection.request(operation['method'], operation['path'], body=body, headers=headers)
+                response = connection.getresponse(); raw = _complete_response(response)
+                status = response.status
             proof = gate.close_generation(desc['generation'])
             evidence = gate.generation_evidence(desc['generation'])
             # A gateway denial/unknown response cannot masquerade as a recorded Engine response.
             finishes = [e['data'] for e in evidence['events'] if e['kind'] == 'finish']
             import base64
-            if len(finishes) != 1 or not finishes[0]['definitive'] or finishes[0]['status'] != response.status or base64.b64decode(finishes[0]['bodyBase64']) != raw:
+            if len(finishes) != 1 or not finishes[0]['definitive'] or finishes[0]['status'] != status or base64.b64decode(finishes[0]['bodyBase64']) != raw:
                 reject()
-            result = dict(status=response.status, body=raw, closure=proof.to_json(),
+            result = dict(status=status, body=raw, closure=proof.to_json(),
                           gateEvidence=evidence, witness=adapter.authenticated_material_after(),
                           binding=binding, productionReady=False, fullTrust=False)
             self._evidence.append(deepcopy(result))
-            if response.status != operation['expectedStatus']:
+            if status != operation['expectedStatus']:
                 reject()
             self._client = client; self._binding = binding; self._index += 1; self._blocked = False
             return result
         finally:
-            server.cancel()
-            if watchdog is not None: watchdog.cancel()
-            if connection is not None:
-                connection.close()
-            if thread.is_alive():
-                server.shutdown(); thread.join()
-            server.server_close()
+            if self._owned_transport is not None:
+                # This token is issued only by this live executor after actual
+                # handler/listener drain, never from a caller's boolean.
+                original = sys.exc_info()[1]
+                try:
+                    self._retry_owned_cleanup(deadline)
+                except Exception:
+                    if original is None: raise
+            else:
+                server.cancel()
+                if watchdog is not None: watchdog.cancel()
+                if connection is not None:
+                    connection.close()
+                if thread.is_alive():
+                    server.shutdown(); thread.join()
+                server.server_close()
+
+    def _retry_owned_cleanup(self, deadline):
+        if os.getpid()!=self._owner_pid or self._owned_transport is None:reject()
+        failure = None
+        try:
+            if self._owned_gateway is not None:
+                server, thread = self._owned_gateway
+                server.drain_owned(thread, deadline)
+                self._owned_gateway_token = object()
+                self._owned_gateway = None
+        except Exception as error:
+            failure = error
+        try:
+            self._owned_transport.close(deadline)
+        except Exception as error:
+            if failure is None: failure = error
+        if failure is not None: raise failure
+        return self._owned_gateway_token
+
+    def retry_owned_cleanup(self, deadline):
+        """Revoke/drain retained resources; never revive a business request."""
+        if os.getpid()!=self._owner_pid or self._owned_transport is None:reject()
+        if (type(deadline) not in (int,float) or not math.isfinite(deadline)
+                or not time.monotonic()<deadline<=time.monotonic()+180):reject()
+        if not self._lock.acquire(timeout=max(0,deadline-time.monotonic())):reject()
+        try:
+            return self._retry_owned_cleanup(deadline)
+        finally:
+            self._lock.release()
+
+    def owned_gateway_token(self, transport):
+        if os.getpid()!=self._owner_pid:reject()
+        if transport is not self._owned_transport or self._owned_gateway_token is None:
+            reject()
+        return self._owned_gateway_token
 
     def private_evidence(self):
         return deepcopy(self._evidence)

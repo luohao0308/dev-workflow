@@ -168,10 +168,11 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             self.serving = False
             self.closing = False
             self.owner = None
+            self._owned_shutdown_waiter = None
             super().__init__(*args)
 
         def check_live(self):
-            if self.cancelled.is_set() or time.monotonic() >= deadline:
+            if self.closing or self.cancelled.is_set() or time.monotonic() >= deadline:
                 raise GatewayHostError('gateway-control-expired-or-cancelled')
 
         def cancel(self):
@@ -197,7 +198,41 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             if drain: self.shutdown()
             super().server_close()
 
+        def drain_owned(self, thread, control_deadline):
+            # Register before any operation that may time out. Closing rejects
+            # new clients; without the dispatch barrier it is not a drain proof.
+            with self.lifecycle_lock:
+                self.closing = True
+                self._blocked_drain = (thread, self._owned_shutdown_waiter)
+            remaining = control_deadline-time.monotonic()
+            if remaining <= 0 or not self.dispatch_lock.acquire(timeout=remaining):
+                raise GatewayHostError('gateway-drain-deadline')
+            try:
+                self.cancelled.set()
+            finally:
+                self.dispatch_lock.release()
+            with self.lifecycle_lock:
+                needs_shutdown = self.serving and self.owner != threading.get_ident()
+                if needs_shutdown and self._owned_shutdown_waiter is None:
+                    self._owned_shutdown_waiter = threading.Thread(target=self.shutdown, daemon=True)
+                    self._owned_shutdown_waiter.start()
+                waiter = self._owned_shutdown_waiter
+                self._blocked_drain = (thread, waiter)
+            if waiter is not None:
+                waiter.join(max(0,control_deadline-time.monotonic()))
+            if thread.is_alive():
+                thread.join(max(0,control_deadline-time.monotonic()))
+            if (waiter is not None and waiter.is_alive()) or thread.is_alive():
+                raise GatewayHostError('gateway-drain-deadline')
+            HTTPServer.server_close(self)
+            if time.monotonic() >= control_deadline:
+                raise GatewayHostError('gateway-drain-deadline')
+            del self._blocked_drain
+
         def finish_request(self, request, client_address):
+            if self.closing:
+                request.close()
+                return
             request.settimeout(min(timeout, 5))
             wrapped = None
             try:

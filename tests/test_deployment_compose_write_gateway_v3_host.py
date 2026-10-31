@@ -15,6 +15,7 @@ import subprocess
 from unittest.mock import patch
 import sys
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler
 
@@ -86,6 +87,95 @@ class WriteGatewayTests(GateFixture, unittest.TestCase):
         self.server = host.create_gateway_v3(self.g, tls_context=context, docker_socket=self.root/'docker.sock', pre_dispatch=guard, timeout=1)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close); self.addCleanup(self.server.shutdown)
+
+    def _owned_executor_for_cleanup(self):
+        from deployment_compose_coordinator_v3_host import Profile3StepExecutor
+        executor=object.__new__(Profile3StepExecutor)
+        executor._owner_pid=os.getpid();executor._owned_transport=unittest.mock.Mock()
+        until=time.monotonic()+2
+        while self.server.owner is None and time.monotonic()<until:time.sleep(.001)
+        owner=next(t for t in threading.enumerate() if t.ident==self.server.owner)
+        executor._owned_gateway=(self.server,owner);executor._owned_gateway_token=None
+        executor._lock=threading.Lock();executor._blocked=True
+        return executor,owner
+
+    def test_owned_expired_drain_retains_resources_for_cleanup_only_retry(self):
+        executor,owner=self._owned_executor_for_cleanup()
+        with self.assertRaises(host.GatewayHostError):
+            executor._retry_owned_cleanup(time.monotonic()-1)
+        self.assertTrue(self.server.closing)
+        self.assertIsNotNone(executor._owned_gateway)
+        self.assertIsNone(executor._owned_gateway_token)
+        self.assertTrue(owner.is_alive())
+        self.assertTrue(hasattr(self.server,'_blocked_drain'))
+        executor._owned_transport.close.assert_called_once()
+        token=executor.retry_owned_cleanup(time.monotonic()+2)
+        self.assertIsNotNone(token)
+        self.assertIsNone(executor._owned_gateway)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(self.server.fileno(),-1)
+        self.assertTrue(executor._blocked)
+
+    def test_owned_dispatch_lock_timeout_retains_resources_until_release(self):
+        executor,owner=self._owned_executor_for_cleanup()
+        self.server.dispatch_lock.acquire()
+        try:
+            with self.assertRaises(host.GatewayHostError):
+                executor.retry_owned_cleanup(time.monotonic()+.02)
+            self.assertTrue(self.server.closing)
+            self.assertIsNotNone(executor._owned_gateway)
+            self.assertIsNone(executor._owned_gateway_token)
+            self.assertTrue(owner.is_alive())
+            executor._owned_transport.close.assert_called_once()
+        finally:self.server.dispatch_lock.release()
+        executor.retry_owned_cleanup(time.monotonic()+2)
+        self.assertIsNone(executor._owned_gateway)
+        self.assertIsNotNone(executor._owned_gateway_token)
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(self.server.fileno(),-1)
+        self.assertTrue(executor._blocked)
+
+    def test_owned_drain_before_serve_enters_has_no_shutdown_waiter(self):
+        context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.directory/'server.pem',self.directory/'server.key')
+        context.load_verify_locations(self.directory/'ca.pem');context.verify_mode=ssl.CERT_REQUIRED
+        server=host.create_gateway_v3(self.g,tls_context=context,
+            docker_socket=self.root/'docker.sock',pre_dispatch=lambda *a:None,timeout=1)
+        entered=threading.Event();release=threading.Event()
+        def delayed():
+            entered.set();release.wait(2);server.serve_forever()
+        owner=threading.Thread(target=delayed,daemon=True);owner.start()
+        self.assertTrue(entered.wait(1))
+        timer=threading.Timer(.05,release.set);timer.start()
+        try:
+            server.drain_owned(owner,time.monotonic()+1)
+            self.assertFalse(owner.is_alive())
+            self.assertFalse(hasattr(server,'_blocked_drain'))
+        finally:
+            release.set();owner.join(1);timer.join(1);server.server_close()
+
+    def test_owned_drain_blocked_handler_has_no_false_success(self):
+        entered=threading.Event();release=threading.Event()
+        original=self.server.RequestHandlerClass._handle
+        def blocked(handler):
+            entered.set();release.wait(2);return original(handler)
+        self.server.RequestHandlerClass._handle=blocked
+        self.server.RequestHandlerClass.do_POST=blocked
+        def call():
+            try:self.send(body=self.body)
+            except Exception:pass
+        caller=threading.Thread(target=call,daemon=True);caller.start()
+        self.assertTrue(entered.wait(2))
+        owner=next(t for t in threading.enumerate() if t.ident==self.server.owner)
+        try:
+            with self.assertRaises(host.GatewayHostError):
+                self.server.drain_owned(owner,time.monotonic()+.05)
+            self.assertTrue(owner.is_alive())
+            self.assertTrue(hasattr(self.server,'_blocked_drain'))
+        finally:
+            release.set();caller.join(3);owner.join(3)
+            for thread in getattr(self.server,'_blocked_drain',()):
+                if thread.ident is not None:thread.join(3)
 
     def send(self, method='POST', path=None, extra=(), body=b'', certificate='client'):
         context = ssl.create_default_context(cafile=self.directory/'ca.pem')
