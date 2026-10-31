@@ -83,6 +83,52 @@ def _write_private(path, value):
     with os.fdopen(fd,'wb') as output:output.write(raw)
 
 
+def _rpc_failure_diagnostic(service, method, error, event_kind=None):
+    """Never serialize exception messages or RPC payloads."""
+    methods = {'intent': {'check'}, 'witness': {'read', 'chain_status', 'check',
+        'events_after', 'append_event', 'transition_successor'}}
+    types = {'ValueError', 'TypeError', 'OSError', 'TimeoutError', 'RuntimeError',
+             'AuthorizationUnavailable', 'GitHubUnavailable', 'HTTPException',
+             'JSONDecodeError', 'LiveAdmissionRejected'}
+    fields = {'iss', 'aud', 'repository', 'repository_id', 'workflow_ref',
+              'workflow_sha', 'run_id', 'run_attempt', 'environment', 'sub'}
+    known_service = type(service) is str and service in methods
+    known_method = known_service and type(method) is str and method in methods[service]
+    kinds = {'open', 'prepared', 'admitted', 'response', 'completed', 'closed'}
+    result = dict(stage='authorize-rpc', service=service if known_service else 'unknown',
+                  method=method if known_method else 'unknown',
+                  eventKind=event_kind if type(event_kind) is str and event_kind in kinds else 'unknown',
+                  causeTypes=[], failureCodes=[], mismatchFields=[])
+    seen = set()
+    while error is not None and id(error) not in seen and len(result['causeTypes']) < 5:
+        seen.add(id(error))
+        name = type(error).__name__
+        result['causeTypes'].append(name if name in types else 'unknown')
+        code = getattr(error, 'failure_code', None)
+        if type(code) is str and re.fullmatch(r'authorization-[0-9a-f]{12}', code):
+            if code not in result['failureCodes']: result['failureCodes'].append(code)
+        mismatches = getattr(error, 'mismatch_fields', ())
+        if type(mismatches) in (tuple, list):
+            for field in mismatches[:32]:
+                if type(field) is str and field in fields and field not in result['mismatchFields']:
+                    result['mismatchFields'].append(field)
+        error = error.__cause__ if error.__cause__ is not None else error.__context__
+    return result
+
+
+def _authorize_rpc(admission, service, method, request, case):
+    try:
+        return admission.authorize_rpc(service, method, request)
+    except Exception as error:
+        try:
+            event = request.get('event') if type(request) is dict else None
+            kind = event.get('kind') if type(event) is dict else None
+            _write_private(case/'rpc-failure.private.json', _rpc_failure_diagnostic(service, method, error, kind))
+        except Exception:
+            pass  # Diagnostic I/O must not replace the original fail-closed error.
+        raise
+
+
 def _live_key(root, name):
     key=root/name
     subprocess.run(['/usr/bin/ssh-keygen','-q','-t','ed25519','-N','','-C',name,
@@ -266,7 +312,7 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                 nonce=data['request'].get('rpcNonce')
                 if type(nonce) is not str or nonce in seen_nonces:reject()
                 seen_nonces.add(nonce);last_rpc=data['rpcId']
-                reply=admission.authorize_rpc(data['service'],data['method'],data['request'])
+                reply=_authorize_rpc(admission,data['service'],data['method'],data['request'],case)
                 send('reply',rpcId=last_rpc,response=reply)
             elif kind=='deployed':
                 if intent_count!=1 or deployed is not None or set(data)!={'result','history'}:reject()
@@ -299,6 +345,14 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
             if thread is not None:thread.join(timeout=5)
             process.stdout.close();process.stderr.close()
         store.close()
+        close_review = getattr(review, 'close', None)
+        if callable(close_review):
+            failure_in_flight = sys.exc_info()[0] is not None
+            try:
+                close_review()
+            except Exception:
+                if not failure_in_flight:
+                    raise
 
 
 def private_json_status(value):

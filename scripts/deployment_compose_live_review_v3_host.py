@@ -2,13 +2,17 @@
 from dataclasses import asdict
 from datetime import datetime, timezone
 import io
+import http.client
+from http.client import HTTPSConnection
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import ssl
 import subprocess
 import time
+import threading
 import zipfile
 
 from deployment_compose_full_body_review_contract import (
@@ -17,7 +21,7 @@ from deployment_compose_full_body_review_contract import (
 from deployment_compose_bundle_v3 import ExecutionBundleV3
 from deployment_contract_v2 import RequestV2
 from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3
-from release_github import GitHubClient, GitHubUnavailable
+from release_github import GitHubClient, GitHubUnavailable, MAX_RESPONSE
 
 CONFIG = dict(DW_AUTH_LEDGER_REPOSITORY='luohao0308/dev-workflow-authority-ledger',
               DW_AUTH_LEDGER_ID='1436718662',
@@ -32,7 +36,80 @@ class LiveReviewBlocked(ValueError):
 
 class _ReadRetryGitHubClient(GitHubClient):
     """Live-host reads only; mutation outcomes are never retried or cached."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._network_lock = threading.RLock()
+        self._connection = None
+        self._owner_pid = os.getpid()
+
+    def _check_owner(self):
+        if os.getpid() != self._owner_pid:
+            raise GitHubUnavailable('Inherited live GitHub client is unavailable')
+
+    def close(self):
+        self._check_owner()
+        with self._network_lock:
+            connection, self._connection = self._connection, None
+            if connection is not None:
+                try: connection.close()
+                except OSError: pass
+
+    def _network(self, method, path, payload, before_send):
+        self._check_owner()
+        data = None if payload is None else json.dumps(payload, ensure_ascii=True, allow_nan=False).encode('ascii')
+        headers = {'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + self._token,
+                   'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'dev-workflow-release',
+                   'Content-Type': 'application/json', 'Cache-Control': 'no-cache'}
+        with self._network_lock:
+            # A mutation guard can make nested GETs. It must finish before we
+            # select the idle connection, and its denial must propagate intact.
+            before_send()
+            response = None
+            try:
+                if self._connection is None:
+                    context = ssl.create_default_context()
+                    if context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname:
+                        raise GitHubUnavailable('GitHub TLS verification required')
+                    self._connection = HTTPSConnection('api.github.com', 443,
+                        timeout=self.timeout, context=context)
+                connection = self._connection
+                if connection.sock is not None:
+                    connection.sock.settimeout(self.timeout)
+                connection.request(method, path, body=data, headers=headers)
+                response = connection.getresponse()
+                status, reply_headers = response.status, dict(response.headers.items())
+                if status >= 300:
+                    # Do not follow redirects or retain unread error bodies.
+                    self.close()
+                    return status, {}, None
+                lengths = response.headers.get_all('Content-Length', [])
+                encodings = response.headers.get_all('Transfer-Encoding', [])
+                if (len(lengths) > 1 or len(encodings) > 1 or lengths and encodings
+                        or lengths and re.fullmatch(r'[0-9]+', lengths[0].strip()) is None
+                        or encodings and encodings[0].strip().lower() != 'chunked'):
+                    raise GitHubUnavailable('GitHub response framing invalid')
+                raw = response.read(MAX_RESPONSE + 1)
+                if len(raw) > MAX_RESPONSE:
+                    raise GitHubUnavailable('GitHub response exceeds the bounded limit')
+                if response.length not in (None, 0) or (not response.will_close and not response.isclosed()):
+                    raise GitHubUnavailable('GitHub response incomplete')
+                result = json.loads(raw.decode('utf-8'))
+                if response.will_close:
+                    self.close()
+                return status, reply_headers, result
+            except (OSError, http.client.HTTPException, ValueError, UnicodeError):
+                self.close()
+                raise GitHubUnavailable('GitHub response unavailable or invalid') from None
+            except BaseException:
+                self.close()
+                raise
+            finally:
+                if response is not None:
+                    try: response.close()
+                    except OSError: self.close()
+
     def request(self, method, path, payload=None, *, allow_missing=False, before_send=lambda: None):
+        self._check_owner()
         attempts = 3 if method == 'GET' else 1
         for attempt in range(attempts):
             guard_passed = False
@@ -61,6 +138,9 @@ def _private(path, mode, directory=False):
 
 
 class GitHubLiveReviewV3:
+    def close(self):
+        self.client.close()
+
     def __init__(self, private_root, *, source_sha, recipient_private_key):
         self.root = _private(private_root, 0o700, True)
         self.key = _private(recipient_private_key, 0o600)
