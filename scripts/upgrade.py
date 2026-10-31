@@ -112,7 +112,7 @@ def inventory(root: Path, packs: list[str]) -> dict[str, tuple[str, bytes]]:
         for item in sorted(directory.rglob('*')):
             if linked(item):
                 raise ValueError('Distribution contains a linked path')
-            if '__pycache__' in item.parts or item.suffix == '.pyc' or item.is_dir():
+            if '__pycache__' in item.parts or item.suffix == '.pyc' or item.name == '.DS_Store' or item.is_dir():
                 continue
             name = relative(item.relative_to(directory).as_posix())
             if name in output:
@@ -517,7 +517,7 @@ def transact(root: Path, manifest: dict, payloads: dict[str, bytes], operation: 
     directory = path_at(root, '.dev-workflow/upgrades/' + transaction)
     items = []
     for key, after in payloads.items():
-        path = info[0] if key == '@git-exclude' else path_at(root, key)
+        path = destination(root, key, str(info[0]) if info else None)
         before = contents(path)
         if expected is not None and key in expected and digest(before) != expected[key]:
             raise ValueError('Transaction input changed before backup; regenerate the plan: ' + key)
@@ -544,7 +544,7 @@ def transact(root: Path, manifest: dict, payloads: dict[str, bytes], operation: 
                 relative_path = ('core/' if owner == 'core' else 'packs/' + owner + '/') + name
                 write_bytes(path_at(directory / 'baseline', relative_path), data)
         for item in items:
-            path = info[0] if item['path'] == '@git-exclude' else path_at(root, item['path'])
+            path = destination(root, item['path'], str(info[0]) if info else None)
             if digest(contents(path)) != item['beforeSha256']:
                 raise ValueError('File changed before replacement; transaction interrupted: ' + item['path'])
             if path.exists() and not same_mode(stat.S_IMODE(path.stat().st_mode), item['mode']):

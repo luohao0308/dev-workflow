@@ -1,5 +1,6 @@
 """Exercise the actual local v0.8.0 distribution, without synthetic old sources."""
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -56,6 +57,17 @@ def outside_core(data):
 
 
 class HistoricalUpgradeTests(unittest.TestCase):
+    def test_transaction_rejects_unrestorable_paths_before_writing(self):
+        spec = importlib.util.spec_from_file_location('upgrade_path_regression', ROOT / 'scripts/upgrade.py')
+        upgrade = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(upgrade)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for key in ('.unexpected', 'workflow.config.json'):
+                with self.subTest(path=key), self.assertRaisesRegex(ValueError, '^Invalid transaction payload path$'):
+                    upgrade.transact(root, {'upgradeState': {}}, {key: b'forbidden'}, 'upgrade', 'a' * 32)
+                self.assertEqual(snapshot(root), {})
+
     def test_historical_upgrade_preserves_and_rejects_conflicting_runtime_helper(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -96,6 +108,8 @@ class HistoricalUpgradeTests(unittest.TestCase):
                 shutil.copytree(ROOT / name, source / name,
                                 ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
             shutil.copy2(ROOT / 'VERSION', source / 'VERSION')
+            for relative in ('core/.DS_Store', 'core/docs/.DS_Store', 'packs/delivery/.DS_Store'):
+                (source / relative).write_bytes(b'local Finder metadata, never distribution content')
             current_version = (source / 'VERSION').read_text().strip()
             self.assertNotEqual(current_version, '0.8.0')
             target = root / 'project'
@@ -117,6 +131,7 @@ class HistoricalUpgradeTests(unittest.TestCase):
             agents.write_bytes(b'Project-specific preamble: preserve my rules.\n\n'
                                + agents.read_bytes()
                                + b'\nProject-specific trailing notes: keep this evidence.\n')
+            (target / '.DS_Store').write_bytes(b'project-owned Finder metadata')
             before = snapshot(target)
             manifest = json.loads(manifest_path.read_text())
             outside_before = outside_core(before['AGENTS.md'])
@@ -134,6 +149,7 @@ class HistoricalUpgradeTests(unittest.TestCase):
             self.assertEqual(plan['baseline'], str(baseline))
             self.assertTrue(plan['ready'], plan)
             self.assertEqual(plan['conflicts'], [])
+            self.assertFalse(any(Path(entry['path']).name == '.DS_Store' for entry in plan['entries']))
             self.assertTrue(any(entry['action'] in ('update', 'merge', 'create')
                                 for entry in plan['entries']), 'Historical test must apply actual changes')
             self.assertEqual(snapshot(target), before)

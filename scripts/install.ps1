@@ -39,7 +39,7 @@ $ErrorActionPreference = 'Stop'
 # Classify paths relative to their distribution root; ancestors may be named __pycache__.
 function Test-DistributionBytecode {
     param([string]$RelativePath)
-    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$'
+    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$' -or $RelativePath -cmatch '(^|/)\.DS_Store$'
 }
 
 function Resolve-FullPath([string]$Path) {

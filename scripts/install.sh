@@ -1088,7 +1088,7 @@ if [[ "$existing_schema_version" == "1" ]]; then
         exit 1
       fi
       set_inventory "$relative_path" "$pack" "legacy" ""
-    done < <(find "$legacy_pack_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print | LC_ALL=C sort)
+    done < <(find "$legacy_pack_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print | LC_ALL=C sort)
   done
 fi
 
@@ -1289,7 +1289,7 @@ for index in "${!overlay_roots[@]}"; do
     cp "$source_path" "$target_path"
     actions+=("[create] $relative_path [$overlay_name]")
     set_inventory "$relative_path" "$overlay_name" "created" "$(sha256_file "$target_path")"
-  done < <(find "$overlay_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print | LC_ALL=C sort)
+  done < <(find "$overlay_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print | LC_ALL=C sort)
 done
 
 new_inventory_summary="$(inventory_summary)"

@@ -24,7 +24,7 @@ class BytecodeInstallTests(unittest.TestCase):
             shutil.copy2(ROOT / 'VERSION', distribution / 'VERSION')
             excluded = ('scripts/__pycache__/sentinel.pyc',
                         'scripts/__pycache__/nested/source.py',
-                        'scripts/standalone.pyc', 'scripts/standalone.pyo')
+                        'scripts/standalone.pyc', 'scripts/standalone.pyo', '.DS_Store', 'docs/.DS_Store')
             for overlay in ('core', 'packs/release'):
                 for relative in excluded:
                     path = distribution / overlay / relative
@@ -38,6 +38,8 @@ class BytecodeInstallTests(unittest.TestCase):
             user_cache = target / 'scripts/__pycache__/user.pyc'
             user_cache.parent.mkdir(parents=True)
             user_cache.write_bytes(b'user owned')
+            user_metadata = target / '.DS_Store'
+            user_metadata.write_bytes(b'project metadata')
             if os.name == 'nt':
                 install = ['pwsh', '-NoProfile', '-File', str(distribution / 'scripts/install.ps1'),
                            '-TargetPath', str(target), '-Packs', 'release', '-NonInteractiveInstall']
@@ -57,13 +59,72 @@ class BytecodeInstallTests(unittest.TestCase):
             self.assertNotIn('[error]', audit.stdout)
             inventory = json.loads((target / '.dev-workflow/manifest.json').read_text(encoding="utf-8"))['files']
             for relative in excluded:
-                self.assertFalse((target / relative).exists(), relative)
+                if relative == '.DS_Store':
+                    self.assertEqual((target / relative).read_bytes(), b'project metadata')
+                else:
+                    self.assertFalse((target / relative).exists(), relative)
                 self.assertNotIn(relative, [entry['path'] for entry in inventory])
             self.assertEqual(user_cache.read_bytes(), b'user owned')
+            self.assertEqual(user_metadata.read_bytes(), b'project metadata')
             self.assertEqual((target / 'docs/__pycache__').read_text(encoding="utf-8"), 'ordinary file, not a cache directory')
             for source in ('core_source.py', 'packs_release_source.py'):
                 self.assertTrue((target / 'scripts' / source).is_file())
                 self.assertIn('scripts/' + source, [entry['path'] for entry in inventory])
+            uninstall = (['pwsh', '-NoProfile', '-File', str(distribution / 'scripts/uninstall.ps1'), '-TargetPath', str(target)]
+                         if os.name == 'nt' else ['bash', str(distribution / 'scripts/uninstall.sh'), '--target', str(target)])
+            removed = subprocess.run(uninstall, capture_output=True, text=True, env=dict(os.environ, LC_ALL='C'))
+            self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+            self.assertEqual(user_metadata.read_bytes(), b'project metadata')
+
+    @unittest.skipUnless(os.name == 'nt' and shutil.which('pwsh'), 'Windows PowerShell runtime unavailable')
+    def test_windows_powershell_install_audit_uninstall_preserves_project_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            distribution = root / 'distribution'
+            distribution.mkdir()
+            for name in ('core', 'packs', 'scripts', 'extensions'):
+                shutil.copytree(ROOT / name, distribution / name,
+                                ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
+            shutil.copy2(ROOT / 'VERSION', distribution / 'VERSION')
+            for overlay, nested in (('core', 'core-metadata'), ('packs/release', 'release-metadata')):
+                for relative in ('.DS_Store', 'docs/' + nested + '/.DS_Store'):
+                    path = distribution / overlay / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'distribution-only metadata')
+            ordinary = distribution / 'packs/release/docs/.DS_Store.keep'
+            ordinary.write_bytes(b'ordinary distribution file')
+            target = root / 'project'
+            sentinels = {'.DS_Store': b'project root metadata',
+                         'docs/release-metadata/.DS_Store': b'project nested metadata'}
+            for relative, data in sentinels.items():
+                path = target / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+
+            def run(script, *arguments):
+                return subprocess.run([shutil.which('pwsh'), '-NoProfile', '-File',
+                                       str(distribution / 'scripts' / script),
+                                       '-TargetPath', str(target), *arguments],
+                                      capture_output=True, text=True, timeout=90,
+                                      env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
+
+            installed = run('install.ps1', '-Packs', 'release', '-NonInteractiveInstall')
+            self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+            inventory = json.loads((target / '.dev-workflow/manifest.json').read_text(encoding='utf-8'))['files']
+            self.assertFalse(any(Path(entry['path']).name == '.DS_Store' for entry in inventory))
+            self.assertFalse((target / 'docs/core-metadata/.DS_Store').exists())
+            self.assertEqual((target / 'docs/.DS_Store.keep').read_bytes(), b'ordinary distribution file')
+            for relative, data in sentinels.items():
+                self.assertEqual((target / relative).read_bytes(), data)
+            audited = run('audit.ps1')
+            self.assertEqual(audited.returncode, 2, audited.stdout + audited.stderr)
+            self.assertNotIn('[error]', audited.stdout + audited.stderr)
+            removed = run('uninstall.ps1')
+            self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+            self.assertFalse((target / 'docs/.DS_Store.keep').exists())
+            for relative, data in sentinels.items():
+                self.assertEqual((target / relative).read_bytes(), data)
+            self.assertFalse((target / 'docs/core-metadata/.DS_Store').exists())
 
     def test_powershell_filters_relative_paths_before_inventory_and_copy(self):
         source = (ROOT / 'scripts/install.ps1').read_text(encoding="utf-8")
@@ -71,13 +132,15 @@ class BytecodeInstallTests(unittest.TestCase):
         pattern = re.search(r"-cmatch '([^']+)'", source).group(1)
         self.assertIsNone(re.search(pattern, 'docs/__pycache__'))
         self.assertIsNotNone(re.search(pattern, 'scripts/__pycache__/module.pyc'))
+        self.assertIn("-or $RelativePath -cmatch '(^|/)\\.DS_Store$'", source)
         self.assertEqual(source.count('if (Test-DistributionBytecode $relativePath) { continue }'), 2)
         for name, variable in (('audit', 'relativePath'), ('uninstall', 'relative')):
             source = (ROOT / 'scripts' / (name + '.ps1')).read_text(encoding="utf-8")
             self.assertIn("$RelativePath -cmatch '(^|/)__pycache__/|\\.py[co]$'", source)
+            self.assertIn("-or $RelativePath -cmatch '(^|/)\\.DS_Store$'", source)
             self.assertIn('if (Test-DistributionBytecode $' + variable + ') { continue }', source)
             shell = (ROOT / 'scripts' / (name + '.sh')).read_text(encoding="utf-8")
-            self.assertIn("-type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print", shell)
+            self.assertIn("-type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print", shell)
 
 
 if __name__ == '__main__':
