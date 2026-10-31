@@ -735,7 +735,19 @@ def main(argv=None):
     parser.add_argument('action', choices=('status', 'execute'))
     args = parser.parse_args(argv)
     result = dict(trustedBackendAvailable=True, executionAvailable=False, productionReady=False,
-                  profile=PROFILE, mode='trusted-host-injection-required')
+                  profile=PROFILE, mode='trusted-host-injection-required', adapters=[
+                      dict(target='linux-docker-single-container', profile=PROFILE,
+                           execution='implemented', implementation='implemented',
+                           validation='scope-specific', availability='trusted-host-required', productionReady=False),
+                      dict(target='docker-compose', execution='unsupported', implementation='unsupported',
+                           preparation='local-foundations', validation='none', availability='unsupported',
+                           blockers=['trusted-report-producers-required',
+                                     'engine-reconstruction-validation-required',
+                                     'product-writer-deploy-rollback-validation-required',
+                                     'phase-crash-recovery-validation-required',
+                                     'production-trust-enrollment-required'], productionReady=False),
+                      dict(target='local-deployment', execution='unsupported', implementation='unsupported',
+                           validation='none', availability='unsupported', productionReady=False)])
     if args.action == 'execute':
         result['error'] = 'Trusted execution host required'
     print(json.dumps(result, sort_keys=True))

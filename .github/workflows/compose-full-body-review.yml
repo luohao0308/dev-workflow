@@ -1,0 +1,121 @@
+name: Compose full-body v3 authorization review
+on:
+  push:
+    branches: [feat/compose-validation-20261028]
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [launch, review]
+        default: launch
+        required: true
+      public_payload:
+        description: 'Canonical public JSON only: request and bundle.public_review(); never private bodies'
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  contract-check:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate public review contract
+        run: python3 -m unittest tests.test_deployment_compose_full_body_review_contract
+  launch:
+    if: github.run_attempt == 1 && inputs.mode == 'launch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PUBLIC_PAYLOAD: ${{ inputs.public_payload }}
+        with:
+          script: |
+            if (context.ref !== 'refs/heads/feat/compose-validation-20261028') throw new Error('Unsupported full-body review ref');
+            if (Buffer.byteLength(process.env.PUBLIC_PAYLOAD, 'utf8') > 32768) throw new Error('Public payload exceeds limit');
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner, repo: context.repo.repo,
+              workflow_id: 'compose-full-body-review.yml', ref: 'feat/compose-validation-20261028',
+              inputs: {mode: 'review', public_payload: process.env.PUBLIC_PAYLOAD}
+            });
+  prepare:
+    if: github.run_attempt == 1 && github.event_name == 'workflow_dispatch' && inputs.mode == 'review'
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-id: ${{ steps.bundle.outputs.artifact-id }}
+      bundle-hash: ${{ steps.prepare.outputs.bundle-hash }}
+    env:
+      DW_AUTH_LEDGER_REPOSITORY: ${{ vars.DW_AUTH_LEDGER_REPOSITORY }}
+      DW_AUTH_LEDGER_ID: ${{ vars.DW_AUTH_LEDGER_ID }}
+      DW_AUTH_LEDGER_SHA: ${{ vars.DW_AUTH_LEDGER_SHA }}
+      DW_AUTH_REVIEWER_ID: ${{ vars.DW_AUTH_REVIEWER_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - id: prepare
+        shell: bash
+        env:
+          PUBLIC_PAYLOAD: ${{ inputs.public_payload }}
+        run: |
+          mkdir -p public-bundle
+          bundle_hash=$(python3 scripts/deployment_compose_full_body_review_contract.py prepare --bundle public-bundle/bundle.json)
+          printf 'bundle-hash=%s\n' "$bundle_hash" >> "$GITHUB_OUTPUT"
+          python3 scripts/deployment_compose_full_body_review_contract.py summary --bundle public-bundle/bundle.json >> "$GITHUB_STEP_SUMMARY"
+      - id: bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compose-full-body-public-review
+          path: public-bundle/bundle.json
+          if-no-files-found: error
+          retention-days: 1
+  protected-review:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: compose-review
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      DW_AUTH_LEDGER_REPOSITORY: ${{ vars.DW_AUTH_LEDGER_REPOSITORY }}
+      DW_AUTH_LEDGER_ID: ${{ vars.DW_AUTH_LEDGER_ID }}
+      DW_AUTH_LEDGER_SHA: ${{ vars.DW_AUTH_LEDGER_SHA }}
+      DW_AUTH_REVIEWER_ID: ${{ vars.DW_AUTH_REVIEWER_ID }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact-id }}
+          path: reviewed-bundle
+          merge-multiple: true
+      - name: Verify public artifact and seal fresh v3 OIDC evidence
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
+        run: |
+          verified_hash=$(python3 scripts/deployment_compose_full_body_review_contract.py verify --bundle reviewed-bundle/bundle.json)
+          test "$verified_hash" = "$EXPECTED_BUNDLE_HASH"
+          mkdir -p sealed-evidence
+          python3 scripts/deployment_compose_full_body_review_contract.py seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-evidence/oidc.cms.der
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: compose-full-body-sealed-oidc
+          path: sealed-evidence/oidc.cms.der
+          if-no-files-found: error
+          retention-days: 1
+      - name: Bounded host verification window (authorization only)
+        shell: bash
+        run: sleep 300

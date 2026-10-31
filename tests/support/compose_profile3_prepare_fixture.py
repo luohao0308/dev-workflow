@@ -1,0 +1,440 @@
+"""Preparation-only live private Engine fixture. Never opens a product writer.
+
+The controller authenticates the callback's daemon boundary and source revision.
+The returned session is PRIVATE; only ``public`` may be published. The caller
+holds the daemon alive and calls cleanup, including on preparation failures.
+"""
+from copy import deepcopy
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import subprocess
+import threading
+import traceback
+import uuid
+
+from deployment_compose_namespaced_runtime_probe import PrivateDaemon, transfer_image, ensure_capacity
+from deployment_compose_namespaced_transition_probe import source_image, V2, delete
+from deployment_compose_log_probe import IMAGE, ID
+from deployment_compose_restore_host_config import _fixed_policy, POLICY as SOURCE_HOST_POLICY
+from deployment_compose_restore_body_host import RUNNING_METADATA_POLICY
+from deployment_compose_private import commit, MOUNT
+from deployment_compose_artifacts import ServiceArtifact, ComposeArtifacts
+from deployment_compose_image_defaults import commit_image_config
+from deployment_compose_network_declaration import commit_network_declaration
+from deployment_compose_snapshot import prepare_snapshot, _encode
+from deployment_compose_reader_host import ComposeReaderHostPolicy, create_gateway, _complete_json_response
+from deployment_compose_write_gateway_v3_host import _complete_response
+from deployment_compose_reader import ComposeReadPolicy
+from deployment_compose_observation_host import ComposeObservationHost
+from deployment_compose_recovery_host import ComposeRecoveryHost
+from deployment_compose_recovery_store import ComposeRecoveryStore
+from deployment_compose_operations import BaselineContainer
+from deployment_compose_prepare_v3_host import ComposePreparationHostV3
+from deployment_compose_phase_state_v3_host import TrustedPhaseStateProducerV3
+from deployment_compose_phase_guard_v3_host import PhaseGuardV3
+from deployment_contract_v2 import SourceIdentity, TargetIdentity
+from deployment_compose_runtime_probe import wait_healthy
+from compose_restore_probe import server_code
+
+REPOSITORY = 'luohao0308/dev-workflow'
+REPOSITORY_ID = 1327491026
+
+
+def validate_controller(root, info, *, source_sha, host_id, expected_daemon_id, keys, policy_hash, expiry_seconds):
+    """Reject invalid controller inputs before creating any local/Engine resource."""
+    if (type(source_sha) is not str or not re.fullmatch('[0-9a-f]{40}', source_sha)
+            or source_sha in ('0'*40, 'a'*40) or type(host_id) is not str or not host_id
+            or type(expected_daemon_id) is not str or not expected_daemon_id
+            or type(info) is not dict or info.get('ID') != expected_daemon_id
+            or type(keys) is not dict or set(keys) != {'config','image','declaration','archive','target'}
+            or any(type(k) is not bytes or not 32 <= len(k) <= 4096 for k in keys.values())
+            or type(policy_hash) is not str or not re.fullmatch('[0-9a-f]{64}',policy_hash)
+            or type(expiry_seconds) is not int or not 1 <= expiry_seconds <= 900):
+        raise ValueError('profile3-controller-input-rejected')
+    target = PrivateDaemon(root, info)
+    if root.is_symlink() or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o777 != 0o700:
+        raise ValueError('profile3-unowned-root')
+    return target
+
+
+def _created_json(response):
+    raw = _complete_response(response)
+    if response.status != 201:
+        raise ValueError('profile3-create-receipt-rejected')
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value: raise ValueError('profile3-duplicate-receipt-field')
+            value[key] = item
+        return value
+    def constant(value):
+        raise ValueError('profile3-invalid-receipt-constant')
+    value = json.loads(raw.decode('utf-8'), object_pairs_hook=unique, parse_constant=constant)
+    if type(value) is not dict: raise ValueError('profile3-create-receipt-rejected')
+    return value
+
+
+def fixture_command(project):
+    # Same code in both images reports the actual Python runtime version.
+    return server_code(project).replace('import errno,json\n', 'import errno,json,sys\n', 1).replace("'version': 'same-image'", "'version': sys.version")
+
+
+def public_payload(prepared):
+    return {'request':asdict(prepared['request']),'review':prepared['bundle'].public_review()}
+
+
+class PreparationSession:
+    def __init__(self, target, project):
+        self.target, self.project = target, project
+        self.created_ids, self.resources, self.listeners = [], [], []
+        self.unknown_write_result = False
+        self.store = None
+        self.public = None
+
+    def write(self, fn):
+        if self.unknown_write_result:
+            raise ValueError('profile3-write-blocked-after-unknown')
+        self.unknown_write_result = True
+        value = fn()
+        self.unknown_write_result = False
+        return value
+
+    def create(self, path, body, *, kind='container', expected=None):
+        connection = self.target.connection()
+        try:
+            connection.request('POST', path, _encode(body), {'Content-Type':'application/json'})
+            value = _created_json(connection.getresponse())
+            if kind == 'volume':
+                if (value.get('Name') != expected or
+                        value.get('Labels', {}).get('com.docker.compose.project') != self.project):
+                    raise ValueError('profile3-volume-receipt-rejected')
+                self.resources.append(('volume', expected))
+                return value
+            receipt = value.get('Id')
+            if (type(receipt) is not str or not ID.fullmatch(receipt)
+                    or receipt in self.created_ids or ('network', receipt) in self.resources):
+                raise ValueError('profile3-create-receipt-rejected')
+            if kind == 'network':
+                self.resources.append(('network', receipt))
+            elif kind == 'container':
+                self.created_ids.append(receipt)
+            else:
+                raise ValueError('profile3-create-kind-rejected')
+            return receipt
+        finally:
+            connection.close()
+
+    def cleanup(self):
+        # Local read resources must close even when Engine writes are blocked.
+        close_errors = []
+        remaining = []
+        for server, thread in self.listeners:
+            try:
+                try:
+                    server.shutdown(); thread.join(timeout=5)
+                finally:
+                    server.server_close()
+                if thread.is_alive(): raise ValueError('profile3-listener-not-stopped')
+            except Exception as error:
+                close_errors.append(error); remaining.append((server, thread))
+        self.listeners = remaining
+        if self.store is not None:
+            try:
+                self.store.close(); self.store = None
+            except Exception as error:
+                close_errors.append(error)
+        # Never infer ownership from a name after an ambiguous write result.
+        if self.unknown_write_result:
+            raise ValueError('profile3-cleanup-blocked-after-unknown') from (close_errors[0] if close_errors else None)
+        if close_errors:
+            raise ValueError('profile3-local-cleanup-failed') from close_errors[0]
+        for cid in reversed(self.created_ids):
+            self.write(lambda cid=cid: self.target.stop(cid))
+            self.write(lambda cid=cid: delete(self.target, cid))
+        self.created_ids.clear()
+        for kind, receipt in reversed(self.resources):
+            self.write(lambda kind=kind, receipt=receipt: self.target.run(kind, 'rm', receipt))
+        self.resources.clear()
+
+
+def _observers(root, session, scope, artifacts, key, *, purpose='initial'):
+    if purpose not in ('initial', 'rollback'):
+        raise ValueError('profile3-observer-purpose-rejected')
+    directory = root/('profile3-tls' if purpose == 'initial' else 'profile3-rollback-tls')
+    directory.mkdir(mode=0o700)
+    def openssl(*args):
+        subprocess.run(['openssl', *args], cwd=directory, capture_output=True, check=True, timeout=20)
+    openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout','ca.key','-out','ca.pem','-days','1',
+            '-subj','/CN=Private preparation CA','-addext','basicConstraints=critical,CA:TRUE',
+            '-addext','keyUsage=critical,keyCertSign,cRLSign')
+    for name in ('server','reader'):
+        openssl('req','-newkey','rsa:2048','-nodes','-keyout',name+'.key','-out',name+'.csr','-subj','/CN='+name)
+        (directory/(name+'.ext')).write_text('subjectAltName=DNS:localhost\nbasicConstraints=critical,CA:FALSE\nextendedKeyUsage='+('serverAuth' if name=='server' else 'clientAuth')+'\n')
+        openssl('x509','-req','-in',name+'.csr','-CA','ca.pem','-CAkey','ca.key','-CAcreateserial','-out',name+'.pem','-days','1','-extfile',name+'.ext')
+    for path in directory.iterdir(): path.chmod(0o600)
+    def fingerprint(name):
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert((directory/(name+'.pem')).read_text())).hexdigest()
+    context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(str(directory/'server.pem'), str(directory/'server.key'))
+    context.load_verify_locations(str(directory/'ca.pem')); context.verify_mode=ssl.CERT_REQUIRED
+    ids=tuple(sorted(list(scope['selectedContainerIds'].values())+list(scope['protectedContainerIds'].values())))
+    observers=[]
+    for source_view in (False, True):
+        policy=ComposeReaderHostPolicy(scope['project'], scope['daemonId'], fingerprint('reader'),
+            ('backend','peer'), ids, tuple(sorted(set(scope['imageIds'].values()))),
+            tuple(sorted(scope['networks'].values())), tuple(sorted(scope['volumes'])),
+            private_key_id='profile3-config', source_view=source_view)
+        server=create_gateway(policy,tls_context=context,docker_socket=Path(session.target.socket),private_hmac_key=key)
+        thread=threading.Thread(target=server.serve_forever,daemon=True); thread.start(); session.listeners.append((server,thread))
+        reader=ComposeReadPolicy('https://localhost:'+str(server.server_port), fingerprint('server'),scope['daemonId'],
+            scope['project'],tuple(sorted(scope['volumes'])),gateway_policy_hash=policy.digest(),
+            private_key_id='profile3-config',source_container_ids=ids if source_view else ())
+        observer=ComposeObservationHost(reader_policy=reader,scope_policy=scope,baseline_artifacts=artifacts,
+            ca_file=directory/'ca.pem',cert_file=directory/'reader.pem',key_file=directory/'reader.key',max_age_seconds=300)
+        observers.append(observer)
+    return tuple(observers)
+
+
+def _prepare_observed(session, *, root, rows, images, references, bodies, network_name,
+                      network, volume, bind, source_sha, host_id, expected_daemon_id,
+                      fresh, keys, policy_hash, environment, expiry_seconds, purpose):
+    """Shared host-only preparation; fixture provisioning has already ended."""
+    target, project = session.target, session.project
+    raw={k:deepcopy(rows['backend'][k]) for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
+    raw['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in raw['Mounts']]
+    projection={k:raw[k] for k in ('Config','HostConfig','NetworkSettings','Mounts')}
+    networks={network_name:network}
+    mounts={'/sample-data':dict(type='volume',source=volume,readOnly=False),'/sample-config':dict(type='bind',source=str(bind),readOnly=True)}
+    identity=dict(project=project,service='backend',containerId=raw['Id'],containerName=project+'-backend',imageId=images[0]['Id'],hostId=host_id,daemonId=expected_daemon_id,requestedApiVersion='1.45',engineVersion=fresh['ServerVersion'])
+    artifact=ServiceArtifact('backend',source_sha,references[0],images[0]['Id'],'linux',images[0]['Architecture'],'profile3-config',commit(project,'backend',projection,'profile3-config',keys['config'])['configHmac'],hashlib.sha256(b'').hexdigest(),'none')
+    peer_projection={k:deepcopy(rows['peer'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
+    peer_projection['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in peer_projection['Mounts']]
+    peer_hash=commit(project,'peer',peer_projection,'profile3-config',keys['config'])['configHmac']
+    scope=dict(project=project,daemonId=expected_daemon_id,selectedServices=['backend'],protectedServices=['peer'],protectedContainerIds={'peer':rows['peer']['Id']},protectedConfigHmacs={'peer':peer_hash},selectedContainerIds={'backend':raw['Id']},containerNames={s:project+'-'+s for s in rows},imageIds={s:rows[s]['Image'] for s in rows},baselineSourceShas={'backend':source_sha},networks=networks,volumes={volume:dict(driver='local',options={})},mounts={s:[dict(type=m['type'],source=m['source'],target=p,readOnly=m['readOnly']) for p,m in mounts.items()] for s in rows},networkAttachments={s:{network_name:rows[s]['NetworkSettings']['Networks'][network_name]['Aliases']} for s in rows})
+    session.whole_observer,session.retention_observer=_observers(root,session,scope,ComposeArtifacts(1,(artifact,)),keys['config'],purpose=purpose)
+    session.whole_observation=session.whole_observer.issue(); session.retention_observation=session.retention_observer.issue()
+    if session.whole_observation is None or session.retention_observation is None: raise ValueError('profile3-live-observation-not-issued')
+    if session.store is None:
+        archive=root/'profile3-archive'; archive.mkdir(mode=0o700)
+        session.store=ComposeRecoveryStore(archive,key=keys['archive'])
+    baseline=(BaselineContainer('backend',raw['Id'],identity['containerName'],images[0]['Id']),)
+    session.recovery=ComposeRecoveryHost(store=session.store,observer=session.retention_observer,baseline=baseline,projections={'backend':projection},private_keys={'profile3-config':keys['config']})
+    reference=session.recovery.retain(session.retention_observation)
+    snapshot=prepare_snapshot(raw,identity,artifact,keys['config'],networks,mounts)
+    model=dict(sourceSha=source_sha,command=fixture_command(project),createBodies=bodies)
+    model_digest=hashlib.sha256(_encode(model)).hexdigest()
+    declaration=dict(schemaVersion=1,identity=identity,sourceSha=source_sha,sourceModelDigest=model_digest,sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),networks={network_name:dict(id=network,aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],addressPolicy='dynamic-no-requested-addresses',requestedMac=None,ipamConfig=None,links=None,driverOpts=None)})
+    proof=commit_network_declaration(declaration,'profile3-declaration',keys['declaration'])
+    inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=SOURCE_HOST_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
+    targets=dict(image=images[1],commitment=commit_image_config(images[1],'profile3-target',keys['target']),key=keys['target'],expected_key_id='profile3-target',expected_image_id=images[1]['Id'],expected_registry_digest=references[1],expected_architecture=images[1]['Architecture'])
+    session.producer=TrustedPhaseStateProducerV3(socket_path=target.socket,project=project,daemon_id=expected_daemon_id,container_ids=tuple(sorted(r['Id'] for r in rows.values())))
+    session.preparer=ComposePreparationHostV3(whole_observer=session.whole_observer,retention_observer=session.retention_observer,recovery=session.recovery,baseline=baseline,source_inputs={'backend':inputs},target_inputs={'backend':targets},source=SourceIdentity('github.com','https://github.com/'+REPOSITORY+'.git',REPOSITORY_ID,REPOSITORY,source_sha),target=TargetIdentity('compose',project,environment),host_id=host_id,daemon_id=expected_daemon_id,environment=environment,policy_hash=policy_hash,dependencies={'backend':()},protected_names={'peer':project+'-peer'},protected_ids={'peer':rows['peer']['Id']},protected_hashes={'peer':peer_hash},archive_reference=reference,phase_state_producer=session.producer,protected_private_keys={'peer':('profile3-config',keys['config'])})
+    expires=(datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex
+    audit=dict(rawSource=raw,rawRows=rows,identity=identity,artifact=asdict(artifact),
+        sourceInputs={k:v for k,v in inputs.items() if type(v) is not bytes},
+        targetInputs={k:v for k,v in targets.items() if type(v) is not bytes},
+        scope=scope,sourceModel=model,operationNonce=operation_nonce,expiresAt=expires)
+    fd=os.open(root/('profile3-inputs.private.json' if purpose == 'initial' else 'profile3-rollback-inputs.private.json'),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+    with os.fdopen(fd,'wb') as stream:stream.write(_encode(audit))
+    session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=operation_nonce,expires_at=expires)
+    version=session.producer._get('/v1.45/version')
+    version={k:version[k] for k in ('Version','GitCommit')}
+    pinned_rows=TrustedPhaseStateProducerV3.reload(session.store,session.prepared['bundle'],read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
+    session.guard=PhaseGuardV3(session.prepared['bundle'],pinned_rows,read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
+    session.raw_source,session.raw_rows,session.source_inputs,session.source_model=raw,rows,inputs,model
+    session.public=public_payload(session.prepared)
+    return session
+
+
+def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, keys, policy_hash,
+                     environment='test', expiry_seconds=600, registry='ecr-public'):
+    target=validate_controller(root,info,source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
+        keys=keys,policy_hash=policy_hash,expiry_seconds=expiry_seconds)
+    fresh=json.loads(target.run('info','--format','{{json .}}'))
+    if (fresh.get('ID') != expected_daemon_id or fresh.get('DockerRootDir') != str(root/'data')
+            or fresh.get('SwapLimit') is not True or target.run('ps','-aq').strip()
+            or target.run('images','-aq').strip() or target.run('volume','ls','-q').strip()):
+        raise ValueError('profile3-daemon-not-private-and-empty')
+    from deployment_compose_registry_enrollment_probe import enroll_image, registry_settings
+    references=[registry_settings(registry,image_reference=ref)[0] for ref in (IMAGE,V2)]
+    project='dw-restore-'+uuid.uuid4().hex[:24]
+    session=PreparationSession(target,project)
+    try:
+        images=[]
+        for ref, enrolled_ref in zip((IMAGE,V2), references):
+            image=source_image(ref); ensure_capacity(root,image)
+            session.write(lambda image=image: transfer_image(image['Id'],target))
+            image, receipt=session.write(lambda image=image,ref=ref: enroll_image(root,target,image,registry=registry,image_reference=ref))
+            if enrolled_ref not in image['RepoDigests']: raise ValueError('profile3-real-registry-digest-required')
+            images.append(image)
+            session.resources.append(('image', enrolled_ref))
+        network_name=project+'-net'; volume=project+'-data'
+        network=session.write(lambda: session.create('/v1.45/networks/create',dict(Name=network_name,Driver='bridge',Internal=True,Labels={'com.docker.compose.project':project}),kind='network'))
+        session.write(lambda: session.create('/v1.45/volumes/create',dict(Name=volume,Driver='local',DriverOpts={},Labels={'com.docker.compose.project':project}),kind='volume',expected=volume))
+        volume_info=json.loads(target.run('volume','inspect',volume))[0]
+        mountpoint=Path(volume_info['Mountpoint'])
+        if mountpoint != root/'data/volumes'/volume/'_data' or any(mountpoint.iterdir()): raise ValueError('profile3-volume-ownership-drift')
+        (mountpoint/'sentinel.txt').write_text(project+'\n')
+        bind=root/'profile3-config'; bind.mkdir(mode=0o700); (bind/'config.txt').write_text(project+'\n')
+        host=_fixed_policy(policy=SOURCE_HOST_POLICY)
+        host.update(NetworkMode=network_name,Mounts=[dict(Type='volume',Source=volume,Target='/sample-data',ReadOnly=False,VolumeOptions={'NoCopy':True}),dict(Type='bind',Source=str(bind),Target='/sample-config',ReadOnly=True)])
+        body=dict(Image=images[0]['Id'],Hostname='profile3',WorkingDir='/tmp',Cmd=['/usr/local/bin/python3','-c',fixture_command(project)],Entrypoint=None,
+            Env=deepcopy(images[0]['Config']['Env']),Labels={},Healthcheck=dict(Test=['CMD','/usr/local/bin/python3','-c',"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=5).read()"],Interval=1000000000,Timeout=20000000000,StartPeriod=1000000000,Retries=3),
+            HostConfig=host,NetworkingConfig={'EndpointsConfig':{network_name:dict(NetworkID=network,Aliases=['backend'])}})
+        rows={}
+        bodies={}
+        for service in ('backend','peer'):
+            own=deepcopy(body); own['Labels']={'com.docker.compose.project':project,'com.docker.compose.service':service}
+            own['NetworkingConfig']['EndpointsConfig'][network_name]['Aliases']=[service]
+            bodies[service]=deepcopy(own)
+            cid=session.write(lambda service=service,own=own: session.create('/v1.45/containers/create?name='+project+'-'+service,own))
+            if session.write(lambda cid=cid: target.run('container','start',cid).strip()) != cid:
+                session.unknown_write_result=True; raise ValueError('profile3-start-receipt-rejected')
+            wait_healthy(target.run,cid)
+            connection=target.connection()
+            try:
+                connection.request('GET','/v1.45/containers/'+cid+'/json')
+                _, rows[service]=_complete_json_response(connection.getresponse())
+            finally: connection.close()
+        # Baseline fixture creation ends here. All subsequent Engine operations are GETs.
+        session.enrolled_images=deepcopy(images)
+        session.enrolled_references=tuple(references)
+        session.root=root
+        result=_prepare_observed(session,root=root,rows=rows,images=images,references=references,
+            bodies=bodies,network_name=network_name,network=network,volume=volume,bind=bind,
+            source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
+            fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
+            expiry_seconds=expiry_seconds,purpose='initial')
+        session.deployment_context=dict(preparer=session.preparer,prepared=session.prepared,
+            bundle=session.prepared['bundle'],request=session.prepared['request'],
+            whole_observer=session.whole_observer,retention_observer=session.retention_observer,
+            guard=session.guard,producer=session.producer,raw_rows=deepcopy(rows),
+            source_model=deepcopy(session.source_model),source_inputs=session.source_inputs,
+            whole_observation=session.whole_observation,retention_observation=session.retention_observation)
+        return result
+    except Exception as error:
+        # Caller retains ownership and may clean up only confirmed receipts.
+        chain=[];cause=error
+        while cause is not None and len(chain)<16:
+            chain.append(dict(type=type(cause).__name__,message=str(cause),
+                frames=[dict(file=Path(f.filename).name,line=f.lineno,function=f.name)
+                        for f in traceback.extract_tb(cause.__traceback__)]))
+            cause=cause.__context__
+        try:
+            fd=os.open(root/'profile3-preparation-failure.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,'wb') as stream:stream.write(_encode(dict(chain=chain)))
+        except OSError:
+            pass  # Preserve the original failure and its cleanup ownership.
+        error.preparation_session=session
+        raise
+
+
+def prepare_current_profile3(session, *, original_bundle, original_request,
+                             authenticated_history, keys, source_sha, host_id,
+                             policy_hash, environment='staging', expiry_seconds=600):
+    """Build private current-baseline preparation from signed completed receipts.
+
+    This host-only path shares the initial CAS and cleanup owner, but never uses
+    the stopped baseline's observers. It issues only Engine GET requests.
+    """
+    from deployment_compose_history_v3_host import AuthenticatedHistoryV3
+    from deployment_compose_bundle_v3 import ExecutionBundleV3
+    from deployment_contract_v2 import RequestV2
+    from deployment_compose_coordinator_v3_host import canonical
+    from deployment_compose_phase_guard_v3_host import protected_state_digest
+    if (type(original_bundle) is not ExecutionBundleV3
+            or type(original_request) is not RequestV2
+            or type(authenticated_history) is not AuthenticatedHistoryV3
+            or original_request.operation != 'deploy'
+            or original_request.plan_hash != original_bundle.digest
+            or authenticated_history._bundle.canonical_bytes != original_bundle.canonical_bytes
+            or authenticated_history._request.digest() != original_request.digest()
+            or source_sha != original_request.source.source_sha
+            or host_id != original_request.host_id or policy_hash != original_request.policy_hash
+            or type(expiry_seconds) is not int or not 1 <= expiry_seconds <= 900
+            or type(keys) is not dict or set(keys) != {'config','image','declaration','archive','target'}
+            or any(type(k) is not bytes or not 32 <= len(k) <= 4096 for k in keys.values())
+            or session.unknown_write_result):
+        raise ValueError('profile3-current-input-rejected')
+    context=session.deployment_context
+    if (session.target.socket != context['producer']._socket_path
+            or session.target.socket != str(session.root/'docker.sock')
+            or keys['config'] != context['source_inputs']['private_key']):
+        raise ValueError('profile3-current-private-boundary-rejected')
+    if (context['prepared']['bundle'].canonical_bytes != original_bundle.canonical_bytes
+            or context['prepared']['request'].digest() != original_request.digest()):
+        raise ValueError('profile3-current-deployment-rejected')
+    signed=authenticated_history.capture()
+    value=json.loads(signed.canonical)
+    original=original_bundle.to_dict()
+    receipts=value['receiptMap']
+    expected=[op for op in original_bundle.resolve_operations(receipts) if op['method'] != 'GET']
+    if (value['bundleDigest'] != original_bundle.digest
+            or value['originalRequestHash'] != original_request.digest()
+            or value['sourceArchiveRef'] != original['archiveReference']
+            or value['blocker'] is not None or value['pending'] is not None
+            or value['closedTail'] is None or len(expected) != 5
+            or set(receipts) != {'backend'}
+            or canonical(value['knownPrefix']) != canonical(expected)
+            or len(value['scopes']) != 5):
+        raise ValueError('profile3-current-history-rejected')
+    # Validate the approved target and unchanged protected pin against fresh GETs.
+    # The original guard reads its immutable CAS baseline, never old observers.
+    guard=context['guard']
+    done=original_bundle.resolve_operations(receipts)
+    first=guard._capture(done,receipts)
+    if canonical(first) != canonical(guard._capture(done,receipts)):
+        raise ValueError('profile3-current-drift')
+    producer=TrustedPhaseStateProducerV3(socket_path=session.target.socket,project=session.project,
+        daemon_id=original['identity']['daemonId'],
+        container_ids=tuple(sorted([receipts['backend']]+[p['containerId'] for p in original['protectedContainers']])))
+    current=producer.capture()
+    peer=original['protectedContainers']
+    if (len(peer) != 1 or peer[0]['containerId'] != context['raw_rows']['peer']['Id']):
+        raise ValueError('profile3-current-peer-rejected')
+    if protected_state_digest(current[peer[0]['containerId']]) != peer[0]['staticConfigDigest']:
+        raise ValueError('profile3-current-peer-rejected')
+    rows={'backend':current[receipts['backend']],'peer':current[peer[0]['containerId']]}
+    images=deepcopy(session.enrolled_images[::-1])
+    for image in images:
+        fresh_image=producer._get('/v1.45/images/'+image['Id']+'/json')
+        if canonical(fresh_image) != canonical(image):
+            raise ValueError('profile3-current-image-drift')
+    service=original['services'][0]
+    if (len(original['services']) != 1 or service['name'] != 'backend'
+            or images[0]['Id'] != service['targetImageId']
+            or images[1]['Id'] != service['baselineImageId']):
+        raise ValueError('profile3-current-image-rejected')
+    bodies={'backend':deepcopy(service['targetCreateBody']),
+            'peer':deepcopy(context['source_model']['createBodies']['peer'])}
+    inputs=context['source_inputs']
+    network_name,network=next(iter(inputs['network_ids'].items()))
+    mounts=inputs['expected_mounts']
+    child=PreparationSession(session.target,session.project)
+    child.listeners=session.listeners
+    child.store=session.store
+    fresh=producer._get('/v1.45/info')
+    references=list(session.enrolled_references[::-1])
+    _prepare_observed(child,root=session.root,rows=rows,images=images,references=references,
+        bodies=bodies,network_name=network_name,network=network,
+        volume=mounts['/sample-data']['source'],bind=Path(mounts['/sample-config']['source']),
+        source_sha=source_sha,host_id=host_id,expected_daemon_id=original['identity']['daemonId'],
+        fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
+        expiry_seconds=expiry_seconds,purpose='rollback')
+    for old,new in zip(original['services'],child.prepared['bundle'].to_dict()['services']):
+        if (canonical(new['baselineCreateBody']) != canonical(old['targetCreateBody'])
+                or canonical(new['targetCreateBody']) != canonical(old['baselineCreateBody'])):
+            raise ValueError('profile3-current-inverse-rejected')
+    if authenticated_history.capture().canonical != signed.canonical:
+        raise ValueError('profile3-current-history-changed')
+    return dict(preparer=child.preparer,whole_observation=child.whole_observation,
+        retention_observation=child.retention_observation,guard=child.guard,
+        prepared=child.prepared,producer=child.producer,private_session=child,
+        authenticated_history_snapshot=signed)

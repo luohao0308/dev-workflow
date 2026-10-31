@@ -10,11 +10,33 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Test-DistributionBytecode {
+    param([string]$RelativePath)
+    return $RelativePath -cmatch '(^|/)__pycache__/|\.py[co]$' -or $RelativePath -cmatch '(^|/)\.DS_Store$'
+}
+
 function Resolve-FullPath([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
         throw "Target directory does not exist: $Path"
     }
-    return (Resolve-Path -LiteralPath $Path).Path
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        return [IO.Path]::GetFullPath($full)
+    }
+    # GetFullPath does not expand Windows 8.3 names. Canonicalize the existing
+    # directory before constructing descendants or applying prefix boundaries.
+    if (-not ('DevWorkflow.UninstallPathNative' -as [type])) {
+        Add-Type -Namespace DevWorkflow -Name UninstallPathNative -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+public static extern uint GetLongPathNameW(string path, System.Text.StringBuilder result, uint size);
+'@
+    }
+    $buffer = [Text.StringBuilder]::new(32768)
+    $length = [DevWorkflow.UninstallPathNative]::GetLongPathNameW($full, $buffer, $buffer.Capacity)
+    if ($length -eq 0 -or $length -ge $buffer.Capacity) {
+        throw 'Cannot canonicalize the existing uninstall directory.'
+    }
+    return [IO.Path]::GetFullPath($buffer.ToString())
 }
 
 function Test-IsWithin([string]$Parent, [string]$Candidate) {
@@ -316,6 +338,7 @@ function Get-Inventory([object]$Manifest, [string]$SourceRoot, [string]$TargetRo
         $prefix = $overlay.Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
         foreach ($file in Get-ChildItem -LiteralPath $overlay.Root -Recurse -File | Sort-Object FullName) {
             $relative = $file.FullName.Substring($prefix.Length).Replace('\', '/')
+            if (Test-DistributionBytecode $relative) { continue }
             if ($seen.ContainsKey($relative)) {
                 throw "Workflow overlays contain a duplicate path: $relative"
             }
@@ -345,7 +368,7 @@ function Remove-EmptyParents([string[]]$Paths, [string]$Root) {
     }
 }
 
-$sourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
+$sourceRoot = Resolve-FullPath (Join-Path $PSScriptRoot '..')
 $targetRoot = Resolve-FullPath $TargetPath
 if (
     [StringComparer]::OrdinalIgnoreCase.Equals($sourceRoot, $targetRoot) -or

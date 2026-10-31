@@ -810,7 +810,7 @@ else
           add_error "manifest 将 ${relative_path} 归属于 ${inventory_source}，而不是 $pack"
         fi
       fi
-    done < <(find "$pack_root" -type f | LC_ALL=C sort)
+    done < <(find "$pack_root" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print | LC_ALL=C sort)
   done
   if [[ "$schema_version" == "2" || "$schema_version" == "3" || "$schema_version" == "4" || "$schema_version" == "5" ]]; then
     for relative_path in "${core_files[@]+"${core_files[@]}"}"; do
