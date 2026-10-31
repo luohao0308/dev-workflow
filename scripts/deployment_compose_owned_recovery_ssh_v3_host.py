@@ -12,6 +12,7 @@ import deployment_compose_live_ssh_v3_host as live
 
 ENTRYPOINT = 'deployment_compose_owned_recovery_worker_v3_host.run'
 WORKER = 'scripts/deployment_compose_owned_recovery_worker_v3_host.py'
+MANAGER_ENTRYPOINT = 'deployment_compose_owned_recovery_manager_v3_host.run'
 
 
 def reject():
@@ -41,4 +42,30 @@ def published_recovery_archive(source_sha):
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         if WORKER not in archive.namelist():
             reject()
+    return raw
+
+
+def manager_bootstrap(archive_digest, source_sha):
+    """Fixed manager receives the loader-validated archive, never source text."""
+    code = recovery_bootstrap(archive_digest,source_sha)
+    worker = 'deployment_compose_owned_recovery_worker_v3_host'
+    call = ' run(config,sys.stdin.buffer,sys.stdout.buffer)'
+    if code.count(worker)!=2 or code.count(call)!=1:reject()
+    return code.replace(worker,'deployment_compose_owned_recovery_manager_v3_host').replace(
+        call,' run(config,sys.stdin.buffer,sys.stdout.buffer,archive)')
+
+
+def manager_ssh_argv(alias, archive_digest, source_sha):
+    code = manager_bootstrap(archive_digest,source_sha)
+    argv = live.ssh_argv(alias,archive_digest,source_sha)
+    argv[-1] = 'exec python3 -I -u -c '+shlex.quote(code)
+    return argv
+
+
+def published_manager_archive(source_sha):
+    raw = published_recovery_archive(source_sha)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        required = {'scripts/deployment_compose_owned_recovery_manager_v3_host.py',
+            'scripts/deployment_compose_owned_recovery_unit_v3_host.py'}
+        if not required.issubset(archive.namelist()):reject()
     return raw
