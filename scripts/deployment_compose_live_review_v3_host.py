@@ -1,10 +1,12 @@
 """Live protected review bridge. All plaintext credentials remain in memory."""
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 import io
 import http.client
 from http.client import HTTPSConnection
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,6 +24,7 @@ from deployment_compose_bundle_v3 import ExecutionBundleV3
 from deployment_contract_v2 import RequestV2
 from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3
 from release_github import GitHubClient, GitHubUnavailable, MAX_RESPONSE
+from release_host import timestamp
 
 CONFIG = dict(DW_AUTH_LEDGER_REPOSITORY='luohao0308/dev-workflow-authority-ledger',
               DW_AUTH_LEDGER_ID='1436718662',
@@ -34,6 +37,21 @@ class LiveReviewBlocked(ValueError):
     """No authority was returned; ambiguous dispatch/consumption must not retry."""
 
 
+def _check_execution_reserve(request, approval, grant, *, now=None):
+    """Reject too-late new consumption; never extend any existing validity."""
+    current = time.time() if now is None else now
+    if type(current) not in (int, float) or not math.isfinite(current):
+        raise LiveReviewBlocked('Invalid execution reserve clock')
+    request_expiry = parse_stamp(request.expires_at).timestamp()
+    authority_expiry = approval._expires
+    if type(authority_expiry) not in (int, float) or not math.isfinite(authority_expiry):
+        raise LiveReviewBlocked('Invalid execution reserve authority')
+    effective = min(request_expiry, authority_expiry,
+                    timestamp(approval.policy.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
+    if request_expiry-current < 360 or effective-current < 240:
+        raise LiveReviewBlocked('Insufficient execution reserve before consumption')
+
+
 class _ReadRetryGitHubClient(GitHubClient):
     """Live-host reads only; mutation outcomes are never retried or cached."""
     def __init__(self, *args, **kwargs):
@@ -41,6 +59,12 @@ class _ReadRetryGitHubClient(GitHubClient):
         self._network_lock = threading.RLock()
         self._connection = None
         self._owner_pid = os.getpid()
+        self._batch_lock = threading.RLock()
+        self._workers_lock = threading.Lock()
+        self._worker_local = threading.local()
+        self._workers = []
+        self._executor = None
+        self._closed = False
 
     def _check_owner(self):
         if os.getpid() != self._owner_pid:
@@ -48,11 +72,64 @@ class _ReadRetryGitHubClient(GitHubClient):
 
     def close(self):
         self._check_owner()
+        with self._batch_lock:
+            self._closed = True
+            self._close_workers()
+        self._drop_connection()
+
+    def _close_workers(self):
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True)
+        for client in self._workers:
+            client.close()
+        self._workers = []
+        self._worker_local = threading.local()
+
+    def _drop_connection(self):
         with self._network_lock:
             connection, self._connection = self._connection, None
             if connection is not None:
                 try: connection.close()
                 except OSError: pass
+
+    def fetch_authority_reads(self, queries):
+        """Seven fresh fixed-role reads; no results survive this call."""
+        self._check_owner()
+        repository = r'/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+'
+        roles = {'host-repository': repository, 'target-repository': repository,
+                 'ledger-repository': repository, 'oidc-subject': repository+r'/actions/oidc/customization/sub',
+                 'workflow-run': repository+r'/actions/runs/[1-9][0-9]*',
+                 'protected-environment': repository+r'/environments/[A-Za-z0-9_-]+',
+                 'approvals': repository+r'/actions/runs/[1-9][0-9]*/approvals'}
+        if (type(queries) is not tuple or len(queries) != len(roles)
+                or any(type(q) is not tuple or len(q) != 2 or type(q[0]) is not str
+                       or q[0] not in roles or type(q[1]) is not str
+                       or re.fullmatch(roles[q[0]], q[1]) is None
+                       or any(p in ('.', '..') for p in q[1].split('/')) for q in queries)
+                or {q[0] for q in queries} != set(roles)):
+            raise GitHubUnavailable('Invalid live authority read batch')
+        def fetch(query):
+            client = getattr(self._worker_local, 'client', None)
+            if client is None:
+                client = _ReadRetryGitHubClient(self._token, timeout=self.timeout, transport=self._transport)
+                self._worker_local.client = client
+                with self._workers_lock: self._workers.append(client)
+            return query[0], client.request('GET', query[1])[0]
+        with self._batch_lock:
+            if self._closed:
+                raise GitHubUnavailable('Live GitHub client is closed')
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix='live-authority-get')
+            futures = []
+            try:
+                for query in queries: futures.append(self._executor.submit(fetch, query))
+                wait(futures)
+                return dict(f.result() for f in futures)
+            except BaseException:
+                wait(futures)  # Never leave a late read running into another batch.
+                self._close_workers()
+                raise
 
     def _network(self, method, path, payload, before_send):
         self._check_owner()
@@ -61,6 +138,8 @@ class _ReadRetryGitHubClient(GitHubClient):
                    'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'dev-workflow-release',
                    'Content-Type': 'application/json', 'Cache-Control': 'no-cache'}
         with self._network_lock:
+            if self._closed:
+                raise GitHubUnavailable('Live GitHub client is closed')
             # A mutation guard can make nested GETs. It must finish before we
             # select the idle connection, and its denial must propagate intact.
             before_send()
@@ -80,7 +159,7 @@ class _ReadRetryGitHubClient(GitHubClient):
                 status, reply_headers = response.status, dict(response.headers.items())
                 if status >= 300:
                     # Do not follow redirects or retain unread error bodies.
-                    self.close()
+                    self._drop_connection()
                     return status, {}, None
                 lengths = response.headers.get_all('Content-Length', [])
                 encodings = response.headers.get_all('Transfer-Encoding', [])
@@ -95,23 +174,25 @@ class _ReadRetryGitHubClient(GitHubClient):
                     raise GitHubUnavailable('GitHub response incomplete')
                 result = json.loads(raw.decode('utf-8'))
                 if response.will_close:
-                    self.close()
+                    self._drop_connection()
                 return status, reply_headers, result
             except (OSError, http.client.HTTPException, ValueError, UnicodeError):
-                self.close()
+                self._drop_connection()
                 raise GitHubUnavailable('GitHub response unavailable or invalid') from None
             except BaseException:
-                self.close()
+                self._drop_connection()
                 raise
             finally:
                 if response is not None:
                     try: response.close()
-                    except OSError: self.close()
+                    except OSError: self._drop_connection()
 
     def request(self, method, path, payload=None, *, allow_missing=False, before_send=lambda: None):
         self._check_owner()
         attempts = 3 if method == 'GET' else 1
         for attempt in range(attempts):
+            if self._closed:
+                raise GitHubUnavailable('Live GitHub client is closed')
             guard_passed = False
             def guard():
                 nonlocal guard_passed
@@ -308,9 +389,11 @@ class GitHubLiveReviewV3:
                         raise LiveReviewBlocked('Invalid sealed OIDC evidence')
                     approval = self._approval(token.decode('ascii'), request, policy)
                     grant = approval.validate(request)
+                    _check_execution_reserve(request, approval, grant)
                     with (session / 'consumption-started').open('x') as marker:
                         os.chmod(marker.name, 0o600)
-                    receipt = approval.consume(grant, request)
+                    receipt = approval.consume(grant, request,
+                        before_consume=lambda: _check_execution_reserve(request, approval, grant))
                     return approval, receipt, dict(runId=run['id'], url=selected['html_url'],
                         requestHash=request.digest(), privateSession=str(session), expiresAt=request.expires_at)
             time.sleep(min(5, max(0, deadline - time.time())))

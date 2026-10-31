@@ -202,5 +202,138 @@ class FullBodyBoundaryTests(ComposeApprovalTests):
         self.assertEqual(self.policy.bundle_context()['bundle_hash'], self.req.plan_hash)
 
 
+class ParallelAuthorityTests(unittest.TestCase):
+    client_for = ComposeApprovalTests.client_for
+
+    def setUp(self):
+        ComposeApprovalTests.setUp(self)
+        import deployment_compose_live_review_v3_host as live
+        self.live = live
+        self.live_client = object.__new__(live._ReadRetryGitHubClient)
+        self.batches = []
+
+    def fetch(self, _client, queries):
+        self.batches.append(queries)
+        return {role: copy.deepcopy(self.client.data[path]) for role, path in queries}
+
+    def approval(self, verifier=None):
+        return host.GitHubFullBodyApprovalV3(
+            self.live_client, 'signed', [self.req], self.policy,
+            verifier=verifier or (lambda _: copy.deepcopy(self.claims)))
+
+    def batch_patch(self, callback=None):
+        return mock.patch.object(self.live._ReadRetryGitHubClient, 'fetch_authority_reads',
+                                 autospec=True, side_effect=callback or self.fetch)
+
+    def test_exact_live_client_fetches_seven_fresh_roles_each_check(self):
+        with self.batch_patch(), mock.patch.object(self.live._ReadRetryGitHubClient, 'request') as sequential:
+            approval = self.approval()
+            first = approval.validate(self.req)
+            self.assertEqual(len(self.batches), 2)
+            self.assertEqual(len(self.batches[0]), 7)
+            self.assertEqual(self.batches[0], self.batches[1])
+            self.client.data['/repos/sample/host/actions/runs/123/approvals'][0]['comment'] = 'revoked'
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.validate(self.req)
+            self.assertEqual(len(self.batches), 3)
+            self.assertEqual(first.request_hash, self.req.digest())
+            sequential.assert_not_called()
+
+    def test_invalid_jwt_or_claims_never_start_batch(self):
+        with self.batch_patch() as fetch:
+            with self.assertRaises(AuthorizationUnavailable):
+                host.GitHubFullBodyApprovalV3(self.live_client, 'invalid-jwt', [self.req], self.policy)
+            with self.assertRaises(AuthorizationUnavailable):
+                self.approval(verifier=mock.Mock(side_effect=AuthorizationUnavailable('bad signature')))
+            self.claims['repository_id'] = '999'
+            with self.assertRaises(AuthorizationUnavailable):
+                self.approval()
+            fetch.assert_not_called()
+
+    def test_consumption_and_ledger_guards_keep_every_fresh_check(self):
+        def request(_client, *args, **kwargs):
+            return self.client.request(*args, **kwargs)
+        with self.batch_patch(), mock.patch.object(self.live._ReadRetryGitHubClient, 'request',
+                                                  autospec=True, side_effect=request) as direct:
+            approval = self.approval()
+            approval.consume(approval.validate(self.req), self.req)
+            self.assertEqual(len(self.batches), 4)  # constructor, validate, consume, before-send
+            approval.check_consumed_intent(self.req)
+            self.assertEqual(len(self.batches), 5)
+            self.assertEqual([call.args[1] for call in direct.call_args_list], ['POST', 'GET'])
+            self.assertIn('/git/ref/', direct.call_args_list[-1].args[2])
+            self.client.data['/repos/sample/host/actions/runs/123/approvals'][0]['comment'] = 'revoked'
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.check_consumed_intent(self.req)
+            self.assertEqual(len(self.batches), 6)
+            self.assertEqual(direct.call_count, 2)
+
+    def test_fake_client_does_not_opt_in(self):
+        with mock.patch.object(self.client, 'fetch_authority_reads', create=True) as fetch:
+            ComposeApprovalTests.approval(self)
+            fetch.assert_not_called()
+
+    def test_source_path_mismatch_rejected(self):
+        with self.batch_patch() as fetch, mock.patch.object(self.live, '__file__', '/tmp/candidate.py'):
+            with self.assertRaises(AuthorizationUnavailable):
+                self.approval()
+            fetch.assert_not_called()
+
+    def test_same_host_and_target_remain_separate_reads(self):
+        self.policy = replace(self.policy, target_repository=self.policy.host_repository, target_repository_id=1)
+        self.req = replace(self.req, source=replace(self.req.source, origin='https://github.com/sample/host.git',
+                                                  project_path='sample/host', project_id=1))
+        self.client = self.client_for([self.req])
+        with self.batch_patch():
+            self.approval()
+        queries = self.batches[0]
+        self.assertEqual(len(queries), 7)
+        self.assertEqual(queries[:2], (('host-repository', '/repos/sample/host'),
+                                      ('target-repository', '/repos/sample/host')))
+
+    def test_bad_batch_or_any_role_rejects_without_sequential_fallback(self):
+        mutations = {
+            'host-repository': lambda x: x.update(id=99),
+            'target-repository': lambda x: x.update(id=99),
+            'ledger-repository': lambda x: x.update(id=99),
+            'oidc-subject': lambda x: x.update(use_default=False),
+            'workflow-run': lambda x: x.update(status='completed'),
+            'protected-environment': lambda x: x.update(can_admins_bypass=True),
+            'approvals': lambda x: x[0].update(user={'id': 99}),
+        }
+        for role, mutate in mutations.items():
+            def fetch(client, queries):
+                result = self.fetch(client, queries)
+                mutate(result[role])
+                return result
+            with self.subTest(role=role), self.batch_patch(fetch), self.assertRaises(AuthorizationUnavailable):
+                self.approval()
+        for result in ({}, {'extra': {}}, None, []):
+            # None is the base hook's explicit sequential sentinel, so a live
+            # client's invalid None must be rejected by its V3 hook.
+            with self.subTest(result=result), self.batch_patch(lambda *_: result), \
+                    mock.patch.object(self.live._ReadRetryGitHubClient, 'request') as sequential, \
+                    self.assertRaises(AuthorizationUnavailable):
+                self.approval()
+            sequential.assert_not_called()
+        def null_subject(client, queries):
+            result = self.fetch(client, queries)
+            result['oidc-subject'] = None
+            return result
+        with self.batch_patch(null_subject), self.assertRaises(AuthorizationUnavailable):
+            self.approval()
+
+    def test_token_expiring_during_batch_denies(self):
+        import time
+        now = time.time()
+        with mock.patch.object(host.time, 'time', return_value=now) as clock:
+            def fetch(client, queries):
+                result = self.fetch(client, queries)
+                clock.return_value = self.claims['exp'] + 1
+                return result
+            with self.batch_patch(fetch), self.assertRaises(AuthorizationUnavailable):
+                self.approval()
+
+
 if __name__ == '__main__':
     unittest.main()

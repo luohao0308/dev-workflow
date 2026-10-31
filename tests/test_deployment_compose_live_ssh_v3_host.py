@@ -37,6 +37,22 @@ class LoaderTests(unittest.TestCase):
 
 
 class RpcDiagnosticTests(unittest.TestCase):
+    def test_review_close_preserves_active_failure_and_reports_own_failure(self):
+        original = ValueError('original authorization rejection')
+        cleanup = RuntimeError('cleanup failure')
+        review = SimpleNamespace(close=unittest.mock.Mock(side_effect=cleanup))
+        with self.assertRaises(ValueError) as caught:
+            try:
+                raise original
+            finally:
+                live._close_review(review)
+        self.assertIs(caught.exception, original)
+        with self.assertRaises(RuntimeError) as caught:
+            live._close_review(review)
+        self.assertIs(caught.exception, cleanup)
+        self.assertEqual(review.close.call_count, 2)
+        live._close_review(SimpleNamespace())
+
     def test_fixed_authorization_identifiers_survive_without_sensitive_messages(self):
         from release_execute import AuthorizationUnavailable
         try:

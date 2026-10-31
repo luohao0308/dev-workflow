@@ -13,6 +13,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict
@@ -127,6 +128,17 @@ def _authorize_rpc(admission, service, method, request, case):
         except Exception:
             pass  # Diagnostic I/O must not replace the original fail-closed error.
         raise
+
+
+def _close_review(review):
+    close_review = getattr(review, 'close', None)
+    if callable(close_review):
+        failure_in_flight = sys.exc_info()[0] is not None
+        try:
+            close_review()
+        except Exception:
+            if not failure_in_flight:
+                raise
 
 
 def _live_key(root, name):
@@ -345,14 +357,7 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
             if thread is not None:thread.join(timeout=5)
             process.stdout.close();process.stderr.close()
         store.close()
-        close_review = getattr(review, 'close', None)
-        if callable(close_review):
-            failure_in_flight = sys.exc_info()[0] is not None
-            try:
-                close_review()
-            except Exception:
-                if not failure_in_flight:
-                    raise
+        _close_review(review)
 
 
 def private_json_status(value):

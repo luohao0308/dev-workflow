@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, ANY
 import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -72,7 +72,7 @@ class ReadRetryTests(unittest.TestCase):
         client = live._ReadRetryGitHubClient('test-token')
         ready = threading.Event(); release = threading.Event()
         def hold():
-            with client._network_lock:
+            with client._network_lock, client._batch_lock:
                 ready.set(); release.wait(10)
         thread = threading.Thread(target=hold); thread.start()
         self.assertTrue(ready.wait(3))
@@ -80,7 +80,8 @@ class ReadRetryTests(unittest.TestCase):
         if pid == 0:
             os.close(reader)
             try:
-                for call in (client.close, lambda: client.request('GET', '/repos/sample/target')):
+                for call in (client.close, lambda: client.request('GET', '/repos/sample/target'),
+                             lambda: client.fetch_authority_reads(PersistentLiveClientTests.queries(None))):
                     try: call()
                     except live.GitHubUnavailable: pass
                     else: os._exit(2)
@@ -100,6 +101,26 @@ class ReadRetryTests(unittest.TestCase):
                 os.kill(pid, signal.SIGKILL); done, status = os.waitpid(pid, 0)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)
         client.close()
+
+
+class ExecutionReserveTests(unittest.TestCase):
+    def test_both_request_and_effective_windows_are_independently_required(self):
+        from types import SimpleNamespace
+        def stamp(t): return live.datetime.fromtimestamp(t, live.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        request=SimpleNamespace(expires_at=stamp(1360))
+        approval=SimpleNamespace(_expires=1300,policy=SimpleNamespace(expires_at=stamp(1400)))
+        grant=SimpleNamespace(expires_at=stamp(1300))
+        live._check_execution_reserve(request,approval,grant,now=1000)
+        for field in ('request','authority','policy','grant'):
+            r=SimpleNamespace(expires_at=stamp(1360));a=SimpleNamespace(_expires=1300,policy=SimpleNamespace(expires_at=stamp(1400)));g=SimpleNamespace(expires_at=stamp(1300))
+            if field=='request': r.expires_at=stamp(1359)
+            elif field=='authority': a._expires=1239
+            elif field=='policy': a.policy.expires_at=stamp(1239)
+            else:g.expires_at=stamp(1239)
+            with self.subTest(field=field),self.assertRaises(live.LiveReviewBlocked):
+                live._check_execution_reserve(r,a,g,now=1000)
+        for now in (True,float('nan'),float('inf')):
+            with self.assertRaises(live.LiveReviewBlocked):live._check_execution_reserve(request,approval,grant,now=now)
 
 
 @unittest.skipUnless(os.name == 'posix', 'private POSIX host credentials and file permissions')
@@ -182,14 +203,17 @@ class LiveReviewTests(unittest.TestCase):
 
     def prepared(self):
         from tests.test_deployment_compose_full_body_review_contract import FullBodyReviewTests
-        from dataclasses import asdict
+        from dataclasses import asdict, replace
         from deployment_compose_full_body_review_contract import prepare, canonical
         fixture = FullBodyReviewTests()
         fixture.setUp()
+        from datetime import timedelta
+        fixture.preparation_now = live.datetime.now(live.timezone.utc).replace(microsecond=0)
+        fixture.request = replace(fixture.request, expires_at=(fixture.preparation_now+timedelta(seconds=900)).strftime('%Y-%m-%dT%H:%M:%SZ'))
         env = dict(fixture.env, **live.CONFIG)
         run = dict(id=int(env['GITHUB_RUN_ID']), head_sha=env['GITHUB_SHA'], path=live.WORKFLOW,
                    run_attempt=1, event='workflow_dispatch', actor=dict(login='github-actions[bot]'),
-                   created_at=live.datetime.now(live.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                   created_at=fixture.preparation_now.strftime('%Y-%m-%dT%H:%M:%SZ'),
                    html_url='https://github.com/' + live.REPOSITORY + '/actions/runs/123',
                    status='in_progress')
         self.host.source_sha = run['head_sha']
@@ -197,8 +221,23 @@ class LiveReviewTests(unittest.TestCase):
                                 review=fixture.bundle.public_review())), env)).encode('ascii')
         return fixture, run, raw
 
-    def test_exact_artifact_callback_once_consumption_and_cipher_only(self):
+    def ready_review(self, *, dispatch_delay_seconds=0):
         fixture, run, raw = self.prepared()
+        from datetime import timedelta
+        anchor = fixture.preparation_now + timedelta(seconds=dispatch_delay_seconds)
+        real_datetime = live.datetime
+        class FixtureDateTime(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return anchor.astimezone(tz) if tz is not None else anchor.replace(tzinfo=None)
+        # The mock run is created by the mock dispatch, using the exact same
+        # UTC/wall clock as the controller. Never rely on test execution speed.
+        for patcher in (patch.object(live, 'datetime', FixtureDateTime),
+                        patch.object(live.time, 'time', return_value=anchor.timestamp()),
+                        patch.object(live.time, 'sleep', side_effect=AssertionError('Unexpected review fixture polling'))):
+            patcher.start(); self.addCleanup(patcher.stop)
+        self.review_run = run
+        fixture.dispatch_now = anchor
         self.host._environment = Mock()
         self.host._get = Mock(side_effect=lambda path: dict(workflow_runs=[run])
             if '/runs?' in path else [] if path.endswith('/approvals')
@@ -209,21 +248,72 @@ class LiveReviewTests(unittest.TestCase):
             (directory / filename).write_bytes(data)
             return data
         self.host._artifact = Mock(side_effect=artifact)
-        self.host._command = Mock(side_effect=[Mock(returncode=0), Mock(returncode=0, stdout=b'a.b.c')])
+        commands = []
+        def command(*args, **kwargs):
+            commands.append(args)
+            if len(commands) == 1:
+                run['created_at'] = live.datetime.now(live.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                return Mock(returncode=0)
+            return Mock(returncode=0, stdout=b'a.b.c')
+        self.host._command = Mock(side_effect=command)
         approval = Mock()
+        approval._expires = live.time.time()+300
+        approval.policy.expires_at = fixture.request.expires_at
+        approval.validate.return_value.expires_at = live.datetime.fromtimestamp(approval._expires, live.timezone.utc).isoformat()
         approval.consume.return_value = 'receipt'
         self.host._approval = Mock(return_value=approval)
+        return fixture, approval
+
+    def test_exact_artifact_callback_once_consumption_and_cipher_only(self):
+        fixture, approval = self.ready_review()
         callback = Mock(return_value=False)  # Notification cannot grant or deny consent.
         result = self.host.consume_prepared(fixture.bundle, fixture.request, callback)
         self.assertEqual(result[1], 'receipt')
         callback.assert_called_once()
         self.assertTrue(callback.call_args.args[0]['comment'].startswith('dev-workflow approve '))
-        approval.consume.assert_called_once_with(approval.validate.return_value, fixture.request)
+        approval.consume.assert_called_once_with(approval.validate.return_value, fixture.request, before_consume=ANY)
         for path in self.root.rglob('*'):
             if path.is_file(): self.assertNotIn(b'a.b.c', path.read_bytes())
         with self.assertRaises(FileExistsError):
             self.host.consume_prepared(fixture.bundle, fixture.request, callback)
         self.assertEqual(self.host._command.call_count, 2)
+
+    def test_review_fixture_crossing_seconds_is_created_by_dispatch_without_polling(self):
+        fixture, approval = self.ready_review(dispatch_delay_seconds=2)
+        self.assertLess(live.parse_stamp(self.review_run['created_at']), fixture.dispatch_now)
+        result = self.host.consume_prepared(fixture.bundle, fixture.request, Mock())
+        self.assertEqual(result[1], 'receipt')
+        self.assertEqual(live.parse_stamp(self.review_run['created_at']), fixture.dispatch_now)
+        live.time.sleep.assert_not_called()
+        approval.consume.assert_called_once()
+
+    def test_stale_mock_run_is_filtered_and_fixture_budget_fails_immediately(self):
+        fixture, approval = self.ready_review(dispatch_delay_seconds=2)
+        # A dispatch double which never creates its new run must not make an
+        # earlier run eligible; the fixture's polling budget catches that bug.
+        self.host._command = Mock(return_value=Mock(returncode=0))
+        with self.assertRaisesRegex(AssertionError, 'Unexpected review fixture polling'):
+            self.host.consume_prepared(fixture.bundle, fixture.request, Mock())
+        approval.consume.assert_not_called()
+        self.assertEqual(list(self.root.rglob('consumption-started')), [])
+
+    def test_low_request_reserve_never_marks_or_calls_consume(self):
+        fixture, approval = self.ready_review()
+        now=live.parse_stamp(fixture.request.expires_at).timestamp()-359
+        with patch.object(live.time,'time',return_value=now),self.assertRaises(live.LiveReviewBlocked):
+            self.host.consume_prepared(fixture.bundle,fixture.request,Mock())
+        approval.consume.assert_not_called()
+        self.assertEqual(list(self.root.rglob('consumption-started')),[])
+
+    def test_reserve_is_rechecked_inside_consumption_before_post(self):
+        fixture, approval = self.ready_review();post=Mock()
+        def consume(grant,request,*,before_consume):
+            with patch.object(live.time,'time',return_value=approval._expires-239):before_consume()
+            post();return 'receipt'
+        approval.consume.side_effect=consume
+        with self.assertRaises(live.LiveReviewBlocked):self.host.consume_prepared(fixture.bundle,fixture.request,Mock())
+        post.assert_not_called()
+        self.assertEqual(len(list(self.root.rglob('consumption-started'))),1)
 
     def test_unknown_dispatch_never_retried(self):
         fixture, _, _ = self.prepared()
@@ -310,15 +400,103 @@ class PersistentLiveClientTests(unittest.TestCase):
         self.client = live._ReadRetryGitHubClient('test-token')
         self.addCleanup(self.client.close)
 
+    def queries(self):
+        root='/repos/sample/target'
+        return (('host-repository',root),('target-repository',root),('ledger-repository',root),
+                ('oidc-subject',root+'/actions/oidc/customization/sub'),
+                ('workflow-run',root+'/actions/runs/123'),
+                ('protected-environment',root+'/environments/compose-review'),
+                ('approvals',root+'/actions/runs/123/approvals'))
+
+    def test_authority_batch_seven_fresh_reads_overlap_on_at_most_four_connections(self):
+        import threading
+        lock=threading.Lock();active=[0];peak=[0];guards=[]
+        handler=self.server.RequestHandlerClass;original=handler.do_GET
+        def delayed(peer):
+            with lock: active[0]+=1;peak[0]=max(peak[0],active[0])
+            try: threading.Event().wait(.1);original(peer)
+            finally:
+                with lock: active[0]-=1
+        handler.do_GET=delayed
+        network=live._ReadRetryGitHubClient._network
+        def checked(client,method,path,payload,before_send):
+            def guard():
+                with lock: guards.append((method,path))
+                before_send()
+            return network(client,method,path,payload,guard)
+        with patch.object(live._ReadRetryGitHubClient,'_network',checked):
+            first=self.client.fetch_authority_reads(self.queries())
+            second=self.client.fetch_authority_reads(self.queries())
+        self.assertEqual(set(first),{q[0] for q in self.queries()})
+        self.assertEqual(len(self.calls),14);self.assertEqual(len(guards),14)
+        self.assertTrue(all(v['n']>7 for v in second.values()))
+        self.assertGreaterEqual(peak[0],2);self.assertLessEqual(peak[0],4)
+        self.assertLessEqual(self.accepts,4)
+        self.client.close();self.assertEqual(self.client._workers,[]);self.assertIsNone(self.client._executor)
+
+    def test_failed_batch_drains_every_read_and_next_batch_is_fresh(self):
+        handler=self.server.RequestHandlerClass;original=handler.do_GET
+        def failing(peer):
+            if peer.path.endswith('/123'):
+                self.calls.append((peer.command,peer.path));peer.send_response(500)
+                peer.send_header('Content-Length','0');peer.end_headers()
+            else: original(peer)
+        handler.do_GET=failing
+        with patch.object(live.time,'sleep'),self.assertRaises(live.GitHubUnavailable):
+            self.client.fetch_authority_reads(self.queries())
+        self.assertEqual(len(self.calls),9)
+        self.assertEqual(self.client._workers,[]);self.assertIsNone(self.client._executor)
+        handler.do_GET=original
+        values=self.client.fetch_authority_reads(self.queries())
+        self.assertEqual(len(self.calls),16);self.assertTrue(all(v['n']>9 for v in values.values()))
+
+    def test_post_guard_can_reenter_batch_without_parent_connection_deadlock(self):
+        def guard():self.client.fetch_authority_reads(self.queries())
+        self.client.request('POST','/repos/sample/target/git/refs',{},before_send=guard)
+        self.assertEqual([m for m,_ in self.calls].count('GET'),7)
+        self.assertEqual([m for m,_ in self.calls].count('POST'),1)
+
+    def test_close_drains_active_batch_and_cannot_start_new_workers_afterward(self):
+        import threading
+        started=threading.Event();release=threading.Event();closed=threading.Event();errors=[]
+        handler=self.server.RequestHandlerClass;original=handler.do_GET
+        def delayed(peer):
+            started.set();release.wait(5);original(peer)
+        handler.do_GET=delayed
+        def batch():
+            try:self.client.fetch_authority_reads(self.queries())
+            except BaseException as error:errors.append(error)
+        reader=threading.Thread(target=batch);reader.start()
+        closer=threading.Thread(target=lambda:(self.client.close(),closed.set()))
+        try:
+            self.assertTrue(started.wait(3));closer.start()
+            self.assertFalse(closed.wait(.05))
+        finally:
+            release.set();reader.join(5)
+            if closer.ident is not None:closer.join(5)
+        self.assertFalse(reader.is_alive());self.assertFalse(closer.is_alive())
+        self.assertEqual(errors,[]);self.assertTrue(closed.is_set());self.assertEqual(len(self.calls),7)
+        self.assertEqual(self.client._workers,[]);self.assertIsNone(self.client._executor)
+        with self.assertRaises(live.GitHubUnavailable):self.client.fetch_authority_reads(self.queries())
+        with self.assertRaises(live.GitHubUnavailable):self.client.request('GET','/repos/sample/target')
+
+    def test_invalid_batches_do_not_start_workers(self):
+        for queries in (list(self.queries()),self.queries()[:-1],self.queries()[:-1]+(('host-repository','/repos/sample/target'),),
+                        self.queries()[:-1]+(('approvals','https://evil.invalid/'),)):
+            with self.assertRaises(live.GitHubUnavailable):self.client.fetch_authority_reads(queries)
+        self.assertEqual(self.calls,[]);self.assertIsNone(self.client._executor)
+
     def test_fresh_gets_share_one_tls_connection_and_each_guard_runs(self):
         guard = Mock()
         with patch.dict(os.environ, HTTPS_PROXY='http://untrusted.invalid:1'):
             values = [self.client.request('GET', '/repos/sample/target', before_send=guard)[0] for _ in range(3)]
         self.assertEqual(values, [{'n':1}, {'n':2}, {'n':3}])
         self.assertEqual(guard.call_count, 3); self.assertEqual(self.accepts, 1)
-        self.client.close(); self.client.close()
+        self.client._drop_connection()
         self.client.request('GET', '/repos/sample/target')
         self.assertEqual(self.accepts, 2)
+        self.client.close(); self.client.close()
+        with self.assertRaises(live.GitHubUnavailable): self.client.request('GET', '/repos/sample/target')
 
     def test_recursive_mutation_guard_uses_idle_connection_after_nested_get(self):
         def guard(): self.client.request('GET', '/repos/sample/target')

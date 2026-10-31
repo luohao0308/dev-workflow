@@ -7,6 +7,7 @@ execution permit; runtime observation and mutation remain separate host duties.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib.util
 from pathlib import Path
 import re
 import sys
@@ -108,6 +109,37 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
 
     def _approval_environment(self):
         return self.policy.approval_environment
+
+    def _prefetch_authority(self):
+        # Only this distribution's exact live client opts into parallel reads.
+        # Fake clients and other protocol versions keep the base read sequence.
+        if type(self) is not GitHubFullBodyApprovalV3:
+            return None
+        name = 'deployment_compose_live_review_v3_host'
+        path = DISTRIBUTION / 'scripts/deployment_compose_live_review_v3_host.py'
+        module = sys.modules.get(name)
+        if module is None:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        if Path(getattr(module, '__file__', '')).resolve() != path:
+            _deny('Live approval client must come from trusted distribution')
+        if type(self.client) is not module._ReadRetryGitHubClient:
+            return None
+        p = self.policy
+        run = '/repos/' + p.host_repository + '/actions/runs/' + str(p.run_id)
+        queries = (('host-repository', '/repos/' + p.host_repository),
+                   ('target-repository', '/repos/' + p.target_repository),
+                   ('ledger-repository', '/repos/' + p.ledger_repository),
+                   ('oidc-subject', '/repos/' + p.host_repository + '/actions/oidc/customization/sub'),
+                   ('workflow-run', run),
+                   ('protected-environment', '/repos/' + p.host_repository + '/environments/' + p.approval_environment),
+                   ('approvals', run + '/approvals'))
+        result = self.client.fetch_authority_reads(queries)
+        if result is None:
+            _deny('Invalid GitHub authority batch')
+        return result
 
     def _match(self, request):
         if type(request) is not RequestV2 or self._requests.get(request.digest()) != request:
