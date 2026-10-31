@@ -20,9 +20,11 @@ CURSOR = {'sequence': 2, 'head': 'b'*64}
 SESSION = 'c'*64
 
 
-def serve(pipe, supervisor, key):
+def serve(pipe, key):
+    supervisor = ActorSupervisorV4()
     server = remote.DiagnosticSupervisorServerV4(supervisor=supervisor, signing_key=key, source_digest=SOURCE)
     try:
+        pipe.send({'supervisorBoot': supervisor.boot})
         while True:
             request = pipe.recv()
             if request is None: break
@@ -64,8 +66,7 @@ class RemoteSupervisorTests(unittest.TestCase):
     def test_real_separate_supervisor_process_starts_and_joins_its_child(self):
         context=multiprocessing.get_context('fork')
         parent, child = context.Pipe()
-        child_supervisor=ActorSupervisorV4(); self.addCleanup(child_supervisor.close)
-        process=context.Process(target=serve,args=(child,child_supervisor,self.key)); process.start(); child.close()
+        process=context.Process(target=serve,args=(child,self.key)); process.start(); child.close()
         def cleanup():
             if process.is_alive():
                 try: parent.send(None)
@@ -74,12 +75,17 @@ class RemoteSupervisorTests(unittest.TestCase):
             if process.is_alive(): process.kill(); process.join(5)
             parent.close()
         self.addCleanup(cleanup)
+        # This is a private parent-owned startup pipe; signing key was pinned separately.
+        self.assertTrue(parent.poll(5))
+        hello = parent.recv()
+        self.assertEqual(set(hello), {'supervisorBoot'})
+        child_boot = hello['supervisorBoot']
         calls=[]
         def rpc(request):
             calls.append(deepcopy(request)); parent.send(request)
             if not parent.poll(5): raise TimeoutError()
             return parent.recv()
-        client=self.client(rpc,expected_boot=child_supervisor.boot)
+        client=self.client(rpc,expected_boot=child_boot)
         actor=client.start_fixed_actor(SESSION)
         self.assertIs(type(actor),remote.RemoteActorHandle)
         proof=client.stop_and_join(actor)
@@ -87,7 +93,7 @@ class RemoteSupervisorTests(unittest.TestCase):
         self.assertIs(client.stop_and_join(actor),proof)
         self.assertEqual(len(calls),2)
         self.assertNotEqual(calls[0]['rpcNonce'],calls[1]['rpcNonce'])
-        restarted=self.client(rpc,expected_boot=child_supervisor.boot)
+        restarted=self.client(rpc,expected_boot=child_boot)
         with self.assertRaises(ValueError): restarted.actor_identity(actor,SESSION)
         with self.assertRaises(ValueError): client.termination_digest(actor,remote.RemoteActorTermination(),SESSION)
         client.close()
@@ -228,3 +234,23 @@ class RemoteSupervisorTests(unittest.TestCase):
                         {'operation':'stop-and-joined','actorEpoch':'0'*64}, {'argv':['echo']}):
             value=dict(request,rpcNonce='1'*64);value.update(changes)
             with self.assertRaises(ValueError): self.server.respond(value)
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'real fork required')
+    def test_fork_inherited_client_server_and_empty_owner_all_reject_before_locks(self):
+        from tests.test_deployment_compose_operation_witness_v4 import assert_fork_copies_rejected
+        from deployment_compose_actor_supervisor_v4 import registered_supervisor
+        client = self.client(); actor = client.start_fixed_actor(SESSION)
+        stopped = client.start_fixed_actor(SESSION); proof = client.stop_and_join(stopped)
+        empty = ActorSupervisorV4(); self.addCleanup(empty.close)
+        leaf = next(row[1] for row in self.local._actors.values() if row[1].poll() is None)
+        callbacks = [lambda: client.start_fixed_actor(SESSION), lambda: client.actor_identity(actor, SESSION),
+                     lambda: client.stop_and_join(actor), lambda: client.termination_digest(stopped, proof, SESSION),
+                     lambda: client._rpc('start', SESSION, 'f'*64), lambda: registered_supervisor(client),
+                     client.close, lambda: self.server.respond({}), self.server.close,
+                     lambda: remote.DiagnosticSupervisorServerV4(supervisor=empty, signing_key=self.key, source_digest=SOURCE),
+                     lambda: remote.DiagnosticSupervisorServerV4(supervisor=empty, signing_key=self.key, source_digest=SOURCE)]
+        assert_fork_copies_rejected(self, callbacks, [client._mutex, self.server._lock, self.local._mutex, empty._mutex])
+        self.assertIsNone(leaf.poll())
+        actual = client.stop_and_join(actor)
+        self.assertEqual(len(client.termination_digest(actor, actual, SESSION)), 64)
+        self.assertIsNotNone(leaf.poll())

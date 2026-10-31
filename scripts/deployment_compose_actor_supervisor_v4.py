@@ -21,6 +21,7 @@ TERMINATION_DOMAIN = b'dev-workflow:compose-actor-termination:v4\0'
 def serialized(method):
     @wraps(method)
     def locked(self, *args, **kwargs):
+        self._check_owner()
         with self._mutex:
             return method(self, *args, **kwargs)
     return locked
@@ -36,11 +37,16 @@ class ActorTermination:
 
 class ActorSupervisorV4:
     def __init__(self):
+        self._owner_pid = os.getpid()
         self._mutex = threading.RLock()
         self.boot = secrets.token_hex(32)
         self._actors = {}
         self._terminations = {}
         self._closed = False
+
+    def _check_owner(self):
+        if os.getpid() != self._owner_pid:
+            raise ValueError('actor-supervisor-v4-rejected')
 
     @serialized
     def start_fixed_actor(self, session_hash):
@@ -117,9 +123,13 @@ class ActorSupervisorV4:
 def registered_supervisor(value):
     """Closed host types only; protocol-shaped caller objects are not issuers."""
     if type(value) is ActorSupervisorV4:
+        value._check_owner()
         return True
     from deployment_compose_remote_supervisor_v4 import RemoteActorSupervisorV4
-    return type(value) is RemoteActorSupervisorV4
+    if type(value) is RemoteActorSupervisorV4:
+        value._check_owner()
+        return True
+    return False
 
 
 def verified_termination_digest(supervisor, actor, proof, session_hash, cursor):

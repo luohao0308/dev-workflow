@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import os
+import multiprocessing
 import shutil
 from pathlib import Path
 import sys
@@ -20,6 +21,36 @@ from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
 from deployment_compose_recovery_prepare_v4_host import RecoveryPreparationHostV4
 from deployment_compose_recovery_store import ComposeRecoveryStore
 from tests.test_deployment_compose_approval_v3_host import request as root_request
+
+
+def assert_fork_copies_rejected(test, callbacks, locks):
+    """Keep locks owned by a vanished thread: child checks must precede locking."""
+    acquired = threading.Event(); release = threading.Event()
+    def hold():
+        for lock in locks: lock.acquire()
+        acquired.set()
+        release.wait(10)
+        for lock in reversed(locks): lock.release()
+    thread = threading.Thread(target=hold); thread.start()
+    test.assertTrue(acquired.wait(5))
+    context = multiprocessing.get_context('fork')
+    parent, child = context.Pipe()
+    def attempt():
+        rejected = []
+        for callback in callbacks:
+            try: callback()
+            except ValueError: rejected.append(True)
+            else: rejected.append(False)
+        child.send(rejected); child.close()
+    process = context.Process(target=attempt)
+    try:
+        process.start(); child.close()
+        test.assertTrue(parent.poll(5), 'fork copy blocked on an inherited lock')
+        test.assertEqual(parent.recv(), [True] * len(callbacks))
+        process.join(5); test.assertEqual(process.exitcode, 0)
+    finally:
+        if process.pid is not None and process.is_alive(): process.kill(); process.join(5)
+        release.set(); thread.join(5); parent.close()
 
 
 @unittest.skipUnless(os.name == 'posix', 'POSIX witness storage and process ownership')
@@ -231,3 +262,22 @@ class WitnessV4Tests(unittest.TestCase):
         self.assertTrue(closed.is_set())
         self.assertIsNotNone(self.supervisor._actors[id(handle)][1].poll())
         self.supervisor.close()
+
+    @unittest.skipUnless(hasattr(os, 'fork'), 'real fork required')
+    def test_fork_copy_cannot_join_parent_leaf_or_mint_proof(self):
+        from deployment_compose_actor_supervisor_v4 import registered_supervisor
+        supervisor = self.supervisor
+        session = self.session['sessionHash']
+        stopped = supervisor.start_fixed_actor(session)
+        proof = supervisor.stop_and_join(stopped)
+        process = supervisor._actors[id(self.actor)][1]
+        callbacks = [lambda: supervisor.start_fixed_actor(session),
+                     lambda: supervisor.actor_identity(self.actor, session),
+                     lambda: supervisor.stop_and_join(self.actor),
+                     lambda: supervisor.termination_digest(stopped, proof, session),
+                     lambda: registered_supervisor(supervisor), supervisor.close]
+        assert_fork_copies_rejected(self, callbacks, [supervisor._mutex])
+        self.assertIsNone(process.poll())
+        actual = supervisor.stop_and_join(self.actor)
+        self.assertIsNotNone(process.returncode)
+        self.assertEqual(len(supervisor.termination_digest(self.actor, actual, session)), 64)

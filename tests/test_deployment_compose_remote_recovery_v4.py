@@ -21,9 +21,7 @@ class RemoteRecoveryTests(unittest.TestCase):
     def setup_session(self):
         context = multiprocessing.get_context('fork')
         parent, child = context.Pipe()
-        supervisor = fixture.ActorSupervisorV4()
-        self.addCleanup(supervisor.close)
-        process = context.Process(target=fixture.serve, args=(child, supervisor, self.key))
+        process = context.Process(target=fixture.serve, args=(child, self.key))
         process.start(); child.close()
         def cleanup():
             if process.is_alive():
@@ -33,6 +31,11 @@ class RemoteRecoveryTests(unittest.TestCase):
             if process.is_alive(): process.kill(); process.join(5)
             parent.close()
         self.addCleanup(cleanup)
+        # This is a private parent-owned startup pipe; signing key was pinned separately.
+        self.assertTrue(parent.poll(5))
+        hello = parent.recv()
+        self.assertEqual(set(hello), {'supervisorBoot'})
+        child_boot = hello['supervisorBoot']
         def rpc(request):
             parent.send(request)
             if not parent.poll(5): raise TimeoutError()
@@ -47,10 +50,10 @@ class RemoteRecoveryTests(unittest.TestCase):
         session = dict(bundleDigest=self.root_request.plan_hash,
                        policyHash=self.root_request.policy_hash,
                        baselineReference=self.cas.put(b'remote diagnostic baseline'),
-                       rootRequestHash=self.root_request.digest(), supervisorBoot=supervisor.boot)
+                       rootRequestHash=self.root_request.digest(), supervisorBoot=child_boot)
         session['sessionHash'] = digest(session)
         initial_cursor = {'sequence': 1, 'head': digest(session)}
-        self.remote = self.client(rpc, expected_cursor=initial_cursor, expected_boot=supervisor.boot)
+        self.remote = self.client(rpc, expected_cursor=initial_cursor, expected_boot=child_boot)
         self.addCleanup(self.remote.close)
         self.actor = self.remote.start_fixed_actor(session['sessionHash'])
         self.store = OperationWitnessStoreV4(witness_root, key=b'w'*32)

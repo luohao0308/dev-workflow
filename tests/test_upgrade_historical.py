@@ -57,6 +57,30 @@ def outside_core(data):
 
 
 class HistoricalUpgradeTests(unittest.TestCase):
+    def test_inventory_uses_distribution_relative_cache_directories(self):
+        spec = importlib.util.spec_from_file_location('upgrade_inventory_regression', ROOT / 'scripts/upgrade.py')
+        upgrade = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(upgrade)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / '__pycache__' / 'distribution'
+            files = {
+                'core/docs/normal.md': b'normal source',
+                'core/docs/__pycache__': b'ordinary file',
+                'core/scripts/__pycache__/module.pyc': b'cache',
+                'core/scripts/standalone.pyo': b'legacy optimized cache',
+                'core/docs/.DS_Store': b'metadata',
+                'packs/release/docs/release.md': b'release source',
+            }
+            for name, data in files.items():
+                path = source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            self.assertEqual(upgrade.inventory(source, ['release']), {
+                'docs/normal.md': ('core', b'normal source'),
+                'docs/__pycache__': ('core', b'ordinary file'),
+                'docs/release.md': ('release', b'release source'),
+            })
+
     def test_transaction_rejects_unrestorable_paths_before_writing(self):
         spec = importlib.util.spec_from_file_location('upgrade_path_regression', ROOT / 'scripts/upgrade.py')
         upgrade = importlib.util.module_from_spec(spec)

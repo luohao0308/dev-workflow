@@ -9,6 +9,7 @@ context, not server-verified witness state; the consumer must match current stat
 import base64
 import hashlib
 import json
+import os
 from pathlib import Path
 import secrets
 import subprocess
@@ -60,6 +61,8 @@ class DiagnosticSupervisorServerV4:
     def __init__(self, *, supervisor, signing_key, source_digest):
         if type(supervisor) is not ActorSupervisorV4 or not isinstance(signing_key, Path) or not hex_value(source_digest):
             reject()
+        self._owner_pid = os.getpid()
+        supervisor._check_owner()
         # Ownership belongs to this live supervisor object, not its boot string.
         # Never clear this registration: reconstructing a server must not reset
         # epoch/nonce history while any original leaf can still exist.
@@ -72,7 +75,13 @@ class DiagnosticSupervisorServerV4:
             self._lock = threading.RLock()
             supervisor._remote_diagnostic_owner_v4 = self
 
+    def _check_owner(self):
+        if os.getpid() != self._owner_pid:
+            reject()
+        self._supervisor._check_owner()
+
     def respond(self, request):
+        self._check_owner()
         with self._lock:
             if getattr(self._supervisor, '_remote_diagnostic_owner_v4', None) is not self:
                 reject()
@@ -110,6 +119,7 @@ class DiagnosticSupervisorServerV4:
             return dict(payload=payload, signature=base64.b64encode(signature).decode('ascii'))
 
     def close(self):
+        self._check_owner()
         self._supervisor.close()
 
 
@@ -119,6 +129,7 @@ class RemoteActorSupervisorV4:
                 or not public_key.startswith(b'ssh-ed25519 ') or b'\n' in public_key.rstrip(b'\n')
                 or not hex_value(expected_boot) or not hex_value(source_digest) or not callable(transport)):
             reject()
+        self._owner_pid = os.getpid()
         self.boot, self._public, self._transport = expected_boot, public_key.strip(), transport
         self._source = source_digest
         self._cursor = json.loads(canonical(expected_cursor))
@@ -129,7 +140,12 @@ class RemoteActorSupervisorV4:
         self._closed = False
         self._mutex = threading.RLock()
 
+    def _check_owner(self):
+        if os.getpid() != self._owner_pid:
+            reject()
+
     def _rpc(self, operation, session, epoch, cursor=None):
+        self._check_owner()
         request = dict(operation=operation, supervisorBoot=self.boot, sessionHash=session,
                        actorEpoch=epoch, rpcNonce=secrets.token_hex(32), challenge=secrets.token_hex(32),
                        sourceDigest=self._source, cursor=json.loads(canonical(self._cursor if cursor is None else cursor)))
@@ -168,6 +184,7 @@ class RemoteActorSupervisorV4:
             raise ValueError('remote-diagnostic-supervisor-v4-rejected') from None
 
     def start_fixed_actor(self, session_hash):
+        self._check_owner()
         with self._mutex:
             if self._closed or not hex_value(session_hash) or len(self._actors) >= 128:
                 reject()
@@ -178,6 +195,7 @@ class RemoteActorSupervisorV4:
             return handle
 
     def actor_identity(self, handle, session_hash):
+        self._check_owner()
         with self._mutex:
             if (self._closed or type(handle) is not RemoteActorHandle or handle not in self._actors
                     or self._actors[handle][0] != session_hash):
@@ -185,6 +203,7 @@ class RemoteActorSupervisorV4:
             return self._actors[handle][1]
 
     def stop_and_join(self, handle, *, expected_cursor=None):
+        self._check_owner()
         with self._mutex:
             if type(handle) is not RemoteActorHandle or handle not in self._actors:
                 reject()
@@ -199,6 +218,7 @@ class RemoteActorSupervisorV4:
             return self._terminations[handle][0]
 
     def termination_digest(self, handle, proof, session_hash, *, expected_cursor=None):
+        self._check_owner()
         with self._mutex:
             self.actor_identity(handle, session_hash)
             record = self._terminations.get(handle)
@@ -209,5 +229,6 @@ class RemoteActorSupervisorV4:
 
     def close(self):
         # A disconnect is not proof. Server/transport owner must drain its actors.
+        self._check_owner()
         with self._mutex:
             self._closed = True

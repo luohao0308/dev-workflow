@@ -112,7 +112,9 @@ def inventory(root: Path, packs: list[str]) -> dict[str, tuple[str, bytes]]:
         for item in sorted(directory.rglob('*')):
             if linked(item):
                 raise ValueError('Distribution contains a linked path')
-            if '__pycache__' in item.parts or item.suffix == '.pyc' or item.name == '.DS_Store' or item.is_dir():
+            parts = item.relative_to(directory).parts
+            if ('__pycache__' in parts[:-1] or item.suffix in ('.pyc', '.pyo')
+                    or item.name == '.DS_Store' or item.is_dir()):
                 continue
             name = relative(item.relative_to(directory).as_posix())
             if name in output:
