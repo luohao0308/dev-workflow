@@ -33,7 +33,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     setUpClass = classmethod(tls_fixture.WriteGatewayTests.setUpClass.__func__)
     tearDownClass = classmethod(tls_fixture.WriteGatewayTests.tearDownClass.__func__)
 
-    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None):
+    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None, continuation_runner=None, service_name='web'):
         kw, observation = prepare_fixture.fixture()
         kw['source'] = approval_fixture.request().source
         prepared = ComposePreparationHostV3(**kw).prepare_intent(observation, observation,
@@ -61,11 +61,26 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
             value['baselineStateDigest'] = hashlib.sha256(raw).hexdigest()
             bundle = ExecutionBundleV3(value, authenticated_image_defaults={n:deepcopy(ZERO_DEFAULTS) for n in ('web','api')})
             request = replace(request, components=('api','web'), plan_hash=bundle.digest)
+        if service_name != 'web':
+            if two_services or service_name != 'backend':
+                raise ValueError('unsupported-test-service')
+            def rename(value):
+                if isinstance(value,dict):
+                    return {('backend' if k=='web' else k):rename(v) for k,v in value.items()}
+                if isinstance(value,list):return [rename(v) for v in value]
+                return 'backend' if value=='web' else value
+            value=rename(bundle.to_dict());rows=rename(rows)
+            for key in ('operations','resolverRules','resolverContract','imageDefaultsDigests'):value.pop(key)
+            raw=baseline_state_bytes(rows)
+            value['baselineStateReference']=store.put(raw)
+            value['baselineStateDigest']=hashlib.sha256(raw).hexdigest()
+            bundle=ExecutionBundleV3(value,authenticated_image_defaults={'backend':deepcopy(ZERO_DEFAULTS)})
+            request=replace(request,components=('backend',),plan_hash=bundle.digest)
         baseline = deepcopy(rows)
         version = {'Version':'29.8.2','GitCommit':'8af9fe3'}
         timeline = []; writes = []
         services = {s['name']:s for s in bundle.to_dict()['services']}
-        receipts = {n:('a' if n=='web' else 'b')*64 for n in services}
+        receipts = {n:('a' if n==service_name else 'b')*64 for n in services}
 
         def apply(operation):
             service = services[operation['service']]; phase = operation['phase']
@@ -183,41 +198,50 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         server_tls.load_verify_locations(self.directory/'ca.pem');server_tls.verify_mode=ssl.CERT_REQUIRED
         client_tls=ssl.create_default_context(cafile=self.directory/'ca.pem')
         client_tls.load_cert_chain(self.directory/'client.pem',self.directory/'client.key')
-        make_fence=fence_factory or Profile3RecoveryFenceV3
-        fence=make_fence(preparation=prep,context_reference=recovery['recovery_context_reference'],
-            reviewed_history=reviewed,quiesce_writer=quiesce_writer)
-        args=dict(intent_authority=authority,phase_guard=guard,gate_root=self.root/'recovery-gate',
-            gate_key=b'g'*32,gate_policy=gate_policy,consumption_receipt_hash=receipt,
-            witness_client_factory=h.factory,registered_binding=binding,tls_server_context=server_tls,
-            tls_client_context=client_tls,server_certificate_sha256=hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.directory/'server.pem').read_text())).hexdigest(),
-            docker_socket=socket_path,timeout=3)
-        with self.assertRaises(ValueError): Profile3StepExecutor(bundle,req,**args)
-        self.assertEqual(writes,[])
-        executor=Profile3StepExecutor(bundle,req,startup_fence=fence,**args)
-        def verify_candidates(candidate_receipts):
-            for cid in candidate_receipts.values():
-                self.assertFalse(get('/v1.45/containers/'+cid+'/json')['State']['Running'])
-            return True
-        coordinator=ComposeCoordinatorV3(executor,verify_candidates=verify_candidates,readiness=readiness)
-        timeline.clear()
-        if fail_resumed_readiness:
-            rows[receipts['web']]['State']['Health']['Status']='unhealthy'
-            with self.assertRaises(ValueError): coordinator.run()
+        child = None
+        if continuation_runner is not None:
+            context = prep.verify_context(recovery['recovery_context_reference'],req,reviewed)
+            result,child = continuation_runner(preparation=prep,prepared=recovery,context=context,
+                authority=authority,receipt=receipt,binding=binding,gate_policy=gate_policy,
+                tls=(server_tls,client_tls,hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.directory/'server.pem').read_text())).hexdigest(),cert),
+                guard=guard,readiness=readiness,get=get,rows=rows,store=store,h=h,socket_path=socket_path)
+        else:
+            make_fence=fence_factory or Profile3RecoveryFenceV3
+            fence=make_fence(preparation=prep,context_reference=recovery['recovery_context_reference'],
+                reviewed_history=reviewed,quiesce_writer=quiesce_writer)
+            args=dict(intent_authority=authority,phase_guard=guard,gate_root=self.root/'recovery-gate',
+                gate_key=b'g'*32,gate_policy=gate_policy,consumption_receipt_hash=receipt,
+                witness_client_factory=h.factory,registered_binding=binding,tls_server_context=server_tls,
+                tls_client_context=client_tls,server_certificate_sha256=hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.directory/'server.pem').read_text())).hexdigest(),
+                docker_socket=socket_path,timeout=3)
+            with self.assertRaises(ValueError): Profile3StepExecutor(bundle,req,**args)
             self.assertEqual(writes,[])
-            self.assertEqual(timeline,[('ready','web')])
-            return
-        result=coordinator.run()
+            executor=Profile3StepExecutor(bundle,req,startup_fence=fence,**args)
+            def verify_candidates(candidate_receipts):
+                for cid in candidate_receipts.values():
+                    self.assertFalse(get('/v1.45/containers/'+cid+'/json')['State']['Running'])
+                return True
+            coordinator=ComposeCoordinatorV3(executor,verify_candidates=verify_candidates,readiness=readiness)
+            timeline.clear()
+            if fail_resumed_readiness:
+                rows[receipts['web']]['State']['Health']['Status']='unhealthy'
+                with self.assertRaises(ValueError): coordinator.run()
+                self.assertEqual(writes,[])
+                self.assertEqual(timeline,[('ready','web')])
+                return
+            result=coordinator.run()
         self.assertEqual(writes,write_operations[count:])
         self.assertEqual(result['initialWriteCount'],count)
         self.assertEqual(result['receipts'],receipts)
         for protected in bundle.to_dict()['protectedContainers']:
             cid = protected['containerId']
             self.assertEqual(rows[cid], baseline[cid])
-        child_client=h.factory(executor._binding)
-        from deployment_compose_history_v3_host import AuthenticatedHistoryV3
-        child=AuthenticatedHistoryV3(bundle,req,gate_policy=gate_policy,gate_key=b'g'*32,
-            consumption_receipt_hash=receipt,witness_client=child_client,witness_client_factory=h.factory,
-            parent_history=parent,reviewed_parent_snapshot=reviewed).capture().snapshot
+        if child is None:
+            child_client=h.factory(executor._binding)
+            from deployment_compose_history_v3_host import AuthenticatedHistoryV3
+            child=AuthenticatedHistoryV3(bundle,req,gate_policy=gate_policy,gate_key=b'g'*32,
+                consumption_receipt_hash=receipt,witness_client=child_client,witness_client_factory=h.factory,
+                parent_history=parent,reviewed_parent_snapshot=reviewed).capture().snapshot
         self.assertEqual(len(child['knownPrefix']),len(write_operations))
         self.assertEqual(len(child['scopes']),len(write_operations)-count)
         self.assertEqual(child['parent']['startWriteIndex'],count)
