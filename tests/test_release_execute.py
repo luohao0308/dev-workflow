@@ -706,6 +706,12 @@ class ReleaseExecuteTests(unittest.TestCase):
         self.assertEqual([(adapter['platform'], adapter['tagRelease']) for adapter in status['adapters']],
                          [('github.com', 'implemented'), ('gitlab', 'unsupported'), ('local', 'unsupported')])
         self.assertTrue(all(not adapter['localExecutionAvailable'] for adapter in status['adapters']))
+        gitlab = next(adapter for adapter in status['adapters'] if adapter['platform'] == 'gitlab')
+        self.assertEqual(gitlab['preparation'], 'native-tag-host-foundations')
+        self.assertEqual(gitlab['blockers'], [
+            'registered-native-review-and-ledger-required',
+            'independent-gitlab-project-validation-required',
+            'release-atomic-tag-constraint-unproven'])
         self.assertEqual([(adapter['implementation'], adapter['validation'], adapter['availability'])
                           for adapter in status['adapters']],
                          [('implemented', 'scope-specific', 'trusted-host-required'),

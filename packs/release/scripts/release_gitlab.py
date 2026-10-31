@@ -9,11 +9,12 @@ Release shape, which requires a numeric releaseId.
 """
 from __future__ import annotations
 
-from http.client import HTTPException
+from http.client import HTTPException, HTTPSConnection
 import json
 import math
 import re
 import socket
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -35,7 +36,50 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
+def _mutation_deadline(value):
+    if value is None:return None
+    if type(value) not in (int,float) or not math.isfinite(value) or value<=time.monotonic():
+        raise GitLabUnavailable('GitLab mutation deadline unavailable')
+    return value
+
+
+class _DeadlineHTTPSConnection(HTTPSConnection):
+    def __init__(self,host,*,deadline,**kwargs):
+        super().__init__(host,**kwargs)
+        self._deadline=deadline
+        self._io_timeout=self.timeout
+
+    def _remaining(self):
+        left=self._deadline-time.monotonic()
+        if left<=0:
+            self.close()
+            raise GitLabUnavailable('GitLab mutation deadline exceeded')
+        return min(self._io_timeout,left)
+
+    def connect(self):
+        self.timeout=self._remaining()
+        super().connect()  # DNS/TCP/TLS may block; no HTTP is sent by connect.
+        self.sock.settimeout(self._remaining())
+
+    def send(self,data):
+        if self.sock is None:self.connect()
+        self.sock.settimeout(self._remaining())
+        super().send(data)
+
+
+class _DeadlineHTTPSHandler(HTTPSHandler):
+    def __init__(self,deadline):
+        super().__init__();self._deadline=deadline
+
+    def https_open(self,request):
+        def connection(host,**kwargs):
+            if host!='gitlab.com':raise GitLabUnavailable('Unexpected GitLab mutation host')
+            return _DeadlineHTTPSConnection(host,deadline=self._deadline,**kwargs)
+        return self.do_open(connection,request,context=self._context)
+
+
 class GitLabClient:
+    """POST guard may return None (legacy) or a finite monotonic send deadline."""
     def __init__(self, token: str, *, timeout: float = 15, transport=None):
         if (not isinstance(token, str) or not token or any(ord(c) < 33 or ord(c) > 126 for c in token)
                 or isinstance(timeout, bool) or not isinstance(timeout, (int, float))
@@ -53,9 +97,11 @@ class GitLabClient:
             'Content-Type': 'application/json', 'Cache-Control': 'no-cache',
             'User-Agent': 'dev-workflow-release',
         })
-        before_send()
+        supplied=before_send()
+        deadline=_mutation_deadline(supplied) if method=='POST' else None
+        opener=self._opener if deadline is None else build_opener(ProxyHandler({}),_DeadlineHTTPSHandler(deadline),NoRedirect())
         try:
-            response = self._opener.open(request, timeout=self.timeout)
+            response = opener.open(request, timeout=self.timeout)
         except HTTPError as error:
             status = error.code
             error.close()
@@ -80,7 +126,8 @@ class GitLabClient:
         if self._transport is None:
             status, headers, result = self._network(method, path, payload, before_send)
         else:
-            before_send()
+            supplied=before_send()
+            if method=='POST':_mutation_deadline(supplied)
             try:
                 status, headers, result = self._transport(method, path, payload)
             except Exception:
