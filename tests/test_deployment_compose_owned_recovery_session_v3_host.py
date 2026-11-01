@@ -194,6 +194,102 @@ class SessionTests(unittest.TestCase):
     def test_review_failure_preserved_and_session_closed(self):
         with self.assertRaisesRegex(RuntimeError,'primary-review-failed'):self.drive(review_failure=True)
         self.assertEqual(self.closed,1);self.assertTrue(self.session._closed)
+        report=self.session.cleanup_report()
+        self.assertFalse(report['completionPathSucceeded'])
+        self.assertTrue(report['localProcessReaped']);self.assertTrue(report['localStreamsClosed'])
+
+    def test_stop_before_start_writes_private_descriptive_report(self):
+        session=self.open('simple');session.close()
+        path=session._case/'cleanup-report.private.json'
+        report=json.loads(path.read_text())
+        self.assertEqual(path.stat().st_mode&0o777,0o600)
+        self.assertEqual(report,session.cleanup_report())
+        self.assertTrue(report['managerReceiptVerified']);self.assertFalse(report['completionPathSucceeded'])
+        self.assertFalse(report['authorityGranted']);self.assertFalse(report['runtimePermit'])
+        self.assertFalse(report['productionReady']);self.assertFalse(report['daemonCleanupVerified'])
+        report['cleanupErrors'].append('forged');self.assertEqual(session.cleanup_report()['cleanupErrors'],[])
+        session.close();self.assertEqual(json.loads(path.read_text()),session.cleanup_report())
+
+    def test_report_failure_does_not_skip_disposal_or_overwrite_existing_file(self):
+        session=self.open('simple');path=session._case/'cleanup-report.private.json'
+        path.write_text('existing')
+        with self.assertRaises(FileExistsError):session.close()
+        self.assertEqual(path.read_text(),'existing');self.assertTrue(session._closed)
+        self.assertTrue(session.cleanup_report()['localProcessReaped'])
+        self.assertTrue(session.cleanup_report()['localStreamsClosed'])
+        self.assertIn('report-write',session.cleanup_report()['cleanupErrors'])
+
+    def test_disposal_error_remains_primary_when_report_also_fails(self):
+        session=self.open('simple');path=session._case/'cleanup-report.private.json';path.write_text('existing')
+        dispose=session._dispose_local
+        def fail():
+            dispose();raise RuntimeError('dispose-primary')
+        with patch.object(session,'_dispose_local',side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError,'dispose-primary'):session.close()
+        self.assertEqual(session.cleanup_report()['cleanupErrors'],['local-dispose','report-write'])
+        self.assertTrue(session.cleanup_report()['localStreamsClosed'])
+
+    def test_begin_failure_survives_review_close_error_and_keeps_report(self):
+        session=self.open('simple')
+        review=SimpleNamespace(close=lambda:(_ for _ in ()).throw(RuntimeError('review-secondary')))
+        with patch.object(session,'begin',side_effect=RuntimeError('begin-primary')):
+            with self.assertRaisesRegex(RuntimeError,'begin-primary') as failure:
+                controller._drive_managed_recovery_protocol(self.root,session=session,review=review,on_review=lambda _:None)
+        self.assertTrue(failure.exception.owned_recovery_cleanup_failed)
+        self.assertTrue(session.cleanup_report()['managerReceiptVerified'])
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_diagnostic_tagging_cannot_replace_immutable_primary_exception(self):
+        class ImmutableFailure(RuntimeError):
+            def __setattr__(self,name,value):
+                if name=='owned_recovery_cleanup_failed':raise AttributeError('immutable')
+                super().__setattr__(name,value)
+            def add_note(self,note):raise RuntimeError('notes-disabled')
+        session=self.open('simple');primary=ImmutableFailure('immutable-primary')
+        review=SimpleNamespace(close=lambda:(_ for _ in ()).throw(RuntimeError('review-secondary')))
+        with patch.object(session,'begin',side_effect=primary):
+            with self.assertRaises(ImmutableFailure) as failure:
+                controller._drive_managed_recovery_protocol(self.root,session=session,review=review,on_review=lambda _:None)
+        self.assertIs(failure.exception,primary);self.assertTrue(session._closed)
+
+    def test_snapshot_failure_cannot_replace_first_disposal_failure(self):
+        session=self.open('simple');dispose=session._dispose_local
+        def fail():
+            dispose();raise RuntimeError('dispose-primary')
+        with patch.object(session,'_dispose_local',side_effect=fail),\
+                patch.object(session,'_capture_cleanup_report',side_effect=ValueError('snapshot-secondary')):
+            with self.assertRaisesRegex(RuntimeError,'dispose-primary'):session.close()
+        self.assertTrue(session._closed);self.assertIsNotNone(session._process.poll())
+
+    def test_review_close_property_cannot_replace_primary_review_error(self):
+        session=self.open()
+        class Review:
+            def consume_prepared(self,*args):raise RuntimeError('review-primary')
+            @property
+            def close(self):raise RuntimeError('close-property-secondary')
+        with self.assertRaisesRegex(RuntimeError,'review-primary') as failure:
+            controller._drive_managed_recovery_protocol(self.root,session=session,review=Review(),on_review=lambda _:None)
+        self.assertTrue(failure.exception.owned_recovery_cleanup_failed);self.assertTrue(session._closed)
+
+    def test_startup_failure_report_omits_raw_exception_and_has_no_remote_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory).resolve();root.chmod(0o700)
+            with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
+                    patch.object(session_module,'_spawn',side_effect=RuntimeError('secret-exception-text')):
+                with self.assertRaisesRegex(RuntimeError,'secret-exception-text'):
+                    session_module.OwnedRecoverySSHSessionV3(root,'host-one','b'*40)
+            path=next(root.glob('managed-ssh-*/cleanup-report.private.json'));report=json.loads(path.read_text())
+            self.assertNotIn('secret',path.read_text());self.assertEqual(report['cleanupErrors'],['startup'])
+            self.assertFalse(report['managerReceiptVerified']);self.assertFalse(report['localProcessReaped'])
+            self.assertEqual(path.stat().st_mode&0o777,0o600)
+
+    def test_live_stderr_reader_is_an_explicit_cleanup_error(self):
+        session=self.open('simple')
+        with patch.object(session._reader,'is_alive',return_value=True):
+            with self.assertRaises(ValueError):session.close()
+        report=session.cleanup_report()
+        self.assertIn('stderr-reader-alive',report['cleanupErrors'])
+        self.assertFalse(report['stderrReaderStopped']);self.assertTrue(report['localStreamsClosed'])
 
     def test_terminal_failures_do_not_complete_issued_session(self):
         for attack in ('simple-terminal-binding','simple-terminal-bool','simple-terminal-missing',
@@ -204,6 +300,7 @@ class SessionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):session.complete()
                 self.assertFalse(session._finished)
                 self.close_session()
+                self.assertFalse(session.cleanup_report()['managerReceiptVerified'])
 
     def test_unissued_copied_or_reused_session_is_not_authority(self):
         fake=object.__new__(session_module.OwnedRecoverySSHSessionV3)

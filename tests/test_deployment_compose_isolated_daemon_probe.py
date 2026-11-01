@@ -27,7 +27,7 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
         def check(changes=None, memberships=None):
             data=dict(state,**(changes or {}))
             raw=''.join(k+'='+v+'\n' for k,v in data.items()).encode()
-            with patch.object(probe.sys,'platform','linux'),patch.object(probe.os,'getuid',return_value=0), \
+            with patch.object(probe.sys,'platform','linux'),patch.object(probe.os,'getuid',return_value=0,create=True), \
                  patch.object(probe.os,'pidfd_open',create=True), \
                  patch.object(Path,'read_text',side_effect=memberships or [membership,membership,'1 (python) '+' '.join(['0']*19+['123'])]), \
                  patch.object(probe.subprocess,'run',return_value=Mock(stdout=raw)) as command:

@@ -214,7 +214,8 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNotNone(self.process.poll());self.assertEqual(self.owner.reviewed,[])
 
     def test_cleanup_does_not_mask_primary_error(self):
-        with self.assertRaisesRegex(RuntimeError,'primary-review-error'):self.drive(review_attack='raise')
+        with self.assertRaisesRegex(RuntimeError,'primary-review-error') as failure:self.drive(review_attack='raise')
+        self.assertTrue(failure.exception.owned_recovery_cleanup_failed)
         self.assertEqual(self.closed,1)
 
 

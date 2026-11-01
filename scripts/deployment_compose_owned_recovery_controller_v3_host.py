@@ -28,6 +28,7 @@ from deployment_compose_history_v3_host import pairs
 from deployment_contract_v2 import RequestV2
 from deployment_gateway import GatePolicy
 from deployment_gate_witness import key_material
+from deployment_compose_owned_recovery_session_v3_host import _note_cleanup_failure
 
 
 def reject():
@@ -287,7 +288,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
     finally:
         # Only this transferred LOCAL process is affected. Preserve primary errors.
         import sys
-        primary = sys.exc_info()[0] is not None
+        primary = sys.exc_info()[1]
         cleanup_error = None
         def cleanup(action):
             nonlocal cleanup_error
@@ -311,8 +312,13 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
         for stream in (() if managed else (process.stdin,process.stdout,process.stderr)):
             if stream is not None:cleanup(stream.close)
         if store is not None:cleanup(store.close)
-        cleanup(lambda:live._close_review(review))
-        if not primary and cleanup_error is not None:raise cleanup_error
+        def close_review():
+            close=getattr(review,'close',None)
+            if callable(close):close()
+        cleanup(close_review)
+        if primary is not None and cleanup_error is not None:
+            _note_cleanup_failure(primary)
+        if primary is None and cleanup_error is not None:raise cleanup_error
 
 
 def _drive_managed_recovery_protocol(private_root, *, session, review, on_review, timeout=3600):
@@ -332,8 +338,16 @@ def _drive_managed_recovery_protocol(private_root, *, session, review, on_review
             timeout=timeout,_managed=session)
     finally:
         import sys
-        primary=sys.exc_info()[0] is not None
+        primary=sys.exc_info()[1]
+        cleanup_error=None
         try:session.close()
-        except Exception:
-            if not primary:raise
-        if not entered:live._close_review(review)
+        except Exception as error:cleanup_error=error
+        if not entered:
+            try:
+                close_review=getattr(review,'close',None)
+                if callable(close_review):close_review()
+            except Exception as error:
+                if cleanup_error is None:cleanup_error=error
+        if cleanup_error is not None:
+            if primary is None:raise cleanup_error
+            _note_cleanup_failure(primary)

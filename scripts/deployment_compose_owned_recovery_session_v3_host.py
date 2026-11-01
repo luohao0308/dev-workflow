@@ -29,6 +29,15 @@ def reject():
     raise ValueError('compose-owned-recovery-session-v3-rejected') from None
 
 
+def _note_cleanup_failure(error):
+    """Diagnostics must not replace even an immutable original exception."""
+    try:error.owned_recovery_cleanup_failed=True
+    except Exception:pass
+    try:
+        if hasattr(error,'add_note'):error.add_note('owned recovery cleanup incomplete; inspect private cleanup report')
+    except Exception:pass
+
+
 def _spawn(argv):
     return subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,bufsize=0,close_fds=True)
@@ -72,11 +81,14 @@ class OwnedRecoverySSHSessionV3:
         self._process=None;self._reader=None
         self._errors=[];self._stop_reader=threading.Event()
         self._started=self._finished=self._closed=False
+        self._completion_path_succeeded=False
+        self._cleanup_error_codes=[];self._cleanup_snapshot=None
         self._cleanup_mode=False
         self._binding=None;self._count=self._bytes=0
         self._deadline=time.monotonic()+timeout
         self._maximum=time.monotonic()+3600
         case=root/('managed-ssh-'+secrets.token_hex(12));case.mkdir(mode=0o700)
+        self._case=case
         fd=os.open(case/'stderr.private.txt',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         try:
             self._process=_spawn(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
@@ -124,12 +136,53 @@ class OwnedRecoverySSHSessionV3:
                     or type(binding['invocationId']) is not str or not re.fullmatch('[0-9a-f]{32}',binding['invocationId'])
                     or type(binding['kernelBoot']) is not str or not re.fullmatch('[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}',binding['kernelBoot'])):reject()
             self._binding=encode(binding)
-        except BaseException:
-            if fd is not None:os.close(fd)
+        except BaseException as primary:
+            self._cleanup_error_codes.append('startup')
+            if fd is not None:
+                try:os.close(fd)
+                except Exception:self._cleanup_error_codes.append('stderr-file-close')
             try:self._dispose_local()
-            except Exception:pass
+            except Exception:self._cleanup_error_codes.append('local-dispose')
+            self._closed=True
             _ISSUED.pop(self,None)
+            try:self._save_cleanup_report()
+            except Exception:
+                self._cleanup_error_codes.append('report-write')
+                try:self._capture_cleanup_report()
+                except Exception:pass
+                _note_cleanup_failure(primary)
             raise
+
+    def _capture_cleanup_report(self):
+        process=self._process
+        self._cleanup_snapshot=encode(dict(schemaVersion=1,sourceSha=self.source_sha,
+            archiveDigest=self.archive_digest,hostId=self.host_id,closed=self._closed,
+            completionPathSucceeded=self._completion_path_succeeded,
+            managerReceiptVerified=self._finished,
+            daemonStoppedVerified=self.daemon_stopped_verified,
+            resourceInventoryRestored=self.resource_inventory_restored,
+            hostSnapshotUnchangedVerified=self.host_snapshot_unchanged_verified,
+            localProcessReaped=process is not None and process.poll() is not None,
+            localStreamsClosed=process is not None and all(s is None or s.closed
+                for s in (process.stdin,process.stdout,process.stderr)),
+            stderrReaderStopped=self._reader is not None and not self._reader.is_alive(),
+            cleanupErrors=list(self._cleanup_error_codes),authorityGranted=False,
+            runtimePermit=False,daemonCleanupVerified=False,productionReady=False))
+
+    def cleanup_report(self):
+        """Descriptive snapshot only; serialized reports never issue authority."""
+        if (os.getpid(),threading.get_ident())!=(self._pid,self._thread):reject()
+        if self._cleanup_snapshot is None:self._capture_cleanup_report()
+        return json.loads(self._cleanup_snapshot)
+
+    def _save_cleanup_report(self):
+        self._capture_cleanup_report()
+        temporary=self._case/('cleanup-report-'+secrets.token_hex(8)+'.new')
+        fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        try:
+            with os.fdopen(fd,'wb') as output:output.write(self._cleanup_snapshot+b'\n')
+            os.link(temporary,self._case/'cleanup-report.private.json')
+        finally:temporary.unlink()
 
     def _left(self,limit=30):
         issued(self)
@@ -258,6 +311,7 @@ class OwnedRecoverySSHSessionV3:
         if not self._started or self._finished:reject()
         self._terminal(self._receive(60 if self.verify_host_snapshot else 30),business=True)
         self._exit()
+        self._completion_path_succeeded=True
 
     def _dispose_local(self):
         failure=None
@@ -271,6 +325,9 @@ class OwnedRecoverySSHSessionV3:
                 cleanup(self._process.kill);cleanup(lambda:self._process.wait(timeout=5))
         self._stop_reader.set()
         if self._reader is not None and self._reader.ident is not None:cleanup(lambda:self._reader.join(timeout=1))
+        if self._reader is not None and self._reader.is_alive():
+            self._cleanup_error_codes.append('stderr-reader-alive')
+            cleanup(reject)
         if self._process is not None:
             for stream in (self._process.stdin,self._process.stdout,self._process.stderr):
                 if stream is not None:cleanup(stream.close)
@@ -299,10 +356,19 @@ class OwnedRecoverySSHSessionV3:
                         continue
                     self._terminal(value,business=False);self._exit();break
                 else:reject()
-        except Exception as error:failure=error
+        except Exception as error:
+            self._cleanup_error_codes.append('manager-close');failure=error
         finally:
             try:self._dispose_local()
             except Exception as error:
+                self._cleanup_error_codes.append('local-dispose')
                 if failure is None:failure=error
             finally:self._closed=True;_ISSUED.pop(self,None)
+            try:self._save_cleanup_report()
+            except Exception as error:
+                self._cleanup_error_codes.append('report-write')
+                try:self._capture_cleanup_report()
+                except Exception:pass
+                if failure is None:failure=error
+                else:_note_cleanup_failure(failure)
         if failure is not None:raise failure
