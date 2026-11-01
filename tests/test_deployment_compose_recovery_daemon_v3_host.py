@@ -19,6 +19,7 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/p) for p in ('scripts','packs/deployment/scripts','packs/release/scripts')]
 import deployment_compose_recovery_daemon_v3_host as daemon
+import deployment_compose_resource_inventory_v3_host as inventory
 BOOT='11111111-1111-1111-1111-111111111111'
 
 
@@ -36,15 +37,18 @@ class DaemonTests(unittest.TestCase):
         (self.root/'daemon.pid').write_text(str(self.pid));(self.root/'daemon.pid').chmod(0o600)
         self.active=True;self.collected=False;self.dead=False;self.invocation='a'*32
         self.peer=(self.pid,os.getuid(),42);self.info={'ID':'daemon-one','DockerRootDir':str(self.root/'data')}
-        self.on_info=None;self.calls=[];self.http=[]
+        self.on_info=None;self.on_request=None;self.calls=[];self.http=[]
+        self.inventory={inventory.CONTAINERS:[],inventory.IMAGES:[],inventory.NETWORKS:[{'Id':'c'*64}],
+            inventory.VOLUMES:{'Volumes':[],'Warnings':None}}
         test=self
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,*args):pass
             def do_GET(self):
                 test.http.append(self.path)
-                raw=json.dumps(test.info).encode()
+                raw=json.dumps(test.info if self.path=='/v1.45/info' else test.inventory[self.path]).encode()
                 self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers()
-                if test.on_info:test.on_info()
+                if self.path=='/v1.45/info' and test.on_info:test.on_info()
+                if test.on_request:test.on_request(self.path)
                 self.wfile.write(raw);self.wfile.flush()
         server=socketserver.UnixStreamServer(str(self.root/'docker.sock'),Handler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
@@ -87,6 +91,49 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(binding['daemonPid'],self.pid);self.assertEqual(self.http,['/v1.45/info'])
         self.stopped();value.verify_stopped()
         self.assertTrue(all('stop' not in cmd for cmd in self.calls))
+    def test_resource_baseline_and_restored_inventory_use_pinned_live_peer(self):
+        value=self.observe();before=value.begin_resource_observation()
+        self.assertEqual(value.verify_resources_restored(),before)
+        self.assertEqual(len(before),64)
+        with self.assertRaises(ValueError):value.begin_resource_observation()
+        self.assertTrue(all(path=='/v1.45/info' or path in inventory.PATHS for path in self.http))
+    def test_each_resource_leak_blocks_inventory_restoration(self):
+        value=self.observe();value.begin_resource_observation()
+        for path,leak in ((inventory.CONTAINERS,[{'Id':'a'*64}]),(inventory.IMAGES,[{'Id':'sha256:'+'b'*64}]),
+                (inventory.NETWORKS,[{'Id':'d'*64}]),(inventory.VOLUMES,{'Volumes':[{'Name':'leaked'}],'Warnings':[]})):
+            with self.subTest(path=path):
+                old=self.inventory[path];self.inventory[path]=leak
+                with self.assertRaises(ValueError):value.verify_resources_restored()
+                self.inventory[path]=old
+    def test_resource_capture_cannot_repin_a_new_pid_or_socket(self):
+        value=self.observe();value.begin_resource_observation()
+        (self.root/'daemon.pid').write_text(str(self.main))
+        with self.assertRaises(ValueError):value.verify_resources_restored()
+        (self.root/'daemon.pid').write_text(str(self.pid))
+        retained=self.root/'original.sock';(self.root/'docker.sock').rename(retained)
+        sock=socket.socket(socket.AF_UNIX);self.addCleanup(sock.close);sock.bind(str(self.root/'docker.sock'))
+        with self.assertRaises(ValueError):value.verify_resources_restored()
+    def test_nonempty_initial_sandbox_or_incomplete_volume_listing_rejects(self):
+        self.inventory[inventory.IMAGES]=[{'Id':'sha256:'+'b'*64}]
+        value=self.observe()
+        with self.assertRaises(ValueError):value.begin_resource_observation()
+        self.inventory[inventory.IMAGES]=[]
+        with self.assertRaises(ValueError):value.begin_resource_observation()
+        other=self.observe();self.inventory[inventory.VOLUMES]['Warnings']=['unavailable-plugin']
+        with self.assertRaises(ValueError):other.begin_resource_observation()
+    def test_unstable_scans_do_not_create_a_new_baseline(self):
+        value=self.observe()
+        def change(path):
+            if path==inventory.CONTAINERS:self.inventory[path]=[{'Id':'b'*64}]
+        self.on_request=change
+        with self.assertRaises(ValueError):value.begin_resource_observation()
+        self.assertIsNone(value._resource_baseline)
+    def test_original_peer_starttime_cannot_be_replaced_during_resource_read(self):
+        value=self.observe();value.begin_resource_observation()
+        def changed(pid,group):return (int(pid),999) if int(pid)==self.pid else self.identity(pid,group)
+        with patch.object(daemon.units,'_pid_identity',side_effect=changed):
+            with self.assertRaises(ValueError):value.verify_resources_restored()
+        self.assertEqual(value.binding()['daemonStartTicks'],456)
     def test_collected_unit_with_bound_group_absent_is_accepted(self):
         value=self.observe();self.stopped();self.collected=True;shutil.rmtree(self.group)
         value.verify_stopped()
@@ -156,8 +203,10 @@ root=pathlib.Path(sys.argv[1])
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*args):pass
  def do_GET(self):
-  assert self.path=='/v1.45/info'
-  body=json.dumps(dict(ID='marker-daemon',DockerRootDir=str(root/'data'))).encode()
+  values={'/v1.45/info':dict(ID='marker-daemon',DockerRootDir=str(root/'data')),
+   '/v1.45/containers/json?all=true':[], '/v1.45/images/json?all=true':[],
+   '/v1.45/networks':[{'Id':'c'*64}], '/v1.45/volumes':{'Volumes':[],'Warnings':None}}
+  body=json.dumps(values[self.path]).encode()
   self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
 service=socketserver.UnixStreamServer(str(root/'docker.sock'),Handler)
 (root/'daemon.pid').write_text(str(os.getpid()));(root/'daemon.pid').chmod(0o600)
@@ -189,9 +238,12 @@ finally:
                 time.sleep(.02)
             observer=daemon.ObservedRecoveryDaemonV3(str(root),'marker-daemon',kernel_boot=daemon.units._boot())
             self.assertNotEqual(observer.binding()['mainPid'],observer.binding()['daemonPid'])
+            baseline=observer.begin_resource_observation()
+            self.assertEqual(observer.verify_resources_restored(),baseline)
             subprocess.run(['/usr/bin/systemctl','--system','stop',unit],capture_output=True,check=True,timeout=10)
             observer.verify_stopped();verified=True
             print(json.dumps(dict(markerBinding=observer.binding(),daemonStopped=True,
+                resourceBaselineDigest=baseline,resourceInventoryRestored=True,
                 cgroupExists=(daemon.units.CGROUP/'system.slice'/unit).exists(),newDockerWrites=0)))
         finally:
             if started and not verified:

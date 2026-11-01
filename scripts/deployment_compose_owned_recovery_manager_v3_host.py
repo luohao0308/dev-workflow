@@ -66,9 +66,12 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     lifecycle data for the owned channel, never business completion or authority.
     """
     verify_daemon=type(config) is dict and 'verifyDaemonStop' in config
+    verify_resources=type(config) is dict and 'verifyResourceInventory' in config
     if (type(config) is not dict
-            or set(config)!={'entrypoint','channelNonce','sourceSha','archiveDigest','hostId'}|({'verifyDaemonStop'} if verify_daemon else set())
+            or set(config)!={'entrypoint','channelNonce','sourceSha','archiveDigest','hostId'}|(
+                {'verifyDaemonStop'} if verify_daemon else set())|({'verifyResourceInventory'} if verify_resources else set())
             or verify_daemon and config['verifyDaemonStop'] is not True
+            or verify_resources and (config['verifyResourceInventory'] is not True or not verify_daemon)
             or config['entrypoint']!=MANAGER_ENTRYPOINT
             or type(config['channelNonce']) is not str or not re.fullmatch('[0-9a-f]{64}',config['channelNonce'])
             or type(config['sourceSha']) is not str or not re.fullmatch('[0-9a-f]{40}',config['sourceSha'])
@@ -82,6 +85,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     owner = OwnedRecoveryUnitV3(config['archiveDigest'],config['sourceSha'])
     process = thread = None
     daemon=None
+    resource_before=resource_after=None
+    resource_final_seen=False
     stop_drain = threading.Event()
     errors = []
     stop_attempted = False
@@ -122,7 +127,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             except Exception:errors.append('stderr-io')
         thread=threading.Thread(target=drain,daemon=True);thread.start()
         queue('client',dict(kind='manager-bound',channelNonce=nonce,binding=binding,
-            **({'verifyDaemonStop':True} if verify_daemon else {})))
+            **({'verifyDaemonStop':True} if verify_daemon else {}),
+            **({'verifyResourceInventory':True} if verify_resources else {})))
         client,worker = _Frames(),_Frames()
         reason = None
         with selectors.DefaultSelector() as selector:
@@ -162,21 +168,37 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                         if count>4096 or frame.get('channelNonce')!=nonce:reject()
                         if side=='worker-read':
                             if not start_requested or len(encode(frame))>INNER_LIMIT:reject()
+                            if verify_resources and resource_after is not None:
+                                if frame.get('kind')!='final' or resource_final_seen:reject()
+                                resource_final_seen=True
                             if verify_daemon:
                                 if daemon is None:
                                     if frame.get('kind')!='hello':reject()
                                     daemon=ObservedRecoveryDaemonV3(frame.get('root'),frame.get('daemonId'),
                                         kernel_boot=owner._boot_id,timeout=remaining(15))
+                                    if verify_resources:resource_before=daemon.begin_resource_observation(timeout=remaining(15))
                                     queue('client',dict(kind='daemon-bound',channelNonce=nonce,
-                                        binding=binding,daemonBinding=daemon.binding()))
+                                        binding=binding,daemonBinding=daemon.binding(),
+                                        **({'resourceBaselineDigest':resource_before} if verify_resources else {})))
                                 elif frame.get('kind')=='hello':reject()
+                            if verify_resources and frame.get('kind')=='cleanup-ready':
+                                if (resource_after is not None or daemon is None
+                                        or queues['worker']
+                                        or set(frame)!={'kind','channelNonce','root','daemonId'}
+                                        or frame['root']!=daemon.binding()['root']
+                                        or frame['daemonId']!=daemon.binding()['daemonId']):reject()
+                                resource_after=daemon.verify_resources_restored(timeout=remaining(15))
+                                if resource_after!=resource_before:reject()
+                                queue('worker',dict(kind='cleanup-checked',channelNonce=nonce))
+                                continue
+                            if verify_resources and frame.get('kind')=='final' and resource_after is None:reject()
                             queue('client',dict(kind='worker-frame',channelNonce=nonce,frame=frame))
                             continue
                         kind=frame.get('kind')
                         if kind=='manager-stop' and set(frame)=={'kind','channelNonce'}:
                             reason='requested-stop';break
                         if kind=='manager-start' and set(frame)=={'kind','channelNonce'} and not start_requested:
-                            initial=dict({k:v for k,v in config.items() if k!='verifyDaemonStop'},
+                            initial=dict({k:v for k,v in config.items() if k not in ('verifyDaemonStop','verifyResourceInventory')},
                                 entrypoint=ENTRYPOINT,archiveBase64=base64.b64encode(archive).decode('ascii'))
                             queue('worker',initial)
                             start_requested=True
@@ -184,6 +206,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                             payload=frame['frame']
                             if (type(payload) is not dict or payload.get('channelNonce')!=nonce
                                     or type(payload.get('kind')) is not str or len(encode(payload))>INNER_LIMIT):reject()
+                            if verify_resources and payload['kind']=='cleanup-checked':reject()
+                            if verify_resources and resource_after is not None:reject()
                             queue('worker',payload)
                         else:reject()
                     if reason is not None:break
@@ -210,7 +234,10 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             wrapperStopped=True,transportReturncode=owner.transport_returncode,
             daemonCleanupVerified=False,productionReady=False,
             **({'daemonBinding':daemon.binding() if daemon is not None else None,
-                'daemonStoppedVerified':daemon is not None} if verify_daemon else {}))
+                'daemonStoppedVerified':daemon is not None} if verify_daemon else {}),
+            **({'resourceBaselineDigest':resource_before,'resourceAfterDigest':resource_after,
+                'resourceInventoryRestored':resource_before is not None and resource_after==resource_before}
+                if verify_resources else {}))
     finally:
         import sys
         primary=sys.exc_info()[1]

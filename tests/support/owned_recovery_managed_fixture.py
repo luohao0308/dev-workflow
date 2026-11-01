@@ -21,6 +21,20 @@ def child(attack,engine):
     assert set(initial)=={'entrypoint','sourceSha','archiveDigest','hostId','channelNonce'}
     if attack.startswith('simple'):
         write_frame(sys.stdout.buffer,dict(kind='hello',channelNonce=initial['channelNonce'],root=engine,daemonId='daemon-one'))
+        if attack.startswith('simple-resource'):
+            read_frame(sys.stdin.buffer)  # Wait for the test parent to consume hello.
+            if attack=='simple-resource-backlog':
+                Path(engine).mkdir(mode=0o700,exist_ok=True)
+                write_frame(sys.stdout.buffer,dict(kind='ready-for-backlog',channelNonce=initial['channelNonce']))
+                while not (Path(engine)/'checkpoint-go').exists():time.sleep(.01)
+            if attack!='simple-resource-missing':
+                ready=dict(kind='cleanup-ready',channelNonce=initial['channelNonce'],root=engine,daemonId='daemon-one')
+                write_frame(sys.stdout.buffer,ready)
+                ack=read_frame(sys.stdin.buffer);assert ack['kind']=='cleanup-checked'
+                if attack=='simple-resource-rpc':
+                    write_frame(sys.stdout.buffer,dict(kind='rpc',channelNonce=initial['channelNonce']));return
+                if attack=='simple-resource-duplicate':write_frame(sys.stdout.buffer,ready);return
+            write_frame(sys.stdout.buffer,dict(kind='final',channelNonce=initial['channelNonce']))
         if attack=='simple-daemon-wait':time.sleep(30)
         return
     root=Path(engine);root.mkdir(mode=0o700,exist_ok=True)
@@ -40,6 +54,10 @@ def main(attack,engine):
         def binding(self):return dict(self.value)
         def verify_stopped(self,**kwargs):
             if attack=='simple-daemon-active':raise ValueError('fixture-daemon-still-active')
+        def begin_resource_observation(self,**kwargs):return 'f'*64
+        def verify_resources_restored(self,**kwargs):
+            if attack=='simple-resource-leak':raise ValueError('fixture-resource-leak')
+            return 'f'*64
         def close(self):pass
     class Owner:
         def __init__(self,*args):
@@ -63,12 +81,15 @@ def main(attack,engine):
     def control(value):
         if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-daemon-downgrade':
             value.pop('verifyDaemonStop',None)
+        if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-resource-downgrade':
+            value.pop('verifyResourceInventory',None)
         if type(value) is dict and value.get('kind')=='daemon-bound':
             if attack=='simple-daemon-missing':
                 nonce=value['channelNonce'];data=value['daemonBinding']
                 value=dict(kind='worker-frame',channelNonce=nonce,
                     frame=dict(kind='hello',channelNonce=nonce,root=data['root'],daemonId=data['daemonId']))
             if attack=='simple-daemon-mismatch':value['daemonBinding']=dict(value['daemonBinding'],daemonId='other')
+            if attack=='simple-resource-wrong-baseline':value['resourceBaselineDigest']='9'*64
         return original_encode(value)
     def output(stream,value,**kwargs):
         if value.get('kind')=='manager-stopped':
@@ -77,6 +98,8 @@ def main(attack,engine):
             if attack=='simple-terminal-binding':value['binding']=dict(value['binding'],invocationId='9'*32)
             if attack=='simple-daemon-false':value['daemonStoppedVerified']=False
             if attack=='simple-daemon-terminal':value['daemonBinding']=dict(value['daemonBinding'],invocationId='9'*32)
+            if attack=='simple-resource-false':value['resourceInventoryRestored']=False
+            if attack=='simple-resource-after':value['resourceAfterDigest']='9'*64
         return original(stream,value,**kwargs)
     with patch.object(manager,'OwnedRecoveryUnitV3',Owner),patch.object(manager,'ObservedRecoveryDaemonV3',Daemon),\
             patch.object(manager,'write_frame',side_effect=output),patch.object(manager,'encode',side_effect=control):

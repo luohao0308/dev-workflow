@@ -216,6 +216,8 @@ def run(config, stdin, stdout):
             setup = channel.receive('configure')
             source_facts='includeSourceFacts' in setup
             if source_facts and setup.pop('includeSourceFacts') is not True:reject()
+            cleanup_check='includeCleanupCheck' in setup
+            if cleanup_check and setup.pop('includeCleanupCheck') is not True:reject()
             if set(setup) != {'policy','epoch','witnessPublicKey','statusPublicKey','keys','gateKey'}:
                 reject()
             policy = GatePolicy(**setup['policy'])
@@ -246,6 +248,9 @@ def run(config, stdin, stdout):
             result,history = recover_suffix(channel,session,prepared,preparation,context,policy,gate_key,public,status,tls,tracker,retained)
             session.cleanup()
             session = None
+            if cleanup_check:
+                channel.emit('cleanup-ready',root=str(root),daemonId=info['ID'])
+                if channel.receive('cleanup-checked')!={}:reject()
             final_payload = dict(result=result,history=history,success=True,cleanupCompleted=True,productionReady=False)
             return dict(success=True)
         except BaseException as error:

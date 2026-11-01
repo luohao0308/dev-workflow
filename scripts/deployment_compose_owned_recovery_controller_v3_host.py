@@ -193,7 +193,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                 send('configure',policy=asdict(policy),epoch=admission._epoch,
                     witnessPublicKey=base64.b64encode(public).decode(),statusPublicKey=base64.b64encode(status_public).decode(),
                     keys={k:base64.b64encode(v).decode() for k,v in keys.items()},gateKey=base64.b64encode(gate_key).decode(),
-                    **({'includeSourceFacts':True} if managed else {}))
+                    **({'includeSourceFacts':True} if managed else {}),
+                    **({'includeCleanupCheck':True} if managed and _managed.verify_resource_inventory else {}))
                 stage = 'managed-source' if managed else 'observer'
             elif kind=='managed-source-facts' and managed and stage=='managed-source':
                 if (set(data)!={'root','daemonId','sourceSha','archiveDigest','hostId','project','normalizationVersion'}
@@ -277,6 +278,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     requestCount=count,workerReport={k:data[k] for k in flags},
                     remoteWrapperStoppedVerified=managed,productionReady=False,
                     **({'daemonStoppedVerified':_managed.daemon_stopped_verified,
+                        'resourceInventoryRestored':_managed.resource_inventory_restored,
                         'daemonCleanupVerified':False} if managed else {}))
             else:
                 reject()

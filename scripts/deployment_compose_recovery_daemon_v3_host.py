@@ -5,6 +5,7 @@ daemon lifetime, not resource deletion, host invariance or hostile-root isolatio
 """
 import os
 import math
+import hashlib
 from pathlib import Path
 import re
 import socket
@@ -17,6 +18,8 @@ import deployment_runtime as runtime
 import deployment_compose_owned_recovery_unit_v3_host as units
 from deployment_compose_reader_host import _UnixDocker,_complete_json_response
 from deployment_compose_writer_cgroup_v3_host import events
+from deployment_compose_operation_witness_client_v3 import encode
+from deployment_compose_resource_inventory_v3_host import inventory,PATHS
 
 _ROOT_UID=0
 
@@ -51,6 +54,9 @@ class ObservedRecoveryDaemonV3:
         self._identity=self._root_identity=None
         self._main=self._daemon=None
         self._binding=None;self._closed=False
+        self._socket_identity=self._pid_file_identity=None
+        self._resource_baseline=None
+        self._resource_attempted=False
         deadline=time.monotonic()+timeout
         try:
             self._check()
@@ -76,6 +82,7 @@ class ObservedRecoveryDaemonV3:
             if (self._state(deadline)!=before
                     or units._pid_identity(before['MainPID'],self._group+'/supervisor')!=self._main
                     or not self._same_group()):reject()
+            self._live_state=dict(before)
             self._binding=dict(root=root,daemonId=daemon_id,unit=self.unit,kernelBoot=kernel_boot,
                 invocationId=self._invocation,cgroupDevice=self._identity[0],cgroupInode=self._identity[1],
                 mainPid=self._main[0],mainStartTicks=self._main[1],daemonPid=self._daemon[0],daemonStartTicks=self._daemon[1])
@@ -139,12 +146,17 @@ class ObservedRecoveryDaemonV3:
             return int(value),self._id(info)
         finally:os.close(fd)
 
-    def _info(self,deadline):
+    def _request(self,path,deadline,budget=None):
+        if path not in PATHS and path!='/v1.45/info':reject()
         self._root_same()
         inode=os.stat('docker.sock',dir_fd=self._root_fd,follow_symlinks=False)
         if not stat.S_ISSOCK(inode.st_mode) or inode.st_uid!=_ROOT_UID:reject()
         pid,file_id=self._pid_file()
-        self._daemon=units._pid_identity(str(pid),self._group+'/supervisor')
+        identity=units._pid_identity(str(pid),self._group+'/supervisor')
+        if self._daemon is None:
+            self._daemon=identity;self._socket_identity=self._id(inode);self._pid_file_identity=(pid,file_id)
+        elif (identity!=self._daemon or self._id(inode)!=self._socket_identity
+                or (pid,file_id)!=self._pid_file_identity):reject()
         connection=_UnixDocker('/proc/self/fd/'+str(self._root_fd)+'/docker.sock',min(5,units._left(deadline)))
         watchdog=None
         try:
@@ -152,9 +164,11 @@ class ObservedRecoveryDaemonV3:
             watchdog=runtime.deadline_watchdog(connection.sock,min(deadline,time.monotonic()+5))
             peer,uid,_=_peer(connection.sock)
             if peer!=pid or uid!=_ROOT_UID:reject()
-            connection.request('GET','/v1.45/info',headers={'Accept':'application/json'})
-            _,value=_complete_json_response(connection.getresponse())
-            if type(value) is not dict or value.get('ID')!=self.daemon_id or value.get('DockerRootDir')!=self.root+'/data':reject()
+            connection.request('GET',path,headers={'Accept':'application/json'})
+            raw,value=_complete_json_response(connection.getresponse())
+            if budget is not None:
+                budget[0]-=len(raw)
+                if budget[0]<0:reject()
         finally:
             if watchdog is not None:watchdog.cancel()
             connection.close()
@@ -162,6 +176,47 @@ class ObservedRecoveryDaemonV3:
         if (self._pid_file()!=(pid,file_id)
                 or self._id(os.stat('docker.sock',dir_fd=self._root_fd,follow_symlinks=False))!=self._id(inode)
                 or units._pid_identity(str(pid),self._group+'/supervisor')!=self._daemon):reject()
+        return value
+
+    def _info(self,deadline,budget=None):
+        value=self._request('/v1.45/info',deadline,budget)
+        if type(value) is not dict or value.get('ID')!=self.daemon_id or value.get('DockerRootDir')!=self.root+'/data':reject()
+
+    def _resources(self,deadline):
+        self._check()
+        state=self._state(deadline)
+        if (state!=self._live_state or state['ActiveState']!='active' or state['InvocationID']!=self._invocation
+                or state['ControlGroup']!=self._group or int(state['MainPID'])!=self._main[0]
+                or units._pid_identity(state['MainPID'],self._group+'/supervisor')!=self._main
+                or not self._same_group()):reject()
+        budget=[16*1024*1024]
+        self._info(deadline,budget)
+        read=lambda path:self._request(path,deadline,budget)
+        first=inventory(read);second=inventory(read)
+        self._info(deadline,budget)
+        if encode(first)!=encode(second) or self._state(deadline)!=state:reject()
+        units._left(deadline)
+        return encode(dict(schemaVersion=1,daemonBindingDigest=hashlib.sha256(encode(self._binding)).hexdigest(),**first))
+
+    def begin_resource_observation(self,*,timeout=15):
+        self._check()
+        if (self._resource_attempted or type(timeout) not in (int,float)
+                or not math.isfinite(timeout) or not 0<timeout<=15):reject()
+        self._resource_attempted=True
+        raw=self._resources(time.monotonic()+timeout)
+        import json
+        value=json.loads(raw)
+        if any(value[k] for k in ('containers','images','volumes')):reject()
+        self._resource_baseline=raw
+        return hashlib.sha256(raw).hexdigest()
+
+    def verify_resources_restored(self,*,timeout=15):
+        self._check()
+        if (self._resource_baseline is None or type(timeout) not in (int,float)
+                or not math.isfinite(timeout) or not 0<timeout<=15):reject()
+        raw=self._resources(time.monotonic()+timeout)
+        if raw!=self._resource_baseline:reject()
+        return hashlib.sha256(raw).hexdigest()
 
     def binding(self):
         self._check()

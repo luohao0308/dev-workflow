@@ -75,6 +75,7 @@ def run():
         serverCertificateSha256='c'*64,sourceSha=cfg['sourceSha'],archiveDigest=cfg['archiveDigest'],hostId=cfg['hostId'])
     setup=channel.receive('configure')
     source_facts=setup.pop('includeSourceFacts',False)
+    cleanup_check=setup.pop('includeCleanupCheck',False)
     if attack=='wrong-order':channel.emit('prepared-private');return
     case=LocalAcceptanceCase(unittest.TestCase())
     # The fixture owns only its own temporary fake Engine directory.
@@ -160,6 +161,11 @@ def run():
             client.transition_successor(expected_seq=view['seq'],expected_head=view['head'],childBinding=following)
             binding=following;finish(index,request,child_refs,binding)
         value=json.loads(child_history.capture().canonical)
+        if cleanup_check:
+            # Engine cleanup is an explicit fixture seam; the signed history above is real.
+            case.harness.rows.clear();session.created_ids.clear()
+            channel.emit('cleanup-ready',root=engine,daemonId='daemon-one')
+            if channel.receive('cleanup-checked')!={}:raise ValueError('bad-cleanup-ack')
         if attack=='buffered-stdin':
             import subprocess
             subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)

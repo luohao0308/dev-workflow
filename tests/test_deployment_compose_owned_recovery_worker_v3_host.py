@@ -94,10 +94,13 @@ class ProtocolTests(unittest.TestCase):
     def test_full_run_wiring_keeps_local_record_and_waits_for_outer_cleanup(self):
         self._run_wiring()
 
+    def test_inventory_checkpoint_follows_cleanup_and_precedes_daemon_stop(self):
+        self._run_wiring(cleanup_check=True)
+
     def test_cleanup_failure_preserves_original_and_blocks_engine_cleanup(self):
         self._run_wiring(fail=True)
 
-    def _run_wiring(self,fail=False):
+    def _run_wiring(self,fail=False,cleanup_check=False):
         # All fixture/product seams below are mocks. This proves protocol order
         # and ownership wiring only; the delegated test supplies OS evidence.
         @dataclass
@@ -115,6 +118,9 @@ class ProtocolTests(unittest.TestCase):
             gateKey=base64.b64encode(b'g'*32).decode(),
             keys={k:base64.b64encode(b'k'*32).decode() for k in worker.live.KEYS})
         channel=Mock();channel.receive.return_value=setup
+        if cleanup_check:
+            setup['includeCleanupCheck']=True
+            channel.receive.side_effect=lambda kind:setup if kind=='configure' else {}
         bundle=Mock();bundle.to_dict.return_value={'protectedContainers':[]}
         session=Mock();session.prepared={'bundle':bundle};session.created_ids=[]
         session.project='private-project'
@@ -137,6 +143,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertEqual(set(payload),{'request','context'})
                 self.assertNotIn(record,payload.values())
         channel.emit.side_effect=emit
+        if cleanup_check:session.cleanup.side_effect=lambda:events.append('cleaned')
         def cut(*args):
             args[-1].update(executor=executor,record=record,history=history,reviewed=reviewed)
             events.append('cut')
@@ -174,7 +181,9 @@ class ProtocolTests(unittest.TestCase):
             session.cleanup.assert_called_once_with()
             return
         self.assertEqual(events,['hello','observer-facts','prepared-private','cut',
-            'recovery-prepared-private','suffix','outer-stopped','final'])
+            'recovery-prepared-private','suffix']+(['cleaned','cleanup-ready'] if cleanup_check else [])+
+            ['outer-stopped','final'])
+        if cleanup_check:self.assertEqual(channel.receive.call_args.args,('cleanup-checked',))
         session.cleanup.assert_called_once_with()
         executor.retry_owned_cleanup.assert_not_called()
 

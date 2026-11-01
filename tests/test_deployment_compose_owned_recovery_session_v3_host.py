@@ -26,7 +26,7 @@ from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcce
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
     'POSIX/OpenSSL/OpenSSH required')
 class SessionTests(unittest.TestCase):
-    def open(self,attack='',*,verify_daemon=False):
+    def open(self,attack='',*,verify_daemon=False,verify_resources=False):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name).resolve();self.root.chmod(0o700)
         self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
@@ -37,7 +37,8 @@ class SessionTests(unittest.TestCase):
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
                 patch.object(session_module,'_spawn',side_effect=spawn):
-            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40,verify_daemon_stop=verify_daemon)
+            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40,
+                verify_daemon_stop=verify_daemon,verify_resource_inventory=verify_resources)
         created=self.session
         def close_created():
             try:created.close()
@@ -47,8 +48,8 @@ class SessionTests(unittest.TestCase):
     def close_session(self):
         try:self.session.close()
         except Exception:pass
-    def drive(self,attack='',review_failure=False,verify_daemon=False):
-        session=self.open(attack,verify_daemon=verify_daemon)
+    def drive(self,attack='',review_failure=False,verify_daemon=False,verify_resources=False):
+        session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources)
         self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
         self.closed=0;owner=self
         class Review:
@@ -84,6 +85,43 @@ class SessionTests(unittest.TestCase):
         result=self.drive(verify_daemon=True)
         self.assertTrue(result['daemonStoppedVerified']);self.assertTrue(result['remoteWrapperStoppedVerified'])
         self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+
+    def test_independent_resource_checkpoint_composes_with_signed_history(self):
+        result=self.drive(verify_daemon=True,verify_resources=True)
+        self.assertTrue(result['resourceInventoryRestored']);self.assertTrue(result['daemonStoppedVerified'])
+        self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+
+    def test_resource_missing_leak_rpc_after_check_and_bad_receipts_reject(self):
+        for attack in ('simple-resource-missing','simple-resource-leak','simple-resource-rpc',
+                'simple-resource-duplicate','simple-resource-false','simple-resource-after','simple-resource-wrong-baseline'):
+            with self.subTest(attack=attack):
+                session=self.open(attack,verify_daemon=True,verify_resources=True);session.begin(15)
+                self.assertEqual(session.receive_worker()['kind'],'hello')
+                session.send_worker(dict(kind='configure',channelNonce=session.nonce))
+                with self.assertRaises(ValueError):
+                    frame=session.receive_worker()
+                    self.assertEqual(frame['kind'],'final');session.complete()
+                self.assertFalse(session.resource_inventory_restored);self.close_session()
+
+    def test_resource_mode_cannot_downgrade_or_accept_client_ack(self):
+        with self.assertRaises(ValueError):self.open('simple-resource-downgrade',verify_daemon=True,verify_resources=True)
+        session=self.open('simple-resource-good',verify_daemon=True,verify_resources=True);session.begin(15)
+        session.receive_worker();session.send_worker(dict(kind='cleanup-checked',channelNonce=session.nonce))
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.close_session()
+
+    def test_resource_mode_stop_before_start_is_unverified(self):
+        session=self.open('simple',verify_daemon=True,verify_resources=True);session.close()
+        self.assertTrue(session._finished);self.assertFalse(session.resource_inventory_restored)
+
+    def test_checkpoint_cannot_seal_with_undelivered_business_bytes(self):
+        session=self.open('simple-resource-backlog',verify_daemon=True,verify_resources=True);session.begin(15)
+        session.receive_worker();session.send_worker(dict(kind='configure',channelNonce=session.nonce))
+        self.assertEqual(session.receive_worker()['kind'],'ready-for-backlog')
+        session.send_worker(dict(kind='unexpected-business',channelNonce=session.nonce,data='x'*(2*1024*1024)))
+        (Path(self.engine)/'checkpoint-go').touch()
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.assertFalse(session.resource_inventory_restored);self.close_session()
 
     def test_daemon_mode_cannot_downgrade_or_miss_binding(self):
         for attack in ('simple-daemon-downgrade','simple-daemon-missing','simple-daemon-mismatch'):

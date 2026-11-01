@@ -40,22 +40,27 @@ def issued(session,process=None):
     if (record is None or record[:2]!=(os.getpid(),threading.get_ident())
             or record[2] is not session._process or (process is not None and process is not record[2])
             or type(session.verify_daemon_stop) is not bool
-            or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id,session.verify_daemon_stop)):reject()
+            or type(session.verify_resource_inventory) is not bool
+            or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id,
+                session.verify_daemon_stop,session.verify_resource_inventory)):reject()
     return session
 
 
 class OwnedRecoverySSHSessionV3:
-    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False):
+    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False,verify_resource_inventory=False):
         if (os.name!='posix' or type(ssh_alias) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',ssh_alias)
                 or type(source_sha) is not str or not re.fullmatch('[0-9a-f]{40}',source_sha)
                 or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=60
-                or type(verify_daemon_stop) is not bool):reject()
+                or type(verify_daemon_stop) is not bool or type(verify_resource_inventory) is not bool
+                or verify_resource_inventory and not verify_daemon_stop):reject()
         root=_private_root(private_root)
         archive=loader.published_manager_archive(source_sha)
         self.source_sha,self.host_id=source_sha,ssh_alias
         self.archive_digest=hashlib.sha256(archive).hexdigest()
         self.nonce=secrets.token_hex(32)
         self.verify_daemon_stop=verify_daemon_stop
+        self.verify_resource_inventory=verify_resource_inventory
+        self._resource_baseline=None;self._pending_resources=False;self.resource_inventory_restored=False
         self._daemon_binding=None;self._awaiting_daemon_hello=False
         self._pending_daemon_stop=False;self.daemon_stopped_verified=False
         self._pid,self._thread=os.getpid(),threading.get_ident()
@@ -71,7 +76,8 @@ class OwnedRecoverySSHSessionV3:
         try:
             self._process=_spawn(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
             if type(self._process) is not subprocess.Popen:reject()
-            _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,ssh_alias,verify_daemon_stop)
+            _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,
+                ssh_alias,verify_daemon_stop,verify_resource_inventory)
             def drain(stderr_fd=fd):
                 size=0
                 try:
@@ -89,10 +95,13 @@ class OwnedRecoverySSHSessionV3:
             self._send('initial',dict(entrypoint=loader.MANAGER_ENTRYPOINT,sourceSha=source_sha,
                 archiveDigest=self.archive_digest,hostId=ssh_alias,channelNonce=self.nonce,
                 archiveBase64=base64.b64encode(archive).decode('ascii'),
-                **({'verifyDaemonStop':True} if verify_daemon_stop else {})))
+                **({'verifyDaemonStop':True} if verify_daemon_stop else {}),
+                **({'verifyResourceInventory':True} if verify_resource_inventory else {})))
             bound=self._receive()
-            if (set(bound)!={'kind','channelNonce','binding'}|({'verifyDaemonStop'} if verify_daemon_stop else set())
-                    or bound['kind']!='manager-bound' or verify_daemon_stop and bound['verifyDaemonStop'] is not True):reject()
+            if (set(bound)!={'kind','channelNonce','binding'}|({'verifyDaemonStop'} if verify_daemon_stop else set())|(
+                    {'verifyResourceInventory'} if verify_resource_inventory else set())
+                    or bound['kind']!='manager-bound' or verify_daemon_stop and bound['verifyDaemonStop'] is not True
+                    or verify_resource_inventory and bound['verifyResourceInventory'] is not True):reject()
             binding=bound['binding']
             if (type(binding) is not dict or set(binding)!={'unit','kernelBoot','invocationId','sourceSha','archiveDigest','hostId'}
                     or binding['sourceSha']!=source_sha or binding['archiveDigest']!=self.archive_digest or binding['hostId']!=ssh_alias
@@ -156,8 +165,13 @@ class OwnedRecoverySSHSessionV3:
         self._awaiting_daemon_hello=False
 
     def _accept_daemon(self,value):
-        if (set(value)!={'kind','channelNonce','binding','daemonBinding'} or value['kind']!='daemon-bound'
+        if (set(value)!={'kind','channelNonce','binding','daemonBinding'}|(
+                    {'resourceBaselineDigest'} if self.verify_resource_inventory else set()) or value['kind']!='daemon-bound'
                 or encode(value['binding'])!=self._binding):reject()
+        if self.verify_resource_inventory:
+            digest=value['resourceBaselineDigest']
+            if type(digest) is not str or not re.fullmatch('[0-9a-f]{64}',digest):reject()
+            self._resource_baseline=digest
         binding=value['daemonBinding']
         names={'root','daemonId','unit','kernelBoot','invocationId','cgroupDevice','cgroupInode',
             'mainPid','mainStartTicks','daemonPid','daemonStartTicks'}
@@ -176,7 +190,9 @@ class OwnedRecoverySSHSessionV3:
     def _terminal(self,value,*,business):
         if (set(value)!={'kind','channelNonce','binding','workerStartRequested','reason','wrapperStopped',
                 'transportReturncode','daemonCleanupVerified','productionReady'}|(
-                    {'daemonBinding','daemonStoppedVerified'} if self.verify_daemon_stop else set())
+                    {'daemonBinding','daemonStoppedVerified'} if self.verify_daemon_stop else set())|(
+                    {'resourceBaselineDigest','resourceAfterDigest','resourceInventoryRestored'}
+                    if self.verify_resource_inventory else set())
                 or value['kind']!='manager-stopped' or encode(value['binding'])!=self._binding
                 or value['workerStartRequested'] is not self._started or value['wrapperStopped'] is not True
                 or value['daemonCleanupVerified'] is not False or value['productionReady'] is not False
@@ -190,6 +206,15 @@ class OwnedRecoverySSHSessionV3:
                 if business or value['daemonBinding'] is not None or value['daemonStoppedVerified'] is not False:reject()
             elif encode(value['daemonBinding'])!=self._daemon_binding or value['daemonStoppedVerified'] is not True:reject()
             self._pending_daemon_stop=self._daemon_binding is not None
+        self._pending_resources=False
+        if self.verify_resource_inventory:
+            if value['resourceBaselineDigest']!=self._resource_baseline:reject()
+            if self._resource_baseline is None:
+                if business or value['resourceAfterDigest'] is not None or value['resourceInventoryRestored'] is not False:reject()
+            elif value['resourceInventoryRestored'] is True:
+                if value['resourceAfterDigest']!=self._resource_baseline:reject()
+                self._pending_resources=True
+            elif business or value['resourceInventoryRestored'] is not False or value['resourceAfterDigest'] is not None:reject()
 
     def _exit(self):
         with selectors.DefaultSelector() as selector:
@@ -200,6 +225,7 @@ class OwnedRecoverySSHSessionV3:
         self._reader.join(timeout=self._left(5))
         if self._reader.is_alive() or self._errors:reject()
         self.daemon_stopped_verified=self._pending_daemon_stop
+        self.resource_inventory_restored=self._pending_resources
         self._finished=True
 
     def complete(self):

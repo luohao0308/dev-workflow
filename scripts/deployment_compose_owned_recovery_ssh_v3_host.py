@@ -67,6 +67,7 @@ def published_manager_archive(source_sha):
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         required = {'scripts/deployment_compose_owned_recovery_manager_v3_host.py',
             'scripts/deployment_compose_owned_recovery_unit_v3_host.py',
-            'scripts/deployment_compose_recovery_daemon_v3_host.py'}
+            'scripts/deployment_compose_recovery_daemon_v3_host.py',
+            'scripts/deployment_compose_resource_inventory_v3_host.py'}
         if not required.issubset(archive.namelist()):reject()
     return raw
