@@ -85,13 +85,47 @@ def cgroup_empty(group):
         return not group.exists()
 
 
-def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600):
+def _owned_writer_binding():
+    """Derive the current service from the OS, never from protocol input."""
+    if sys.platform != 'linux' or os.getuid() != 0 or not hasattr(os,'pidfd_open'):
+        raise ValueError('owned-writer-service-required')
+    membership = Path('/proc/self/cgroup').read_text().strip()
+    match = re.fullmatch(r'0::/system.slice/(dw-writer-host-[0-9a-f]{16}\.service)', membership)
+    if match is None:
+        raise ValueError('owned-writer-service-required')
+    unit = match[1]
+    names = ('LoadState','ActiveState','SubState','MainPID','ControlGroup','Delegate','InvocationID')
+    raw = subprocess.run(['/usr/bin/systemctl','--system','show',unit,
+        *('--property='+name for name in names)],capture_output=True,check=True,timeout=3,env={}).stdout
+    rows = [line.split('=',1) for line in raw.decode('ascii').splitlines()]
+    if any(len(row)!=2 for row in rows) or len(rows)!=len(names):
+        raise ValueError('owned-writer-service-required')
+    state = dict(rows)
+    if (set(state)!=set(names) or state['LoadState']!='loaded' or state['ActiveState']!='active'
+            or state['SubState']!='running' or state['MainPID']!=str(os.getpid())
+            or state['ControlGroup']!='/system.slice/'+unit or state['Delegate']!='yes'
+            or not re.fullmatch('[0-9a-f]{32}',state['InvocationID'])
+            or state['InvocationID']=='0'*32
+            or Path('/proc/self/cgroup').read_text().strip()!=membership):
+        raise ValueError('owned-writer-service-required')
+    state['StartTime'] = Path('/proc/self/stat').read_text().rsplit(')',1)[1].split()[19]
+    if not state['StartTime'].isdigit():
+        raise ValueError('owned-writer-service-required')
+    return unit,state
+
+
+def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600,
+          bind_to_owned_writer=False):
     if workload is not None and not callable(workload):
         raise ValueError('trusted-diagnostic-callback-required')
     if (type(workload_lifetime_seconds) is not int
             or workload_lifetime_seconds not in (600, 3600)
             or workload is None and workload_lifetime_seconds != 600):
         raise ValueError('bounded-workload-lifetime-required')
+    if (type(bind_to_owned_writer) is not bool
+            or bind_to_owned_writer and (workload is None or workload_lifetime_seconds!=3600)):
+        raise ValueError('owned-writer-workload-required')
+    parent = _owned_writer_binding() if bind_to_owned_writer else None
     if os.getuid() != 0:
         raise ValueError('root-required-for-bounded-namespace-probe')
     if workload is not None:
@@ -111,11 +145,23 @@ def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600)
         '[grpc]\naddress = '+json.dumps(str(root/'containerd.sock'))+'\n')
     containerd_config.chmod(0o600)
     supervisor=root/'supervisor.py'
-    supervisor.write_text("""import pathlib,signal,subprocess,sys,time,json
-root=pathlib.Path(sys.argv[1]);children=[]
+    if parent is not None:
+        owner_file=root/'owner.private.json'
+        owner_file.write_text(json.dumps(parent[1]));owner_file.chmod(0o600)
+    supervisor.write_text("""import pathlib,signal,subprocess,sys,time,json,os,select
+root=pathlib.Path(sys.argv[1]);children=[];owner_fd=None
 def interrupted(*args):raise SystemExit(143)
 signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
+def owner_alive():
+ if owner_fd is not None and select.select([owner_fd],[],[],0)[0]:raise RuntimeError('owned-writer-exited')
 try:
+ if sys.argv[2:]:
+  if sys.argv[2:]!=['--owned-writer']:raise RuntimeError('unexpected-owner-mode')
+  owner=json.loads((root/'owner.private.json').read_text());pid=int(owner['MainPID'])
+  owner_fd=os.pidfd_open(pid,0)
+  proc=pathlib.Path('/proc')/str(pid)
+  if proc.stat().st_uid!=0 or proc.joinpath('stat').read_text().rsplit(')',1)[1].split()[19]!=owner['StartTime'] or proc.joinpath('cgroup').read_text().strip()!='0::'+owner['ControlGroup']:raise RuntimeError('owned-writer-identity-changed')
+  owner_alive()
  unit=root.name+'.service';group=pathlib.Path('/sys/fs/cgroup/system.slice')/unit
  expected='0::/system.slice/'+unit+'/supervisor'
  if pathlib.Path('/proc/self/cgroup').read_text().strip()!=expected:raise RuntimeError('unexpected-private-cgroup')
@@ -127,12 +173,18 @@ try:
  if not (group/'supervisor/memory.swap.max').is_file():raise RuntimeError('private-swap-controller-not-enabled')
  preflight.update(parentSubtreeAfter=(group/'cgroup.subtree_control').read_text(),swapFileAfter=True,parentSwapMax=(group/'memory.swap.max').read_text())
  evidence=root/'cgroup-preflight.private.json';evidence.write_text(json.dumps(preflight));evidence.chmod(0o600)
+ owner_alive()
  c=subprocess.Popen(['containerd','--config',str(root/'containerd.toml')]);children.append(c)
  deadline=time.monotonic()+20
  while not (root/'containerd.sock').exists():
+  owner_alive()
   if c.poll() is not None or time.monotonic()>deadline:raise RuntimeError('private-containerd-not-ready')
   time.sleep(.1)
+ owner_alive()
  d=subprocess.Popen(['dockerd','--config-file='+str(root/'daemon.json')]);children.append(d)
+ if owner_fd is not None:
+  while d.poll() is None:
+   owner_alive();time.sleep(.1)
  raise SystemExit(d.wait())
 finally:
  for child in reversed(children):
@@ -140,6 +192,7 @@ finally:
  for child in reversed(children):
   try:child.wait(timeout=15)
   except subprocess.TimeoutExpired:child.kill();child.wait(timeout=5)
+ if owner_fd is not None:os.close(owner_fd)
 """)
     supervisor.chmod(0o600)
     before = production_snapshot(firewall_evidence=root/'firewall-before.private.json')
@@ -158,6 +211,8 @@ finally:
         tasks='384' if workload is not None else '256'
         lifetime=str(workload_lifetime_seconds) if workload is not None else '120'
         result['unitCreationOutcomeUnknown']=True
+        if parent is not None and _owned_writer_binding()!=parent:
+            raise ValueError('owned-writer-service-changed')
         run('systemd-run', '--unit='+unit, '--collect', '--service-type=exec',
             '--property=MemoryMax='+memory, '--property=MemorySwapMax=0', '--property=CPUQuota=50%', '--property=TasksMax='+tasks,
             '--property=Delegate=yes', '--property=DelegateSubgroup=supervisor',
@@ -165,9 +220,12 @@ finally:
             '--property=TimeoutStopSec=30', '--property=SendSIGKILL=yes', '--property=StandardOutput=append:'+str(root/'daemon.log'),
             '--property=StandardError=append:'+str(root/'daemon.log'),
             'unshare','--mount','--net','--propagation','private','--',
-            'sh','-c','ip link set lo up && exec python3 "$1" "$2"','sh',str(supervisor),str(root))
+            'sh','-c','ip link set lo up && exec python3 "$@"','sh',str(supervisor),str(root),
+            *(['--owned-writer'] if parent is not None else []))
         started=True
         result['unitCreationOutcomeUnknown']=False
+        if parent is not None and _owned_writer_binding()!=parent:
+            raise ValueError('owned-writer-service-changed')
         prefix = ['docker','--host','unix://'+str(root/'docker.sock')]
         deadline = time.monotonic()+60
         info = None

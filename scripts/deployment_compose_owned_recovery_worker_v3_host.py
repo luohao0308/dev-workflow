@@ -280,7 +280,7 @@ def run(config, stdin, stdout):
                         raise
                     if hasattr(original,'add_note'):
                         original.add_note('fixture cleanup failed: '+str(error))
-    report = _probe(workload)
+    report = _probe(workload,bind_to_owned_writer=True)
     if workload_error is not None:
         raise workload_error
     return live.finish_probe(channel,report,final_payload)

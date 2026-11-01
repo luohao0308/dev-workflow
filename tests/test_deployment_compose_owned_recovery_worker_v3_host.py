@@ -154,7 +154,8 @@ class ProtocolTests(unittest.TestCase):
                 session.unknown_write_result=False
                 raise ValueError('original-failure')
             return {'productionReady':False},{'schemaVersion':2}
-        def probe(workload):
+        def probe(workload, *, bind_to_owned_writer=False):
+            self.assertIs(bind_to_owned_writer,True)
             workload(Path('/private-fixture'),{'ID':'daemon'})
             events.append('outer-stopped')
             return dict(completed=True,stopped=True,productionSnapshotUnchanged=True)

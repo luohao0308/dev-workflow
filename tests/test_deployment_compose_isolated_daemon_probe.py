@@ -19,6 +19,38 @@ probe=importlib.util.module_from_spec(spec);spec.loader.exec_module(probe)
 
 
 class IsolatedDaemonConfigTests(unittest.TestCase):
+    def test_owned_binding_is_derived_from_current_service_and_rechecked(self):
+        unit='dw-writer-host-'+'a'*16+'.service'
+        membership='0::/system.slice/'+unit+'\n'
+        state=dict(LoadState='loaded',ActiveState='active',SubState='running',MainPID=str(os.getpid()),
+            ControlGroup='/system.slice/'+unit,Delegate='yes',InvocationID='b'*32)
+        def check(changes=None, memberships=None):
+            data=dict(state,**(changes or {}))
+            raw=''.join(k+'='+v+'\n' for k,v in data.items()).encode()
+            with patch.object(probe.sys,'platform','linux'),patch.object(probe.os,'getuid',return_value=0), \
+                 patch.object(probe.os,'pidfd_open',create=True), \
+                 patch.object(Path,'read_text',side_effect=memberships or [membership,membership,'1 (python) '+' '.join(['0']*19+['123'])]), \
+                 patch.object(probe.subprocess,'run',return_value=Mock(stdout=raw)) as command:
+                result=probe._owned_writer_binding()
+                self.assertEqual(command.call_args.kwargs['env'],{})
+                self.assertEqual(command.call_args.kwargs['timeout'],3)
+                return result
+        self.assertEqual(check(),(unit,dict(state,StartTime='123')))
+        for change in (dict(Delegate='no'),dict(MainPID='0'),dict(MainPID=str(os.getpid()+1)),
+                dict(ActiveState='inactive'),dict(SubState='exited'),dict(InvocationID='0'*32),
+                dict(InvocationID='bad'),dict(ControlGroup='/system.slice/other.service')):
+            with self.subTest(change=change),self.assertRaises(ValueError):check(change)
+        for memberships in (['0::/system.slice/docker.service\n'],[membership,'0::/different\n']):
+            with self.subTest(memberships=memberships),self.assertRaises(ValueError):check(memberships=memberships)
+
+    def test_owned_binding_opt_in_rejects_wrong_types_and_unbounded_context(self):
+        for value in (1,'yes',None,[],{}):
+            with self.subTest(value=value),patch.object(probe,'_owned_writer_binding') as binding:
+                with self.assertRaises(ValueError):
+                    probe.probe(lambda *_:None,workload_lifetime_seconds=3600,bind_to_owned_writer=value)
+                binding.assert_not_called()
+        with self.assertRaises(ValueError):probe.probe(bind_to_owned_writer=True)
+
     def test_unsupported_hold_lifetime_rejected_before_host_access(self):
         for seconds in (True, 0, 599, 601, 3601, '3600', None):
             with self.subTest(seconds=seconds), patch.object(probe.uuid,'uuid4') as allocate:
@@ -30,6 +62,10 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name=='posix','POSIX bounded hold controller simulation')
     def test_explicit_approval_hold_keeps_limits_and_autonomous_cleanup(self):
+        self.hold(False)
+        self.hold(True)
+
+    def hold(self,owned):
         token=uuid.uuid4();root=Path('/var/tmp')/('dw-engine-'+token.hex[:16])
         self.addCleanup(lambda:shutil.rmtree(root,ignore_errors=True))
         original_read=Path.read_text
@@ -42,9 +78,18 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
              patch.object(probe,'production_snapshot',return_value={'netns':'host','mountns':'host'}), \
              patch.object(probe,'run',side_effect=[b'not-found\n',b'valid',b'created']) as commands, \
              patch.object(probe.time,'monotonic',side_effect=[0,61]), \
-             patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)):
-            result=probe.probe(lambda *_: {'success': True},workload_lifetime_seconds=3600)
+             patch.object(probe.subprocess,'run',side_effect=subprocess.TimeoutExpired('stop',45)), \
+             patch.object(probe,'_owned_writer_binding',return_value=('dw-writer-host-'+'a'*16+'.service',
+                 {'MainPID':'123','StartTime':'456','ControlGroup':'/fixture'})) as parent:
+            result=probe.probe(lambda *_: {'success': True},workload_lifetime_seconds=3600,
+                               bind_to_owned_writer=owned)
+        self.assertEqual(parent.call_count,3 if owned else 0)
         command=commands.call_args_list[2].args
+        self.assertEqual('--owned-writer' in command,owned)
+        self.assertEqual((root/'owner.private.json').exists(),owned)
+        if owned:
+            self.assertEqual((root/'owner.private.json').stat().st_mode&0o777,0o600)
+            self.assertEqual(__import__('json').loads((root/'owner.private.json').read_text())['StartTime'],'456')
         for option in ('--property=RuntimeMaxSec=3600','--property=MemoryMax=768M',
                        '--property=MemorySwapMax=0','--property=KillMode=control-group',
                        '--property=TimeoutStopSec=30'):

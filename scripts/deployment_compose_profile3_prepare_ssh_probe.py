@@ -155,8 +155,11 @@ def _prepare_dependencies():
     return prepare_profile3
 
 
-def _probe(workload):
+def _probe(workload, *, bind_to_owned_writer=False):
     from deployment_compose_isolated_daemon_probe import probe
+    if bind_to_owned_writer:
+        return probe(workload,storage_driver='overlayfs',workload_lifetime_seconds=3600,
+                     bind_to_owned_writer=True)
     return probe(workload,storage_driver='overlayfs',workload_lifetime_seconds=3600)
 
 
