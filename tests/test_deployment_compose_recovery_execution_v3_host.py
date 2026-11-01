@@ -33,7 +33,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     setUpClass = classmethod(tls_fixture.WriteGatewayTests.setUpClass.__func__)
     tearDownClass = classmethod(tls_fixture.WriteGatewayTests.tearDownClass.__func__)
 
-    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None, continuation_runner=None, service_name='web'):
+    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None, continuation_runner=None, service_name='web', drop_first_create_response=False):
         kw, observation = prepare_fixture.fixture()
         kw['source'] = approval_fixture.request().source
         prepared = ComposePreparationHostV3(**kw).prepare_intent(observation, observation,
@@ -79,6 +79,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
         baseline = deepcopy(rows)
         version = {'Version':'29.8.2','GitCommit':'8af9fe3'}
         timeline = []; writes = []
+        self.backend_rows = rows
         services = {s['name']:s for s in bundle.to_dict()['services']}
         receipts = {n:('a' if n==service_name else 'b')*64 for n in services}
 
@@ -122,7 +123,11 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
                 op=next(o for o in write_operations if o['method']==self.command and o['path']==self.path)
                 if body != (b'' if op['body'] is None else canonical(op['body'])): raise AssertionError('wrong body')
                 writes.append(op);timeline.append(('write',op['phase'],op['service']))
-                self.respond(201 if op['phase']=='create' else 204,apply(op))
+                response_body=apply(op)
+                if drop_first_create_response and op['phase']=='create' and len(writes)==1:
+                    self.close_connection=True
+                    return  # Effect is applied, but no HTTP response reaches the gateway.
+                self.respond(201 if op['phase']=='create' else 204,response_body)
             do_POST=write_operation
             do_DELETE=write_operation
         class Unix(socketserver.ThreadingMixIn,socketserver.UnixStreamServer): daemon_threads=True

@@ -81,6 +81,7 @@ class WriteGatewayTests(GateFixture, unittest.TestCase):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(self.directory/'server.pem', self.directory/'server.key')
         context.load_verify_locations(self.directory/'ca.pem'); context.verify_mode = ssl.CERT_REQUIRED
+        self.tls_context=context
         def guard(*args):
             self.guards.append(args)
             if self.guard_failure: raise ValueError('guard-failed')
@@ -222,7 +223,44 @@ class WriteGatewayTests(GateFixture, unittest.TestCase):
 
     def test_disconnect_blocks_generation(self):
         self.mode = 'disconnect'; self.assertEqual(self.send()[0], 502)
-        with self.assertRaises(ValueError): self.g.close_generation(self.gen)
+        self.assert_upstream_loss_frozen(4,'blocked')
+
+    def assert_upstream_loss_frozen(self,seq,phase):
+        self.assertEqual(self.writes,[(self.ops[0][1],self.body)])
+        before=(self.root/'actual-witness/state.json').read_bytes()
+        view=self.client.read();self.assertEqual((view['seq'],view['phase']),(seq,phase))
+        records=self.adapter.authenticated_material_after()['records']
+        self.assertEqual([r['event']['kind'] for r in records],['open','prepared','admitted','response'][:seq])
+        if seq==4:
+            data=records[-1]['event']['data']
+            self.assertFalse(data['definitive']);self.assertEqual(data['status'],0)
+            self.assertEqual(data['bodyBase64'],'')
+        with self.assertRaises(ValueError):self.g.close_generation(self.gen)
+        with self.assertRaises(ValueError):
+            self.client.transition_successor(expected_seq=view['seq'],expected_head=view['head'],
+                childBinding=dict(self.binding,generation='7'*64,scopeHash='8'*64))
+        self.assertEqual(self.send()[0],403);self.assertEqual(len(self.writes),1)
+        # Fresh local gate and authenticated store objects cannot clear the
+        # unresolved state. The original signer/context remains in this test.
+        context=self.tls_context
+        self.server.shutdown();self.server.server_close();self.store.close()
+        self.store=signed.OperationWitnessStoreV3(self.root/'actual-witness',key=b'w'*32)
+        self.addCleanup(self.store.close);self.g=self.gate()
+        self.server=host.create_gateway_v3(self.g,tls_context=context,docker_socket=self.root/'docker.sock',
+            pre_dispatch=lambda *args:None,timeout=1)
+        threading.Thread(target=self.server.serve_forever,daemon=True).start()
+        self.addCleanup(self.server.server_close);self.addCleanup(self.server.shutdown)
+        self.assertEqual(self.send()[0],403);self.assertEqual(len(self.writes),1)
+        self.assertEqual((self.root/'actual-witness/state.json').read_bytes(),before)
+
+    def test_disconnect_with_response_witness_unavailable_retains_admitted(self):
+        self.mode='disconnect';reserve=self.adapter.reserve_event
+        def unavailable(*args,**kwargs):
+            if args[1]==3:raise OSError('fixture-response-witness-unavailable')
+            return reserve(*args,**kwargs)
+        with patch.object(self.adapter,'reserve_event',side_effect=unavailable):
+            self.assertEqual(self.send()[0],502)
+        self.assert_upstream_loss_frozen(3,'admitted')
 
     def test_timeout_blocks_generation(self):
         self.mode = 'timeout'; self.assertEqual(self.send()[0], 502)

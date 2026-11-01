@@ -303,17 +303,19 @@ class DelegatedWorkerCompositionTests(OwnedRecoveryTests):
         self.worker_channel=SignedChannel();self.retained={}
         self.worker_channel.enroll(request,authority,receipt,h.binding)
         self.actual_writes=writes
+        self.initial_h=h
+        self.initial_receipt=receipt;self.initial_request_hash=request.digest()
         worker.create_cut(self.worker_channel,self.worker_session,dict(bundle=bundle,request=request),
             h.policy,b'g'*32,h.public,self.public,self.worker_tls,self.worker_tracker,self.retained)
         self.assertFalse(self.worker_session.unknown_write_result)
         self.assertIn('a'*64,self.worker_session.created_ids)
         self.assertEqual(len(self.retained['reviewed'].snapshot['knownPrefix']),1)
-        h.receipts={'backend':'a'*64};self.initial_h=h
-        self.initial_receipt=receipt;self.initial_request_hash=request.digest()
+        h.receipts={'backend':'a'*64}
         self.assertEqual(writes,operations)
         return None
 
     def continuation(self,**values):
+        self.continuation_called=True
         self.worker_session.guard=values['guard']
         h=values['h'];self.worker_channel.enroll(values['prepared']['request'],values['authority'],values['receipt'],values['binding'])
         if getattr(self,'bad_binding',False):
@@ -332,10 +334,12 @@ class DelegatedWorkerCompositionTests(OwnedRecoveryTests):
         self.assertIn(values['prepared']['request'].digest(),self.worker_channel.status_calls)
         return result,final
 
-    def run_worker(self):
+    def run_worker(self,*,drop_first_create_response=False):
         from tests import test_deployment_compose_recovery_prepare_v3_host as recovery_fixture
+        self.continuation_called=False
         return self.run_recovery(1,prefix_runner=self.prefix,continuation_runner=self.continuation,
-            initial_request_factory=lambda req:replace(req,expires_at=recovery_fixture.expiry()),service_name='backend')
+            initial_request_factory=lambda req:replace(req,expires_at=recovery_fixture.expiry()),service_name='backend',
+            drop_first_create_response=drop_first_create_response)
 
     def test_new_helpers_actual_owned_cut_fresh_status_and_suffix(self):
         self.run_worker()
@@ -365,6 +369,42 @@ class DelegatedWorkerCompositionTests(OwnedRecoveryTests):
         self.assertEqual(len(self.actual_writes),1)
         self.assertEqual(self.actual_writes[0]['phase'],'create')
         self.assertNotIn('record',self.retained)
+
+    def test_engine_applies_create_then_drops_response_blocks_replay_and_recovery(self):
+        from deployment_compose_recovery_prepare_v3_host import RecoveryPreparationHostV3
+        from tests import test_deployment_compose_recovery_prepare_v3_host as recovery_fixture
+        with self.assertRaises(ValueError):self.run_worker(drop_first_create_response=True)
+        self.assertEqual(len(self.actual_writes),1)
+        self.assertEqual(self.actual_writes[0]['phase'],'create')
+        self.assertIn('a'*64,self.backend_rows)
+        self.assertEqual(self.worker_session.guard._read('/v1.45/containers/'+'a'*64+'/json')['Id'],'a'*64)
+        self.assertTrue(self.worker_session.unknown_write_result)
+        self.assertNotIn('a'*64,self.worker_session.created_ids)
+        self.assertNotIn('record',self.retained)
+        self.assertEqual(len(self.worker_channel.consumptions),1)
+        self.assertFalse(self.continuation_called)
+        witness_state=self.initial_h.root/'new-worker-witness'/'state.json'
+        witness_before=witness_state.read_bytes()
+        history=self.initial_h.history();snapshot=history.capture();value=json.loads(snapshot.canonical)
+        self.assertEqual((value['chainStatus']['activeSeq'],value['chainStatus']['activePhase']),(4,'blocked'))
+        self.assertEqual(value['blocker'],'unknown-response')
+        self.assertEqual(value['pending']['type'],'unknown-response')
+        self.assertEqual(value['receiptMap'],{});self.assertEqual(value['knownPrefix'],[])
+        response=value['scopes'][0]['records'][-1]['event']
+        self.assertEqual(response['kind'],'response')
+        self.assertEqual((response['data']['definitive'],response['data']['status'],response['data']['bodyBase64']),(False,0,''))
+        with self.assertRaises(ValueError):history.verify_prefix(snapshot,value['chainStatus'],require_complete=False)
+        preparation=RecoveryPreparationHostV3(original_history=history,store=self.worker_session.store,
+            phase_guard=self.worker_session.guard,readiness=lambda *_:False)
+        with self.assertRaises(ValueError):preparation.prepare_intent(operation_nonce='5'*64,expires_at=recovery_fixture.expiry())
+        executor=self.retained['executor']
+        self.assertIsNone(executor._owned_gateway);self.assertIsNotNone(executor._owned_gateway_token)
+        self.assertTrue(executor._owned_transport._closed)
+        self.assertIsNotNone(executor._owned_transport._process.poll())
+        with self.assertRaises(ValueError):executor.execute(self.actual_writes[0],phase_index=0,receipts={},completed_operations=[])
+        with self.assertRaises(ValueError):executor.capture_owned_closed_create(history)
+        self.assertEqual(len(self.actual_writes),1)
+        self.assertEqual(witness_state.read_bytes(),witness_before)
 
 
 def load_tests(loader,tests,pattern):
