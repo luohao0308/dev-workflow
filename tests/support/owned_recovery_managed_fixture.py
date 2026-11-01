@@ -46,6 +46,16 @@ def child(attack,engine):
 def main(attack,engine):
     initial=read_frame(sys.stdin.buffer)
     archive=base64.b64decode(initial.pop('archiveBase64'))
+    phase={'host':False}
+    class Host:
+        def __init__(self,**kwargs):phase['host']=True;self.checks=0
+        def descriptor(self):return dict(profile='linux-docker-host-projection-v1',beforeDigest='e'*64,endpointDigest='d'*64)
+        def verify_unchanged(self,**kwargs):
+            self.checks+=1
+            if attack=='simple-resource-host-drift' or attack=='simple-resource-host-late-drift' and self.checks>1:
+                raise ValueError('fixture-host-changed')
+            return 'e'*64
+        def close(self):pass
     class Daemon:
         def __init__(self,root,daemon_id,*,kernel_boot,timeout):
             assert root==engine and daemon_id=='daemon-one'
@@ -65,6 +75,7 @@ def main(attack,engine):
             self._boot_id='11111111-1111-1111-1111-111111111111'
             self._invocation='3'*32;self._stopped=False;self.transport_returncode=None
         def start(self,**kwargs):
+            if initial.get('verifyHostSnapshot'):assert phase['host']
             self.process=subprocess.Popen([sys.executable,'-u',__file__,'--child',attack,engine],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
             return self.process
@@ -83,6 +94,8 @@ def main(attack,engine):
             value.pop('verifyDaemonStop',None)
         if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-resource-downgrade':
             value.pop('verifyResourceInventory',None)
+        if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-resource-host-downgrade':
+            value.pop('verifyHostSnapshot',None)
         if type(value) is dict and value.get('kind')=='daemon-bound':
             if attack=='simple-daemon-missing':
                 nonce=value['channelNonce'];data=value['daemonBinding']
@@ -100,9 +113,13 @@ def main(attack,engine):
             if attack=='simple-daemon-terminal':value['daemonBinding']=dict(value['daemonBinding'],invocationId='9'*32)
             if attack=='simple-resource-false':value['resourceInventoryRestored']=False
             if attack=='simple-resource-after':value['resourceAfterDigest']='9'*64
+            if attack=='simple-resource-host-after':value['hostSnapshotAfterDigest']='9'*64
+            if attack=='simple-resource-host-flag':value['hostSnapshotUnchangedVerified']=False
+            if attack=='simple-resource-host-binding':value['hostSnapshotBaseline']=dict(value['hostSnapshotBaseline'],endpointDigest='9'*64)
         return original(stream,value,**kwargs)
     with patch.object(manager,'OwnedRecoveryUnitV3',Owner),patch.object(manager,'ObservedRecoveryDaemonV3',Daemon),\
-            patch.object(manager,'write_frame',side_effect=output),patch.object(manager,'encode',side_effect=control):
+            patch.object(manager,'HostSnapshotV3',Host),patch.object(manager,'write_frame',side_effect=output),\
+            patch.object(manager,'encode',side_effect=control):
         manager.run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90)
     if attack=='simple-terminal-extra':write_frame(sys.stdout.buffer,dict(kind='extra',channelNonce=initial['channelNonce']))
     if attack=='simple-ssh-nonzero':raise SystemExit(7)

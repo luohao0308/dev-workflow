@@ -279,6 +279,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     remoteWrapperStoppedVerified=managed,productionReady=False,
                     **({'daemonStoppedVerified':_managed.daemon_stopped_verified,
                         'resourceInventoryRestored':_managed.resource_inventory_restored,
+                        'hostSnapshotUnchangedVerified':_managed.host_snapshot_unchanged_verified,
                         'daemonCleanupVerified':False} if managed else {}))
             else:
                 reject()

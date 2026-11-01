@@ -41,18 +41,21 @@ def issued(session,process=None):
             or record[2] is not session._process or (process is not None and process is not record[2])
             or type(session.verify_daemon_stop) is not bool
             or type(session.verify_resource_inventory) is not bool
+            or type(session.verify_host_snapshot) is not bool
             or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id,
-                session.verify_daemon_stop,session.verify_resource_inventory)):reject()
+                session.verify_daemon_stop,session.verify_resource_inventory,session.verify_host_snapshot)):reject()
     return session
 
 
 class OwnedRecoverySSHSessionV3:
-    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False,verify_resource_inventory=False):
+    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False,
+            verify_resource_inventory=False,verify_host_snapshot=False):
         if (os.name!='posix' or type(ssh_alias) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',ssh_alias)
                 or type(source_sha) is not str or not re.fullmatch('[0-9a-f]{40}',source_sha)
                 or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=60
                 or type(verify_daemon_stop) is not bool or type(verify_resource_inventory) is not bool
-                or verify_resource_inventory and not verify_daemon_stop):reject()
+                or verify_resource_inventory and not verify_daemon_stop or type(verify_host_snapshot) is not bool
+                or verify_host_snapshot and (not verify_daemon_stop or not verify_resource_inventory or timeout<45)):reject()
         root=_private_root(private_root)
         archive=loader.published_manager_archive(source_sha)
         self.source_sha,self.host_id=source_sha,ssh_alias
@@ -60,6 +63,8 @@ class OwnedRecoverySSHSessionV3:
         self.nonce=secrets.token_hex(32)
         self.verify_daemon_stop=verify_daemon_stop
         self.verify_resource_inventory=verify_resource_inventory
+        self.verify_host_snapshot=verify_host_snapshot
+        self._host_baseline=None;self._pending_host=False;self.host_snapshot_unchanged_verified=False
         self._resource_baseline=None;self._pending_resources=False;self.resource_inventory_restored=False
         self._daemon_binding=None;self._awaiting_daemon_hello=False
         self._pending_daemon_stop=False;self.daemon_stopped_verified=False
@@ -77,7 +82,7 @@ class OwnedRecoverySSHSessionV3:
             self._process=_spawn(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
             if type(self._process) is not subprocess.Popen:reject()
             _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,
-                ssh_alias,verify_daemon_stop,verify_resource_inventory)
+                ssh_alias,verify_daemon_stop,verify_resource_inventory,verify_host_snapshot)
             def drain(stderr_fd=fd):
                 size=0
                 try:
@@ -96,12 +101,22 @@ class OwnedRecoverySSHSessionV3:
                 archiveDigest=self.archive_digest,hostId=ssh_alias,channelNonce=self.nonce,
                 archiveBase64=base64.b64encode(archive).decode('ascii'),
                 **({'verifyDaemonStop':True} if verify_daemon_stop else {}),
-                **({'verifyResourceInventory':True} if verify_resource_inventory else {})))
-            bound=self._receive()
+                **({'verifyResourceInventory':True} if verify_resource_inventory else {}),
+                **({'verifyHostSnapshot':True} if verify_host_snapshot else {})))
+            bound=self._receive(60 if verify_host_snapshot else 30)
             if (set(bound)!={'kind','channelNonce','binding'}|({'verifyDaemonStop'} if verify_daemon_stop else set())|(
-                    {'verifyResourceInventory'} if verify_resource_inventory else set())
+                    {'verifyResourceInventory'} if verify_resource_inventory else set())|(
+                    {'verifyHostSnapshot','hostSnapshotBaseline'} if verify_host_snapshot else set())
                     or bound['kind']!='manager-bound' or verify_daemon_stop and bound['verifyDaemonStop'] is not True
-                    or verify_resource_inventory and bound['verifyResourceInventory'] is not True):reject()
+                    or verify_resource_inventory and bound['verifyResourceInventory'] is not True
+                    or verify_host_snapshot and bound['verifyHostSnapshot'] is not True):reject()
+            if verify_host_snapshot:
+                descriptor=bound['hostSnapshotBaseline']
+                if (type(descriptor) is not dict or set(descriptor)!={'profile','beforeDigest','endpointDigest'}
+                        or descriptor['profile']!='linux-docker-host-projection-v1'
+                        or any(type(descriptor[k]) is not str or not re.fullmatch('[0-9a-f]{64}',descriptor[k])
+                            for k in ('beforeDigest','endpointDigest'))):reject()
+                self._host_baseline=encode(descriptor)
             binding=bound['binding']
             if (type(binding) is not dict or set(binding)!={'unit','kernelBoot','invocationId','sourceSha','archiveDigest','hostId'}
                     or binding['sourceSha']!=source_sha or binding['archiveDigest']!=self.archive_digest or binding['hostId']!=ssh_alias
@@ -192,7 +207,9 @@ class OwnedRecoverySSHSessionV3:
                 'transportReturncode','daemonCleanupVerified','productionReady'}|(
                     {'daemonBinding','daemonStoppedVerified'} if self.verify_daemon_stop else set())|(
                     {'resourceBaselineDigest','resourceAfterDigest','resourceInventoryRestored'}
-                    if self.verify_resource_inventory else set())
+                    if self.verify_resource_inventory else set())|(
+                    {'hostSnapshotBaseline','hostSnapshotAfterDigest','hostSnapshotUnchangedVerified'}
+                    if self.verify_host_snapshot else set())
                 or value['kind']!='manager-stopped' or encode(value['binding'])!=self._binding
                 or value['workerStartRequested'] is not self._started or value['wrapperStopped'] is not True
                 or value['daemonCleanupVerified'] is not False or value['productionReady'] is not False
@@ -215,6 +232,13 @@ class OwnedRecoverySSHSessionV3:
                 if value['resourceAfterDigest']!=self._resource_baseline:reject()
                 self._pending_resources=True
             elif business or value['resourceInventoryRestored'] is not False or value['resourceAfterDigest'] is not None:reject()
+        self._pending_host=False
+        if self.verify_host_snapshot:
+            import json
+            if (encode(value['hostSnapshotBaseline'])!=self._host_baseline
+                    or value['hostSnapshotAfterDigest']!=json.loads(self._host_baseline)['beforeDigest']
+                    or value['hostSnapshotUnchangedVerified'] is not True):reject()
+            self._pending_host=True
 
     def _exit(self):
         with selectors.DefaultSelector() as selector:
@@ -226,12 +250,13 @@ class OwnedRecoverySSHSessionV3:
         if self._reader.is_alive() or self._errors:reject()
         self.daemon_stopped_verified=self._pending_daemon_stop
         self.resource_inventory_restored=self._pending_resources
+        self.host_snapshot_unchanged_verified=self._pending_host
         self._finished=True
 
     def complete(self):
         issued(self)
         if not self._started or self._finished:reject()
-        self._terminal(self._receive(),business=True)
+        self._terminal(self._receive(60 if self.verify_host_snapshot else 30),business=True)
         self._exit()
 
     def _dispose_local(self):
@@ -258,13 +283,13 @@ class OwnedRecoverySSHSessionV3:
         try:
             if not self._finished and self._binding is not None:
                 # Cleanup has its own finite budget; it cannot resume business.
-                self._deadline=time.monotonic()+30
+                self._deadline=time.monotonic()+(90 if self.verify_host_snapshot else 30)
                 self._cleanup_mode=True
                 if self._process.poll() is None:
                     try:self._send('manager-stop')
                     except BrokenPipeError:pass  # Exit may race with the stop send; still verify queued receipt.
                 for _ in range(4096):
-                    value=self._receive()
+                    value=self._receive(90 if self.verify_host_snapshot else 30)
                     if value['kind']=='daemon-bound' and self.verify_daemon_stop and self._daemon_binding is None:
                         self._accept_daemon(value);continue
                     if value['kind']=='worker-frame':

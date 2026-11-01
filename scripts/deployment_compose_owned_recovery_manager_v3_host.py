@@ -20,6 +20,7 @@ from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_owned_recovery_ssh_v3_host import ENTRYPOINT, MANAGER_ENTRYPOINT
 from deployment_compose_owned_recovery_unit_v3_host import OwnedRecoveryUnitV3
 from deployment_compose_recovery_daemon_v3_host import ObservedRecoveryDaemonV3
+from deployment_compose_host_snapshot_v3_host import HostSnapshotV3
 from deployment_compose_v3_channel_worker import LIMIT, write_frame
 
 INNER_LIMIT = LIMIT-1024
@@ -67,11 +68,14 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     """
     verify_daemon=type(config) is dict and 'verifyDaemonStop' in config
     verify_resources=type(config) is dict and 'verifyResourceInventory' in config
+    verify_host=type(config) is dict and 'verifyHostSnapshot' in config
     if (type(config) is not dict
             or set(config)!={'entrypoint','channelNonce','sourceSha','archiveDigest','hostId'}|(
-                {'verifyDaemonStop'} if verify_daemon else set())|({'verifyResourceInventory'} if verify_resources else set())
+                {'verifyDaemonStop'} if verify_daemon else set())|({'verifyResourceInventory'} if verify_resources else set())|(
+                {'verifyHostSnapshot'} if verify_host else set())
             or verify_daemon and config['verifyDaemonStop'] is not True
             or verify_resources and (config['verifyResourceInventory'] is not True or not verify_daemon)
+            or verify_host and (config['verifyHostSnapshot'] is not True or not verify_resources or not verify_daemon)
             or config['entrypoint']!=MANAGER_ENTRYPOINT
             or type(config['channelNonce']) is not str or not re.fullmatch('[0-9a-f]{64}',config['channelNonce'])
             or type(config['sourceSha']) is not str or not re.fullmatch('[0-9a-f]{40}',config['sourceSha'])
@@ -85,6 +89,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     owner = OwnedRecoveryUnitV3(config['archiveDigest'],config['sourceSha'])
     process = thread = None
     daemon=None
+    host=None;host_before=None;host_after=None
     resource_before=resource_after=None
     resource_final_seen=False
     stop_drain = threading.Event()
@@ -107,6 +112,9 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
         if not 0<len(raw)<=LIMIT or len(queues[side])+len(raw)+4>2*LIMIT:reject()
         queues[side].extend(struct.pack('!I',len(raw))+raw)
     try:
+        if verify_host:
+            # Capture before the waiting loader starts its fixed 30s input clock.
+            host=HostSnapshotV3(timeout=remaining(20));host_before=host.descriptor()
         process = owner.start(timeout=min(15,remaining()))
         for stream in (stdout,process.stdin):
             flags.append((stream,os.get_blocking(stream.fileno())))
@@ -128,7 +136,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
         thread=threading.Thread(target=drain,daemon=True);thread.start()
         queue('client',dict(kind='manager-bound',channelNonce=nonce,binding=binding,
             **({'verifyDaemonStop':True} if verify_daemon else {}),
-            **({'verifyResourceInventory':True} if verify_resources else {})))
+            **({'verifyResourceInventory':True} if verify_resources else {}),
+            **({'verifyHostSnapshot':True,'hostSnapshotBaseline':host_before} if verify_host else {})))
         client,worker = _Frames(),_Frames()
         reason = None
         with selectors.DefaultSelector() as selector:
@@ -198,7 +207,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                         if kind=='manager-stop' and set(frame)=={'kind','channelNonce'}:
                             reason='requested-stop';break
                         if kind=='manager-start' and set(frame)=={'kind','channelNonce'} and not start_requested:
-                            initial=dict({k:v for k,v in config.items() if k not in ('verifyDaemonStop','verifyResourceInventory')},
+                            initial=dict({k:v for k,v in config.items() if k not in ('verifyDaemonStop','verifyResourceInventory','verifyHostSnapshot')},
                                 entrypoint=ENTRYPOINT,archiveBase64=base64.b64encode(archive).decode('ascii'))
                             queue('worker',initial)
                             start_requested=True
@@ -211,9 +220,14 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                             queue('worker',payload)
                         else:reject()
                     if reason is not None:break
+        if verify_host:
+            # One shared terminal budget, below the negotiated client's 60s wait.
+            deadline=min(deadline,time.monotonic()+50)
+        stop_timeout=remaining(30)
         stop_attempted=True
-        owner.stop(timeout=30)
+        owner.stop(timeout=stop_timeout)
         if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
+        if host is not None:host_after=host.verify_unchanged(timeout=remaining(20))
         thread.join(timeout=1)
         if thread.is_alive() or errors:reject()
         # The service is already stopped. Drain previously queued worker frames
@@ -230,6 +244,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                 del queues['client'][:n]
         # Binding stays manager-created. A nested worker kind can never emit this.
         if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
+        if host is not None:host_after=host.verify_unchanged(timeout=remaining(20))
         emit('manager-stopped',binding=binding,workerStartRequested=start_requested,reason=reason,
             wrapperStopped=True,transportReturncode=owner.transport_returncode,
             daemonCleanupVerified=False,productionReady=False,
@@ -237,7 +252,9 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                 'daemonStoppedVerified':daemon is not None} if verify_daemon else {}),
             **({'resourceBaselineDigest':resource_before,'resourceAfterDigest':resource_after,
                 'resourceInventoryRestored':resource_before is not None and resource_after==resource_before}
-                if verify_resources else {}))
+                if verify_resources else {}),
+            **({'hostSnapshotBaseline':host_before,'hostSnapshotAfterDigest':host_after,
+                'hostSnapshotUnchangedVerified':host_after==host_before['beforeDigest']} if verify_host else {}))
     finally:
         import sys
         primary=sys.exc_info()[1]
@@ -254,6 +271,10 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             if cleanup_error is None:cleanup_error=error
         if daemon is not None:
             try:daemon.close()
+            except Exception as error:
+                if cleanup_error is None:cleanup_error=error
+        if host is not None:
+            try:host.close()
             except Exception as error:
                 if cleanup_error is None:cleanup_error=error
         for stream,blocking in flags:

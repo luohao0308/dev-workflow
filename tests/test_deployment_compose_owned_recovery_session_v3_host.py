@@ -26,7 +26,7 @@ from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcce
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
     'POSIX/OpenSSL/OpenSSH required')
 class SessionTests(unittest.TestCase):
-    def open(self,attack='',*,verify_daemon=False,verify_resources=False):
+    def open(self,attack='',*,verify_daemon=False,verify_resources=False,verify_host=False):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name).resolve();self.root.chmod(0o700)
         self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
@@ -38,7 +38,8 @@ class SessionTests(unittest.TestCase):
         with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
                 patch.object(session_module,'_spawn',side_effect=spawn):
             self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40,
-                verify_daemon_stop=verify_daemon,verify_resource_inventory=verify_resources)
+                timeout=60 if verify_host else 30,verify_daemon_stop=verify_daemon,
+                verify_resource_inventory=verify_resources,verify_host_snapshot=verify_host)
         created=self.session
         def close_created():
             try:created.close()
@@ -48,8 +49,8 @@ class SessionTests(unittest.TestCase):
     def close_session(self):
         try:self.session.close()
         except Exception:pass
-    def drive(self,attack='',review_failure=False,verify_daemon=False,verify_resources=False):
-        session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources)
+    def drive(self,attack='',review_failure=False,verify_daemon=False,verify_resources=False,verify_host=False):
+        session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources,verify_host=verify_host)
         self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
         self.closed=0;owner=self
         class Review:
@@ -90,6 +91,27 @@ class SessionTests(unittest.TestCase):
         result=self.drive(verify_daemon=True,verify_resources=True)
         self.assertTrue(result['resourceInventoryRestored']);self.assertTrue(result['daemonStoppedVerified'])
         self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+
+    def test_host_profile_composes_with_independent_business_and_lifecycle(self):
+        result=self.drive(verify_daemon=True,verify_resources=True,verify_host=True)
+        self.assertTrue(result['hostSnapshotUnchangedVerified']);self.assertTrue(result['resourceInventoryRestored'])
+        self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+
+    def test_host_downgrade_or_changed_projection_and_terminal_reject(self):
+        with self.assertRaises(ValueError):self.open('simple-resource-host-downgrade',
+            verify_daemon=True,verify_resources=True,verify_host=True)
+        for attack in ('simple-resource-host-drift','simple-resource-host-late-drift','simple-resource-host-after',
+                'simple-resource-host-flag','simple-resource-host-binding'):
+            with self.subTest(attack=attack):
+                session=self.open(attack,verify_daemon=True,verify_resources=True,verify_host=True);session.begin(20)
+                session.receive_worker();session.send_worker(dict(kind='configure',channelNonce=session.nonce))
+                with self.assertRaises(ValueError):session.receive_worker();session.complete()
+                self.assertFalse(session.host_snapshot_unchanged_verified);self.close_session()
+
+    def test_host_baseline_is_observed_even_when_business_never_starts(self):
+        session=self.open('simple',verify_daemon=True,verify_resources=True,verify_host=True);session.close()
+        self.assertTrue(session.host_snapshot_unchanged_verified)
+        self.assertFalse(session.daemon_stopped_verified);self.assertFalse(session.resource_inventory_restored)
 
     def test_resource_missing_leak_rpc_after_check_and_bad_receipts_reject(self):
         for attack in ('simple-resource-missing','simple-resource-leak','simple-resource-rpc',
@@ -204,6 +226,12 @@ class SessionTests(unittest.TestCase):
 
 
 class SourceFactsTests(unittest.TestCase):
+    def test_host_mode_requires_dependencies_and_explicit_startup_budget(self):
+        with patch.object(session_module.loader,'published_manager_archive') as fetch:
+            for daemon,resources,timeout in ((False,False,60),(True,False,60),(True,True,30)):
+                with self.assertRaises(ValueError):session_module.OwnedRecoverySSHSessionV3(None,'host-one','b'*40,
+                    verify_daemon_stop=daemon,verify_resource_inventory=resources,verify_host_snapshot=True,timeout=timeout)
+            fetch.assert_not_called()
     def test_unsupported_local_platform_rejects_before_source_or_ssh_access(self):
         with patch.object(session_module.os,'name','nt'),\
                 patch.object(session_module.loader,'published_manager_archive') as fetch:
