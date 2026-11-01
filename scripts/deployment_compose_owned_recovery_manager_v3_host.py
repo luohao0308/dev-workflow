@@ -226,7 +226,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
         stop_timeout=remaining(30)
         stop_attempted=True
         owner.stop(timeout=stop_timeout)
-        if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
+        if daemon is not None:daemon.verify_stopped(timeout=remaining(20))
         if host is not None:host_after=host.verify_unchanged(timeout=remaining(20))
         thread.join(timeout=1)
         if thread.is_alive() or errors:reject()

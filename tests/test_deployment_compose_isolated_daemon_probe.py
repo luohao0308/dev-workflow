@@ -92,8 +92,9 @@ class IsolatedDaemonConfigTests(unittest.TestCase):
             self.assertEqual(__import__('json').loads((root/'owner.private.json').read_text())['StartTime'],'456')
         for option in ('--property=RuntimeMaxSec=3600','--property=MemoryMax=768M',
                        '--property=MemorySwapMax=0','--property=KillMode=control-group',
-                       '--property=TimeoutStopSec=30'):
+                       '--property=TimeoutStopSec='+('10' if owned else '30')):
             self.assertIn(option,command)
+        self.assertIn('--property=SendSIGKILL=yes',command)
         self.assertFalse(result['completed'])
         self.assertEqual(result['cleanupFailureType'],'TimeoutExpired')
 

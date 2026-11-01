@@ -156,6 +156,13 @@ class DaemonTests(unittest.TestCase):
         with self.assertRaises(ValueError):value.verify_stopped(timeout=.05)
         self.assertLess(time.monotonic()-start,.5);self.assertTrue(self.active)
 
+    def test_explicit_stop_wait_has_a_bounded_twenty_second_cap(self):
+        value=self.observe();self.stopped();value.verify_stopped(timeout=20)
+        for timeout in (True,0,20.1,float('nan'),float('inf')):
+            with self.subTest(timeout=timeout),patch.object(value,'_state') as read:
+                with self.assertRaises(ValueError):value.verify_stopped(timeout=timeout)
+                read.assert_not_called()
+
     def test_invocation_change_while_waiting_is_rejected(self):
         value=self.observe();read=value._state;count=[]
         def transition(deadline):
