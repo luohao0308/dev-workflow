@@ -46,13 +46,13 @@ class ConnectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):cls().request('POST',PATH)
         self.assertEqual(sum(x[0]=='request' for x in calls),1)
         self.assertFalse(any(x[0]=='response' for x in calls))
-        self.assertEqual(state,dict(attempts=1,dispatched=True))
+        self.assertEqual(state,dict(attempts=1,dispatched=True,suppressed=True))
 
     def test_partial_send_consumes_attempt_and_preserves_original_error(self):
         cls,state,calls=self.fake(True)
-        with self.assertRaisesRegex(RuntimeError,'partial-send'):cls().request('POST',PATH)
+        with self.assertRaisesRegex(RuntimeError,'partial-send'):cls().request('POST',PATH,b'{}')
         with self.assertRaises(ValueError):cls().request('POST',PATH)
-        self.assertEqual(state,dict(attempts=1,dispatched=False))
+        self.assertEqual(state,dict(attempts=1,dispatched=False,suppressed=False))
         self.assertEqual(sum(x[0]=='request' for x in calls),1)
 
     def test_get_delegates_and_wrong_mutations_fail_before_original_request(self):
@@ -81,6 +81,86 @@ class ConnectorTests(unittest.TestCase):
                 self.assertTrue(done.wait(2));self.assertEqual(applied,[(PATH,b'{}')]);self.assertTrue(state['dispatched'])
             finally:server.shutdown();server.server_close();thread.join(2)
 
+    def test_observer_runs_once_after_close_and_failure_never_reads_response(self):
+        calls=[];observed=[]
+        class Connection:
+            def __init__(self):pass
+            def request(self,*args,**kwargs):calls.append('request')
+            def close(self):calls.append('close')
+            def getresponse(self):raise AssertionError('original-response-read')
+        def observe(value):
+            self.assertEqual(calls,['request','close']);observed.append(value)
+            raise OSError('observation-I/O-failed')
+        cls,state=diagnostic._connector(Connection,observe);connection=cls()
+        connection.request('POST',PATH,b'secret-body')
+        with self.assertRaisesRegex(OSError,'observation-I/O-failed'):connection.getresponse()
+        with self.assertRaises(http.client.RemoteDisconnected):connection.getresponse()
+        self.assertEqual(len(observed),1);self.assertNotIn('secret',repr(observed))
+        self.assertTrue(state['dispatched']);self.assertTrue(state['suppressed'])
+
+    def test_partial_send_cannot_emit_positive_observation(self):
+        class Connection:
+            def __init__(self):pass
+            def request(self,*args,**kwargs):raise OSError('partial')
+            def close(self):pass
+            def getresponse(self):raise AssertionError('response')
+        observed=[];cls,state=diagnostic._connector(Connection,observed.append);connection=cls()
+        with self.assertRaises(OSError):connection.request('POST',PATH,b'{}')
+        with self.assertRaises(http.client.RemoteDisconnected):connection.getresponse()
+        self.assertEqual(observed,[]);self.assertFalse(state['dispatched'])
+
+
+class ObservationChannelTests(unittest.TestCase):
+    def channel(self):
+        channels=[];cls=diagnostic._channel_class(diagnostic.worker.Channel,config(),channels)
+        return cls(dict(config(),entrypoint=diagnostic.worker.ENTRYPOINT),None,None)
+
+    def test_metadata_uses_actual_hello_and_consumed_request_without_body(self):
+        channel=self.channel();frames=[]
+        with patch.object(diagnostic.worker.live,'write_frame',side_effect=lambda stream,value,**kw:frames.append(value)):
+            with self.assertRaises(ValueError):channel.observe(dict(method='POST',pathSha256='4'*64,bodySha256='5'*64))
+            channel.emit('hello',root='/var/tmp/dw-engine-'+'a'*16,daemonId='actual-id')
+            with patch.object(diagnostic.worker.Channel,'receive',return_value=dict(requestHash='6'*64)):
+                channel.receive('consume-intent')
+            channel.observe(dict(method='POST',pathSha256='4'*64,bodySha256='5'*64))
+        value=frames[-1]['observation']
+        self.assertEqual(value['requestHash'],'6'*64);self.assertEqual(value['daemonId'],'actual-id')
+        self.assertEqual(value['sourceSha'],config()['sourceSha']);self.assertTrue(value['requestReturned'])
+        self.assertFalse(value['originalResponseRead']);self.assertEqual(value['engineOutcome'],'unknown')
+
+    def test_failed_hello_emit_does_not_capture_identity(self):
+        channel=self.channel()
+        with patch.object(diagnostic.worker.live,'write_frame',side_effect=OSError('hello-write-failed')):
+            with self.assertRaises(OSError):channel.emit('hello',root='/var/tmp/dw-engine-'+'a'*16,daemonId='id')
+        self.assertIsNone(channel._hello)
+        with self.assertRaises(ValueError):channel.observe(dict(method='POST',pathSha256='4'*64,bodySha256='5'*64))
+
+    def test_emit_serializes_with_base_rpc_and_lock_wait_is_bounded(self):
+        channel=self.channel();frames=[];sent=threading.Event();release=threading.Event();errors=[]
+        def write(stream,value,**kwargs):
+            frames.append(value['kind'])
+            if value['kind']=='rpc':sent.set()
+        def read(*args,**kwargs):
+            if not release.wait(2):raise TimeoutError('fixture')
+            return dict(kind='reply',channelNonce=config()['channelNonce'],rpcId=1,response={})
+        def rpc():
+            try:channel.rpc('witness','read',{})
+            except Exception as error:errors.append(error)
+        with patch.object(diagnostic.worker.live,'write_frame',side_effect=write),patch.object(diagnostic.worker.live,'read_frame',side_effect=read):
+            thread=threading.Thread(target=rpc);thread.start();self.assertTrue(sent.wait(2))
+            emit=threading.Thread(target=lambda:channel.emit('observation'));emit.start()
+            time.sleep(.03);self.assertEqual(frames,['rpc'])
+            release.set();thread.join(2);emit.join(2)
+        self.assertEqual(errors,[]);self.assertEqual(frames,['rpc','observation'])
+        self.assertFalse(thread.is_alive());self.assertFalse(emit.is_alive())
+        channel._rpc_lock.acquire()
+        try:
+            with patch.object(channel,'timeout',return_value=.02),patch.object(diagnostic.worker.live,'write_frame') as write:
+                start=time.monotonic()
+                with self.assertRaises(ValueError):channel.emit('blocked')
+                self.assertLess(time.monotonic()-start,.3);write.assert_not_called()
+        finally:channel._rpc_lock.release()
+
 
 class WorkerTests(unittest.TestCase):
     def setUp(self):
@@ -102,6 +182,29 @@ class WorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'original-worker-error'):diagnostic.run(config(),None,None)
         self.assertIs(diagnostic.gateway._UnixDocker,original)
         with self.assertRaises(ValueError):diagnostic.run(config(),None,None)
+
+    def test_fixed_run_emits_bound_fact_after_actual_channel_capture(self):
+        frames=[];calls=[];base=diagnostic.worker.Channel
+        class Connection:
+            def __init__(self,*args,**kwargs):pass
+            def request(self,*args,**kwargs):calls.append('request')
+            def close(self):calls.append('close')
+            def getresponse(self):raise AssertionError('original-response-read')
+        def run(value,stdin,stdout):
+            channel=diagnostic.worker.Channel(value,stdin,stdout)
+            channel.emit('hello',root='/var/tmp/dw-engine-'+'a'*16,daemonId='bound-daemon')
+            channel.receive('consume-intent')
+            connection=diagnostic.gateway._UnixDocker();connection.request('POST',PATH,b'private-body')
+            connection.getresponse()
+        with patch.object(diagnostic.gateway,'_UnixDocker',Connection),                patch.object(base,'receive',return_value=dict(requestHash='6'*64)),                patch.object(diagnostic.worker.live,'write_frame',side_effect=lambda stream,value,**kw:frames.append(value)),                patch.object(diagnostic.worker,'run',side_effect=run):
+            with self.assertRaises(http.client.RemoteDisconnected):diagnostic.run(config(),None,None)
+        self.assertIs(diagnostic.worker.Channel,base)
+        self.assertEqual(calls,['request','close']);self.assertEqual(len(frames),2)
+        observation=frames[-1]['observation']
+        self.assertEqual(observation['daemonId'],'bound-daemon')
+        self.assertEqual(observation['requestHash'],'6'*64)
+        self.assertTrue(observation['responseSuppressed']);self.assertTrue(observation['requestReturned'])
+        self.assertNotIn('private-body',repr(frames))
 
     def test_worker_return_never_becomes_diagnostic_success(self):
         original=diagnostic.gateway._UnixDocker

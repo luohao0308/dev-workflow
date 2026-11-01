@@ -24,6 +24,22 @@ def child(attack,engine):
     if attack.startswith('simple'):
         if attack=='simple-no-hello':return
         write_frame(sys.stdout.buffer,dict(kind='hello',channelNonce=initial['channelNonce'],root=engine,daemonId='daemon-one'))
+        if attack.startswith('simple-observation'):
+            consume=read_frame(sys.stdin.buffer)
+            value=dict(schemaVersion=1,diagnosticProfile=profiles.RESPONSE_LOSS_MARKER,
+                sourceSha=initial['sourceSha'],archiveDigest=initial['archiveDigest'],hostId=initial['hostId'],
+                root=engine,daemonId='daemon-one',requestHash=consume['requestHash'],method='POST',
+                pathSha256='e'*64,bodySha256='f'*64,attempts=1,requestReturned=True,
+                responseSuppressed=True,originalResponseRead=False,engineOutcome='unknown',
+                authorityGranted=False,runtimePermit=False,productionReady=False)
+            mutations={'wrong-source':('sourceSha','9'*40),'wrong-root':('root','/var/tmp/dw-engine-'+'9'*16),
+                'wrong-request':('requestHash','9'*64),'wrong-hash':('bodySha256','9'*64),'wrong-type':('attempts',True)}
+            for suffix,(key,replacement) in mutations.items():
+                if attack.endswith(suffix):value[key]=replacement
+            frame=dict(kind='diagnostic-observation',channelNonce=initial['channelNonce'],observation=value)
+            write_frame(sys.stdout.buffer,frame)
+            if attack.endswith('duplicate'):write_frame(sys.stdout.buffer,frame)
+            return
         if attack in ('simple-recovery-frame','simple-final-frame'):
             write_frame(sys.stdout.buffer,dict(kind='recovery-prepared-private' if attack=='simple-recovery-frame' else 'final',channelNonce=initial['channelNonce']))
         if attack=='simple-worker-terminal':
@@ -118,6 +134,8 @@ def main(attack,engine):
         return original_encode(value)
     def output(stream,value,**kwargs):
         if value.get('kind')=='manager-stopped':
+            if attack=='simple-observation-digest':value['diagnosticObservationDigest']='9'*64
+            if attack=='simple-observation-missing-digest':value.pop('diagnosticObservationDigest',None)
             if attack=='simple-profile-terminal':value['binding']=dict(value['binding'],diagnosticProfile='wrong-profile')
             if attack=='simple-terminal-missing':return
             if attack=='simple-terminal-bool':value['transportReturncode']=False
@@ -138,7 +156,7 @@ def main(attack,engine):
             manager.run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90)
         else:manager._run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90,_profile=profiles.RESPONSE_LOSS)
     if attack=='simple-terminal-extra':write_frame(sys.stdout.buffer,dict(kind='extra',channelNonce=initial['channelNonce']))
-    if attack=='simple-ssh-nonzero':raise SystemExit(7)
+    if attack=='simple-ssh-nonzero' or attack.endswith('ssh-nonzero'):raise SystemExit(7)
 
 
 if __name__=='__main__':

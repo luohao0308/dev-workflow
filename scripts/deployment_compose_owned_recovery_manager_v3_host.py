@@ -26,6 +26,8 @@ from deployment_compose_v3_channel_worker import LIMIT, write_frame
 
 import deployment_compose_recovery_profiles_v3_host as profiles
 
+from deployment_compose_response_loss_observation_v3_host import KIND, validate_observation, observation_digest
+
 INNER_LIMIT = LIMIT-1024
 
 
@@ -104,6 +106,7 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
     host=None;host_before=None;host_after=None
     resource_before=resource_after=None
     resource_final_seen=False
+    observation=None;hello_identity=None;consume_hash=None
     stop_drain = threading.Event()
     errors = []
     stop_attempted = False
@@ -190,6 +193,20 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
                         if count>4096 or frame.get('channelNonce')!=nonce:reject()
                         if side=='worker-read':
                             if not start_requested or len(encode(frame))>INNER_LIMIT:reject()
+                            if frame.get('kind')==KIND:
+                                if (not diagnostic or observation is not None or resource_after is not None or hello_identity is None
+                                        or consume_hash is None or queues['worker']
+                                        or set(frame)!={'kind','channelNonce','observation'}):reject()
+                                candidate=validate_observation(frame['observation'])
+                                expected=dict(sourceSha=config['sourceSha'],archiveDigest=config['archiveDigest'],
+                                    hostId=config['hostId'],root=hello_identity[0],daemonId=hello_identity[1],requestHash=consume_hash)
+                                if any(candidate[k]!=v for k,v in expected.items()):reject()
+                                observation=candidate
+                                queue('client',dict(kind=KIND,channelNonce=nonce,binding=binding,observation=observation))
+                                continue
+                            if frame.get('kind')=='hello':
+                                if hello_identity is not None:reject()
+                                hello_identity=(frame.get('root'),frame.get('daemonId'))
                             if verify_resources and resource_after is not None:
                                 if frame.get('kind')!='final' or resource_final_seen:reject()
                                 resource_final_seen=True
@@ -228,8 +245,13 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
                             payload=frame['frame']
                             if (type(payload) is not dict or payload.get('channelNonce')!=nonce
                                     or type(payload.get('kind')) is not str or len(encode(payload))>INNER_LIMIT):reject()
+                            if payload['kind']==KIND:reject()
                             if verify_resources and payload['kind']=='cleanup-checked':reject()
                             if verify_resources and resource_after is not None:reject()
+                            if diagnostic and payload['kind']=='consume-intent':
+                                if (consume_hash is not None or set(payload)!={'kind','channelNonce','requestHash','receiptHash','firstBinding'}
+                                        or type(payload['requestHash']) is not str or not re.fullmatch('[0-9a-f]{64}',payload['requestHash'])):reject()
+                                consume_hash=payload['requestHash']
                             queue('worker',payload)
                         else:reject()
                     if reason is not None:break
@@ -259,6 +281,7 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
         if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
         if host is not None:host_after=host.verify_unchanged(timeout=remaining(20))
         emit('manager-stopped',binding=binding,workerStartRequested=start_requested,reason=reason,
+            **({'diagnosticObservationDigest':observation_digest(observation) if observation is not None else None} if diagnostic else {}),
             wrapperStopped=True,transportReturncode=owner.transport_returncode,
             daemonCleanupVerified=False,productionReady=False,
             **({'daemonBinding':daemon.binding() if daemon is not None else None,

@@ -177,13 +177,21 @@ class LoaderTests(unittest.TestCase):
                  'scripts/deployment_compose_resource_inventory_v3_host.py',
                  'scripts/deployment_compose_host_snapshot_v3_host.py',
                  'scripts/deployment_compose_host_commands_v3_host.py',
-                 'scripts/deployment_compose_recovery_profiles_v3_host.py']):
+                 'scripts/deployment_compose_recovery_profiles_v3_host.py'],
+                ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',
+                 'scripts/deployment_compose_owned_recovery_unit_v3_host.py',
+                 'scripts/deployment_compose_recovery_daemon_v3_host.py',
+                 'scripts/deployment_compose_resource_inventory_v3_host.py',
+                 'scripts/deployment_compose_host_snapshot_v3_host.py',
+                 'scripts/deployment_compose_host_commands_v3_host.py',
+                 'scripts/deployment_compose_recovery_profiles_v3_host.py',
+                 'scripts/deployment_compose_response_loss_observation_v3_host.py']):
             output=io.BytesIO()
             with zipfile.ZipFile(output,'w') as archive:
                 for name in names:archive.writestr(name,'')
             raw=output.getvalue()
             with patch.object(recovery,'published_recovery_archive',return_value=raw) as fetch:
-                if len(names)==7:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
+                if len(names)==8:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
                 else:
                     with self.assertRaises(ValueError):recovery.published_manager_archive('b'*40)
                 fetch.assert_called_once_with('b'*40)

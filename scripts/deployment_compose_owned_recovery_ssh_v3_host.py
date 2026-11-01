@@ -74,7 +74,8 @@ def published_manager_archive(source_sha):
             'scripts/deployment_compose_resource_inventory_v3_host.py',
             'scripts/deployment_compose_host_snapshot_v3_host.py',
             'scripts/deployment_compose_host_commands_v3_host.py',
-            'scripts/deployment_compose_recovery_profiles_v3_host.py'}
+            'scripts/deployment_compose_recovery_profiles_v3_host.py',
+            'scripts/deployment_compose_response_loss_observation_v3_host.py'}
         if not required.issubset(archive.namelist()):reject()
     return raw
 

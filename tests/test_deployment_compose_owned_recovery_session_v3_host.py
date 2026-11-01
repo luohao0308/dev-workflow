@@ -54,6 +54,66 @@ class SessionTests(unittest.TestCase):
         try:self.session.close()
         except Exception:pass
 
+    def observation_session(self,attack='simple-observation',diagnostic=True):
+        session=self.open(attack,diagnostic=diagnostic);session.begin(15);session.receive_worker()
+        # The real controller binds exact typed bundle/request; this toy worker
+        # exercises only relay validation and has no Gate/approval authority.
+        session._diagnostic_expected=dict(requestHash='d'*64,method='POST',pathSha256='e'*64,bodySha256='f'*64)
+        session.send_worker(dict(kind='consume-intent',channelNonce=session.nonce,requestHash='d'*64,
+            receiptHash='a'*64,firstBinding={}))
+        return session
+
+    def test_diagnostic_observation_relay_is_verified_only_with_terminal_and_exit(self):
+        session=self.observation_session()
+        self.assertIsNone(session.diagnostic_observation())
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.assertFalse(session.diagnostic_observation_verified)
+        session.close();value=session.diagnostic_observation()
+        self.assertTrue(session.diagnostic_observation_verified);self.assertTrue(value['requestReturned'])
+        value['requestReturned']=False;self.assertTrue(session.diagnostic_observation()['requestReturned'])
+        self.assertEqual(session.cleanup_report()['diagnosticObservation'],session.diagnostic_observation())
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_diagnostic_observation_invalid_or_unclosed_delivery_never_verifies(self):
+        for suffix in ('wrong-source','wrong-root','wrong-request','wrong-hash','wrong-type','duplicate','digest','missing-digest','ssh-nonzero'):
+            with self.subTest(suffix=suffix):
+                session=self.observation_session('simple-observation-'+suffix)
+                with self.assertRaises(ValueError):session.receive_worker()
+                self.close_session()
+                self.assertFalse(session.diagnostic_observation_verified)
+                self.assertIsNone(session.diagnostic_observation())
+        session=self.observation_session(diagnostic=False)
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.close_session();self.assertIsNone(session.diagnostic_observation())
+
+    def test_diagnostic_request_pin_requires_typed_matching_context_and_is_one_use(self):
+        from dataclasses import replace
+        with self.assertRaises(ValueError):self.drive(diagnostic=True)
+        entry=self.admission._root;bundle,request=entry['bundle'],entry['request']
+        session=self.open('simple-daemon-wait',diagnostic=True);session.begin(15);session.receive_worker()
+        with self.assertRaises(ValueError):session.bind_diagnostic_request(object(),request)
+        for changed in (replace(request,host_id='other-host'),replace(request,daemon_id='other-daemon'),
+                replace(request,plan_hash='9'*64)):
+            with self.assertRaises(ValueError):session.bind_diagnostic_request(bundle,changed)
+        self.assertIsNone(session._diagnostic_expected)
+        session.bind_diagnostic_request(bundle,request)
+        with self.assertRaises(ValueError):session.bind_diagnostic_request(bundle,request)
+        with self.assertRaises(ValueError):session.send_worker(dict(kind='consume-intent',channelNonce=session.nonce,requestHash='9'*64))
+        self.assertFalse(session._diagnostic_consumed)
+        self.close_session()
+
+    def test_client_cannot_inject_observation_as_worker_input(self):
+        session=self.open('simple-daemon-wait');session.begin(15);session.receive_worker()
+        session.send_worker(dict(kind='diagnostic-observation',channelNonce=session.nonce,observation={}))
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.close_session();self.assertIsNone(session.diagnostic_observation())
+
+    def test_close_can_verify_queued_diagnostic_observation(self):
+        import select
+        session=self.observation_session()
+        self.assertTrue(select.select([session._process.stdout],[],[],5)[0])
+        session.close();self.assertTrue(session.diagnostic_observation_verified)
+
     def test_diagnostic_profile_receipt_is_distinct_and_cleanup_only(self):
         session=self.open('simple',diagnostic=True)
         self.assertEqual(session.diagnostic_profile,'response-unobserved-v3')
@@ -78,7 +138,8 @@ class SessionTests(unittest.TestCase):
                 with self.assertRaises(ValueError):session.complete()
                 self.close_session()
         session=self.open('simple-daemon-wait',diagnostic=True);session.begin(15);session.receive_worker()
-        frame=dict(kind='consume-intent',channelNonce=session.nonce)
+        session._diagnostic_expected=dict(requestHash='d'*64)  # Pure send-burn fixture, not authority.
+        frame=dict(kind='consume-intent',channelNonce=session.nonce,requestHash='d'*64)
         with patch.object(session,'_send',side_effect=BrokenPipeError):
             with self.assertRaises(BrokenPipeError):session.send_worker(frame)
         with self.assertRaises(ValueError):session.send_worker(frame)

@@ -237,6 +237,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                 remaining()
                 if process.poll() is not None:reject()
                 binding = admission.register_intent(bundle,request,approval,consumption)
+                if managed and _managed.diagnostic_profile is not None:
+                    _managed.bind_diagnostic_request(bundle,request)
                 send('consume-intent',requestHash=request.digest(),receiptHash=live.digest(asdict(consumption)),firstBinding=binding)
                 count = 1;stage = 'create'
             elif kind == 'recovery-prepared-private' and stage == 'create':

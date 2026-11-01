@@ -23,6 +23,8 @@ from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_profile3_prepare_ssh_probe import _private_root
 from deployment_compose_v3_channel_worker import write_frame
 
+from deployment_compose_response_loss_observation_v3_host import KIND, validate_observation, observation_digest
+
 _ISSUED = weakref.WeakKeyDictionary()
 
 
@@ -76,6 +78,8 @@ class OwnedRecoverySSHSessionV3:
                 or verify_host_snapshot and (not verify_daemon_stop or not verify_resource_inventory or timeout<45)):reject()
         root=_private_root(private_root)
         self._profile=profile;self._diagnostic_consumed=False
+        self._diagnostic_expected=None;self._diagnostic_fact=None;self._hello_identity=None
+        self.diagnostic_observation_verified=False
         archive=(loader.published_manager_archive(source_sha) if profile is profiles.NORMAL
                  else loader.published_response_loss_manager_archive(source_sha))
         self.source_sha,self.host_id=source_sha,ssh_alias
@@ -176,7 +180,9 @@ class OwnedRecoverySSHSessionV3:
     def _capture_cleanup_report(self):
         process=self._process
         self._cleanup_snapshot=encode(dict(schemaVersion=1,sourceSha=self.source_sha,
-            **({'diagnosticProfile':self.diagnostic_profile} if self._profile is profiles.RESPONSE_LOSS else {}),
+            **({'diagnosticProfile':self.diagnostic_profile,
+                'diagnosticObservationVerified':self.diagnostic_observation_verified,
+                'diagnosticObservation':self.diagnostic_observation()} if self._profile is profiles.RESPONSE_LOSS else {}),
             archiveDigest=self.archive_digest,hostId=self.host_id,closed=self._closed,
             completionPathSucceeded=self._completion_path_succeeded,
             managerReceiptVerified=self._finished,
@@ -230,11 +236,46 @@ class OwnedRecoverySSHSessionV3:
         self._started=True
         self._send('manager-start')
 
+    def bind_diagnostic_request(self,bundle,request):
+        from deployment_compose_bundle_v3 import ExecutionBundleV3
+        from deployment_contract_v2 import RequestV2
+        from deployment_compose_coordinator_v3_host import canonical
+        issued(self)
+        if (self._profile is not profiles.RESPONSE_LOSS or not self._started or self._diagnostic_consumed
+                or self._diagnostic_expected is not None or self._hello_identity is None
+                or type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
+                or request.operation!='deploy' or request.plan_hash!=bundle.digest
+                or request.host_id!=self.host_id or request.source.source_sha!=self.source_sha
+                or request.daemon_id!=self._hello_identity[1]):reject()
+        operations=bundle.creation_operations()
+        if len(operations)!=1 or operations[0]['method']!='POST':reject()
+        op=operations[0]
+        self._diagnostic_expected=dict(requestHash=request.digest(),method=op['method'],
+            pathSha256=hashlib.sha256(op['path'].encode('ascii')).hexdigest(),
+            bodySha256=hashlib.sha256(canonical(op['body'])).hexdigest())
+
+    def diagnostic_observation(self):
+        if (os.getpid(),threading.get_ident())!=(self._pid,self._thread):reject()
+        return json.loads(self._diagnostic_fact) if self.diagnostic_observation_verified else None
+
+    def _accept_observation(self,value):
+        if (self._profile is not profiles.RESPONSE_LOSS or self._diagnostic_fact is not None
+                or not self._diagnostic_consumed or self._diagnostic_expected is None
+                or self._hello_identity is None or self._awaiting_daemon_hello
+                or set(value)!={'kind','channelNonce','binding','observation'}
+                or value['kind']!=KIND or encode(value['binding'])!=self._binding):reject()
+        fact=validate_observation(value['observation'])
+        expected=dict(self._diagnostic_expected,sourceSha=self.source_sha,archiveDigest=self.archive_digest,
+            hostId=self.host_id,root=self._hello_identity[0],daemonId=self._hello_identity[1])
+        if any(fact[k]!=v for k,v in expected.items()):reject()
+        self._diagnostic_fact=encode(fact)
+
     def send_worker(self,frame):
         issued(self)
         if self._early_terminal is not None or not self._started or type(frame) is not dict or frame.get('channelNonce')!=self.nonce:reject()
         if self._profile is profiles.RESPONSE_LOSS and frame.get('kind')=='consume-intent':
-            if self._diagnostic_consumed:reject()
+            if (self._diagnostic_consumed or self._diagnostic_expected is None
+                    or frame.get('requestHash')!=self._diagnostic_expected['requestHash']):reject()
             self._diagnostic_consumed=True  # Partial sends cannot be retried.
         self._send('worker-frame',frame=frame)
 
@@ -242,6 +283,8 @@ class OwnedRecoverySSHSessionV3:
         if not self._started or self._early_terminal is not None:reject()
         def next_frame():
             value=self._receive(limit)
+            while value.get('kind')==KIND:
+                self._accept_observation(value);value=self._receive(limit)
             if value.get('kind')=='manager-stopped':
                 # Business failed. Preserve this one bounded frame only for
                 # close's full binding/terminal/EOF/SSH verification.
@@ -257,6 +300,9 @@ class OwnedRecoverySSHSessionV3:
         frame=value['frame']
         if type(frame) is not dict or frame.get('channelNonce')!=self.nonce or type(frame.get('kind')) is not str:reject()
         if self._awaiting_daemon_hello:self._match_daemon_hello(frame)
+        if frame['kind']=='hello':
+            if self._hello_identity is not None:reject()
+            self._hello_identity=(frame.get('root'),frame.get('daemonId'))
         if self._profile is profiles.RESPONSE_LOSS and frame['kind'] in ('recovery-prepared-private','final'):reject()
         return frame
 
@@ -291,7 +337,7 @@ class OwnedRecoverySSHSessionV3:
 
     def _terminal(self,value,*,business):
         if (set(value)!={'kind','channelNonce','binding','workerStartRequested','reason','wrapperStopped',
-                'transportReturncode','daemonCleanupVerified','productionReady'}|(
+                'transportReturncode','daemonCleanupVerified','productionReady'}|({'diagnosticObservationDigest'} if self._profile is profiles.RESPONSE_LOSS else set())|(
                     {'daemonBinding','daemonStoppedVerified'} if self.verify_daemon_stop else set())|(
                     {'resourceBaselineDigest','resourceAfterDigest','resourceInventoryRestored'}
                     if self.verify_resource_inventory else set())|(
@@ -302,6 +348,9 @@ class OwnedRecoverySSHSessionV3:
                 or value['daemonCleanupVerified'] is not False or value['productionReady'] is not False
                 or type(value['transportReturncode']) is not int
                 or value['reason'] not in ('worker-eof','requested-stop')):reject()
+        if self._profile is profiles.RESPONSE_LOSS:
+            expected_digest=observation_digest(json.loads(self._diagnostic_fact)) if self._diagnostic_fact is not None else None
+            if value['diagnosticObservationDigest']!=expected_digest:reject()
         if business and (value['reason']!='worker-eof' or value['transportReturncode']!=0):reject()
         self._pending_daemon_stop=False
         if self.verify_daemon_stop:
@@ -321,7 +370,6 @@ class OwnedRecoverySSHSessionV3:
             elif business or value['resourceInventoryRestored'] is not False or value['resourceAfterDigest'] is not None:reject()
         self._pending_host=False
         if self.verify_host_snapshot:
-            import json
             if (encode(value['hostSnapshotBaseline'])!=self._host_baseline
                     or value['hostSnapshotAfterDigest']!=json.loads(self._host_baseline)['beforeDigest']
                     or value['hostSnapshotUnchangedVerified'] is not True):reject()
@@ -338,6 +386,7 @@ class OwnedRecoverySSHSessionV3:
         self.daemon_stopped_verified=self._pending_daemon_stop
         self.resource_inventory_restored=self._pending_resources
         self.host_snapshot_unchanged_verified=self._pending_host
+        self.diagnostic_observation_verified=self._diagnostic_fact is not None
         self._finished=True
 
     def complete(self):
@@ -384,12 +433,16 @@ class OwnedRecoverySSHSessionV3:
                     if self._early_terminal is not None:
                         value=json.loads(self._early_terminal);self._early_terminal=None
                     else:value=self._receive(90 if self.verify_host_snapshot else 30)
+                    if value['kind']==KIND:
+                        self._accept_observation(value);continue
                     if value['kind']=='daemon-bound' and self.verify_daemon_stop and self._daemon_binding is None:
                         self._accept_daemon(value);continue
                     if value['kind']=='worker-frame':
                         if self._awaiting_daemon_hello:
                             if set(value)!={'kind','channelNonce','frame'}:reject()
                             self._match_daemon_hello(value['frame'])
+                        if value.get('frame',{}).get('kind')=='hello':
+                            self._hello_identity=(value['frame'].get('root'),value['frame'].get('daemonId'))
                         continue
                     self._terminal(value,business=False);self._exit();break
                 else:reject()
