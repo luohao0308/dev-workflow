@@ -51,6 +51,23 @@ def preflight():
     group.close(deadline=time.monotonic()+5)
 
 
+def emit_managed_source_facts(channel,session,root):
+    """Read identities from the owned source, independently of candidate JSON."""
+    from deployment_compose_phase_state_v3_host import TrustedPhaseStateProducerV3
+    producer=session.producer
+    if (type(producer) is not TrustedPhaseStateProducerV3 or producer.project!=session.project
+            or producer._socket_path!=session.target.socket or session.target.socket!=str(root/'docker.sock')):
+        reject()
+    info=producer._get('/v1.45/info')
+    version=producer._get('/v1.45/version')
+    profile={k:version[k] for k in ('Version','GitCommit')}
+    if (info['ID']!=producer.daemon_id or info['DockerRootDir']!=str(root/'data')
+            or session.guard._root!=str(root/'data') or profile!=session.guard._version):reject()
+    channel.emit('managed-source-facts',root=str(root),daemonId=info['ID'],
+        sourceSha=channel.config['sourceSha'],archiveDigest=channel.config['archiveDigest'],
+        hostId=channel.config['hostId'],project=session.project,normalizationVersion=profile)
+
+
 def consume(channel, bundle, request, policy, epoch, operation, index, receipts):
     refs = channel.receive('consume-intent')
     if (type(refs) is not dict or set(refs) != {'requestHash','receiptHash','firstBinding'}
@@ -197,6 +214,8 @@ def run(config, stdin, stdout):
             channel.emit('hello',root=str(root),daemonId=info['ID'],writerCertificateSha256=tls[3],
                 serverCertificateSha256=tls[2],sourceSha=config['sourceSha'],archiveDigest=config['archiveDigest'],hostId=config['hostId'])
             setup = channel.receive('configure')
+            source_facts='includeSourceFacts' in setup
+            if source_facts and setup.pop('includeSourceFacts') is not True:reject()
             if set(setup) != {'policy','epoch','witnessPublicKey','statusPublicKey','keys','gateKey'}:
                 reject()
             policy = GatePolicy(**setup['policy'])
@@ -214,6 +233,7 @@ def run(config, stdin, stdout):
             tracker = FixtureOwnershipTrackerV3(project=session.project,daemon_id=info['ID'],policy_hash=policy.identity_hash(),
                 witness_pub_hash=policy.witness_key_sha256,epoch=setup['epoch'],initial_confirmed_ids=session.created_ids,
                 protected_ids=[x['containerId'] for x in session.prepared['bundle'].to_dict()['protectedContainers']])
+            if source_facts:emit_managed_source_facts(channel,session,root)
             live.emit_observer_facts(channel,session,session.prepared,root)
             channel.emit('prepared-private',**live.private_capsule(session,session.prepared))
             create_cut(channel,session,session.prepared,policy,gate_key,public,status,tls,tracker,retained)

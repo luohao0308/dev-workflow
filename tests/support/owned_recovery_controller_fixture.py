@@ -31,10 +31,19 @@ from deployment_compose_witness_store import canonical
 
 def run():
     attack=sys.argv[1]; engine=sys.argv[2]
-    cfg=dict(entrypoint=ENTRYPOINT,channelNonce='1'*64,sourceSha='b'*40,archiveDigest='2'*64,hostId='host-one')
+    cfg=(json.loads(Path(sys.argv[3]).read_text()) if len(sys.argv)>3 else
+        dict(entrypoint=ENTRYPOINT,channelNonce='1'*64,sourceSha='b'*40,archiveDigest='2'*64,hostId='host-one'))
     channel=Channel(cfg,sys.stdin.buffer,sys.stdout.buffer)
     original_emit=channel.emit
     def emit(kind,**data):
+        if kind=='managed-source-facts':
+            if attack=='missing-managed-source':return
+            # Normalize only the fake Engine's macOS /private alias.
+            data['root']=engine
+            if attack=='bad-managed-project':data['project']='dw-restore-'+'9'*24
+            if attack=='reordered-managed-source':
+                original_emit('observer-facts',operation='deploy',root=engine,daemonId='daemon-one',
+                    sourceSha=cfg['sourceSha'],archiveDigest=cfg['archiveDigest'],bootId='4'*32,bindDigest=None)
         if kind=='hello':
             if attack=='bad-nonce':channel.config=dict(cfg,channelNonce='0'*64)
             if attack in ('bad-source','buffered-stderr'):data['sourceSha']='0'*40
@@ -65,6 +74,7 @@ def run():
     channel.emit('hello',root=engine,daemonId='daemon-one',writerCertificateSha256='a'*64,
         serverCertificateSha256='c'*64,sourceSha=cfg['sourceSha'],archiveDigest=cfg['archiveDigest'],hostId=cfg['hostId'])
     setup=channel.receive('configure')
+    source_facts=setup.pop('includeSourceFacts',False)
     if attack=='wrong-order':channel.emit('prepared-private');return
     case=LocalAcceptanceCase(unittest.TestCase())
     # The fixture owns only its own temporary fake Engine directory.
@@ -81,6 +91,9 @@ def run():
         with patch('deployment_compose_reader_host.uuid.uuid4',return_value=uuid.UUID('4'*32)):
             session=case.prepare(case.engine_root,{'ID':'daemon-one'},source_sha=cfg['sourceSha'],host_id=cfg['hostId'],
                 expected_daemon_id='daemon-one',keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=900)
+        if source_facts:
+            from deployment_compose_owned_recovery_worker_v3_host import emit_managed_source_facts
+            emit_managed_source_facts(channel,session,case.engine_root)
         channel.emit('observer-facts',operation='deploy',root=engine,daemonId='daemon-one',
             sourceSha=cfg['sourceSha'],archiveDigest=cfg['archiveDigest'],bootId='4'*32,bindDigest=None)
         channel.emit('prepared-private',**live.private_capsule(session,session.prepared))

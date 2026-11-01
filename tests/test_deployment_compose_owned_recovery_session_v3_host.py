@@ -1,0 +1,159 @@
+"""Actual SSH-manager-shaped local pipes/admission/signatures; providers doubled."""
+import json
+import copy
+import os
+from pathlib import Path
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+
+ROOT=Path(__file__).resolve().parents[1]
+sys.path[:0]=[str(ROOT/p) for p in ('scripts','packs/deployment/scripts','packs/release/scripts','tests/support')]
+import deployment_compose_owned_recovery_session_v3_host as session_module
+import deployment_compose_owned_recovery_controller_v3_host as controller
+import deployment_compose_owned_recovery_worker_v3_host as worker
+from deployment_compose_phase_state_v3_host import TrustedPhaseStateProducerV3
+from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcceptanceCase
+
+
+@unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
+    'POSIX/OpenSSL/OpenSSH required')
+class SessionTests(unittest.TestCase):
+    def open(self,attack=''):
+        temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
+        self.root=Path(temp.name).resolve();self.root.chmod(0o700)
+        self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
+        self.addCleanup(lambda:shutil.rmtree(self.engine,ignore_errors=True))
+        def spawn(argv):
+            self.argv=argv
+            return subprocess.Popen([sys.executable,'-u',str(ROOT/'tests/support/owned_recovery_managed_fixture.py'),attack,self.engine],
+                stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
+        with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
+                patch.object(session_module,'_spawn',side_effect=spawn):
+            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40)
+        self.addCleanup(self.close_session)
+        return self.session
+    def close_session(self):
+        try:self.session.close()
+        except Exception:pass
+    def drive(self,attack='',review_failure=False):
+        session=self.open(attack)
+        self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
+        self.closed=0;owner=self
+        class Review:
+            def consume_prepared(self,bundle,request,notify):
+                if review_failure:raise RuntimeError('primary-review-failed')
+                return base.consume_prepared(bundle,request,notify)
+            def close(self):owner.closed+=1
+        return controller._drive_managed_recovery_protocol(self.root,session=session,
+            review=Review(),on_review=lambda _:None,timeout=80)
+
+    def test_full_managed_flow_checks_independent_history_and_manager_completion(self):
+        original=controller.live.verify_private_capsule
+        seen=[]
+        def verify(*args,**kwargs):
+            seen.append(kwargs['trusted_boot_id'])
+            return original(*args,**kwargs)
+        with patch.object(controller.live,'verify_private_capsule',side_effect=verify):result=self.drive()
+        self.assertEqual(seen,['4'*32])
+        self.assertNotEqual(seen[0],'1'*32)
+        for key in ('protocolCompleted','historyCompleted','localTransportExited','remoteWrapperStoppedVerified'):
+            self.assertIs(result[key],True)
+        self.assertIs(result['daemonCleanupVerified'],False);self.assertIs(result['productionReady'],False)
+        self.assertEqual([r.operation for r in self.owner.reviewed],['deploy','recovery'])
+        self.assertEqual(self.closed,1)
+        self.assertIn('StrictHostKeyChecking=yes',self.argv)
+        self.assertTrue(self.session._finished);self.assertTrue(self.session._closed)
+
+    def test_source_project_pin_cannot_be_copied_from_valid_capsule(self):
+        with self.assertRaises(ValueError):self.drive('bad-managed-project')
+        self.assertEqual(self.owner.reviewed,[]);self.assertEqual(self.closed,1)
+
+    def test_gateway_boot_must_match_owned_observation_before_review(self):
+        with self.assertRaises(ValueError):self.drive('bad-observer')
+        self.assertEqual(self.owner.reviewed,[]);self.assertEqual(self.closed,1)
+
+    def test_missing_or_reordered_source_facts_never_reach_review(self):
+        for attack in ('missing-managed-source','reordered-managed-source'):
+            with self.subTest(attack=attack):
+                with self.assertRaises(ValueError):self.drive(attack)
+                self.assertEqual(self.owner.reviewed,[]);self.assertEqual(self.closed,1)
+
+    def test_review_failure_preserved_and_session_closed(self):
+        with self.assertRaisesRegex(RuntimeError,'primary-review-failed'):self.drive(review_failure=True)
+        self.assertEqual(self.closed,1);self.assertTrue(self.session._closed)
+
+    def test_terminal_failures_do_not_complete_issued_session(self):
+        for attack in ('simple-terminal-binding','simple-terminal-bool','simple-terminal-missing',
+                'simple-terminal-extra','simple-ssh-nonzero'):
+            with self.subTest(attack=attack):
+                session=self.open(attack);session.begin(15)
+                self.assertEqual(session.receive_worker()['kind'],'hello')
+                with self.assertRaises(ValueError):session.complete()
+                self.assertFalse(session._finished)
+                self.close_session()
+
+    def test_unissued_copied_or_reused_session_is_not_authority(self):
+        fake=object.__new__(session_module.OwnedRecoverySSHSessionV3)
+        with self.assertRaises(ValueError):session_module.issued(fake)
+        session=self.open('simple')
+        with self.assertRaises(ValueError):session_module.issued(copy.copy(session))
+        with patch.object(session_module.os,'getpid',return_value=session._pid+1):
+            with self.assertRaises(ValueError):session_module.issued(session)
+        session.close()
+        with self.assertRaises(ValueError):session_module.issued(session)
+
+    def test_late_stderr_reader_keeps_transferred_descriptor(self):
+        base=session_module.threading.Thread
+        class LateReader(base):
+            def run(self):time.sleep(.15);super().run()
+        with patch.object(session_module.threading,'Thread',LateReader):session=self.open('simple')
+        time.sleep(.3)
+        self.assertEqual(session._errors,[])
+        session.close();self.assertTrue(session._finished)
+
+
+class SourceFactsTests(unittest.TestCase):
+    def test_unsupported_local_platform_rejects_before_source_or_ssh_access(self):
+        with patch.object(session_module.os,'name','nt'),\
+                patch.object(session_module.loader,'published_manager_archive') as fetch:
+            with self.assertRaises(ValueError):session_module.OwnedRecoverySSHSessionV3(None,'host-one','b'*40)
+            fetch.assert_not_called()
+
+    def test_owned_producer_facts_do_not_come_from_request_and_drift_rejects(self):
+        root=Path(tempfile.gettempdir()).resolve()/('dw-engine-'+'a'*16)
+        project='dw-restore-'+'2'*24
+        producer=TrustedPhaseStateProducerV3(socket_path=str(root/'docker.sock'),project=project,
+            daemon_id='daemon-one',container_ids=('1'*64,))
+        version=dict(Version='29.8.2',GitCommit='8af9fe3')
+        session=SimpleNamespace(project=project,producer=producer,target=SimpleNamespace(socket=producer._socket_path),
+            guard=SimpleNamespace(_root=str(root/'data'),_version=version),
+            prepared=SimpleNamespace(request=SimpleNamespace(target=SimpleNamespace(namespace='candidate-project'))))
+        for attack in ('valid','daemon','root','version','project'):
+            with self.subTest(attack=attack):
+                info=dict(ID='other' if attack=='daemon' else 'daemon-one',
+                    DockerRootDir='/wrong' if attack=='root' else str(root/'data'))
+                profile=dict(version,GitCommit='wrong') if attack=='version' else version
+                session.project='other' if attack=='project' else project
+                frames=[]
+                channel=SimpleNamespace(config=dict(sourceSha='b'*40,archiveDigest='c'*64,hostId='host-one'),
+                    emit=lambda kind,**data:frames.append((kind,data)))
+                def get(path):return info if path=='/v1.45/info' else profile
+                with patch.object(producer,'_get',side_effect=get) as read:
+                    if attack=='valid':
+                        worker.emit_managed_source_facts(channel,session,root)
+                        self.assertEqual(frames[0][1]['project'],project)
+                        self.assertEqual(frames[0][1]['normalizationVersion'],version)
+                        self.assertEqual([c.args[0] for c in read.call_args_list],['/v1.45/info','/v1.45/version'])
+                    else:
+                        with self.assertRaises(ValueError):worker.emit_managed_source_facts(channel,session,root)
+                        self.assertEqual(frames,[])
+
+
+if __name__=='__main__':unittest.main()
