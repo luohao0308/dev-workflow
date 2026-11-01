@@ -49,8 +49,10 @@ def fixture(mode,state):
             self._boot_id='kernel-boot';self._invocation='3'*32
             self._stopped=False;self.transport_returncode=None;self.process=None
         def record(self):
-            Path(state).write_text(json.dumps(dict(stopped=self._stopped,started=self.process is not None,
+            path=Path(state);temporary=path.with_name(path.name+'.new')
+            temporary.write_text(json.dumps(dict(stopped=self._stopped,started=self.process is not None,
                 reaped=self.process is not None and self.process.poll() is not None)))
+            os.replace(temporary,path)
         def start(self,**kwargs):
             self.process=subprocess.Popen([sys.executable,'-u',__file__,'--worker',mode],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
