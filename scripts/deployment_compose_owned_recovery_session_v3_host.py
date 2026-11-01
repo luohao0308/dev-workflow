@@ -81,6 +81,7 @@ class OwnedRecoverySSHSessionV3:
         self._process=None;self._reader=None
         self._errors=[];self._stop_reader=threading.Event()
         self._started=self._finished=self._closed=False
+        self._early_terminal=None
         self._completion_path_succeeded=False
         self._cleanup_error_codes=[];self._cleanup_snapshot=None
         self._cleanup_mode=False
@@ -210,16 +211,24 @@ class OwnedRecoverySSHSessionV3:
         self._send('manager-start')
 
     def send_worker(self,frame):
-        if not self._started or type(frame) is not dict or frame.get('channelNonce')!=self.nonce:reject()
+        if self._early_terminal is not None or not self._started or type(frame) is not dict or frame.get('channelNonce')!=self.nonce:reject()
         self._send('worker-frame',frame=frame)
 
     def receive_worker(self,limit=900):
-        if not self._started:reject()
-        value=self._receive(limit)
+        if not self._started or self._early_terminal is not None:reject()
+        def next_frame():
+            value=self._receive(limit)
+            if value.get('kind')=='manager-stopped':
+                # Business failed. Preserve this one bounded frame only for
+                # close's full binding/terminal/EOF/SSH verification.
+                self._early_terminal=encode(value)
+                reject()
+            return value
+        value=next_frame()
         first_daemon=self.verify_daemon_stop and self._daemon_binding is None
         if first_daemon:
             self._accept_daemon(value)
-            value=self._receive(limit)
+            value=next_frame()
         if set(value)!={'kind','channelNonce','frame'} or value['kind']!='worker-frame':reject()
         frame=value['frame']
         if type(frame) is not dict or frame.get('channelNonce')!=self.nonce or type(frame.get('kind')) is not str:reject()
@@ -308,7 +317,7 @@ class OwnedRecoverySSHSessionV3:
 
     def complete(self):
         issued(self)
-        if not self._started or self._finished:reject()
+        if not self._started or self._finished or self._early_terminal is not None:reject()
         self._terminal(self._receive(60 if self.verify_host_snapshot else 30),business=True)
         self._exit()
         self._completion_path_succeeded=True
@@ -342,11 +351,13 @@ class OwnedRecoverySSHSessionV3:
                 # Cleanup has its own finite budget; it cannot resume business.
                 self._deadline=time.monotonic()+(90 if self.verify_host_snapshot else 30)
                 self._cleanup_mode=True
-                if self._process.poll() is None:
+                if self._process.poll() is None and self._early_terminal is None:
                     try:self._send('manager-stop')
                     except BrokenPipeError:pass  # Exit may race with the stop send; still verify queued receipt.
                 for _ in range(4096):
-                    value=self._receive(90 if self.verify_host_snapshot else 30)
+                    if self._early_terminal is not None:
+                        value=json.loads(self._early_terminal);self._early_terminal=None
+                    else:value=self._receive(90 if self.verify_host_snapshot else 30)
                     if value['kind']=='daemon-bound' and self.verify_daemon_stop and self._daemon_binding is None:
                         self._accept_daemon(value);continue
                     if value['kind']=='worker-frame':

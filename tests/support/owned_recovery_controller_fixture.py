@@ -18,6 +18,7 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(ROOT),*(str(ROOT/p) for p in ('scripts','packs/deployment/scripts','packs/release/scripts','tests/support'))]
 from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcceptanceCase
 import deployment_compose_live_worker_v3_host as live
+from deployment_compose_live_ssh_v3_host import _write_private
 from deployment_compose_owned_recovery_worker_v3_host import Channel, ENTRYPOINT
 from deployment_compose_history_v3_host import AuthenticatedHistoryV3
 from deployment_compose_intent_status_v3 import IntentStatusClientV3
@@ -121,6 +122,13 @@ def run():
             attempt=opened.prepare_attempt(op['method'],op['path'],raw)
             ticket=gate.admit(binding['generation'],attempt.ref,method=op['method'],path=op['path'],
                 body=raw,writer_certificate_sha256=policy.writer_certificate_sha256)
+            if index==0 and attack in ('admitted-cut','unknown-response-cut'):
+                if attack=='unknown-response-cut':
+                    gate.finish_response(ticket,definitive=False,status=0,body=b'')
+                _write_private(Path(engine).with_suffix('.interruption.private.json'),dict(
+                    engineWrites=sum(method!='GET' for method,_ in case.harness.calls),
+                    candidatePresent='a'*64 in case.harness.rows))
+                raise RuntimeError('fixed-interrupted-witness-fixture')
             gate.finish_response(ticket,definitive=True,status=201 if index==0 else 204,
                 body=canonical({'Id':'a'*64}) if index==0 else b'')
             gate.close_generation(binding['generation'])

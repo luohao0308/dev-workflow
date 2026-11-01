@@ -30,6 +30,8 @@ class SessionTests(unittest.TestCase):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name).resolve();self.root.chmod(0o700)
         self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
+        marker=Path(self.engine).with_suffix('.interruption.private.json')
+        self.addCleanup(lambda:marker.unlink(missing_ok=True))
         self.addCleanup(lambda:shutil.rmtree(self.engine,ignore_errors=True))
         def spawn(argv):
             self.argv=argv
@@ -53,13 +55,63 @@ class SessionTests(unittest.TestCase):
         session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources,verify_host=verify_host)
         self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
         self.closed=0;owner=self
+        original_admission=controller.MacLiveAdmissionV3
+        original_store=controller.OperationWitnessStoreV3
+        def admission(**kwargs):
+            self.admission=original_admission(**kwargs);return self.admission
+        def store(path,**kwargs):
+            self.witness_path=path;self.witness_key=kwargs['key']
+            return original_store(path,**kwargs)
         class Review:
             def consume_prepared(self,bundle,request,notify):
                 if review_failure:raise RuntimeError('primary-review-failed')
                 return base.consume_prepared(bundle,request,notify)
             def close(self):owner.closed+=1
-        return controller._drive_managed_recovery_protocol(self.root,session=session,
-            review=Review(),on_review=lambda _:None,timeout=80)
+        with patch.object(controller,'MacLiveAdmissionV3',side_effect=admission),\
+                patch.object(controller,'OperationWitnessStoreV3',side_effect=store):
+            return controller._drive_managed_recovery_protocol(self.root,session=session,
+                review=Review(),on_review=lambda _:None,timeout=80)
+
+    def test_admitted_and_unknown_response_cuts_never_resume_or_consume_again(self):
+        for attack,seq,phase,blocker in (
+                ('admitted-cut',3,'admitted','active-pending'),
+                ('unknown-response-cut',4,'blocked','unknown-response')):
+            with self.subTest(attack=attack):
+                with self.assertRaises(ValueError):
+                    self.drive(attack,verify_daemon=True,verify_resources=True,verify_host=True)
+                self.assertEqual([r.operation for r in self.owner.reviewed],['deploy'])
+                self.assertEqual(self.closed,1);self.assertIs(self.admission._root,self.admission._current)
+                self.assertIsNone(self.admission._pending)
+                report=self.session.cleanup_report()
+                self.assertTrue(report['managerReceiptVerified']);self.assertFalse(report['completionPathSucceeded'])
+                self.assertFalse(report['resourceInventoryRestored']);self.assertFalse(report['runtimePermit'])
+                self.assertIsNotNone(self.session._process.poll())
+                state=self.witness_path/'state.json';before=state.read_bytes()
+                reopened=controller.OperationWitnessStoreV3(self.witness_path,key=self.witness_key)
+                try:
+                    # The original Mac context stays alive. Only the worker dies;
+                    # reopening bytes cannot create a new issuer or permission.
+                    self.admission._store=reopened
+                    history=self.admission._history(self.admission._root)
+                    snapshot=history.capture();captured=snapshot.snapshot
+                    with self.assertRaises(ValueError):
+                        history.verify_prefix(snapshot,json.loads(snapshot.canonical)['chainStatus'],require_complete=False)
+                finally:reopened.close()
+                self.assertEqual(state.read_bytes(),before)
+                self.assertEqual(captured['chainStatus']['activeSeq'],seq)
+                self.assertEqual(captured['chainStatus']['activePhase'],phase)
+                self.assertEqual(captured['blocker'],blocker)
+                self.assertEqual(captured['pending']['type'],blocker)
+                self.assertEqual(len(captured['knownPrefix']),0);self.assertEqual(captured['receiptMap'],{})
+                self.assertEqual(len(captured['scopes']),1)
+                self.assertFalse(captured['authorityGranted']);self.assertFalse(captured['runtimePermit'])
+                marker=json.loads(Path(self.engine).with_suffix('.interruption.private.json').read_text())
+                self.assertEqual(marker,dict(engineWrites=0,candidatePresent=False))
+                if seq==4:
+                    event=captured['scopes'][0]['records'][-1]['event']
+                    self.assertEqual(event['kind'],'response')
+                    self.assertEqual(event['data']['status'],0)
+                    self.assertFalse(event['data']['definitive']);self.assertEqual(event['data']['bodyBase64'],'')
 
     def test_full_managed_flow_checks_independent_history_and_manager_completion(self):
         original=controller.live.verify_private_capsule
@@ -209,6 +261,42 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(report['productionReady']);self.assertFalse(report['daemonCleanupVerified'])
         report['cleanupErrors'].append('forged');self.assertEqual(session.cleanup_report()['cleanupErrors'],[])
         session.close();self.assertEqual(json.loads(path.read_text()),session.cleanup_report())
+
+    def test_early_terminal_is_cleanup_only_and_freezes_business(self):
+        session=self.open('simple');session.begin(15);session.receive_worker()
+        with self.assertRaises(ValueError):session.receive_worker()
+        self.assertIsNotNone(session._early_terminal)
+        with self.assertRaises(ValueError):session.receive_worker()
+        with self.assertRaises(ValueError):session.send_worker(dict(kind='configure',channelNonce=session.nonce))
+        with self.assertRaises(ValueError):session.complete()
+        session.close();report=session.cleanup_report()
+        self.assertTrue(report['managerReceiptVerified']);self.assertFalse(report['completionPathSucceeded'])
+        self.assertIsNone(session._early_terminal)
+
+    def test_early_terminal_before_daemon_hello_has_no_vacuous_daemon_proof(self):
+        session=self.open('simple-no-hello',verify_daemon=True);session.begin(15)
+        with self.assertRaises(ValueError):session.receive_worker()
+        session.close();report=session.cleanup_report()
+        self.assertTrue(report['managerReceiptVerified']);self.assertFalse(report['daemonStoppedVerified'])
+        self.assertFalse(report['completionPathSucceeded'])
+
+    def test_early_terminal_still_requires_binding_clean_eof_and_ssh_zero(self):
+        for attack in ('simple-terminal-binding','simple-terminal-nonce','simple-terminal-bool','simple-terminal-missing',
+                'simple-terminal-extra','simple-ssh-nonzero'):
+            with self.subTest(attack=attack):
+                session=self.open(attack);session.begin(15);session.receive_worker()
+                with self.assertRaises(ValueError):session.receive_worker()
+                with self.assertRaises(ValueError):session.close()
+                self.assertFalse(session.cleanup_report()['managerReceiptVerified'])
+                self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_worker_terminal_name_is_not_an_outer_manager_receipt(self):
+        session=self.open('simple-worker-terminal');session.begin(15);session.receive_worker()
+        self.assertEqual(session.receive_worker()['kind'],'manager-stopped')
+        self.assertIsNone(session._early_terminal)
+        with self.assertRaises(ValueError):session.receive_worker()
+        session.close();self.assertTrue(session.cleanup_report()['managerReceiptVerified'])
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
 
     def test_report_failure_does_not_skip_disposal_or_overwrite_existing_file(self):
         session=self.open('simple');path=session._case/'cleanup-report.private.json'

@@ -20,7 +20,10 @@ def child(attack,engine):
     assert hashlib.sha256(archive).hexdigest()==initial['archiveDigest']
     assert set(initial)=={'entrypoint','sourceSha','archiveDigest','hostId','channelNonce'}
     if attack.startswith('simple'):
+        if attack=='simple-no-hello':return
         write_frame(sys.stdout.buffer,dict(kind='hello',channelNonce=initial['channelNonce'],root=engine,daemonId='daemon-one'))
+        if attack=='simple-worker-terminal':
+            write_frame(sys.stdout.buffer,dict(kind='manager-stopped',channelNonce=initial['channelNonce']))
         if attack.startswith('simple-resource'):
             read_frame(sys.stdin.buffer)  # Wait for the test parent to consume hello.
             if attack=='simple-resource-backlog':
@@ -109,6 +112,7 @@ def main(attack,engine):
             if attack=='simple-terminal-missing':return
             if attack=='simple-terminal-bool':value['transportReturncode']=False
             if attack=='simple-terminal-binding':value['binding']=dict(value['binding'],invocationId='9'*32)
+            if attack=='simple-terminal-nonce':value['channelNonce']='0'*64
             if attack=='simple-daemon-false':value['daemonStoppedVerified']=False
             if attack=='simple-daemon-terminal':value['daemonBinding']=dict(value['daemonBinding'],invocationId='9'*32)
             if attack=='simple-resource-false':value['resourceInventoryRestored']=False
