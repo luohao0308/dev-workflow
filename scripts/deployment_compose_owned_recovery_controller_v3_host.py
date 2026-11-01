@@ -115,6 +115,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
     if type(process) is not subprocess.Popen:
         reject()
     store = thread = None
+    completion_candidate=completion=None
     errors = _managed._errors if managed else []
     stop_drain = threading.Event()
     try:
@@ -272,7 +273,11 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                 flags = ('success','cleanupCompleted','daemonStopped','productionSnapshotUnchanged')
                 if (set(data) != {'result','history','productionReady',*flags}
                         or data['productionReady'] is not False or any(data[k] is not True for k in flags)):reject()
-                snapshot = _completed_history(admission)
+                if managed and all((_managed.verify_daemon_stop,_managed.verify_resource_inventory,_managed.verify_host_snapshot)):
+                    import deployment_compose_completion_certificate_v3_host as completion
+                    completion_candidate=completion.prepare_completion(admission,_managed)
+                    snapshot=completion_candidate.snapshot
+                else:snapshot = _completed_history(admission)
                 if live.encode(data['history']) != snapshot.canonical:reject()
                 result = data['result']
                 if (type(result) is not dict or result.get('receipts') != snapshot.snapshot['receiptMap']
@@ -285,13 +290,21 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     if process.wait(timeout=remaining(30)) != 0:reject()
                     thread.join(timeout=remaining(5))
                     if thread.is_alive() or errors:reject()
+                certificate_result={}
+                if completion_candidate is not None:
+                    certificate=completion.issue_completion(completion_candidate)
+                    path=case/'history-terminal-certificate.private.json'
+                    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+                    with os.fdopen(fd,'wb') as output:output.write(certificate)
+                    certificate_result=dict(completionCertificatePath=str(path),
+                        completionCertificateDigest=hashlib.sha256(certificate).hexdigest())
                 return dict(protocolCompleted=True,historyCompleted=True,localTransportExited=True,
                     requestCount=count,workerReport={k:data[k] for k in flags},
                     remoteWrapperStoppedVerified=managed,productionReady=False,
                     **({'daemonStoppedVerified':_managed.daemon_stopped_verified,
                         'resourceInventoryRestored':_managed.resource_inventory_restored,
                         'hostSnapshotUnchangedVerified':_managed.host_snapshot_unchanged_verified,
-                        'daemonCleanupVerified':False} if managed else {}))
+                        'daemonCleanupVerified':False} if managed else {}),**certificate_result)
             else:
                 reject()
         reject()
@@ -305,6 +318,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
             try:action()
             except Exception as error:
                 if cleanup_error is None:cleanup_error = error
+        if completion_candidate is not None:cleanup(lambda:completion.discard_completion(completion_candidate))
         if managed:cleanup(_managed.close)
         elif process.poll() is None:
             cleanup(process.terminate)

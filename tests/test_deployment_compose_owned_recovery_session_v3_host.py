@@ -291,9 +291,73 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
 
     def test_host_profile_composes_with_independent_business_and_lifecycle(self):
-        result=self.drive(verify_daemon=True,verify_resources=True,verify_host=True)
+        import copy
+        import threading
+        import deployment_compose_completion_certificate_v3_host as completion
+        original=completion.issue_completion
+        original_prepare=completion.prepare_completion;extras=[]
+        def prepared(admission,session):
+            candidate=original_prepare(admission,session)
+            extra=original_prepare(admission,session);extras.append(extra)
+            self.addCleanup(lambda:completion.discard_completion(extra))
+            return candidate
+        def checked_issue(candidate):
+            with self.assertRaises(ValueError):original(copy.copy(candidate))
+            with patch.object(completion.os,'getpid',return_value=os.getpid()+1):
+                with self.assertRaises(ValueError):original(candidate)
+            rejected=[]
+            def foreign_thread():
+                try:original(candidate)
+                except ValueError:rejected.append(True)
+            thread=threading.Thread(target=foreign_thread);thread.start();thread.join(2)
+            self.assertFalse(thread.is_alive());self.assertEqual(rejected,[True])
+            key=self.admission._key
+            try:
+                self.admission._key=b'changed-issuer-key'*2
+                with self.assertRaises(ValueError):original(extras[0])
+            finally:self.admission._key=key
+            with self.assertRaises(ValueError):original(extras[0])
+            raw=original(candidate)
+            with self.assertRaises(ValueError):original(candidate)
+            return raw
+        with patch.object(completion,'issue_completion',side_effect=checked_issue),\
+                patch.object(completion,'prepare_completion',side_effect=prepared):
+            result=self.drive(verify_daemon=True,verify_resources=True,verify_host=True)
         self.assertTrue(result['hostSnapshotUnchangedVerified']);self.assertTrue(result['resourceInventoryRestored'])
         self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+        payload=self.verify_certificate(result['completionCertificatePath'])
+        self.assertEqual(payload['totalWriteCount'],5);self.assertEqual(payload['childScopeCount'],4)
+        self.assertFalse(payload['authorityGranted']);self.assertFalse(payload['recoveryAuthorized'])
+        self.assertNotIn('localStreamsClosed',payload['proofs'])
+        self.assertEqual(Path(result['completionCertificatePath']).stat().st_mode&0o777,0o600)
+        import deployment_compose_completion_certificate_v3_host as completion
+        with self.assertRaises(ValueError):completion.prepare_completion(self.admission,self.session)
+
+    def verify_certificate(self,path):
+        import deployment_compose_completion_certificate_v3_host as completion
+        store=controller.OperationWitnessStoreV3(self.witness_path,key=self.witness_key)
+        try:
+            self.admission._store=store
+            expected_history=controller._completed_history(self.admission).digest
+        finally:store.close()
+        return completion.verify_completion(Path(path).read_bytes(),public_key=self.admission._public[0],
+            expected_binding=dict(sourceSha=self.session.source_sha,archiveDigest=self.session.archive_digest,
+                hostId=self.session.host_id,historyDigest=expected_history))
+
+    def test_historical_certificate_does_not_hide_later_finalizer_failure(self):
+        original=session_module.OwnedRecoverySSHSessionV3.close;failed=[]
+        def late_failure(session):
+            completed=session._completion_path_succeeded
+            original(session)
+            if completed and not failed:
+                failed.append(True);raise RuntimeError('late-finalizer-failure')
+        with patch.object(session_module.OwnedRecoverySSHSessionV3,'close',late_failure):
+            with self.assertRaisesRegex(RuntimeError,'late-finalizer-failure'):
+                self.drive(verify_daemon=True,verify_resources=True,verify_host=True)
+        path=next(self.root.glob('owned-recovery-*/history-terminal-certificate.private.json'))
+        payload=self.verify_certificate(path)
+        self.assertFalse(payload['runtimePermit']);self.assertFalse(payload['productionReady'])
+        self.assertTrue(self.session._closed)
 
     def test_host_downgrade_or_changed_projection_and_terminal_reject(self):
         with self.assertRaises(ValueError):self.open('simple-resource-host-downgrade',

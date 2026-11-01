@@ -79,6 +79,7 @@ class OwnedRecoverySSHSessionV3:
         root=_private_root(private_root)
         self._profile=profile;self._diagnostic_consumed=False
         self._diagnostic_expected=None;self._diagnostic_fact=None;self._hello_identity=None
+        self._hello_canonical=None
         self.diagnostic_observation_verified=False
         archive=(loader.published_manager_archive(source_sha) if profile is profiles.NORMAL
                  else loader.published_response_loss_manager_archive(source_sha))
@@ -303,6 +304,7 @@ class OwnedRecoverySSHSessionV3:
         if frame['kind']=='hello':
             if self._hello_identity is not None:reject()
             self._hello_identity=(frame.get('root'),frame.get('daemonId'))
+            self._hello_canonical=encode({k:v for k,v in frame.items() if k not in ('kind','channelNonce')})
         if self._profile is profiles.RESPONSE_LOSS and frame['kind'] in ('recovery-prepared-private','final'):reject()
         return frame
 
