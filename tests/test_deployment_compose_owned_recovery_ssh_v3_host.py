@@ -73,6 +73,49 @@ class LoaderTests(unittest.TestCase):
         with patch.object(recovery.live,'live_bootstrap',return_value='changed-template'):
             with self.assertRaises(ValueError):recovery.manager_bootstrap('a'*64,'b'*40)
 
+    def test_response_loss_loader_is_fixed_and_separate_from_normal_manager(self):
+        code=recovery.response_loss_bootstrap('a'*64,'b'*40)
+        compile(code,'<response-loss-loader>','exec')
+        self.assertIn(recovery.RESPONSE_LOSS_ENTRYPOINT,code)
+        self.assertNotIn(recovery.ENTRYPOINT,code)
+        self.assertNotIn(recovery.RESPONSE_LOSS_ENTRYPOINT,recovery.manager_bootstrap('a'*64,'b'*40))
+        with patch.object(recovery,'recovery_bootstrap',return_value='drift'):
+            with self.assertRaises(ValueError):recovery.response_loss_bootstrap('a'*64,'b'*40)
+
+    def test_response_loss_archive_keeps_source_checks_and_requires_diagnostic_worker(self):
+        for present in (False,True):
+            raw=self.archive((recovery.RESPONSE_LOSS_WORKER,'') if present else None)
+            with patch.object(recovery,'published_manager_archive',return_value=raw) as fetch:
+                if present:self.assertEqual(recovery.published_response_loss_archive('b'*40),raw)
+                else:
+                    with self.assertRaises(ValueError):recovery.published_response_loss_archive('b'*40)
+                fetch.assert_called_once_with('b'*40)
+
+    @unittest.skipUnless(os.name=='posix','bootstrap uses POSIX pipe selectors')
+    def test_response_loss_loader_rejects_wrong_entry_source_digest_and_paths(self):
+        toy="def run(config,stdin,stdout):\n import json\n stdout.write(json.dumps({'entrypoint':config['entrypoint']}).encode());stdout.flush()\n"
+        for attack in ('valid','entrypoint','source','digest','path'):
+            with self.subTest(attack=attack):
+                output=io.BytesIO()
+                with zipfile.ZipFile(output,'w') as archive:
+                    archive.writestr(recovery.RESPONSE_LOSS_WORKER,toy)
+                    archive.writestr('scripts/deployment_compose_v3_channel_worker.py',
+                        "def write_frame(*args,**kwargs):raise AssertionError('unused')\n")
+                    if attack=='path':archive.writestr('../escape.py','')
+                raw=output.getvalue();digest=hashlib.sha256(raw).hexdigest()
+                config=dict(archiveBase64=base64.b64encode(raw).decode(),archiveDigest=digest,
+                    sourceSha='b'*40,entrypoint=recovery.RESPONSE_LOSS_ENTRYPOINT)
+                if attack=='entrypoint':config['entrypoint']=recovery.ENTRYPOINT
+                if attack=='source':config['sourceSha']='c'*40
+                if attack=='digest':config['archiveDigest']='0'*64
+                payload=json.dumps(config).encode()
+                result=subprocess.run([sys.executable,'-I','-u','-c',recovery.response_loss_bootstrap(digest,'b'*40)],
+                    input=struct.pack('!I',len(payload))+payload,capture_output=True,timeout=10)
+                if attack=='valid':
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(json.loads(result.stdout),dict(entrypoint=recovery.RESPONSE_LOSS_ENTRYPOINT))
+                else:self.assertNotEqual(result.returncode,0)
+
     def test_manager_archive_requires_manager_unit_and_daemon_observer(self):
         for names in ([],['scripts/deployment_compose_owned_recovery_manager_v3_host.py'],
                 ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',

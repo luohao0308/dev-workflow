@@ -225,6 +225,11 @@ class WriteGatewayTests(GateFixture, unittest.TestCase):
         self.mode = 'disconnect'; self.assertEqual(self.send()[0], 502)
         self.assert_upstream_loss_frozen(4,'blocked')
 
+    def test_existing_listener_keeps_its_connector_after_module_changes(self):
+        with patch.object(host,'_UnixDocker',side_effect=AssertionError('late-connector-replacement')) as changed:
+            self.assertEqual(self.send(),(201,b'{}'))
+        changed.assert_not_called();self.assertEqual(len(self.writes),1)
+
     def assert_upstream_loss_frozen(self,seq,phase):
         self.assertEqual(self.writes,[(self.ops[0][1],self.body)])
         before=(self.root/'actual-witness/state.json').read_bytes()

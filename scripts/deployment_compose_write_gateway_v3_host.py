@@ -66,6 +66,9 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
 
     deadline = time.monotonic()+control_timeout if control_deadline is None else control_deadline
 
+    # Bind each listener to its construction-time connector. A fixed diagnostic
+    # process restoring its module scope cannot change a surviving handler.
+    connector = _UnixDocker
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
@@ -123,7 +126,7 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
                 # forwarding wins the race and its result becomes unknown.
                 with self.server.dispatch_lock:
                     self.server.check_live()
-                    connection = _UnixDocker(docker_socket, min(timeout, deadline-time.monotonic()))
+                    connection = connector(docker_socket, min(timeout, deadline-time.monotonic()))
                     connection.connect()
                     self.server.check_live()
                     watchdog = runtime.deadline_watchdog(connection.sock, min(deadline,time.monotonic()+timeout))

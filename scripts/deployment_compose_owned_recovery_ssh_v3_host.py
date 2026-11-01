@@ -13,6 +13,8 @@ import deployment_compose_live_ssh_v3_host as live
 ENTRYPOINT = 'deployment_compose_owned_recovery_worker_v3_host.run'
 WORKER = 'scripts/deployment_compose_owned_recovery_worker_v3_host.py'
 MANAGER_ENTRYPOINT = 'deployment_compose_owned_recovery_manager_v3_host.run'
+RESPONSE_LOSS_ENTRYPOINT = 'deployment_compose_response_loss_worker_v3_host.run'
+RESPONSE_LOSS_WORKER = 'scripts/deployment_compose_response_loss_worker_v3_host.py'
 
 
 def reject():
@@ -72,4 +74,19 @@ def published_manager_archive(source_sha):
             'scripts/deployment_compose_host_snapshot_v3_host.py',
             'scripts/deployment_compose_host_commands_v3_host.py'}
         if not required.issubset(archive.namelist()):reject()
+    return raw
+
+
+def response_loss_bootstrap(archive_digest,source_sha):
+    """Fixed diagnostic worker code only; current manager/session cannot select it."""
+    code=recovery_bootstrap(archive_digest,source_sha)
+    module='deployment_compose_owned_recovery_worker_v3_host'
+    if code.count(module)!=2:reject()
+    return code.replace(module,'deployment_compose_response_loss_worker_v3_host')
+
+
+def published_response_loss_archive(source_sha):
+    raw=published_manager_archive(source_sha)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        if RESPONSE_LOSS_WORKER not in archive.namelist():reject()
     return raw
