@@ -224,7 +224,7 @@ class ObservedRecoveryDaemonV3:
 
     def verify_stopped(self,*,timeout=10):
         self._check()
-        if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=20:reject()
+        if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30:reject()
         deadline=time.monotonic()+timeout
         confirmed=0
         while confirmed<2:
