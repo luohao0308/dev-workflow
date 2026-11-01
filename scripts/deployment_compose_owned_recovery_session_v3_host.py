@@ -39,20 +39,25 @@ def issued(session,process=None):
     record=_ISSUED.get(session)
     if (record is None or record[:2]!=(os.getpid(),threading.get_ident())
             or record[2] is not session._process or (process is not None and process is not record[2])
-            or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id)):reject()
+            or type(session.verify_daemon_stop) is not bool
+            or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id,session.verify_daemon_stop)):reject()
     return session
 
 
 class OwnedRecoverySSHSessionV3:
-    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30):
+    def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False):
         if (os.name!='posix' or type(ssh_alias) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',ssh_alias)
                 or type(source_sha) is not str or not re.fullmatch('[0-9a-f]{40}',source_sha)
-                or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=60):reject()
+                or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=60
+                or type(verify_daemon_stop) is not bool):reject()
         root=_private_root(private_root)
         archive=loader.published_manager_archive(source_sha)
         self.source_sha,self.host_id=source_sha,ssh_alias
         self.archive_digest=hashlib.sha256(archive).hexdigest()
         self.nonce=secrets.token_hex(32)
+        self.verify_daemon_stop=verify_daemon_stop
+        self._daemon_binding=None;self._awaiting_daemon_hello=False
+        self._pending_daemon_stop=False;self.daemon_stopped_verified=False
         self._pid,self._thread=os.getpid(),threading.get_ident()
         self._process=None;self._reader=None
         self._errors=[];self._stop_reader=threading.Event()
@@ -66,7 +71,7 @@ class OwnedRecoverySSHSessionV3:
         try:
             self._process=_spawn(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
             if type(self._process) is not subprocess.Popen:reject()
-            _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,ssh_alias)
+            _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,ssh_alias,verify_daemon_stop)
             def drain(stderr_fd=fd):
                 size=0
                 try:
@@ -83,9 +88,11 @@ class OwnedRecoverySSHSessionV3:
             self._reader=threading.Thread(target=drain,daemon=True);self._reader.start();fd=None
             self._send('initial',dict(entrypoint=loader.MANAGER_ENTRYPOINT,sourceSha=source_sha,
                 archiveDigest=self.archive_digest,hostId=ssh_alias,channelNonce=self.nonce,
-                archiveBase64=base64.b64encode(archive).decode('ascii')))
+                archiveBase64=base64.b64encode(archive).decode('ascii'),
+                **({'verifyDaemonStop':True} if verify_daemon_stop else {})))
             bound=self._receive()
-            if set(bound)!={'kind','channelNonce','binding'} or bound['kind']!='manager-bound':reject()
+            if (set(bound)!={'kind','channelNonce','binding'}|({'verifyDaemonStop'} if verify_daemon_stop else set())
+                    or bound['kind']!='manager-bound' or verify_daemon_stop and bound['verifyDaemonStop'] is not True):reject()
             binding=bound['binding']
             if (type(binding) is not dict or set(binding)!={'unit','kernelBoot','invocationId','sourceSha','archiveDigest','hostId'}
                     or binding['sourceSha']!=source_sha or binding['archiveDigest']!=self.archive_digest or binding['hostId']!=ssh_alias
@@ -132,20 +139,57 @@ class OwnedRecoverySSHSessionV3:
     def receive_worker(self,limit=900):
         if not self._started:reject()
         value=self._receive(limit)
+        first_daemon=self.verify_daemon_stop and self._daemon_binding is None
+        if first_daemon:
+            self._accept_daemon(value)
+            value=self._receive(limit)
         if set(value)!={'kind','channelNonce','frame'} or value['kind']!='worker-frame':reject()
         frame=value['frame']
         if type(frame) is not dict or frame.get('channelNonce')!=self.nonce or type(frame.get('kind')) is not str:reject()
+        if self._awaiting_daemon_hello:self._match_daemon_hello(frame)
         return frame
+
+    def _match_daemon_hello(self,frame):
+        binding=json.loads(self._daemon_binding)
+        if (type(frame) is not dict or frame.get('channelNonce')!=self.nonce or frame.get('kind')!='hello'
+                or frame.get('root')!=binding['root'] or frame.get('daemonId')!=binding['daemonId']):reject()
+        self._awaiting_daemon_hello=False
+
+    def _accept_daemon(self,value):
+        if (set(value)!={'kind','channelNonce','binding','daemonBinding'} or value['kind']!='daemon-bound'
+                or encode(value['binding'])!=self._binding):reject()
+        binding=value['daemonBinding']
+        names={'root','daemonId','unit','kernelBoot','invocationId','cgroupDevice','cgroupInode',
+            'mainPid','mainStartTicks','daemonPid','daemonStartTicks'}
+        if (type(binding) is not dict or set(binding)!=names
+                or type(binding['root']) is not str or not re.fullmatch('/var/tmp/dw-engine-[0-9a-f]{16}',binding['root'])
+                or type(binding['daemonId']) is not str or not 0<len(binding['daemonId'])<=256
+                or binding['unit']!=binding['root'].rsplit('/',1)[1]+'.service'
+                or binding['kernelBoot']!=json.loads(self._binding)['kernelBoot']
+                or type(binding['invocationId']) is not str or not re.fullmatch('[0-9a-f]{32}',binding['invocationId'])
+                or any(type(binding[k]) is not int or not 0<binding[k]<2**64 for k in
+                    ('cgroupInode','mainPid','mainStartTicks','daemonPid','daemonStartTicks'))
+                or type(binding['cgroupDevice']) is not int or not 0<=binding['cgroupDevice']<2**64):reject()
+        self._daemon_binding=encode(binding)
+        self._awaiting_daemon_hello=True
 
     def _terminal(self,value,*,business):
         if (set(value)!={'kind','channelNonce','binding','workerStartRequested','reason','wrapperStopped',
-                'transportReturncode','daemonCleanupVerified','productionReady'}
+                'transportReturncode','daemonCleanupVerified','productionReady'}|(
+                    {'daemonBinding','daemonStoppedVerified'} if self.verify_daemon_stop else set())
                 or value['kind']!='manager-stopped' or encode(value['binding'])!=self._binding
                 or value['workerStartRequested'] is not self._started or value['wrapperStopped'] is not True
                 or value['daemonCleanupVerified'] is not False or value['productionReady'] is not False
                 or type(value['transportReturncode']) is not int
                 or value['reason'] not in ('worker-eof','requested-stop')):reject()
         if business and (value['reason']!='worker-eof' or value['transportReturncode']!=0):reject()
+        self._pending_daemon_stop=False
+        if self.verify_daemon_stop:
+            if self._awaiting_daemon_hello:reject()
+            if self._daemon_binding is None:
+                if business or value['daemonBinding'] is not None or value['daemonStoppedVerified'] is not False:reject()
+            elif encode(value['daemonBinding'])!=self._daemon_binding or value['daemonStoppedVerified'] is not True:reject()
+            self._pending_daemon_stop=self._daemon_binding is not None
 
     def _exit(self):
         with selectors.DefaultSelector() as selector:
@@ -155,6 +199,7 @@ class OwnedRecoverySSHSessionV3:
         if self._process.wait(timeout=self._left())!=0:reject()
         self._reader.join(timeout=self._left(5))
         if self._reader.is_alive() or self._errors:reject()
+        self.daemon_stopped_verified=self._pending_daemon_stop
         self._finished=True
 
     def complete(self):
@@ -185,14 +230,22 @@ class OwnedRecoverySSHSessionV3:
         if self._closed:return
         failure=None
         try:
-            if not self._finished and self._binding is not None and self._process.poll() is None:
+            if not self._finished and self._binding is not None:
                 # Cleanup has its own finite budget; it cannot resume business.
                 self._deadline=time.monotonic()+30
                 self._cleanup_mode=True
-                self._send('manager-stop')
+                if self._process.poll() is None:
+                    try:self._send('manager-stop')
+                    except BrokenPipeError:pass  # Exit may race with the stop send; still verify queued receipt.
                 for _ in range(4096):
                     value=self._receive()
-                    if value['kind']=='worker-frame':continue
+                    if value['kind']=='daemon-bound' and self.verify_daemon_stop and self._daemon_binding is None:
+                        self._accept_daemon(value);continue
+                    if value['kind']=='worker-frame':
+                        if self._awaiting_daemon_hello:
+                            if set(value)!={'kind','channelNonce','frame'}:reject()
+                            self._match_daemon_hello(value['frame'])
+                        continue
                     self._terminal(value,business=False);self._exit();break
                 else:reject()
         except Exception as error:failure=error

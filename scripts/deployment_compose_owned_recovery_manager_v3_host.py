@@ -19,6 +19,7 @@ from deployment_compose_history_v3_host import pairs
 from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_owned_recovery_ssh_v3_host import ENTRYPOINT, MANAGER_ENTRYPOINT
 from deployment_compose_owned_recovery_unit_v3_host import OwnedRecoveryUnitV3
+from deployment_compose_recovery_daemon_v3_host import ObservedRecoveryDaemonV3
 from deployment_compose_v3_channel_worker import LIMIT, write_frame
 
 INNER_LIMIT = LIMIT-1024
@@ -64,8 +65,10 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     manager-stop terminates only the bound wrapper. A terminal envelope is
     lifecycle data for the owned channel, never business completion or authority.
     """
+    verify_daemon=type(config) is dict and 'verifyDaemonStop' in config
     if (type(config) is not dict
-            or set(config)!={'entrypoint','channelNonce','sourceSha','archiveDigest','hostId'}
+            or set(config)!={'entrypoint','channelNonce','sourceSha','archiveDigest','hostId'}|({'verifyDaemonStop'} if verify_daemon else set())
+            or verify_daemon and config['verifyDaemonStop'] is not True
             or config['entrypoint']!=MANAGER_ENTRYPOINT
             or type(config['channelNonce']) is not str or not re.fullmatch('[0-9a-f]{64}',config['channelNonce'])
             or type(config['sourceSha']) is not str or not re.fullmatch('[0-9a-f]{40}',config['sourceSha'])
@@ -78,6 +81,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
     config = json.loads(encode(config))
     owner = OwnedRecoveryUnitV3(config['archiveDigest'],config['sourceSha'])
     process = thread = None
+    daemon=None
     stop_drain = threading.Event()
     errors = []
     stop_attempted = False
@@ -117,7 +121,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                         if size>1024*1024:errors.append('stderr-bound');return
             except Exception:errors.append('stderr-io')
         thread=threading.Thread(target=drain,daemon=True);thread.start()
-        queue('client',dict(kind='manager-bound',channelNonce=nonce,binding=binding))
+        queue('client',dict(kind='manager-bound',channelNonce=nonce,binding=binding,
+            **({'verifyDaemonStop':True} if verify_daemon else {})))
         client,worker = _Frames(),_Frames()
         reason = None
         with selectors.DefaultSelector() as selector:
@@ -157,13 +162,22 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                         if count>4096 or frame.get('channelNonce')!=nonce:reject()
                         if side=='worker-read':
                             if not start_requested or len(encode(frame))>INNER_LIMIT:reject()
+                            if verify_daemon:
+                                if daemon is None:
+                                    if frame.get('kind')!='hello':reject()
+                                    daemon=ObservedRecoveryDaemonV3(frame.get('root'),frame.get('daemonId'),
+                                        kernel_boot=owner._boot_id,timeout=remaining(15))
+                                    queue('client',dict(kind='daemon-bound',channelNonce=nonce,
+                                        binding=binding,daemonBinding=daemon.binding()))
+                                elif frame.get('kind')=='hello':reject()
                             queue('client',dict(kind='worker-frame',channelNonce=nonce,frame=frame))
                             continue
                         kind=frame.get('kind')
                         if kind=='manager-stop' and set(frame)=={'kind','channelNonce'}:
                             reason='requested-stop';break
                         if kind=='manager-start' and set(frame)=={'kind','channelNonce'} and not start_requested:
-                            initial=dict(config,entrypoint=ENTRYPOINT,archiveBase64=base64.b64encode(archive).decode('ascii'))
+                            initial=dict({k:v for k,v in config.items() if k!='verifyDaemonStop'},
+                                entrypoint=ENTRYPOINT,archiveBase64=base64.b64encode(archive).decode('ascii'))
                             queue('worker',initial)
                             start_requested=True
                         elif kind=='worker-frame' and set(frame)=={'kind','channelNonce','frame'} and start_requested:
@@ -175,6 +189,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                     if reason is not None:break
         stop_attempted=True
         owner.stop(timeout=30)
+        if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
         thread.join(timeout=1)
         if thread.is_alive() or errors:reject()
         # The service is already stopped. Drain previously queued worker frames
@@ -190,9 +205,12 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                 if n<=0:reject()
                 del queues['client'][:n]
         # Binding stays manager-created. A nested worker kind can never emit this.
+        if daemon is not None:daemon.verify_stopped(timeout=remaining(10))
         emit('manager-stopped',binding=binding,workerStartRequested=start_requested,reason=reason,
             wrapperStopped=True,transportReturncode=owner.transport_returncode,
-            daemonCleanupVerified=False,productionReady=False)
+            daemonCleanupVerified=False,productionReady=False,
+            **({'daemonBinding':daemon.binding() if daemon is not None else None,
+                'daemonStoppedVerified':daemon is not None} if verify_daemon else {}))
     finally:
         import sys
         primary=sys.exc_info()[1]
@@ -207,6 +225,10 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             else:owner._discard_local()
         except Exception as error:
             if cleanup_error is None:cleanup_error=error
+        if daemon is not None:
+            try:daemon.close()
+            except Exception as error:
+                if cleanup_error is None:cleanup_error=error
         for stream,blocking in flags:
             try:
                 if not stream.closed:os.set_blocking(stream.fileno(),blocking)

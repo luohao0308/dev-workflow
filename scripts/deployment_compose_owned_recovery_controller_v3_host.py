@@ -276,7 +276,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                 return dict(protocolCompleted=True,historyCompleted=True,localTransportExited=True,
                     requestCount=count,workerReport={k:data[k] for k in flags},
                     remoteWrapperStoppedVerified=managed,productionReady=False,
-                    **({'daemonCleanupVerified':False} if managed else {}))
+                    **({'daemonStoppedVerified':_managed.daemon_stopped_verified,
+                        'daemonCleanupVerified':False} if managed else {}))
             else:
                 reject()
         reject()

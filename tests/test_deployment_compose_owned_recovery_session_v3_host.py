@@ -4,6 +4,7 @@ import copy
 import os
 from pathlib import Path
 import secrets
+import selectors
 import shutil
 import subprocess
 import sys
@@ -25,7 +26,7 @@ from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcce
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
     'POSIX/OpenSSL/OpenSSH required')
 class SessionTests(unittest.TestCase):
-    def open(self,attack=''):
+    def open(self,attack='',*,verify_daemon=False):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name).resolve();self.root.chmod(0o700)
         self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
@@ -36,14 +37,18 @@ class SessionTests(unittest.TestCase):
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
         with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
                 patch.object(session_module,'_spawn',side_effect=spawn):
-            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40)
-        self.addCleanup(self.close_session)
+            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40,verify_daemon_stop=verify_daemon)
+        created=self.session
+        def close_created():
+            try:created.close()
+            except Exception:pass
+        self.addCleanup(close_created)
         return self.session
     def close_session(self):
         try:self.session.close()
         except Exception:pass
-    def drive(self,attack='',review_failure=False):
-        session=self.open(attack)
+    def drive(self,attack='',review_failure=False,verify_daemon=False):
+        session=self.open(attack,verify_daemon=verify_daemon)
         self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
         self.closed=0;owner=self
         class Review:
@@ -74,6 +79,47 @@ class SessionTests(unittest.TestCase):
     def test_source_project_pin_cannot_be_copied_from_valid_capsule(self):
         with self.assertRaises(ValueError):self.drive('bad-managed-project')
         self.assertEqual(self.owner.reviewed,[]);self.assertEqual(self.closed,1)
+
+    def test_verified_daemon_mode_composes_with_signed_business_history(self):
+        result=self.drive(verify_daemon=True)
+        self.assertTrue(result['daemonStoppedVerified']);self.assertTrue(result['remoteWrapperStoppedVerified'])
+        self.assertFalse(result['daemonCleanupVerified']);self.assertFalse(result['productionReady'])
+
+    def test_daemon_mode_cannot_downgrade_or_miss_binding(self):
+        for attack in ('simple-daemon-downgrade','simple-daemon-missing','simple-daemon-mismatch'):
+            with self.subTest(attack=attack):
+                if attack.endswith('downgrade'):
+                    with self.assertRaises(ValueError):self.open(attack,verify_daemon=True)
+                else:
+                    session=self.open(attack,verify_daemon=True);session.begin(15)
+                    with self.assertRaises(ValueError):session.receive_worker()
+                    self.close_session()
+
+    def test_daemon_false_or_changed_terminal_is_not_verified(self):
+        for attack in ('simple-daemon-active','simple-daemon-false','simple-daemon-terminal'):
+            with self.subTest(attack=attack):
+                session=self.open(attack,verify_daemon=True);session.begin(15)
+                self.assertEqual(session.receive_worker()['kind'],'hello')
+                with self.assertRaises(ValueError):session.complete()
+                self.assertFalse(session.daemon_stopped_verified);self.close_session()
+
+    def test_stop_before_start_never_vacuously_verifies_daemon(self):
+        session=self.open('simple',verify_daemon=True);session.close()
+        self.assertTrue(session._finished);self.assertFalse(session.daemon_stopped_verified)
+
+    def test_close_can_validate_daemon_binding_queued_before_first_receive(self):
+        session=self.open('simple-daemon-wait',verify_daemon=True);session.begin(15)
+        with selectors.DefaultSelector() as selector:
+            selector.register(session._process.stdout,selectors.EVENT_READ)
+            self.assertTrue(selector.select(5))
+        session.close()
+        self.assertTrue(session._finished);self.assertTrue(session.daemon_stopped_verified)
+
+    def test_close_drains_valid_receipt_even_after_manager_exit(self):
+        session=self.open('simple',verify_daemon=True);session.begin(15)
+        self.assertEqual(session._process.wait(timeout=5),0)
+        session.close()
+        self.assertTrue(session._finished);self.assertTrue(session.daemon_stopped_verified)
 
     def test_gateway_boot_must_match_owned_observation_before_review(self):
         with self.assertRaises(ValueError):self.drive('bad-observer')

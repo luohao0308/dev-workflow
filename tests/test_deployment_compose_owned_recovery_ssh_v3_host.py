@@ -73,16 +73,19 @@ class LoaderTests(unittest.TestCase):
         with patch.object(recovery.live,'live_bootstrap',return_value='changed-template'):
             with self.assertRaises(ValueError):recovery.manager_bootstrap('a'*64,'b'*40)
 
-    def test_manager_archive_requires_both_manager_and_unit_owner(self):
+    def test_manager_archive_requires_manager_unit_and_daemon_observer(self):
         for names in ([],['scripts/deployment_compose_owned_recovery_manager_v3_host.py'],
                 ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',
-                 'scripts/deployment_compose_owned_recovery_unit_v3_host.py']):
+                 'scripts/deployment_compose_owned_recovery_unit_v3_host.py'],
+                ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',
+                 'scripts/deployment_compose_owned_recovery_unit_v3_host.py',
+                 'scripts/deployment_compose_recovery_daemon_v3_host.py']):
             output=io.BytesIO()
             with zipfile.ZipFile(output,'w') as archive:
                 for name in names:archive.writestr(name,'')
             raw=output.getvalue()
             with patch.object(recovery,'published_recovery_archive',return_value=raw) as fetch:
-                if len(names)==2:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
+                if len(names)==3:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
                 else:
                     with self.assertRaises(ValueError):recovery.published_manager_archive('b'*40)
                 fetch.assert_called_once_with('b'*40)
