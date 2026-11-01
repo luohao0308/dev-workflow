@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-from deployment_compose_owned_recovery_ssh_v3_host import recovery_bootstrap
+from deployment_compose_owned_recovery_ssh_v3_host import recovery_bootstrap, response_loss_bootstrap
 from deployment_compose_writer_cgroup_v3_host import events
 
 CGROUP = Path('/sys/fs/cgroup')
@@ -245,3 +245,10 @@ class OwnedRecoveryUnitV3:
             self._check()
             if not self._stopped:reject()
             self._discard_local()
+
+
+class ResponseLossUnitV3(OwnedRecoveryUnitV3):
+    """Same owner invariants, with only the fixed diagnostic loader selected."""
+    def __init__(self,archive_digest,source_sha):
+        super().__init__(archive_digest,source_sha)
+        self._code=response_loss_bootstrap(archive_digest,source_sha)

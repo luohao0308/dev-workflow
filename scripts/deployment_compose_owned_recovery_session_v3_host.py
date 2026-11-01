@@ -18,6 +18,7 @@ import time
 import weakref
 
 import deployment_compose_owned_recovery_ssh_v3_host as loader
+import deployment_compose_recovery_profiles_v3_host as profiles
 from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_profile3_prepare_ssh_probe import _private_root
 from deployment_compose_v3_channel_worker import write_frame
@@ -43,8 +44,14 @@ def _spawn(argv):
         stderr=subprocess.PIPE,bufsize=0,close_fds=True)
 
 
+def _profile_type(cls):
+    if cls is OwnedRecoverySSHSessionV3:return profiles.NORMAL
+    if cls is ResponseLossSSHSessionV3:return profiles.RESPONSE_LOSS
+    reject()
+
+
 def issued(session,process=None):
-    if type(session) is not OwnedRecoverySSHSessionV3:reject()
+    profile=_profile_type(type(session))
     record=_ISSUED.get(session)
     if (record is None or record[:2]!=(os.getpid(),threading.get_ident())
             or record[2] is not session._process or (process is not None and process is not record[2])
@@ -52,13 +59,15 @@ def issued(session,process=None):
             or type(session.verify_resource_inventory) is not bool
             or type(session.verify_host_snapshot) is not bool
             or record[3:]!=(session.nonce,session.source_sha,session.archive_digest,session.host_id,
-                session.verify_daemon_stop,session.verify_resource_inventory,session.verify_host_snapshot)):reject()
+                session.verify_daemon_stop,session.verify_resource_inventory,session.verify_host_snapshot,type(session),profile)
+            or session._profile is not profile):reject()
     return session
 
 
 class OwnedRecoverySSHSessionV3:
     def __init__(self,private_root,ssh_alias,source_sha,*,timeout=30,verify_daemon_stop=False,
             verify_resource_inventory=False,verify_host_snapshot=False):
+        profile=_profile_type(type(self))
         if (os.name!='posix' or type(ssh_alias) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',ssh_alias)
                 or type(source_sha) is not str or not re.fullmatch('[0-9a-f]{40}',source_sha)
                 or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=60
@@ -66,7 +75,9 @@ class OwnedRecoverySSHSessionV3:
                 or verify_resource_inventory and not verify_daemon_stop or type(verify_host_snapshot) is not bool
                 or verify_host_snapshot and (not verify_daemon_stop or not verify_resource_inventory or timeout<45)):reject()
         root=_private_root(private_root)
-        archive=loader.published_manager_archive(source_sha)
+        self._profile=profile;self._diagnostic_consumed=False
+        archive=(loader.published_manager_archive(source_sha) if profile is profiles.NORMAL
+                 else loader.published_response_loss_manager_archive(source_sha))
         self.source_sha,self.host_id=source_sha,ssh_alias
         self.archive_digest=hashlib.sha256(archive).hexdigest()
         self.nonce=secrets.token_hex(32)
@@ -92,10 +103,12 @@ class OwnedRecoverySSHSessionV3:
         self._case=case
         fd=os.open(case/'stderr.private.txt',os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
         try:
-            self._process=_spawn(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
+            argv=(loader.manager_ssh_argv(ssh_alias,self.archive_digest,source_sha) if profile is profiles.NORMAL
+                  else loader.response_loss_manager_ssh_argv(ssh_alias,self.archive_digest,source_sha))
+            self._process=_spawn(argv)
             if type(self._process) is not subprocess.Popen:reject()
             _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,
-                ssh_alias,verify_daemon_stop,verify_resource_inventory,verify_host_snapshot)
+                ssh_alias,verify_daemon_stop,verify_resource_inventory,verify_host_snapshot,type(self),profile)
             def drain(stderr_fd=fd):
                 size=0
                 try:
@@ -110,7 +123,7 @@ class OwnedRecoverySSHSessionV3:
                             if size>1024*1024:self._errors.append('stderr-bound');return
                 except Exception:self._errors.append('stderr-io')
             self._reader=threading.Thread(target=drain,daemon=True);self._reader.start();fd=None
-            self._send('initial',dict(entrypoint=loader.MANAGER_ENTRYPOINT,sourceSha=source_sha,
+            self._send('initial',dict(entrypoint=loader.MANAGER_ENTRYPOINT if profile is profiles.NORMAL else loader.RESPONSE_LOSS_MANAGER_ENTRYPOINT,sourceSha=source_sha,
                 archiveDigest=self.archive_digest,hostId=ssh_alias,channelNonce=self.nonce,
                 archiveBase64=base64.b64encode(archive).decode('ascii'),
                 **({'verifyDaemonStop':True} if verify_daemon_stop else {}),
@@ -131,7 +144,9 @@ class OwnedRecoverySSHSessionV3:
                             for k in ('beforeDigest','endpointDigest'))):reject()
                 self._host_baseline=encode(descriptor)
             binding=bound['binding']
-            if (type(binding) is not dict or set(binding)!={'unit','kernelBoot','invocationId','sourceSha','archiveDigest','hostId'}
+            if (type(binding) is not dict or set(binding)!={'unit','kernelBoot','invocationId','sourceSha','archiveDigest','hostId'}|(
+                    {'diagnosticProfile'} if profile is profiles.RESPONSE_LOSS else set())
+                    or profile is profiles.RESPONSE_LOSS and binding['diagnosticProfile']!=profiles.RESPONSE_LOSS_MARKER
                     or binding['sourceSha']!=source_sha or binding['archiveDigest']!=self.archive_digest or binding['hostId']!=ssh_alias
                     or type(binding['unit']) is not str or not re.fullmatch('dw-writer-host-[0-9a-f]{16}\\.service',binding['unit'])
                     or type(binding['invocationId']) is not str or not re.fullmatch('[0-9a-f]{32}',binding['invocationId'])
@@ -154,9 +169,14 @@ class OwnedRecoverySSHSessionV3:
                 _note_cleanup_failure(primary)
             raise
 
+    @property
+    def diagnostic_profile(self):
+        return profiles.marker(self._profile)
+
     def _capture_cleanup_report(self):
         process=self._process
         self._cleanup_snapshot=encode(dict(schemaVersion=1,sourceSha=self.source_sha,
+            **({'diagnosticProfile':self.diagnostic_profile} if self._profile is profiles.RESPONSE_LOSS else {}),
             archiveDigest=self.archive_digest,hostId=self.host_id,closed=self._closed,
             completionPathSucceeded=self._completion_path_succeeded,
             managerReceiptVerified=self._finished,
@@ -211,7 +231,11 @@ class OwnedRecoverySSHSessionV3:
         self._send('manager-start')
 
     def send_worker(self,frame):
+        issued(self)
         if self._early_terminal is not None or not self._started or type(frame) is not dict or frame.get('channelNonce')!=self.nonce:reject()
+        if self._profile is profiles.RESPONSE_LOSS and frame.get('kind')=='consume-intent':
+            if self._diagnostic_consumed:reject()
+            self._diagnostic_consumed=True  # Partial sends cannot be retried.
         self._send('worker-frame',frame=frame)
 
     def receive_worker(self,limit=900):
@@ -233,6 +257,7 @@ class OwnedRecoverySSHSessionV3:
         frame=value['frame']
         if type(frame) is not dict or frame.get('channelNonce')!=self.nonce or type(frame.get('kind')) is not str:reject()
         if self._awaiting_daemon_hello:self._match_daemon_hello(frame)
+        if self._profile is profiles.RESPONSE_LOSS and frame['kind'] in ('recovery-prepared-private','final'):reject()
         return frame
 
     def _match_daemon_hello(self,frame):
@@ -317,7 +342,7 @@ class OwnedRecoverySSHSessionV3:
 
     def complete(self):
         issued(self)
-        if not self._started or self._finished or self._early_terminal is not None:reject()
+        if self._profile is profiles.RESPONSE_LOSS or not self._started or self._finished or self._early_terminal is not None:reject()
         self._terminal(self._receive(60 if self.verify_host_snapshot else 30),business=True)
         self._exit()
         self._completion_path_succeeded=True
@@ -345,6 +370,7 @@ class OwnedRecoverySSHSessionV3:
     def close(self):
         if (os.getpid(),threading.get_ident())!=(self._pid,self._thread):reject()
         if self._closed:return
+        issued(self)
         failure=None
         try:
             if not self._finished and self._binding is not None:
@@ -383,3 +409,7 @@ class OwnedRecoverySSHSessionV3:
                 if failure is None:failure=error
                 else:_note_cleanup_failure(failure)
         if failure is not None:raise failure
+
+
+class ResponseLossSSHSessionV3(OwnedRecoverySSHSessionV3):
+    """Issued fixed diagnostic profile; never completes business or recovery."""

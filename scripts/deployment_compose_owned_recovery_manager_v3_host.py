@@ -17,11 +17,14 @@ import time
 
 from deployment_compose_history_v3_host import pairs
 from deployment_compose_operation_witness_client_v3 import encode
-from deployment_compose_owned_recovery_ssh_v3_host import ENTRYPOINT, MANAGER_ENTRYPOINT
-from deployment_compose_owned_recovery_unit_v3_host import OwnedRecoveryUnitV3
+from deployment_compose_owned_recovery_ssh_v3_host import (ENTRYPOINT, MANAGER_ENTRYPOINT,
+    RESPONSE_LOSS_ENTRYPOINT, RESPONSE_LOSS_MANAGER_ENTRYPOINT)
+from deployment_compose_owned_recovery_unit_v3_host import OwnedRecoveryUnitV3, ResponseLossUnitV3
 from deployment_compose_recovery_daemon_v3_host import ObservedRecoveryDaemonV3
 from deployment_compose_host_snapshot_v3_host import HostSnapshotV3
 from deployment_compose_v3_channel_worker import LIMIT, write_frame
+
+import deployment_compose_recovery_profiles_v3_host as profiles
 
 INNER_LIMIT = LIMIT-1024
 
@@ -61,11 +64,19 @@ class _Frames:
 
 
 def run(config, stdin, stdout, archive, *, timeout=3600):
+    return _run(config,stdin,stdout,archive,timeout=timeout,_profile=profiles.NORMAL)
+
+
+def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
     """One wrapper, one start command, no protocol/consumption retry.
 
     manager-stop terminates only the bound wrapper. A terminal envelope is
     lifecycle data for the owned channel, never business completion or authority.
     """
+    profile_marker=profiles.marker(_profile)
+    diagnostic=_profile is profiles.RESPONSE_LOSS
+    expected_manager=RESPONSE_LOSS_MANAGER_ENTRYPOINT if diagnostic else MANAGER_ENTRYPOINT
+    expected_worker=RESPONSE_LOSS_ENTRYPOINT if diagnostic else ENTRYPOINT
     verify_daemon=type(config) is dict and 'verifyDaemonStop' in config
     verify_resources=type(config) is dict and 'verifyResourceInventory' in config
     verify_host=type(config) is dict and 'verifyHostSnapshot' in config
@@ -76,7 +87,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             or verify_daemon and config['verifyDaemonStop'] is not True
             or verify_resources and (config['verifyResourceInventory'] is not True or not verify_daemon)
             or verify_host and (config['verifyHostSnapshot'] is not True or not verify_resources or not verify_daemon)
-            or config['entrypoint']!=MANAGER_ENTRYPOINT
+            or config['entrypoint']!=expected_manager
             or type(config['channelNonce']) is not str or not re.fullmatch('[0-9a-f]{64}',config['channelNonce'])
             or type(config['sourceSha']) is not str or not re.fullmatch('[0-9a-f]{40}',config['sourceSha'])
             or type(config['archiveDigest']) is not str or not re.fullmatch('[0-9a-f]{64}',config['archiveDigest'])
@@ -86,7 +97,8 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=3600):reject()
     # Freeze before the owner is created; an embedding cannot mutate later sends.
     config = json.loads(encode(config))
-    owner = OwnedRecoveryUnitV3(config['archiveDigest'],config['sourceSha'])
+    owner_type=ResponseLossUnitV3 if diagnostic else OwnedRecoveryUnitV3
+    owner = owner_type(config['archiveDigest'],config['sourceSha'])
     process = thread = None
     daemon=None
     host=None;host_before=None;host_after=None
@@ -121,6 +133,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
             os.set_blocking(stream.fileno(),False)
         binding = dict(unit=owner.unit,kernelBoot=owner._boot_id,invocationId=owner._invocation,
             sourceSha=config['sourceSha'],archiveDigest=config['archiveDigest'],hostId=config['hostId'])
+        if diagnostic:binding['diagnosticProfile']=profile_marker
         def drain():
             size=0
             try:
@@ -208,7 +221,7 @@ def run(config, stdin, stdout, archive, *, timeout=3600):
                             reason='requested-stop';break
                         if kind=='manager-start' and set(frame)=={'kind','channelNonce'} and not start_requested:
                             initial=dict({k:v for k,v in config.items() if k not in ('verifyDaemonStop','verifyResourceInventory','verifyHostSnapshot')},
-                                entrypoint=ENTRYPOINT,archiveBase64=base64.b64encode(archive).decode('ascii'))
+                                entrypoint=expected_worker,archiveBase64=base64.b64encode(archive).decode('ascii'))
                             queue('worker',initial)
                             start_requested=True
                         elif kind=='worker-frame' and set(frame)=={'kind','channelNonce','frame'} and start_requested:

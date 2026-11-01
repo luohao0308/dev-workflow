@@ -33,6 +33,15 @@ class UnitTests(unittest.TestCase):
         self.owner=unit.OwnedRecoveryUnitV3('b'*64,'c'*40)
         self.group=self.root/'system.slice'/self.owner.unit
 
+    def test_diagnostic_unit_changes_only_fixed_loader_before_start(self):
+        diagnostic=unit.ResponseLossUnitV3('b'*64,'c'*40)
+        self.addCleanup(diagnostic._release_fds)
+        self.assertIsNone(diagnostic._process)
+        self.assertIn('deployment_compose_response_loss_worker_v3_host.run',diagnostic._code)
+        self.assertNotIn('deployment_compose_owned_recovery_worker_v3_host.run',diagnostic._code)
+        self.assertIn('deployment_compose_owned_recovery_worker_v3_host.run',self.owner._code)
+        self.assertFalse(diagnostic._attempted)
+
     def reap(self):
         if self.process is not None:
             if self.process.poll() is None:self.process.kill();self.process.wait(timeout=5)

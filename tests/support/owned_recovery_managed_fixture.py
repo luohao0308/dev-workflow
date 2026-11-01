@@ -12,6 +12,8 @@ ROOT=Path(__file__).resolve().parents[2]
 sys.path[:0]=[str(ROOT/p) for p in ('scripts','packs/deployment/scripts','packs/release/scripts')]
 from deployment_compose_v3_channel_worker import read_frame,write_frame
 import deployment_compose_owned_recovery_manager_v3_host as manager
+import deployment_compose_recovery_profiles_v3_host as profiles
+import deployment_compose_owned_recovery_ssh_v3_host as loader
 
 
 def child(attack,engine):
@@ -22,6 +24,8 @@ def child(attack,engine):
     if attack.startswith('simple'):
         if attack=='simple-no-hello':return
         write_frame(sys.stdout.buffer,dict(kind='hello',channelNonce=initial['channelNonce'],root=engine,daemonId='daemon-one'))
+        if attack in ('simple-recovery-frame','simple-final-frame'):
+            write_frame(sys.stdout.buffer,dict(kind='recovery-prepared-private' if attack=='simple-recovery-frame' else 'final',channelNonce=initial['channelNonce']))
         if attack=='simple-worker-terminal':
             write_frame(sys.stdout.buffer,dict(kind='manager-stopped',channelNonce=initial['channelNonce']))
         if attack.startswith('simple-resource'):
@@ -41,6 +45,7 @@ def child(attack,engine):
         if attack=='simple-daemon-wait':time.sleep(30)
         return
     root=Path(engine);root.mkdir(mode=0o700,exist_ok=True)
+    initial['entrypoint']=manager.ENTRYPOINT
     config=root/'managed-config.json';config.write_text(json.dumps(initial));config.chmod(0o600)
     import os
     os.execv(sys.executable,[sys.executable,str(ROOT/'tests/support/owned_recovery_controller_fixture.py'),attack,engine,str(config)])
@@ -93,6 +98,10 @@ def main(attack,engine):
     original=manager.write_frame
     original_encode=manager.encode
     def control(value):
+        if type(value) is dict and value.get('kind')=='manager-bound':
+            if attack=='simple-profile-missing':value['binding'].pop('diagnosticProfile',None)
+            if attack=='simple-profile-wrong':value['binding']['diagnosticProfile']='wrong-profile'
+            if attack=='simple-profile-normal':value['binding']['diagnosticProfile']=profiles.RESPONSE_LOSS_MARKER
         if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-daemon-downgrade':
             value.pop('verifyDaemonStop',None)
         if type(value) is dict and value.get('kind')=='manager-bound' and attack=='simple-resource-downgrade':
@@ -109,6 +118,7 @@ def main(attack,engine):
         return original_encode(value)
     def output(stream,value,**kwargs):
         if value.get('kind')=='manager-stopped':
+            if attack=='simple-profile-terminal':value['binding']=dict(value['binding'],diagnosticProfile='wrong-profile')
             if attack=='simple-terminal-missing':return
             if attack=='simple-terminal-bool':value['transportReturncode']=False
             if attack=='simple-terminal-binding':value['binding']=dict(value['binding'],invocationId='9'*32)
@@ -121,10 +131,12 @@ def main(attack,engine):
             if attack=='simple-resource-host-flag':value['hostSnapshotUnchangedVerified']=False
             if attack=='simple-resource-host-binding':value['hostSnapshotBaseline']=dict(value['hostSnapshotBaseline'],endpointDigest='9'*64)
         return original(stream,value,**kwargs)
-    with patch.object(manager,'OwnedRecoveryUnitV3',Owner),patch.object(manager,'ObservedRecoveryDaemonV3',Daemon),\
+    with patch.object(manager,'OwnedRecoveryUnitV3',Owner),patch.object(manager,'ResponseLossUnitV3',Owner,create=True),patch.object(manager,'ObservedRecoveryDaemonV3',Daemon),\
             patch.object(manager,'HostSnapshotV3',Host),patch.object(manager,'write_frame',side_effect=output),\
             patch.object(manager,'encode',side_effect=control):
-        manager.run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90)
+        if initial['entrypoint']==loader.MANAGER_ENTRYPOINT:
+            manager.run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90)
+        else:manager._run(initial,sys.stdin.buffer,sys.stdout.buffer,archive,timeout=90,_profile=profiles.RESPONSE_LOSS)
     if attack=='simple-terminal-extra':write_frame(sys.stdout.buffer,dict(kind='extra',channelNonce=initial['channelNonce']))
     if attack=='simple-ssh-nonzero':raise SystemExit(7)
 

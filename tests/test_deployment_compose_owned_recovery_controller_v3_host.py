@@ -18,6 +18,18 @@ import deployment_compose_owned_recovery_controller_v3_host as controller
 from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcceptanceCase
 
 
+class ProfilePolicyTests(unittest.TestCase):
+    def test_diagnostic_context_separates_policy_hash_and_preserves_normal_contract(self):
+        from deployment_compose_recovery_profiles_v3_host import RESPONSE_LOSS_MARKER
+        hello=dict(sourceSha='a'*40,daemonId='same-daemon')
+        normal=controller._policy_scope_hash(hello,None)
+        self.assertEqual(normal,controller.live.digest(hello))
+        self.assertNotEqual(normal,controller._policy_scope_hash(hello,RESPONSE_LOSS_MARKER))
+        self.assertEqual(hello,dict(sourceSha='a'*40,daemonId='same-daemon'))
+        for marker in (True,{},'normal','response-unobserved-v2'):
+            with self.subTest(marker=marker),self.assertRaises(ValueError):controller._policy_scope_hash(hello,marker)
+
+
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),'POSIX/OpenSSL/OpenSSH required')
 class ControllerTests(unittest.TestCase):
     def drive(self,attack='',*,review_attack=None,timeout=60):

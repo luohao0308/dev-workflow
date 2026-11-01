@@ -1,7 +1,7 @@
 """Fixed private response-unobserved diagnostic leaf; not a normal manager entry.
 
-No current session/manager launches this leaf. A distinct acknowledged profile
-is required before real acceptance. Request return means dispatch, not commit.
+Only the distinct profile-bound diagnostic session/manager launches this leaf.
+The normal route cannot select it. Request return means dispatch, not commit.
 """
 import http.client
 import os

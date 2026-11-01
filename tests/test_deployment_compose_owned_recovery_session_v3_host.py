@@ -26,7 +26,7 @@ from tests.test_deployment_compose_live_controller_flow_v3_host import LocalAcce
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
     'POSIX/OpenSSL/OpenSSH required')
 class SessionTests(unittest.TestCase):
-    def open(self,attack='',*,verify_daemon=False,verify_resources=False,verify_host=False):
+    def open(self,attack='',*,verify_daemon=False,verify_resources=False,verify_host=False,diagnostic=False):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         self.root=Path(temp.name).resolve();self.root.chmod(0o700)
         self.engine='/var/tmp/dw-engine-'+secrets.token_hex(8)
@@ -37,9 +37,11 @@ class SessionTests(unittest.TestCase):
             self.argv=argv
             return subprocess.Popen([sys.executable,'-u',str(ROOT/'tests/support/owned_recovery_managed_fixture.py'),attack,self.engine],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
-        with patch.object(session_module.loader,'published_manager_archive',return_value=b'fixture-code'),\
+        publisher='published_response_loss_manager_archive' if diagnostic else 'published_manager_archive'
+        cls=session_module.ResponseLossSSHSessionV3 if diagnostic else session_module.OwnedRecoverySSHSessionV3
+        with patch.object(session_module.loader,publisher,return_value=b'fixture-code'),\
                 patch.object(session_module,'_spawn',side_effect=spawn):
-            self.session=session_module.OwnedRecoverySSHSessionV3(self.root,'host-one','b'*40,
+            self.session=cls(self.root,'host-one','b'*40,
                 timeout=60 if verify_host else 30,verify_daemon_stop=verify_daemon,
                 verify_resource_inventory=verify_resources,verify_host_snapshot=verify_host)
         created=self.session
@@ -51,8 +53,91 @@ class SessionTests(unittest.TestCase):
     def close_session(self):
         try:self.session.close()
         except Exception:pass
-    def drive(self,attack='',review_failure=False,verify_daemon=False,verify_resources=False,verify_host=False):
-        session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources,verify_host=verify_host)
+
+    def test_diagnostic_profile_receipt_is_distinct_and_cleanup_only(self):
+        session=self.open('simple',diagnostic=True)
+        self.assertEqual(session.diagnostic_profile,'response-unobserved-v3')
+        session.close();report=session.cleanup_report()
+        self.assertTrue(report['managerReceiptVerified'])
+        self.assertEqual(report['diagnosticProfile'],'response-unobserved-v3')
+        self.assertFalse(report['completionPathSucceeded'])
+
+    def test_profile_substitution_is_rejected_at_start_and_terminal(self):
+        for attack in ('simple-profile-missing','simple-profile-wrong'):
+            with self.subTest(attack=attack),self.assertRaises(ValueError):self.open(attack,diagnostic=True)
+        with self.assertRaises(ValueError):self.open('simple-profile-normal')
+        session=self.open('simple-profile-terminal',diagnostic=True)
+        with self.assertRaises(ValueError):session.close()
+        self.assertFalse(session.cleanup_report()['managerReceiptVerified'])
+
+    def test_diagnostic_business_and_second_consumption_are_blocked(self):
+        for attack in ('simple-recovery-frame','simple-final-frame'):
+            with self.subTest(attack=attack):
+                session=self.open(attack,diagnostic=True);session.begin(15);session.receive_worker()
+                with self.assertRaises(ValueError):session.receive_worker()
+                with self.assertRaises(ValueError):session.complete()
+                self.close_session()
+        session=self.open('simple-daemon-wait',diagnostic=True);session.begin(15);session.receive_worker()
+        frame=dict(kind='consume-intent',channelNonce=session.nonce)
+        with patch.object(session,'_send',side_effect=BrokenPipeError):
+            with self.assertRaises(BrokenPipeError):session.send_worker(frame)
+        with self.assertRaises(ValueError):session.send_worker(frame)
+        self.close_session()
+
+    def test_diagnostic_issuer_freezes_type_profile_pid_and_thread(self):
+        session=self.open('simple',diagnostic=True)
+        self.assertIs(session_module.issued(session),session)
+        with self.assertRaises(ValueError):session_module.issued(copy.copy(session))
+        cls=type(session);session.__class__=session_module.OwnedRecoverySSHSessionV3
+        with self.assertRaises(ValueError):session_module.issued(session)
+        session.__class__=cls
+        profile=session._profile;session._profile=session_module.profiles.NORMAL
+        with self.assertRaises(ValueError):session_module.issued(session)
+        session._profile=profile
+        with patch.object(session_module.os,'getpid',return_value=os.getpid()+1):
+            with self.assertRaises(ValueError):session_module.issued(session)
+        with patch.object(session_module.threading,'get_ident',return_value=-1):
+            with self.assertRaises(ValueError):session.send_worker(dict(kind='consume-intent',channelNonce=session.nonce))
+        self.assertFalse(session._diagnostic_consumed)
+        class Unissued(session_module.ResponseLossSSHSessionV3):pass
+        with patch.object(session_module.loader,'published_response_loss_manager_archive') as fetch:
+            with self.assertRaises(ValueError):Unissued(self.root,'host-one','b'*40)
+            fetch.assert_not_called()
+        session.close()
+
+    def test_unissued_close_cannot_dispose_the_original_live_session(self):
+        session=self.open('simple',diagnostic=True);clone=copy.copy(session)
+        with self.assertRaises(ValueError):clone.close()
+        self.assertIsNone(session._process.poll());self.assertFalse(session._closed)
+        cls=type(session);session.__class__=session_module.OwnedRecoverySSHSessionV3
+        with self.assertRaises(ValueError):session.close()
+        session.__class__=cls
+        profile=session._profile;session._profile=session_module.profiles.NORMAL
+        with self.assertRaises(ValueError):session.close()
+        session._profile=profile
+        self.assertIsNone(session._process.poll());session.close()
+
+    def test_diagnostic_controller_rejects_recovery_before_second_review(self):
+        with self.assertRaises(ValueError):self.drive(diagnostic=True)
+        self.assertEqual([r.operation for r in self.owner.reviewed],['deploy'])
+        self.assertFalse(self.session.cleanup_report()['completionPathSucceeded'])
+        hello=dict(root=self.engine,daemonId='daemon-one',writerCertificateSha256='a'*64,
+            serverCertificateSha256='c'*64,sourceSha=self.session.source_sha,
+            archiveDigest=self.session.archive_digest,hostId=self.session.host_id)
+        self.assertEqual(self.admission._policy.scope_hash,
+            controller._policy_scope_hash(hello,session_module.profiles.RESPONSE_LOSS_MARKER))
+        self.assertNotEqual(self.admission._policy.scope_hash,controller.live.digest(hello))
+        self.assertEqual(self.admission._root['request'].policy_hash,self.admission._policy.identity_hash())
+
+    def test_diagnostic_early_terminal_keeps_profile_and_cleanup_proofs(self):
+        session=self.open('simple',diagnostic=True);session.begin(15);session.receive_worker()
+        with self.assertRaises(ValueError):session.receive_worker()
+        session.close();report=session.cleanup_report()
+        self.assertTrue(report['managerReceiptVerified'])
+        self.assertEqual(report['diagnosticProfile'],'response-unobserved-v3')
+        self.assertFalse(report['completionPathSucceeded'])
+    def drive(self,attack='',review_failure=False,verify_daemon=False,verify_resources=False,verify_host=False,diagnostic=False):
+        session=self.open(attack,verify_daemon=verify_daemon,verify_resources=verify_resources,verify_host=verify_host,diagnostic=diagnostic)
         self.owner=SimpleNamespace(reviewed=[]);base=LocalAcceptanceCase.review_adapter(self.owner)
         self.closed=0;owner=self
         original_admission=controller.MacLiveAdmissionV3

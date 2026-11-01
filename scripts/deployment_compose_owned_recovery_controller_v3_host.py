@@ -35,6 +35,13 @@ def reject():
     raise ValueError('compose-owned-recovery-controller-v3-rejected') from None
 
 
+def _policy_scope_hash(hello,diagnostic_profile):
+    if diagnostic_profile is None:return live.digest(hello)
+    from deployment_compose_recovery_profiles_v3_host import RESPONSE_LOSS_MARKER
+    if type(diagnostic_profile) is not str or diagnostic_profile!=RESPONSE_LOSS_MARKER:reject()
+    return live.digest(dict(hello=hello,diagnosticProfile=diagnostic_profile))
+
+
 def _receive(stream, deadline, errors):
     """A single frame deadline, with prompt private stderr failure detection."""
     def exact(size):
@@ -186,7 +193,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                         or any(type(data[k]) is not str or not re.fullmatch('[0-9a-f]{64}',data[k])
                             for k in ('writerCertificateSha256','serverCertificateSha256'))):reject()
                 hello = data
-                policy = GatePolicy(case.name,'recovery-gate-v3',live.digest(hello),
+                policy = GatePolicy(case.name,'recovery-gate-v3',
+                    _policy_scope_hash(hello,_managed.diagnostic_profile if managed else None),
                     hello['writerCertificateSha256'],True,'0'*64,
                     hashlib.sha256(key_material(public)).hexdigest(),operation_profile='compose-v3')
                 admission = MacLiveAdmissionV3(store=store,gate_policy=policy,gate_key=gate_key,

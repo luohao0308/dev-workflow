@@ -116,6 +116,44 @@ class LoaderTests(unittest.TestCase):
                     self.assertEqual(json.loads(result.stdout),dict(entrypoint=recovery.RESPONSE_LOSS_ENTRYPOINT))
                 else:self.assertNotEqual(result.returncode,0)
 
+    def test_diagnostic_manager_loader_and_argv_are_fixed(self):
+        argv=recovery.response_loss_manager_ssh_argv('linux-test','a'*64,'b'*40)
+        self.assertEqual(argv[:-1],recovery.manager_ssh_argv('linux-test','a'*64,'b'*40)[:-1])
+        code=shlex.split(argv[-1])[-1];compile(code,'<diagnostic-manager>','exec')
+        self.assertIn(recovery.RESPONSE_LOSS_MANAGER_ENTRYPOINT,code)
+        self.assertNotIn(recovery.RESPONSE_LOSS_ENTRYPOINT,code)
+        with patch.object(recovery,'response_loss_bootstrap',return_value='drift'):
+            with self.assertRaises(ValueError):recovery.response_loss_manager_bootstrap('a'*64,'b'*40)
+
+    def test_diagnostic_manager_archive_requires_manager_and_profile_closure(self):
+        needed=['scripts/deployment_compose_response_loss_manager_v3_host.py',
+                'scripts/deployment_compose_recovery_profiles_v3_host.py']
+        for count in range(3):
+            output=io.BytesIO()
+            with zipfile.ZipFile(output,'w') as archive:
+                for name in needed[:count]:archive.writestr(name,'')
+            raw=output.getvalue()
+            with patch.object(recovery,'published_response_loss_archive',return_value=raw) as fetch:
+                if count==2:self.assertEqual(recovery.published_response_loss_manager_archive('b'*40),raw)
+                else:
+                    with self.assertRaises(ValueError):recovery.published_response_loss_manager_archive('b'*40)
+                fetch.assert_called_once_with('b'*40)
+
+    @unittest.skipUnless(os.name=='posix','bootstrap uses POSIX pipe selectors')
+    def test_diagnostic_manager_loader_passes_same_archive_and_rejects_normal_entry(self):
+        toy="def run(config,stdin,stdout,archive):\n import hashlib,json\n stdout.write(json.dumps({'entrypoint':config['entrypoint'],'digest':hashlib.sha256(archive).hexdigest()}).encode());stdout.flush()\n"
+        raw=self.archive(('scripts/deployment_compose_response_loss_manager_v3_host.py',toy))
+        digest=hashlib.sha256(raw).hexdigest()
+        for entry in (recovery.RESPONSE_LOSS_MANAGER_ENTRYPOINT,recovery.MANAGER_ENTRYPOINT):
+            config=dict(archiveBase64=base64.b64encode(raw).decode(),archiveDigest=digest,sourceSha='b'*40,entrypoint=entry)
+            payload=json.dumps(config).encode()
+            result=subprocess.run([sys.executable,'-I','-u','-c',recovery.response_loss_manager_bootstrap(digest,'b'*40)],
+                input=struct.pack('!I',len(payload))+payload,capture_output=True,timeout=10)
+            if entry==recovery.RESPONSE_LOSS_MANAGER_ENTRYPOINT:
+                self.assertEqual(result.returncode,0,result.stderr)
+                self.assertEqual(json.loads(result.stdout),dict(entrypoint=entry,digest=digest))
+            else:self.assertNotEqual(result.returncode,0)
+
     def test_manager_archive_requires_manager_unit_and_daemon_observer(self):
         for names in ([],['scripts/deployment_compose_owned_recovery_manager_v3_host.py'],
                 ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',
@@ -132,13 +170,20 @@ class LoaderTests(unittest.TestCase):
                  'scripts/deployment_compose_recovery_daemon_v3_host.py',
                  'scripts/deployment_compose_resource_inventory_v3_host.py',
                  'scripts/deployment_compose_host_snapshot_v3_host.py',
-                 'scripts/deployment_compose_host_commands_v3_host.py']):
+                 'scripts/deployment_compose_host_commands_v3_host.py'],
+                ['scripts/deployment_compose_owned_recovery_manager_v3_host.py',
+                 'scripts/deployment_compose_owned_recovery_unit_v3_host.py',
+                 'scripts/deployment_compose_recovery_daemon_v3_host.py',
+                 'scripts/deployment_compose_resource_inventory_v3_host.py',
+                 'scripts/deployment_compose_host_snapshot_v3_host.py',
+                 'scripts/deployment_compose_host_commands_v3_host.py',
+                 'scripts/deployment_compose_recovery_profiles_v3_host.py']):
             output=io.BytesIO()
             with zipfile.ZipFile(output,'w') as archive:
                 for name in names:archive.writestr(name,'')
             raw=output.getvalue()
             with patch.object(recovery,'published_recovery_archive',return_value=raw) as fetch:
-                if len(names)==6:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
+                if len(names)==7:self.assertEqual(recovery.published_manager_archive('b'*40),raw)
                 else:
                     with self.assertRaises(ValueError):recovery.published_manager_archive('b'*40)
                 fetch.assert_called_once_with('b'*40)

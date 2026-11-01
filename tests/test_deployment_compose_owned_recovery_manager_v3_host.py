@@ -26,7 +26,7 @@ NONCE='1'*64
 def worker(mode):
     if mode=='blocked-input':time.sleep(30);return
     initial=read_frame(sys.stdin.buffer)
-    assert initial['entrypoint']==manager.ENTRYPOINT
+    assert initial['entrypoint']==(manager.RESPONSE_LOSS_ENTRYPOINT if mode=='diagnostic' else manager.ENTRYPOINT)
     assert base64.b64decode(initial['archiveBase64'])==ARCHIVE
     if mode=='stderr-overflow':
         sys.stderr.buffer.write(b'x'*(1024*1024+1));sys.stderr.buffer.flush();time.sleep(30);return
@@ -65,10 +65,13 @@ def fixture(mode,state):
             for stream in (self.process.stdin,self.process.stdout,self.process.stderr):stream.close()
             self.record()
         def close(self):self._discard_local()
-    config=dict(entrypoint=manager.MANAGER_ENTRYPOINT,channelNonce=NONCE,sourceSha='b'*40,
+    config=dict(entrypoint=manager.RESPONSE_LOSS_MANAGER_ENTRYPOINT if mode=='diagnostic' else manager.MANAGER_ENTRYPOINT,channelNonce=NONCE,sourceSha='b'*40,
         archiveDigest=hashlib.sha256(ARCHIVE).hexdigest(),hostId='host-one')
-    with patch.object(manager,'OwnedRecoveryUnitV3',Owner):
-        manager.run(config,sys.stdin.buffer,sys.stdout.buffer,ARCHIVE,timeout=5)
+    with patch.object(manager,'OwnedRecoveryUnitV3',Owner),patch.object(manager,'ResponseLossUnitV3',Owner):
+        if mode=='diagnostic':
+            import deployment_compose_response_loss_manager_v3_host as diagnostic
+            diagnostic.run(config,sys.stdin.buffer,sys.stdout.buffer,ARCHIVE,timeout=5)
+        else:manager.run(config,sys.stdin.buffer,sys.stdout.buffer,ARCHIVE,timeout=5)
 
 
 @unittest.skipUnless(os.name=='posix','POSIX pipe selectors required')
@@ -96,8 +99,33 @@ class ManagerTests(unittest.TestCase):
         else:self.assertNotEqual(code,0)
         return json.loads(self.state.read_text())
 
+    def test_diagnostic_route_acknowledges_profile_and_pins_worker_entry(self):
+        self.start('diagnostic')
+        self.assertEqual(self.bound['binding']['diagnosticProfile'],'response-unobserved-v3')
+        self.send('manager-start');self.assertEqual(self.receive()['frame']['kind'],'hello')
+        self.send('worker-frame',frame=dict(kind='configure',channelNonce=NONCE))
+        self.assertEqual(self.receive()['frame']['kind'],'final')
+        terminal=self.receive();self.assertEqual(terminal['binding'],self.bound['binding'])
+        self.done()
+
+    def test_profile_identity_and_wrong_fixed_entry_fail_before_owner_creation(self):
+        config=dict(entrypoint=manager.MANAGER_ENTRYPOINT,channelNonce=NONCE,sourceSha='b'*40,
+            archiveDigest=hashlib.sha256(ARCHIVE).hexdigest(),hostId='host-one')
+        with patch.object(manager,'OwnedRecoveryUnitV3') as normal,patch.object(manager,'ResponseLossUnitV3') as diagnostic:
+            for profile in (None,'response-unobserved-v3',object(),{}):
+                with self.assertRaises(ValueError):manager._run(config,None,None,ARCHIVE,_profile=profile)
+            with self.assertRaises(ValueError):manager._run(config,None,None,ARCHIVE,_profile=manager.profiles.RESPONSE_LOSS)
+            config['entrypoint']=manager.RESPONSE_LOSS_MANAGER_ENTRYPOINT
+            with self.assertRaises(ValueError):manager.run(config,None,None,ARCHIVE)
+            for key in ('diagnosticProfile','faultMode','program','connector'):
+                with self.assertRaises(ValueError):
+                    manager._run(dict(config,**{key:'response-unobserved-v3'}),None,None,ARCHIVE,
+                        _profile=manager.profiles.RESPONSE_LOSS)
+            normal.assert_not_called();diagnostic.assert_not_called()
+
     def test_bound_then_stop_never_starts_worker_archive(self):
         self.start();self.send('manager-stop')
+        self.assertNotIn('diagnosticProfile',self.bound['binding'])
         result=self.receive()
         self.assertEqual(result['kind'],'manager-stopped')
         self.assertEqual(result['binding'],self.bound['binding'])
