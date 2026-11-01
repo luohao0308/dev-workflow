@@ -226,8 +226,21 @@ class ObservedRecoveryDaemonV3:
         self._check()
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=10:reject()
         deadline=time.monotonic()+timeout
-        for _ in range(2):
+        confirmed=0
+        while confirmed<2:
+            units._left(deadline)
             value=self._state(deadline)
+            if value['ActiveState'] in ('active','deactivating'):
+                # Parent death initiates asynchronous supervisor teardown. Wait
+                # for this same service, never start/stop/rebind or reset time.
+                if (value['LoadState']!='loaded' or value['InvocationID']!=self._invocation
+                        or value['ControlGroup']!=self._group or value['Delegate']!='yes'
+                        or value['MainPID'] not in ('0',str(self._main[0]))):reject()
+                self._same_group()  # An absent group can be normal stop progress.
+                if value['MainPID']!='0' and _ticks(self._main[0]) not in (None,self._main[1]):reject()
+                confirmed=0
+                time.sleep(min(.1,units._left(deadline)))
+                continue
             if not units.OwnedRecoveryUnitV3._absent(value):
                 if (value['LoadState']!='loaded' or value['ActiveState'] not in ('inactive','failed')
                         or value['MainPID']!='0' or value['InvocationID'] not in ('',self._invocation)
@@ -235,6 +248,7 @@ class ObservedRecoveryDaemonV3:
             if self._same_group() and events(self._read('cgroup.events'))['populated']!=0:reject()
             for pid,ticks in (self._main,self._daemon):
                 if _ticks(pid)==ticks:reject()
+            confirmed+=1
         units._left(deadline)
         return None
 

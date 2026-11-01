@@ -137,6 +137,61 @@ class DaemonTests(unittest.TestCase):
     def test_collected_unit_with_bound_group_absent_is_accepted(self):
         value=self.observe();self.stopped();self.collected=True;shutil.rmtree(self.group)
         value.verify_stopped()
+
+    def test_stop_observation_waits_for_original_service_with_one_deadline(self):
+        value=self.observe();read=value._state;calls=[]
+        def transition(deadline):
+            calls.append(deadline)
+            if len(calls)==2:self.stopped()
+            result=read(deadline)
+            if len(calls)==1:result['ActiveState']='deactivating';result['SubState']='stop-sigterm'
+            return result
+        with patch.object(value,'_state',side_effect=transition),patch.object(daemon.time,'sleep'):
+            value.verify_stopped(timeout=.5)
+        self.assertGreaterEqual(len(calls),3);self.assertEqual(len(set(calls)),1)
+        self.assertTrue(all('stop' not in cmd for cmd in self.calls))
+
+    def test_live_original_service_times_out_without_claiming_stop(self):
+        value=self.observe();start=time.monotonic()
+        with self.assertRaises(ValueError):value.verify_stopped(timeout=.05)
+        self.assertLess(time.monotonic()-start,.5);self.assertTrue(self.active)
+
+    def test_invocation_change_while_waiting_is_rejected(self):
+        value=self.observe();read=value._state;count=[]
+        def transition(deadline):
+            count.append(1)
+            if len(count)==2:self.invocation='b'*32
+            return read(deadline)
+        with patch.object(value,'_state',side_effect=transition),patch.object(daemon.time,'sleep'):
+            with self.assertRaises(ValueError):value.verify_stopped(timeout=.5)
+        self.assertEqual(len(count),2)
+
+    def test_disappearance_between_service_and_process_reads_is_stop_progress(self):
+        value=self.observe();read=value._state;count=[]
+        def transition(deadline):
+            count.append(1);result=read(deadline)
+            if len(count)==1:
+                self.stopped();self.collected=True;shutil.rmtree(self.group)
+            return result
+        with patch.object(value,'_state',side_effect=transition),patch.object(daemon.time,'sleep'):
+            value.verify_stopped(timeout=.5)
+        self.assertGreaterEqual(len(count),3)
+
+    def test_replacement_pid_or_cgroup_during_stop_wait_is_rejected_immediately(self):
+        for attack in ('pid','ticks','group'):
+            with self.subTest(attack=attack):
+                value=self.observe();read=value._state
+                def changed(deadline):
+                    row=read(deadline)
+                    if attack=='pid':row['MainPID']=str(self.main+1)
+                    if attack=='group':
+                        self.group.rename(self.group.with_suffix('.retained'));self.group.mkdir()
+                    return row
+                with patch.object(value,'_state',side_effect=changed),\
+                        patch.object(daemon,'_ticks',return_value=999 if attack=='ticks' else 123),\
+                        patch.object(daemon.time,'sleep') as sleep:
+                    with self.assertRaises(ValueError):value.verify_stopped(timeout=.5)
+                sleep.assert_not_called()
     def test_inactive_zero_mainpid_does_not_hide_descendants_or_escaped_pid(self):
         value=self.observe();self.active=False
         with self.assertRaises(ValueError):value.verify_stopped()
