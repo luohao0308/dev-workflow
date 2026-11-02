@@ -96,3 +96,17 @@ Linux worker严格校验输入与EOF，仅调用原cold.observe_stopped_writer�
 `checkpointBinding`仅为本次请求/回复的相关性绑定，不是Linux独立认证Mac历史。reader路径必须含material/origin artifact/history三摘要且精确匹配；私有低层真实origin-only smoke可传None，但结果须明确`checkpointBound=false`，不能冒称真实checkpoint验收。
 
 验收分两部分：合成checkpoint通过原native callback交付、旧producer退出、新Mac reader调用固定SSH协议（Linux/sysfs为明确替身）的完整接缝与负例；真实发布源码先捕获startup origin并关闭，再由新Mac进程通过严格SSH取得实际Linux停止观测。真实路径无业务checkpoint写入，不发送业务worker归档/config、不启动Engine或消费审批，不将其升级为真实已准入恢复验收。
+
+## 第六切片：独立存活Engine的实时phase适用性
+
+当前managed contract为停止独立daemon、保留磁盘证据，并在PreparationSession.cleanup删除已确认自建容器/网络/卷；unknown写入时拒绝猜测删除。这些默认行为不变。保留root/data/CAS目录不证明资源连续性或可重新启动，已清理scene必须拒绝实时phase捕获。
+
+先为由独立可信fixture owner保持存活的同一Engine/资源现场实现`LiveRecoveryPhaseCaptureV3`。输入原AuthenticatedHistoryV3和已认证checkpoint.baseline_bytes；历史只读transport可由独立Mac见证提供，不把见证store密钥或签名私钥搬入subject Linux。仅接受单服务root deploy的首create闭合前缀，固定原request/bundle/receiptMap/baseline摘要，拒pending/unknown/推进后的history。
+
+GET producer复用原ObservedRecoveryDaemonV3实际Unix连接和SO_PEERCRED/pidfile/socket/root/cgroup身份。新增phase读取从可信bundle/receiptMap推导固定version/info、项目过滤清单、固定container/network/volume GET白名单，预算与deadline共享；不接受任意read_json callback后宣称机器真实性。peer PID/start及PID/net/mount namespace在新capture前后核验，peer namespace需与可信/proc PID视图一致，net/mount不要求等于observer但不可漂移。预期Version/GitCommit来自可信embedding的原解释版本，不能用当前GET自证。
+
+使用原inflate(baseline_bytes)和PhaseGuardV3.capture_phase对下一操作进行两次一致读取，再重验原history、当前endpoint和私有结果。交付可供后续准备器消费的phase bytes及绑定摘要，只声明本次项目phase与认证闭合前缀一致。daemonContinuityVerified、旧writer排他性、恢复/执行权限仍false，不宣称全Engine库存、卷内容或观测后的永久新鲜性。
+
+原RecoveryPreparationHostV3要求重开Linux ComposeRecoveryStore；该CAS使用keys.archive，当前Mac custody只保管gate/store。因此本切片不冒称已接通其新请求签发，不跳过旧CAS校验。后续必须明确checkpoint基线来源的新准备器契约或补CAS密钥保管，并在新请求/精确审批/新消费/尾部CAS之后才开放writer。
+
+正例由独立fixture owner持有Unix Engine与见证服务，在producer退出后让新consumer捕获，再由owner统一清理。负例包括原scene清理/候选丢失、保护资源/网络/卷变化、错peer/socket/daemon/version/root、namespace或history漂移、超限/超时；断言新producer只有GET、零产品写入、零审批消费。Linux/sysfs/systemd/Engine若为替身必须逐项注明，不以模拟连续性冒充真实保留daemon验收。

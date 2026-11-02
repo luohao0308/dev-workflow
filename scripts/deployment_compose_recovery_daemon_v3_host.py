@@ -146,8 +146,10 @@ class ObservedRecoveryDaemonV3:
             return int(value),self._id(info)
         finally:os.close(fd)
 
-    def _request(self,path,deadline,budget=None):
-        if path not in PATHS and path!='/v1.45/info':reject()
+    def _request(self,path,deadline,budget=None,*,phase_paths=None):
+        allowed=PATHS|{'/v1.45/info'} if phase_paths is None else phase_paths
+        if phase_paths is not None and type(phase_paths) is not frozenset:reject()
+        if path not in allowed:reject()
         self._root_same()
         inode=os.stat('docker.sock',dir_fd=self._root_fd,follow_symlinks=False)
         if not stat.S_ISSOCK(inode.st_mode) or inode.st_uid!=_ROOT_UID:reject()
@@ -159,19 +161,50 @@ class ObservedRecoveryDaemonV3:
                 or (pid,file_id)!=self._pid_file_identity):reject()
         connection=_UnixDocker('/proc/self/fd/'+str(self._root_fd)+'/docker.sock',min(5,units._left(deadline)))
         watchdog=None
+        phase_response=None
         try:
             connection.connect()
             watchdog=runtime.deadline_watchdog(connection.sock,min(deadline,time.monotonic()+5))
             peer,uid,_=_peer(connection.sock)
             if peer!=pid or uid!=_ROOT_UID:reject()
             connection.request('GET',path,headers={'Accept':'application/json'})
-            raw,value=_complete_json_response(connection.getresponse())
-            if budget is not None:
+            response=connection.getresponse()
+            if phase_paths is not None:
+                phase_response=response
+                if type(budget) is not list or len(budget)!=1 or type(budget[0]) is not int or budget[0]<0:reject()
+                original_response=response
+                class BudgetResponse:
+                    def __getattr__(self,name):return getattr(original_response,name)
+                    def read1(self,size):
+                        raw=original_response.read1(min(size,budget[0]+1))
+                        budget[0]-=len(raw)
+                        if budget[0]<0:reject()
+                        return raw
+                response=BudgetResponse()
+            raw,value=_complete_json_response(response)
+            if budget is not None and phase_paths is None:
                 budget[0]-=len(raw)
                 if budget[0]<0:reject()
         finally:
-            if watchdog is not None:watchdog.cancel()
-            connection.close()
+            if phase_paths is None:
+                if watchdog is not None:watchdog.cancel()
+                connection.close()
+            else:
+                import sys
+                primary=sys.exc_info()[1]
+                failed=False
+                actions=[]
+                if phase_response is not None:actions.append(lambda:phase_response.close())
+                if watchdog is not None:actions.append(lambda:watchdog.cancel())
+                actions.append(lambda:connection.close())
+                for action in actions:
+                    try:action()
+                    except Exception:failed=True
+                if failed:
+                    if primary is None:reject()
+                    try:
+                        if hasattr(primary,'add_note'):primary.add_note('live phase response cleanup incomplete')
+                    except Exception:pass
         self._root_same()
         if (self._pid_file()!=(pid,file_id)
                 or self._id(os.stat('docker.sock',dir_fd=self._root_fd,follow_symlinks=False))!=self._id(inode)
@@ -217,6 +250,65 @@ class ObservedRecoveryDaemonV3:
         raw=self._resources(time.monotonic()+timeout)
         if raw!=self._resource_baseline:reject()
         return hashlib.sha256(raw).hexdigest()
+
+    def _phase_endpoint(self,deadline,budget,paths,version):
+        from deployment_compose_cold_writer_v3_host import pid_namespace,process_pid_namespace,PROC
+        self._check()
+        self._root_same()
+        root_info=os.fstat(self._root_fd)
+        if root_info.st_uid!=_ROOT_UID or root_info.st_mode&0o777!=0o700:reject()
+        state=self._state(deadline)
+        if (state!=self._live_state or state['ActiveState']!='active' or state['InvocationID']!=self._invocation
+                or state['ControlGroup']!=self._group or int(state['MainPID'])!=self._main[0]
+                or units._pid_identity(state['MainPID'],self._group+'/supervisor')!=self._main
+                or not self._same_group() or self._read('cgroup.type').strip()!='domain'
+                or events(self._read('cgroup.events'))['populated']!=1):reject()
+        info=self._request('/v1.45/info',deadline,budget,phase_paths=paths)
+        if type(info) is not dict or info.get('ID')!=self.daemon_id or info.get('DockerRootDir')!=self.root+'/data':reject()
+        namespace=pid_namespace();daemon_namespace=process_pid_namespace(self._daemon[0])
+        if namespace!=daemon_namespace:reject()
+        def ns(name):
+            info=os.stat(PROC/str(self._daemon[0])/'ns'/name)
+            return [info.st_dev,info.st_ino]
+        value=dict(daemonBinding=self.binding(),pidNamespace=list(namespace),daemonPidNamespace=list(daemon_namespace),
+            networkNamespace=ns('net'),mountNamespace=ns('mnt'),normalizationVersion=version,
+            rootIdentity=list(self._root_identity),socketIdentity=list(self._socket_identity),
+            pidFileIdentity=[self._pid_file_identity[0],list(self._pid_file_identity[1])])
+        if self._state(deadline)!=state or not self._same_group():reject()
+        units._left(deadline)
+        return encode(value)
+
+    def capture_recovery_phase(self,bundle,baseline_rows,phase_context,*,expected_version,timeout=15):
+        from copy import deepcopy
+        import json
+        from urllib.parse import quote
+        from deployment_compose_bundle_v3 import ExecutionBundleV3
+        from deployment_compose_phase_guard_v3_host import PhaseGuardV3,_plain
+        try:
+            self._check()
+            if (type(bundle) is not ExecutionBundleV3 or bundle.to_dict()['identity']['daemonId']!=self.daemon_id
+                    or type(expected_version) is not dict or set(expected_version)!={'Version','GitCommit'}
+                    or any(type(v) is not str or not v for v in expected_version.values())
+                    or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30):reject()
+            deadline=time.monotonic()+timeout;budget=[16*1024*1024]
+            version=deepcopy(expected_version);baseline=deepcopy(baseline_rows);context=_plain(phase_context)
+            value=bundle.to_dict()
+            filters=json.dumps({'label':['com.docker.compose.project='+value['identity']['project']]},sort_keys=True,separators=(',',':'))
+            ids=set(baseline)|set(context['receipts'].values())
+            paths=frozenset({'/v1.45/info','/v1.45/version',
+                '/v1.45/containers/json?all=1&filters='+quote(filters,safe='')}|
+                {'/v1.45/containers/'+cid+'/json' for cid in ids}|
+                {'/v1.45/networks/'+pin['id'] for pin in value['networks'].values()}|
+                {'/v1.45/volumes/'+quote(m['Name'],safe='') for row in baseline.values() for m in row['Mounts'] if m['Type']=='volume'})
+            def read(path):return self._request(path,deadline,budget,phase_paths=paths)
+            guard=PhaseGuardV3(bundle,baseline,read_json=read,daemon_version=version,expected_docker_root=self.root+'/data')
+            guard._context(context)
+            before=self._phase_endpoint(deadline,budget,paths,version)
+            phase=encode(_plain(guard.capture_phase(context)))
+            if self._phase_endpoint(deadline,budget,paths,version)!=before:reject()
+            units._left(deadline)
+            return phase,before
+        except Exception:reject()
 
     def binding(self):
         self._check()
