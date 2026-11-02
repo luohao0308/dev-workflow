@@ -160,3 +160,13 @@ start只在原Popen、nonce与封闭hello匹配后自建原生ObservedRecoveryDa
 这是独立于业务writer、由可信宿主issuer存活期间管理的实际daemon creator。控制管道EOF沿原finally清理；issuer或owner遭SIGKILL的最坏收尾仍依赖原systemd RuntimeMaxSec，不宣称持久接管、owner重启恢复、业务资源清理或产品准入已接通。随机unit由可信独占宿主管理保留，systemd没有原子compare-invocation-and-stop，此切片不承诺抵抗恶意root替换unit。
 
 验证采用真实本地pipe/Unix HTTP及明确kernel替身的边界用例，再在已发布源码上通过严格SSH完成空Engine实际start/stop及二次unit/PID/cgroup核查；不启动应用workload或消费审批，保留全部production/恢复权限false。
+
+## 第十二切片：独立场景服务跨控制客户端重连
+
+独立固定systemd场景服务持有原daemon creator，不再把其issuer放在Mac控制会话中。服务启动随机私有scene目录及Unix socket；固定程序、Restart=no及有界服务/daemon RuntimeMax，客户端无任意程序/unit/root/workload入口。scene ID以独占started marker烧录，旧socket/marker不删除修复、不重新采用；跨服务重启接管仍拒绝。
+
+控制凭据是独立32字节场景控制key，由可信embedding私有保管，不能从邻接JSON自证。双方校验root Unix peer/私有目录socket权限，并用新server/client nonce及双向HMAC认证；每次请求/响应绑定scene、lease nonce、generation和递增序号。服务只允许单控制连接；断线撤销连接lease但保留同一daemon，后续认证连接取得更高generation。旧/并发lease、重放、坏帧和慢连接不获得控制权；租期固定30秒，只有完整认证status可续租，零碎字节不续期且不超过service绝对deadline；服务过期仍按绝对deadline退出。
+
+启动仅在listen与权限身份验证完成、ready原子发布后认证；closeScene响应预算独立于5秒半帧/认证预算。本轮仅status/detach/closeScene实际服务接口，closeScene始终由服务持有的原creator执行guarded stop，不把key或generation当业务准入。服务需在同线程调用原PID/thread绑定creator。SIGTERM/过期沿原guard清理；服务SIGKILL最坏依赖daemon RuntimeMax，不提前报告清理。控制通道排他不是writer fence，所有业务恢复权限仍false。
+
+验证包括真实Unix/HMAC服务与明确daemon/peer替身的跨进程断开及重连、错误key/并发连接拒绝、同ID禁止重启；再用已发布源码在真实Linux systemd启动服务，让旧客户端退出，新客户端重连同一daemon并主动关闭，独立核验无残留。业务worker、精确审批/新消费、尾部CAS、真实已准入checkpoint与整闭环继续接线，不将此切片标成最终业务恢复。
