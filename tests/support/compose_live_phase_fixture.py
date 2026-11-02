@@ -120,7 +120,7 @@ def produce(directory):
         signingPrivateKeyReceived=False, witnessStoreKeyReceived=False)
 
 
-def consume(directory):
+def consume(directory, prepare=False):
     # New process rereads the producer-validated bytes against the same external pins.
     config, pins, raw, context, calls = load(directory, material_path=directory/'validated-material.private.json')
     if (directory/'validated-material.private.json').exists():
@@ -164,18 +164,44 @@ def consume(directory):
             stack.enter_context(item)
         observer = daemon.ObservedRecoveryDaemonV3(str(root), context.history._request.daemon_id, kernel_boot=BOOT)
         try:
-            result = LiveRecoveryPhaseCaptureV3(original_history=context.history, baseline_bytes=context.baseline_bytes,
-                daemon=observer, expected_version=config.get('expectedVersion', {'Version':'29.8.2','GitCommit':'8af9fe3'})).capture()
+            if prepare:
+                from datetime import datetime, timedelta, timezone
+                from deployment_compose_checkpoint_prepare_v3_host import CheckpointRecoveryPreparationHostV3
+                from deployment_compose_recovery_store import ComposeRecoveryStore
+                stack.enter_context(patch.object(sys,'platform','linux'))
+                cas_root=directory/'draft-cas';cas_root.mkdir(mode=0o700)
+                store=ComposeRecoveryStore(cas_root.resolve(strict=True),key=b'n'*32)  # External test custody, independent of old subject CAS.
+                try:
+                    host=CheckpointRecoveryPreparationHostV3(restart_material=raw,
+                        expected_material_digest=pins['expectedDigest'],expected_context=pins['expectedContext'],
+                        gate_key=bytes.fromhex(config['gateKeyHex']) if 'gateKeyHex' in config else GATE_KEY,
+                        witness_public_key=context.history._client._public,
+                        witness_transport=context.history._client._transport,daemon=observer,
+                        expected_version=config.get('expectedVersion',{'Version':'29.8.2','GitCommit':'8af9fe3'}),store=store)
+                    expiry=(datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    draft=host.prepare_intent(expires_at=expiry)
+                    verified=host.verify_context(draft['recovery_context_reference'],draft['request'],draft['reviewed_history'])
+                    prepared_summary=dict(requestDigest=draft['request'].digest(),requestProfileId=draft['request'].profile_id,
+                        contextKind=verified['kind'],baselineDigest=verified['baselineStateDigest'],verified=True,
+                        approvalReady=draft['review']['approvalReady'],
+                        nativeCASPlatformDouble=True,authorityGranted=False,runtimePermit=False,recoveryAuthorized=False,productionReady=False)
+                finally:
+                    store.close()
+            else:
+                result = LiveRecoveryPhaseCaptureV3(original_history=context.history, baseline_bytes=context.baseline_bytes,
+                    daemon=observer, expected_version=config.get('expectedVersion', {'Version':'29.8.2','GitCommit':'8af9fe3'})).capture()
         finally:
             observer.close()
-    return dict(kind='consumer-captured', consumerPid=os.getpid(), summary=result.public_summary(),
+    return dict(kind='consumer-prepared' if prepare else 'consumer-captured', consumerPid=os.getpid(),
+        summary=prepared_summary if prepare else result.public_summary(),
         readonlyRPC=calls, systemdShowCount=len(commands), systemdProcPeerRootDoubles=True,
         actualUnixHTTP=True, signingPrivateKeyReceived=False, witnessStoreKeyReceived=False)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('mode', choices=('produce','consume'))
+    parser.add_argument('mode', choices=('produce','consume','prepare'))
     parser.add_argument('directory', type=Path)
     args = parser.parse_args()
-    print(json.dumps((produce if args.mode == 'produce' else consume)(args.directory)), flush=True)
+    result=produce(args.directory) if args.mode=='produce' else consume(args.directory,prepare=args.mode=='prepare')
+    print(json.dumps(result),flush=True)
