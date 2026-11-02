@@ -1,0 +1,98 @@
+"""One pre-dispatch writer slot, held by its original live native issuer.
+
+No archive, worker configuration, GO or product request is sent. Controller and
+slot generations are separate; draining this slot is not a global writer fence.
+Unknown creation/stop results block replacement, with original loader/service
+lifetime bounds retained. Serialized origin records never recreate stop authority.
+"""
+import os
+import re
+import threading
+import weakref
+
+from deployment_compose_owned_recovery_unit_v3_host import OwnedRecoveryUnitV3
+from deployment_compose_cold_writer_v3_host import observe_stopped_writer,validate_origin
+from deployment_compose_witness_store import canonical
+from deployment_compose_recovery_phase_capsule_v3_host import decode
+import hashlib
+
+_RECORDS=weakref.WeakKeyDictionary()
+_FALSE=('authorityGranted','runtimePermit','recoveryAuthorized','productionReady','writerQuiescenceVerified',
+        'sourceRevalidated','executionAvailable')
+
+
+def reject():raise ValueError('compose-scene-writer-slot-v3-rejected') from None
+
+
+def _construct_unit(source_sha,archive_digest):
+    return OwnedRecoveryUnitV3(archive_digest,source_sha)
+
+
+def _record(slot):
+    value=_RECORDS.get(slot)
+    if type(slot) is not SlotOwnerV3 or value is None or value['issuer']!=(os.getpid(),threading.get_ident()):reject()
+    return value
+
+
+def _generation(value):
+    if type(value) is not int or not 0<=value<2**53:reject()
+
+
+def _summary(record):
+    return dict(slotGeneration=record['generation'],slotState=record['state'],
+        writerSourceSha=record['source'],writerArchiveDigest=record['archive'],
+        creationOutcomeUnknown=record['unknown'],writerOrigin=decode(record['origin']) if record['origin'] is not None else None,
+        writerOriginDigest=hashlib.sha256(record['origin']).hexdigest() if record['origin'] is not None else None,
+        slotStoppedObserved=record['state']=='drained',**{key:False for key in _FALSE})
+
+
+class SlotOwnerV3:
+    def __init__(self,source_sha,archive_digest):
+        if (type(source_sha) is not str or re.fullmatch('[0-9a-f]{40}',source_sha) is None
+                or type(archive_digest) is not str or re.fullmatch('[0-9a-f]{64}',archive_digest) is None):reject()
+        _RECORDS[self]=dict(issuer=(os.getpid(),threading.get_ident()),source=source_sha,archive=archive_digest,
+            generation=0,state='empty',owner=None,origin=None,unknown=False,result=None)
+
+    def __copy__(self):reject()
+    def __deepcopy__(self,memo):reject()
+    def __reduce_ex__(self,protocol):reject()
+
+    def status(self):return _summary(_record(self))
+
+    def reserve(self,expected_slot_generation):
+        record=_record(self);_generation(expected_slot_generation)
+        if record['generation']!=expected_slot_generation or record['state'] not in ('empty','drained'):reject()
+        record.update(generation=record['generation']+1,state='starting',unknown=True,owner=None,origin=None,result=None)
+        try:
+            owner=_construct_unit(record['source'],record['archive']);record['owner']=owner
+            if type(owner) is not OwnedRecoveryUnitV3:reject()
+            owner.start(timeout=15)
+            origin=owner.capture_origin(timeout=5)
+            parsed=validate_origin(origin)
+            if parsed['sourceSha']!=record['source'] or parsed['archiveDigest']!=record['archive']:reject()
+            record.update(state='waiting',unknown=False,origin=origin)
+            return _summary(record)
+        except BaseException:
+            record['state']='failed'
+            raise
+
+    def drain(self,expected_slot_generation):
+        record=_record(self);_generation(expected_slot_generation)
+        if record['generation']!=expected_slot_generation:reject()
+        if record['state']=='drained':return decode(record['result'])
+        if record['state'] not in ('waiting','failed') or record['owner'] is None:reject()
+        try:
+            record['owner'].stop(timeout=30)
+            origin=record['origin']
+            if origin is None:reject()  # Stop may clean the original issuer, but no proof can be minted.
+            observed=observe_stopped_writer(origin,expected_digest=hashlib.sha256(origin).hexdigest(),
+                expected_source_sha=record['source'],expected_archive_digest=record['archive'],timeout=5)
+            if observed.writerStoppedObserved is not True:reject()
+            record['owner'].close()
+            record.update(state='drained',unknown=False)
+            result=_summary(record);result['stopObservationDigest']=observed.observation_digest
+            record['result']=canonical(result)
+            return decode(record['result'])
+        except BaseException:
+            record['state']='failed'
+            raise

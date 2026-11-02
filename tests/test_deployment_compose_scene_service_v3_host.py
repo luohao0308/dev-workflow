@@ -25,13 +25,17 @@ class SceneTests(unittest.TestCase):
         self.base=Path(self.temporary.name).resolve();self.base.chmod(0o700)
         self.scene_id='dw-scene-'+secrets.token_hex(8);self.path=self.base/self.scene_id;self.path.mkdir(mode=0o700)
         self.key=secrets.token_bytes(32);keyfile=self.path/'control.key';keyfile.write_bytes(self.key);keyfile.chmod(0o600)
+        if getattr(self,'writer_source_enabled',False):
+            source=scene._signed(self.key,dict(kind='scene-loader-source-v3',sceneId=self.scene_id,sourceSha='a'*40,archiveDigest='b'*64))
+            file=self.path/'loader-source.private.json';file.write_bytes(scene.canonical(source));file.chmod(0o600)
         self.marker=self.base/'owner-stopped'
         for item in (patch.object(scene,'BASE',self.base),patch.object(scene,'ROOT_UID',os.getuid()),
                 patch.object(scene,'_peer',return_value=(os.getpid(),os.getuid(),os.getgid()))):
             item.start();self.addCleanup(item.stop)
         self.script=ROOT/'tests/support/compose_scene_service_fixture.py'
         self.process=subprocess.Popen([sys.executable,str(self.script),'serve',str(self.base),self.scene_id,str(self.marker),'6' if 'slow_stop' in self._testMethodName else '0',
-             '.2' if 'idle_lease' in self._testMethodName else '30'],
+             '.2' if 'idle_lease' in self._testMethodName else '30','0',
+             'fail-drain' if 'failed_drain' in self._testMethodName else ''],
             stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup_service)
         end=time.monotonic()+5
@@ -88,7 +92,8 @@ class SceneTests(unittest.TestCase):
     def test_used_scene_identity_cannot_restart_or_adopt(self):
         self.connect().close_scene();self.assertEqual(self.process.wait(timeout=5),0)
         again=subprocess.run([sys.executable,str(self.script),'serve',str(self.base),self.scene_id,str(self.marker),'6' if 'slow_stop' in self._testMethodName else '0',
-             '.2' if 'idle_lease' in self._testMethodName else '30'],
+             '.2' if 'idle_lease' in self._testMethodName else '30','0',
+             'fail-drain' if 'failed_drain' in self._testMethodName else ''],
             capture_output=True,timeout=5)
         self.assertNotEqual(again.returncode,0)
 
@@ -135,3 +140,40 @@ class SceneTests(unittest.TestCase):
             for child in children:
                 if child.poll() is None:child.terminate();child.wait(timeout=5)
                 child.stderr.close()
+
+
+@unittest.skipUnless(os.name=='posix','POSIX Unix sockets required')
+class WriterSceneTests(unittest.TestCase):
+    writer_source_enabled=True
+    setUp=SceneTests.setUp
+    cleanup_service=SceneTests.cleanup_service
+    connect=SceneTests.connect
+
+    def test_reconnect_retains_original_writer_and_requires_drain_before_replacement(self):
+        first=self.connect();one=first.reserve_writer(0)
+        origin=one['writerSlot']['writerOrigin']
+        first.detach();second=self.connect()
+        self.assertEqual(second.status()['writerSlot']['writerOrigin'],origin)
+        with self.assertRaises(ValueError):second.reserve_writer(1)
+        time.sleep(.02);third=self.connect()
+        drained=third.drain_writer(1);self.assertTrue(drained['writerSlot']['slotStoppedObserved'])
+        two=third.reserve_writer(1)
+        self.assertEqual(two['slotGeneration'],2)
+        self.assertNotEqual(two['writerSlot']['writerOrigin']['unit'],origin['unit'])
+        self.assertFalse(two['runtimePermit']);self.assertFalse(two['writerQuiescenceVerified'])
+        closed=third.close_scene();self.assertEqual(closed['slotState'],'drained')
+        self.assertTrue(closed['daemonStoppedVerified']);self.assertEqual(self.process.wait(timeout=5),0)
+
+    def test_old_slot_generation_cannot_drain_new_slot(self):
+        client=self.connect();client.reserve_writer(0)
+        with self.assertRaises(ValueError):client.drain_writer(0)
+        time.sleep(.02);replacement=self.connect()
+        self.assertEqual(replacement.status()['slotState'],'waiting')
+        replacement.drain_writer(1);replacement.close_scene()
+        self.assertEqual(self.process.wait(timeout=5),0)
+
+    def test_close_scene_failed_drain_rejects_client_stops_daemon_and_exits_nonzero(self):
+        client=self.connect();client.reserve_writer(0)
+        with self.assertRaises(ValueError):client.close_scene()
+        self.assertNotEqual(self.process.wait(timeout=5),0)
+        self.assertTrue(self.marker.exists())

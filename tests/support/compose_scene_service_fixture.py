@@ -2,7 +2,7 @@
 import json,os,sys,time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
-sys.path[:0]=[str(ROOT/p) for p in ('scripts','core/scripts','packs/deployment/scripts','packs/release/scripts')]
+sys.path[:0]=[str(ROOT),*(str(ROOT/p) for p in ('scripts','core/scripts','packs/deployment/scripts','packs/release/scripts'))]
 import deployment_compose_scene_service_v3_host as scene
 base=Path(sys.argv[2]);scene.BASE=base;scene.ROOT_UID=os.getuid();scene._peer=lambda sock:(os.getpid(),os.getuid(),os.getgid());scene.units._environment=lambda:None
 if sys.argv[1]=='serve':
@@ -26,6 +26,12 @@ if sys.argv[1]=='serve':
             self.result=dict(daemonStoppedVerified=True,productionSnapshotUnchanged=True,authorityGranted=False,runtimePermit=False,productionReady=False)
             return self.result
         def close(self):return self.stop()
+    import deployment_compose_scene_writer_slot_v3_host as slots
+    from tests.test_deployment_compose_scene_writer_slot_v3_host import FakeUnit
+    from types import SimpleNamespace
+    if len(sys.argv)>8 and sys.argv[8]=='fail-drain':FakeUnit.fail_stop=True
+    slots.OwnedRecoveryUnitV3=FakeUnit
+    slots.observe_stopped_writer=lambda *a,**kw:SimpleNamespace(writerStoppedObserved=True,observation_digest='c'*64)
     scene.OwnedRecoveryDaemonHostV3=Owner
     scene.serve(sys.argv[3])
 elif sys.argv[1]=='client':
