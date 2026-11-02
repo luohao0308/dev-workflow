@@ -30,6 +30,9 @@ if sys.argv[1]=='serve':
     from tests.test_deployment_compose_scene_writer_slot_v3_host import FakeUnit
     from types import SimpleNamespace
     if len(sys.argv)>8 and sys.argv[8]=='fail-drain':FakeUnit.fail_stop=True
+    from tests.test_deployment_compose_scene_attach_read_v3_host import WireUnit
+    import deployment_compose_scene_attach_read_v3_host as attached
+    slots.AttachReadUnitV3=WireUnit;attached.AttachReadUnitV3=WireUnit
     slots.OwnedRecoveryUnitV3=FakeUnit
     slots.observe_stopped_writer=lambda *a,**kw:SimpleNamespace(writerStoppedObserved=True,observation_digest='c'*64)
     scene.OwnedRecoveryDaemonHostV3=Owner

@@ -35,6 +35,7 @@ LEASE_SECONDS=30
 STOP_RESPONSE_SECONDS=110
 RESERVE_RESPONSE_SECONDS=25
 DRAIN_RESPONSE_SECONDS=40
+INSPECT_RESPONSE_SECONDS=60
 _FALSE=('authorityGranted','runtimePermit','recoveryAuthorized','productionReady','writerQuiescenceVerified')
 
 
@@ -175,6 +176,7 @@ class SceneClientV3:
             if command=='closeScene':end=time.monotonic()+STOP_RESPONSE_SECONDS
             elif command=='reserve_writer':end=time.monotonic()+RESERVE_RESPONSE_SECONDS
             elif command=='drain_writer':end=time.monotonic()+DRAIN_RESPONSE_SECONDS
+            elif command=='inspect_attached_worker':end=time.monotonic()+INSPECT_RESPONSE_SECONDS
             reply=_verify(self._handle.controlKey,_read(self._socket,end))
             expected=dict(kind='scene-result-v3',**self._lease,seq=self._seq,command=command)
             if set(reply)!=set(expected)|{'result'} or any(canonical(reply[k])!=canonical(v) for k,v in expected.items()):reject()
@@ -184,6 +186,9 @@ class SceneClientV3:
         except Exception:
             self._socket.close();self._closed=True;reject()
 
+    def inspect_attached_worker(self,expected_slot_generation):
+        if type(expected_slot_generation) is not int or not 0<=expected_slot_generation<2**53:reject()
+        return self._call('inspect_attached_worker',{'slotGeneration':expected_slot_generation})
     def reserve_writer(self,expected_slot_generation):
         if type(expected_slot_generation) is not int or not 0<=expected_slot_generation<2**53:reject()
         return self._call('reserve_writer',{'slotGeneration':expected_slot_generation})
@@ -205,11 +210,15 @@ class SceneClientV3:
 def client_scene(handle):return SceneClientV3(handle)
 
 
-def start_scene(*,writer_source_sha=None,writer_archive_digest=None):
+def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archive_bytes=None):
     if (writer_source_sha is None)!=(writer_archive_digest is None):reject()
     if writer_source_sha is not None:
         if (type(writer_source_sha) is not str or re.fullmatch('[0-9a-f]{40}',writer_source_sha) is None
                 or type(writer_archive_digest) is not str or re.fullmatch('[0-9a-f]{64}',writer_archive_digest) is None):reject()
+    if writer_archive_bytes is not None:
+        if writer_source_sha is None:reject()
+        from deployment_compose_scene_attach_read_v3_host import validate_distribution_archive
+        validate_distribution_archive(writer_archive_bytes,writer_archive_digest)
     units._environment()
     scene_id='dw-scene-'+secrets.token_hex(8);path=_path(scene_id);path.mkdir(mode=0o700)
     fd,identity=_directory(path)
@@ -222,6 +231,9 @@ def start_scene(*,writer_source_sha=None,writer_archive_digest=None):
                 sourceSha=writer_source_sha,archiveDigest=writer_archive_digest))
             source_fd=os.open('loader-source.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
             with os.fdopen(source_fd,'wb') as output:output.write(canonical(source));output.flush();os.fsync(output.fileno())
+        if writer_archive_bytes is not None:
+            archive_fd=os.open('loader-archive.private.zip',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+            with os.fdopen(archive_fd,'wb') as output:output.write(writer_archive_bytes);output.flush();os.fsync(output.fileno())
         os.fsync(fd)
     finally:os.close(fd)
     unit='dw-scene-owner-'+scene_id[-16:]+'.service'
@@ -271,11 +283,35 @@ def _loader_source(fd,key,scene_id):
     finally:os.close(file)
 
 
+def _loader_archive(fd,expected_digest,*,validate=False):
+    try:file=os.open('loader-archive.private.zip',os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=fd)
+    except FileNotFoundError:return None,None
+    try:
+        info=os.fstat(file)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=ROOT_UID or stat.S_IMODE(info.st_mode)!=0o600
+                or info.st_nlink!=1 or not 0<info.st_size<=2*1024*1024):reject()
+        chunks=[];size=0
+        while True:
+            raw=os.read(file,min(65536,2*1024*1024+1-size))
+            if not raw:break
+            chunks.append(raw);size+=len(raw)
+            if size>2*1024*1024:reject()
+        raw=b''.join(chunks);after=os.fstat(file)
+        identity=lambda v:(v.st_dev,v.st_ino,v.st_size,v.st_mtime_ns,v.st_ctime_ns)
+        if identity(info)!=identity(after) or len(raw)!=info.st_size or digest(raw)!=expected_digest:reject()
+        if validate:
+            from deployment_compose_scene_attach_read_v3_host import validate_distribution_archive
+            validate_distribution_archive(raw,expected_digest)
+        return raw,identity(info)+(digest(raw),)
+    finally:os.close(file)
+
+
 def serve(scene_id):
     units._environment();path=_path(scene_id);fd,identity=_directory(path)
     key,key_identity=_key(fd);listener=connection=None;owner=OwnedRecoveryDaemonHostV3();generation=0
     service_end=time.monotonic()+3150;state=None;closing=False;socket_identity=None;slot_cleanup_attempted=False
     source,source_identity=_loader_source(fd,key,scene_id)
+    attached_archive,archive_identity=_loader_archive(fd,source['archiveDigest'] if source is not None else None,validate=True)
     from deployment_compose_scene_writer_slot_v3_host import SlotOwnerV3
     slot=SlotOwnerV3(source['sourceSha'],source['archiveDigest']) if source is not None else None
     def interrupted(*args):raise SystemExit('scene-service-interrupted')
@@ -285,6 +321,7 @@ def serve(scene_id):
         try:
             if again!=identity or _key(fd)!=(key,key_identity):reject()
             if _loader_source(fd,key,scene_id)!=(source,source_identity):reject()
+            if _loader_archive(fd,source['archiveDigest'] if source is not None else None)!=(attached_archive,archive_identity):reject()
             if socket_identity is not None:
                 info=os.stat('control.sock',dir_fd=fd,follow_symlinks=False)
                 if (not stat.S_ISSOCK(info.st_mode) or info.st_uid!=ROOT_UID
@@ -378,10 +415,10 @@ def serve(scene_id):
                                     reply=dict(kind='scene-lease-v3',**state['lease'],seq=0)
                                 else:
                                     lease=state['lease']
-                                    extended=value.get('command') in ('reserve_writer','drain_writer')
+                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker')
                                     if (set(value)!=({'kind',*lease,'seq','command'}|({'args'} if extended else set())) or value['kind']!='scene-command-v3'
                                             or any(canonical(value[k])!=canonical(v) for k,v in lease.items()) or type(value['seq']) is not int
-                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer')):reject()
+                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker')):reject()
                                     if time.monotonic()>=state['lease_deadline']:reject()
                                     if extended:
                                         args=value['args']
@@ -395,6 +432,9 @@ def serve(scene_id):
                                     metadata=slot.status() if slot is not None else dict(slotGeneration=0,slotState='disabled')
                                     if command=='reserve_writer':metadata=slot.reserve(value['args']['slotGeneration'])
                                     if command=='drain_writer':metadata=slot.drain(value['args']['slotGeneration'])
+                                    if command=='inspect_attached_worker':
+                                        if attached_archive is None:reject()
+                                        metadata=slot.inspect_attached(attached_archive,owner.observer.binding(),value['args']['slotGeneration'])
                                     result.update(writerSlot=metadata,slotGeneration=metadata['slotGeneration'],slotState=metadata['slotState'])
                                     if command=='detach':state['release']=True
                                     if command=='closeScene':

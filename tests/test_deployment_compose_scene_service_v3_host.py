@@ -25,8 +25,18 @@ class SceneTests(unittest.TestCase):
         self.base=Path(self.temporary.name).resolve();self.base.chmod(0o700)
         self.scene_id='dw-scene-'+secrets.token_hex(8);self.path=self.base/self.scene_id;self.path.mkdir(mode=0o700)
         self.key=secrets.token_bytes(32);keyfile=self.path/'control.key';keyfile.write_bytes(self.key);keyfile.chmod(0o600)
+        if getattr(self,'attach_archive',False):
+            import io,zipfile,hashlib
+            import deployment_compose_scene_attach_read_v3_host as attached
+            out=io.BytesIO()
+            with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as archive:
+                for file in attached.ROOT.rglob('*.py'):
+                    name=file.relative_to(attached.ROOT).as_posix()
+                    if attached._allowed(name):archive.writestr(name,file.read_bytes())
+            raw=out.getvalue();file=self.path/'loader-archive.private.zip';file.write_bytes(raw);file.chmod(0o600)
+            self.writer_digest=hashlib.sha256(raw).hexdigest()
         if getattr(self,'writer_source_enabled',False):
-            source=scene._signed(self.key,dict(kind='scene-loader-source-v3',sceneId=self.scene_id,sourceSha='a'*40,archiveDigest='b'*64))
+            source=scene._signed(self.key,dict(kind='scene-loader-source-v3',sceneId=self.scene_id,sourceSha='a'*40,archiveDigest=getattr(self,'writer_digest','b'*64)))
             file=self.path/'loader-source.private.json';file.write_bytes(scene.canonical(source));file.chmod(0o600)
         self.marker=self.base/'owner-stopped'
         for item in (patch.object(scene,'BASE',self.base),patch.object(scene,'ROOT_UID',os.getuid()),
@@ -177,3 +187,22 @@ class WriterSceneTests(unittest.TestCase):
         with self.assertRaises(ValueError):client.close_scene()
         self.assertNotEqual(self.process.wait(timeout=5),0)
         self.assertTrue(self.marker.exists())
+
+
+@unittest.skipUnless(os.name=='posix','POSIX service process required')
+class AttachedSceneTests(unittest.TestCase):
+    writer_source_enabled=True
+    attach_archive=True
+    setUp=SceneTests.setUp
+    cleanup_service=SceneTests.cleanup_service
+    connect=SceneTests.connect
+
+    def test_service_uses_held_archive_and_attachment_not_client_supplied_program(self):
+        client=self.connect();result=client.inspect_attached_worker(0)
+        self.assertEqual(result['slotState'],'drained')
+        receipt=result['writerSlot']['closedReadReceipt']
+        self.assertTrue(receipt['readOnly']);self.assertFalse(receipt['runtimePermit'])
+        client.detach();new=self.connect()
+        self.assertEqual(new.status()['slotGeneration'],1)
+        self.assertEqual(new.status()['writerSlot']['closedReadReceipt'],receipt)
+        new.close_scene();self.assertEqual(self.process.wait(timeout=5),0)
