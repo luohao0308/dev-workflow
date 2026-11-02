@@ -78,3 +78,21 @@ Mac验证会话nonce、完整binding及origin的source/archive/unit/boot/invocat
 冷reader仅在调用者提供独立外部origin artifact pin时读取并验证它，交叉核全部checkpoint/context/binding/source数据，输出raw Linux origin供后续只读停止核验；不从相邻文件自行推导信任，不恢复session或执行权限。未提供origin pin的旧reader保持原语义。
 
 测试覆盖默认无新帧、diag/raw拒绝、原对象/线程/复制/属性替换、partial send不重试、同批stop、pending回执排空、重复/嵌套伪帧、错pin/串场、producer退出后冷读。真实发布源码SSH stop-before-start只验证origin认证交付与关闭：不发送业务worker归档/config，不启动Engine，不消费审批，不能标成跨主机执行恢复。
+
+## 第五切片：Mac冷reader的固定SSH停止观测
+
+reader仅在原owner/PID/thread、origin双外部pin及全部私有文件Guard仍有效时发起纯读SSH核验。host别名和旧producer source/archive必须从已pin origin artifact重读，不能从可改写的history缓存或caller的unit/PID参数推导；网络调用前后重新核对Guard和原artifact绑定。
+
+成功构造reader时以module WeakKey seal固定原guard/store/context身份、case和全部外部pins，观测入口拒绝缓存/guard/store替换。前后以这些原pins重新读取真实材料与history及origin artifact，而不是把可改写对象当唯一来源。
+
+SSH使用原strict host-key/禁转发参数、精确已发布源码归档及固定cold worker.run；不接受caller提供Popen、program、module或command。单canonical请求绑定新nonce、host、origin摘要、producer source/archive、verifier source/archive及checkpoint摘要。两套source/archive独立，旧writer与新verifier版本或重新打包ZIP不必相同。
+
+Linux worker严格校验输入与EOF，仅调用原cold.observe_stopped_writer，只读systemctl show、/proc和cgroup。Mac仅在结果形状/context/request摘要/观察摘要匹配、干净EOF、SSH0、stderr无字节以及本地进程/线程/流回收通过后交付只读远端观测；任何错误、额外帧、警告stderr、半帧或非零退出均拒绝，不自动重试。共享绝对deadline和有界stderr/帧保留原阻塞filesystem/crypto边界，不宣称不可中断内核IO的硬期限。
+
+`timeout`限定自建SSH进程从spawn到输入/输出、EOF、SSH退出及stderr收尾的共享阶段；发布归档的逐文件Git预检及本地历史前后重验保留原有单步超时/阻塞flock，不能宣称整个API的30秒硬期限。新固定bootstrap须独立补重复键拒绝及原始输入字节canonical相等校验，不扩大改写其他原入口。响应中的两份观察须封闭、完全相等、boot/namespace对应原origin，观察摘要可重算，权限字段严格false。
+
+返回结果绑定原checkpoint和origin，仍无admission/RuntimePermit、daemon停止、Engine新鲜性或执行恢复权限。checkpoint未加载可信origin则不得发送SSH；只读失败不会重放任何产品请求。
+
+`checkpointBinding`仅为本次请求/回复的相关性绑定，不是Linux独立认证Mac历史。reader路径必须含material/origin artifact/history三摘要且精确匹配；私有低层真实origin-only smoke可传None，但结果须明确`checkpointBound=false`，不能冒称真实checkpoint验收。
+
+验收分两部分：合成checkpoint通过原native callback交付、旧producer退出、新Mac reader调用固定SSH协议（Linux/sysfs为明确替身）的完整接缝与负例；真实发布源码先捕获startup origin并关闭，再由新Mac进程通过严格SSH取得实际Linux停止观测。真实路径无业务checkpoint写入，不发送业务worker归档/config、不启动Engine或消费审批，不将其升级为真实已准入恢复验收。

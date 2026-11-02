@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import threading
+import weakref
 
 from deployment_compose_restart_material_v3_host import capture_material, reopen_material, MAX_MATERIAL
 from deployment_compose_recovery_phase_capsule_v3_host import decode
@@ -23,6 +24,35 @@ from deployment_gate_witness import key_material
 
 ROOT = Path(__file__).resolve().parents[1]
 _READS = {'read', 'check', 'events_after', 'chain_status'}
+_READER_SEALS = weakref.WeakKeyDictionary()
+
+
+def _reader_fingerprint(reader):
+    """Scalar-only identity/content pins; never retain a context through a weak key."""
+    context, store, guard = reader._context, reader._store, reader._guard
+    history = context.history
+    client = history._client
+    return (id(guard), id(store), id(context), str(guard.case), str(store.root),
+            digest(store._key), store._dir, store._lock, store._root_id, store._lock_id,
+            id(history), id(history._request), history._request.digest(),
+            id(history._bundle), digest(history._bundle.canonical_bytes),
+            id(history._policy), history._policy.identity_hash(), digest(history._key),
+            history._receipt, id(client), digest(client._public), canonical(client._binding),
+            id(client._transport), id(history._factory), id(history._parent),
+            id(history._reviewed_parent), digest(context.snapshot.canonical),
+            digest(context.baseline_bytes), context.material_digest)
+
+
+def _sealed_reader(reader):
+    if type(reader) is not RestartCheckpointReaderV3:
+        reject()
+    RestartCheckpointReaderV3._owned(reader)
+    seal = _READER_SEALS.get(reader)
+    if (seal is None or seal[0] != (os.getpid(), threading.get_ident())
+            or _reader_fingerprint(reader) != seal[3]):
+        reject()
+    reader._guard.check()
+    return seal
 
 
 def reject():
@@ -256,6 +286,10 @@ class RestartCheckpointReaderV3:
                     hello_digest=self._context.history._policy.scope_hash,
                     origin_digest=expected_origin_digest)
             guard.check()
+            _READER_SEALS[self] = (self._owner, case,
+                (expected_material_digest, expected_custody_digest, canonical(pins),
+                 expected_witness_key_hash, expected_origin_material_digest, expected_origin_digest),
+                _reader_fingerprint(self))
         except Exception:
             try:
                 self.close()
@@ -293,12 +327,67 @@ class RestartCheckpointReaderV3:
         except Exception:
             reject()
 
+    def observe_writer_stopped(self, *, verifier_source_sha, timeout=30):
+        """Observe the pinned original writer over SSH; confer no execution authority."""
+        from deployment_compose_cold_writer_ssh_v3_host import (
+            observe_origin_over_ssh, RemoteWriterStopObservationV3)
+        try:
+            seal = _sealed_reader(self)
+            material, custody, context, witness, origin_material, origin_digest = seal[2]
+            if origin_material is None or origin_digest is None:
+                reject()
+
+            def reauthenticate():
+                if _sealed_reader(self) is not seal:
+                    reject()
+                parent = seal[1] / 'writer-origin'
+                raw, identity = read_file(self._guard.dirs[parent][0], 'origin.private.json', 32768)
+                if (identity != self._guard.files[(parent, 'origin.private.json')][1]
+                        or digest(raw) != origin_material):
+                    reject()
+                # Reopen with original external pins, rather than caller-visible cached history.
+                # Local signing/HMAC/flock work is deliberately outside the SSH deadline.
+                with RestartCheckpointReaderV3(seal[1], expected_material_digest=material,
+                        expected_custody_digest=custody, expected_context=decode(context),
+                        expected_witness_key_hash=witness,
+                        expected_origin_material_digest=origin_material,
+                        expected_origin_digest=origin_digest) as fresh:
+                    origin = fresh.writer_origin
+                    artifact = decode(raw)
+                    if (origin != canonical(artifact['origin'])
+                            or self._writer_origin != origin):
+                        reject()
+                if _sealed_reader(self) is not seal:
+                    reject()
+                return origin, artifact['context']
+
+            origin, trusted = reauthenticate()
+            binding = dict(materialDigest=material, originMaterialDigest=origin_material,
+                           historyDigest=trusted['historyDigest'])
+            result = observe_origin_over_ssh(origin, expected_origin_digest=origin_digest,
+                host_id=trusted['hostId'], producer_source_sha=trusted['sourceSha'],
+                producer_archive_digest=trusted['archiveDigest'],
+                verifier_source_sha=verifier_source_sha, checkpoint_binding=binding, timeout=timeout)
+            after_origin, after_context = reauthenticate()
+            if (after_origin != origin or after_context != trusted
+                    or type(result) is not RemoteWriterStopObservationV3
+                    or result.checkpoint_binding != canonical(binding) or result.checkpointBound is not True
+                    or result.origin_digest != origin_digest or result.host_id != trusted['hostId']
+                    or result.producer_source_sha != trusted['sourceSha']
+                    or result.producer_archive_digest != trusted['archiveDigest']
+                    or result.verifier_source_sha != verifier_source_sha):
+                reject()
+            return result
+        except Exception:
+            reject()
+
     def close(self):
         if self._issuer is not self or self._owner != (os.getpid(), threading.get_ident()):
             reject()
         if self._closed:
             return
         self._closed = True
+        _READER_SEALS.pop(self, None)
         failed = False
         for resource in (self._store, self._guard):
             if resource is not None:
