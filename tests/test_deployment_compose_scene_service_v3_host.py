@@ -44,8 +44,9 @@ class SceneTests(unittest.TestCase):
             item.start();self.addCleanup(item.stop)
         self.script=ROOT/'tests/support/compose_scene_service_fixture.py'
         self.process=subprocess.Popen([sys.executable,str(self.script),'serve',str(self.base),self.scene_id,str(self.marker),'6' if 'slow_stop' in self._testMethodName else '0',
-             '.2' if 'idle_lease' in self._testMethodName else '30','0',
-             'fail-drain' if 'failed_drain' in self._testMethodName else ''],
+             '.2' if ('idle_lease' in self._testMethodName or 'long_preparation' in self._testMethodName) else '30','0',
+             'fail-drain' if 'failed_drain' in self._testMethodName else ('fail-prep' if 'failed_preparation' in self._testMethodName else ''),
+             '.4' if 'long_preparation' in self._testMethodName else '0'],
             stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup_service)
         end=time.monotonic()+5
@@ -102,8 +103,9 @@ class SceneTests(unittest.TestCase):
     def test_used_scene_identity_cannot_restart_or_adopt(self):
         self.connect().close_scene();self.assertEqual(self.process.wait(timeout=5),0)
         again=subprocess.run([sys.executable,str(self.script),'serve',str(self.base),self.scene_id,str(self.marker),'6' if 'slow_stop' in self._testMethodName else '0',
-             '.2' if 'idle_lease' in self._testMethodName else '30','0',
-             'fail-drain' if 'failed_drain' in self._testMethodName else ''],
+             '.2' if ('idle_lease' in self._testMethodName or 'long_preparation' in self._testMethodName) else '30','0',
+             'fail-drain' if 'failed_drain' in self._testMethodName else ('fail-prep' if 'failed_preparation' in self._testMethodName else ''),
+             '.4' if 'long_preparation' in self._testMethodName else '0'],
             capture_output=True,timeout=5)
         self.assertNotEqual(again.returncode,0)
 
@@ -205,4 +207,43 @@ class AttachedSceneTests(unittest.TestCase):
         client.detach();new=self.connect()
         self.assertEqual(new.status()['slotGeneration'],1)
         self.assertEqual(new.status()['writerSlot']['closedReadReceipt'],receipt)
+        new.close_scene();self.assertEqual(self.process.wait(timeout=5),0)
+
+
+@unittest.skipUnless(os.name=='posix','POSIX resource service required')
+class PreparedSceneTests(unittest.TestCase):
+    writer_source_enabled=True
+    attach_archive=True
+    setUp=SceneTests.setUp
+    cleanup_service=SceneTests.cleanup_service
+    connect=SceneTests.connect
+
+    def test_preparation_and_private_chunks_survive_controller_reconnect(self):
+        import base64,hashlib
+        client=self.connect();hello=client.prepare_identity('host-one')['hello']
+        keys={k:b'k'*32 for k in ('config','image','declaration','archive','target')}
+        meta=client.prepare_staging('c'*64,keys)['preparation'];client.close();time.sleep(.03)
+        other=self.connect();status=other.status()
+        self.assertEqual(status['preparationIdentity'],hello);self.assertEqual(status['preparation'],meta)
+        raw=bytearray()
+        while len(raw)<meta['totalBytes']:
+            chunk=other.preparation_chunk(meta['preparationId'],meta['capsuleDigest'],len(raw),7)['preparationChunk']
+            self.assertEqual(chunk['offset'],len(raw));raw.extend(base64.b64decode(chunk['dataBase64']))
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),meta['capsuleDigest'])
+        self.assertFalse(status['runtimePermit']);closed=other.close_scene()
+        self.assertEqual(closed['preparationState'],'cleaned');self.assertTrue(closed['preparationCleaned'])
+        self.assertEqual(self.process.wait(timeout=5),0)
+
+    def test_failed_preparation_cleanup_rejects_client_and_service_success(self):
+        client=self.connect();client.prepare_identity('host-one')
+        client.prepare_staging('c'*64,{k:b'k'*32 for k in ('config','image','declaration','archive','target')})
+        with self.assertRaises(ValueError):client.close_scene()
+        self.assertNotEqual(self.process.wait(timeout=5),0);self.assertTrue(self.marker.exists())
+
+    def test_long_preparation_reply_flushes_before_expired_lease_disconnect(self):
+        client=self.connect();client.prepare_identity('host-one')
+        result=client.prepare_staging('c'*64,{k:b'k'*32 for k in ('config','image','declaration','archive','target')})
+        self.assertIsNotNone(result['preparation'])
+        with self.assertRaises(ValueError):client.status()
+        new=self.connect();self.assertEqual(new.status()['preparation'],result['preparation'])
         new.close_scene();self.assertEqual(self.process.wait(timeout=5),0)

@@ -408,3 +408,23 @@ class CurrentPreparationUnixTests(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+
+
+class SessionHandoffTests(unittest.TestCase):
+    def test_fixed_callback_receives_original_session_before_first_write_even_on_system_exit(self):
+        from unittest.mock import Mock,patch
+        root=Path('/var/tmp/dw-engine-'+'a'*16);target=Mock()
+        target.run.side_effect=lambda *args:json.dumps(dict(ID='expected',DockerRootDir=str(root/'data'),SwapLimit=True)) if args[0]=='info' else ''
+        retained=[]
+        def created(session):
+            self.assertIs(type(session),fixture.PreparationSession)
+            self.assertEqual(session.created_ids,[]);retained.append(session)
+        with patch.object(fixture,'validate_controller',return_value=target),\
+                patch.object(fixture,'source_image',side_effect=SystemExit('interrupted-before-first-write')):
+            with self.assertRaises(SystemExit):
+                fixture.prepare_profile3(root,{'ID':'expected'},source_sha='b'*40,host_id='host-one',
+                    expected_daemon_id='expected',keys={k:b'k'*32 for k in ('config','image','declaration','archive','target')},
+                    policy_hash='c'*64,on_session_created=created)
+        self.assertEqual(len(retained),1);self.assertIs(retained[0].target,target)
+        self.assertFalse(retained[0].unknown_write_result)
+        retained[0].cleanup();target.stop.assert_not_called()

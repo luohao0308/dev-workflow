@@ -35,6 +35,30 @@ if sys.argv[1]=='serve':
     slots.AttachReadUnitV3=WireUnit;attached.AttachReadUnitV3=WireUnit
     slots.OwnedRecoveryUnitV3=FakeUnit
     slots.observe_stopped_writer=lambda *a,**kw:SimpleNamespace(writerStoppedObserved=True,observation_digest='c'*64)
+    import deployment_compose_scene_preparation_v3_host as prep
+    import base64,hashlib
+    class Preparation:
+        def __init__(self,observer,source,archive):
+            self.observer=observer;self.source=source;self.archive=archive;self.state='new';self.hello=None;self.meta=None;self.raw=b'{"private":"fixture capsule"}'
+        def identity(self,host):
+            if self.hello is None:
+                self.hello=dict(root=self.observer.binding()['root'],daemonId=self.observer.daemon_id,sourceSha=self.source,archiveDigest=self.archive,
+                    hostId=host,serverCertificateSha256='a'*64,writerCertificateSha256='b'*64);self.state='identity'
+            return self.hello
+        def prepare(self,policy,keys):
+            if self.state!='identity':raise ValueError('once')
+            if len(sys.argv)>9:time.sleep(float(sys.argv[9]))
+            self.state='prepared';self.meta=dict(preparationId='d'*64,capsuleDigest=hashlib.sha256(self.raw).hexdigest(),totalBytes=len(self.raw),
+                requestDigest='e'*64,expiresAt='2030-01-01T00:00:00Z',observerFacts={'bootId':'f'*32},approvalReady=False)
+            return self.meta
+        def status(self):return dict(preparationState=self.state,preparationIdentity=self.hello,capsule=self.meta)
+        def chunk(self,identity,digest,offset,length):
+            if identity!=self.meta['preparationId'] or digest!=self.meta['capsuleDigest']:raise ValueError('pin')
+            return dict(preparationId=identity,capsuleDigest=digest,totalBytes=len(self.raw),offset=offset,dataBase64=base64.b64encode(self.raw[offset:offset+length]).decode())
+        def cleanup(self):
+            if len(sys.argv)>8 and sys.argv[8]=='fail-prep':raise ValueError('unknown-write')
+            self.state='cleaned';return dict(preparationCleaned=True)
+    prep.PreparationOwnerV3=Preparation
     scene.OwnedRecoveryDaemonHostV3=Owner
     scene.serve(sys.argv[3])
 elif sys.argv[1]=='client':

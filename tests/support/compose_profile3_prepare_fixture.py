@@ -254,7 +254,9 @@ def _prepare_observed(session, *, root, rows, images, references, bodies, networ
 
 
 def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, keys, policy_hash,
-                     environment='test', expiry_seconds=600, registry='ecr-public'):
+                     environment='test', expiry_seconds=600, registry='ecr-public', on_session_created=None):
+    if on_session_created is not None and not callable(on_session_created):
+        raise ValueError('profile3-session-callback-rejected')
     target=validate_controller(root,info,source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
         keys=keys,policy_hash=policy_hash,expiry_seconds=expiry_seconds)
     fresh=json.loads(target.run('info','--format','{{json .}}'))
@@ -267,6 +269,7 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
     project='dw-restore-'+uuid.uuid4().hex[:24]
     session=PreparationSession(target,project)
     try:
+        if on_session_created is not None:on_session_created(session)
         images=[]
         for ref, enrolled_ref in zip((IMAGE,V2), references):
             image=source_image(ref); ensure_capacity(root,image)

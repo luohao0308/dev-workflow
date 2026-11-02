@@ -6,6 +6,7 @@ No restart/adoption, product dispatch, or reconstructed stop authority exists.
 """
 from dataclasses import dataclass,field
 import hashlib
+import base64
 import hmac
 import os
 from pathlib import Path
@@ -32,10 +33,13 @@ ROOT_UID=0
 DOMAIN=b'dev-workflow:scene-control:v3\0'
 MAX_FRAME=8192
 LEASE_SECONDS=30
-STOP_RESPONSE_SECONDS=110
+CLOSE_RESPONSE_SECONDS=420
+STOP_RESPONSE_SECONDS=CLOSE_RESPONSE_SECONDS
 RESERVE_RESPONSE_SECONDS=25
 DRAIN_RESPONSE_SECONDS=40
 INSPECT_RESPONSE_SECONDS=60
+IDENTITY_RESPONSE_SECONDS=90
+PREPARATION_RESPONSE_SECONDS=1200
 _FALSE=('authorityGranted','runtimePermit','recoveryAuthorized','productionReady','writerQuiescenceVerified')
 
 
@@ -177,6 +181,8 @@ class SceneClientV3:
             elif command=='reserve_writer':end=time.monotonic()+RESERVE_RESPONSE_SECONDS
             elif command=='drain_writer':end=time.monotonic()+DRAIN_RESPONSE_SECONDS
             elif command=='inspect_attached_worker':end=time.monotonic()+INSPECT_RESPONSE_SECONDS
+            elif command=='prepare_identity':end=time.monotonic()+IDENTITY_RESPONSE_SECONDS
+            elif command=='prepare_staging':end=time.monotonic()+PREPARATION_RESPONSE_SECONDS
             reply=_verify(self._handle.controlKey,_read(self._socket,end))
             expected=dict(kind='scene-result-v3',**self._lease,seq=self._seq,command=command)
             if set(reply)!=set(expected)|{'result'} or any(canonical(reply[k])!=canonical(v) for k,v in expected.items()):reject()
@@ -186,6 +192,12 @@ class SceneClientV3:
         except Exception:
             self._socket.close();self._closed=True;reject()
 
+    def prepare_identity(self,host_id):return self._call('prepare_identity',{'hostId':host_id})
+    def prepare_staging(self,policy_hash,keys):
+        if type(keys) is not dict or set(keys)!={'config','image','declaration','archive','target'} or any(type(v) is not bytes or len(v)!=32 for v in keys.values()):reject()
+        return self._call('prepare_staging',{'policyHash':policy_hash,'keys':{k:base64.b64encode(v).decode('ascii') for k,v in keys.items()}})
+    def preparation_chunk(self,preparation_id,capsule_digest,offset,length):
+        return self._call('preparation_chunk',dict(preparationId=preparation_id,capsuleDigest=capsule_digest,offset=offset,length=length))
     def inspect_attached_worker(self,expected_slot_generation):
         if type(expected_slot_generation) is not int or not 0<=expected_slot_generation<2**53:reject()
         return self._call('inspect_attached_worker',{'slotGeneration':expected_slot_generation})
@@ -210,6 +222,33 @@ class SceneClientV3:
 def client_scene(handle):return SceneClientV3(handle)
 
 
+def _install_distribution(scene_fd,raw):
+    import io,zipfile
+    from deployment_compose_scene_attach_read_v3_host import validate_distribution_archive
+    validate_distribution_archive(raw,digest(raw))
+    os.mkdir('distribution',0o700,dir_fd=scene_fd);os.fsync(scene_fd)
+    root=os.open('distribution',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=scene_fd)
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            for info in archive.infolist():
+                parts=info.filename.split('/');parent=os.dup(root)
+                try:
+                    for part in parts[:-1]:
+                        try:os.mkdir(part,0o700,dir_fd=parent);os.fsync(parent)
+                        except FileExistsError:pass
+                        child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+                        st=os.fstat(child)
+                        if st.st_uid!=ROOT_UID or stat.S_IMODE(st.st_mode)!=0o700:os.close(child);reject()
+                        os.close(parent);parent=child
+                    file=os.open(parts[-1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+                    with os.fdopen(file,'wb') as output:output.write(archive.read(info));output.flush();os.fsync(output.fileno())
+                    os.fsync(parent)
+                finally:os.close(parent)
+        os.fsync(root)
+    finally:os.close(root)
+    os.fsync(scene_fd)
+
+
 def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archive_bytes=None):
     if (writer_source_sha is None)!=(writer_archive_digest is None):reject()
     if writer_source_sha is not None:
@@ -222,6 +261,7 @@ def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archi
     units._environment()
     scene_id='dw-scene-'+secrets.token_hex(8);path=_path(scene_id);path.mkdir(mode=0o700)
     fd,identity=_directory(path)
+    script=Path(__file__).resolve()
     try:
         key=secrets.token_bytes(32)
         file=os.open('control.key',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
@@ -234,13 +274,15 @@ def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archi
         if writer_archive_bytes is not None:
             archive_fd=os.open('loader-archive.private.zip',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
             with os.fdopen(archive_fd,'wb') as output:output.write(writer_archive_bytes);output.flush();os.fsync(output.fileno())
+            _install_distribution(fd,writer_archive_bytes)
+            script=path/'distribution/scripts/deployment_compose_scene_service_v3_host.py'
         os.fsync(fd)
     finally:os.close(fd)
     unit='dw-scene-owner-'+scene_id[-16:]+'.service'
     subprocess.run(['/usr/bin/systemd-run','--system','--quiet','--collect','--service-type=exec','--unit='+unit,
-        '--property=User=root','--property=Restart=no','--property=RuntimeMaxSec=3300','--property=TimeoutStopSec=120',
+        '--property=User=root','--property=Restart=no','--property=RuntimeMaxSec=3300','--property=TimeoutStopSec=420',
         '--property=KillMode=control-group','--property=MemoryMax=256M','--property=MemorySwapMax=0',
-        '--property=CPUQuota=50%','--property=TasksMax=128','--',sys.executable,'-I','-u',str(Path(__file__).resolve()),'--serve',scene_id],
+        '--property=CPUQuota=50%','--property=TasksMax=128','--',sys.executable,'-I','-u',str(script),'--serve',scene_id],
         capture_output=True,check=True,timeout=10,env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin'})
     handle=SceneHandleV3(scene_id,str(path/'control.sock'),key);end=time.monotonic()+100
     while True:
@@ -309,10 +351,11 @@ def _loader_archive(fd,expected_digest,*,validate=False):
 def serve(scene_id):
     units._environment();path=_path(scene_id);fd,identity=_directory(path)
     key,key_identity=_key(fd);listener=connection=None;owner=OwnedRecoveryDaemonHostV3();generation=0
-    service_end=time.monotonic()+3150;state=None;closing=False;socket_identity=None;slot_cleanup_attempted=False
+    service_end=time.monotonic()+2850;state=None;closing=False;socket_identity=None;slot_cleanup_attempted=False;preparation=None;preparation_cleanup_attempted=False
     source,source_identity=_loader_source(fd,key,scene_id)
     attached_archive,archive_identity=_loader_archive(fd,source['archiveDigest'] if source is not None else None,validate=True)
     from deployment_compose_scene_writer_slot_v3_host import SlotOwnerV3
+    from deployment_compose_scene_preparation_v3_host import PreparationOwnerV3
     slot=SlotOwnerV3(source['sourceSha'],source['archiveDigest']) if source is not None else None
     def interrupted(*args):raise SystemExit('scene-service-interrupted')
     signal.signal(signal.SIGTERM,interrupted);signal.signal(signal.SIGINT,interrupted)
@@ -367,9 +410,17 @@ def serve(scene_id):
             selector.register(listener,selectors.EVENT_READ,'listener')
             while not closing:
                 _left(service_end);check()
-                if state is not None and (
-                        state['expires'] is not None and time.monotonic()>=state['expires']
-                        or state.get('lease_deadline') is not None and time.monotonic()>=state['lease_deadline']):release(selector)
+                if state is not None:
+                    now=time.monotonic()
+                    expired=(state['expires'] is not None and now>=state['expires'] or
+                        state.get('lease_deadline') is not None and now>=state['lease_deadline'])
+                    if state.get('flush_expires') is not None and now>=state['flush_expires']:
+                        release(selector)
+                    elif expired:
+                        if state['output'] and state.get('flush_expires') is not None:state['release']=True
+                        else:release(selector)
+                    if connection is not None and state['release']:
+                        selector.modify(connection,selectors.EVENT_WRITE,'client')
                 ready=selector.select(min(.1,_left(service_end)))
                 ready.sort(key=lambda event:event[0].data=='listener')
                 for selected,events in ready:
@@ -382,7 +433,7 @@ def serve(scene_id):
                             if peer is not None:peer.close()
                             continue
                         connection=peer;state=dict(buffer=bytearray(),output=bytearray(),expires=time.monotonic()+5,
-                            server=secrets.token_hex(32),lease=None,seq=0,release=False)
+                            server=secrets.token_hex(32),lease=None,seq=0,release=False,flush_expires=None)
                         state['output'].extend(_frame(dict(kind='scene-challenge-v3',sceneId=scene_id,serverNonce=state['server'])))
                         selector.register(peer,selectors.EVENT_READ|selectors.EVENT_WRITE,'client');continue
                     if connection is None:continue
@@ -392,9 +443,10 @@ def serve(scene_id):
                             if sent<=0:reject()
                             del state['output'][:sent]
                             if not state['output']:
+                                state['flush_expires']=None
                                 if closing or state['release']:release(selector);continue
                                 if state['lease'] is not None and not state['buffer']:state['expires']=None
-                        if events&selectors.EVENT_READ:
+                        if events&selectors.EVENT_READ and not state['release']:
                             raw=connection.recv(16384)
                             if not raw:release(selector);continue
                             if state['expires'] is None:state['expires']=time.monotonic()+5
@@ -415,15 +467,20 @@ def serve(scene_id):
                                     reply=dict(kind='scene-lease-v3',**state['lease'],seq=0)
                                 else:
                                     lease=state['lease']
-                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker')
+                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk')
                                     if (set(value)!=({'kind',*lease,'seq','command'}|({'args'} if extended else set())) or value['kind']!='scene-command-v3'
                                             or any(canonical(value[k])!=canonical(v) for k,v in lease.items()) or type(value['seq']) is not int
-                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker')):reject()
+                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk')):reject()
                                     if time.monotonic()>=state['lease_deadline']:reject()
                                     if extended:
-                                        args=value['args']
-                                        if (type(args) is not dict or set(args)!={'slotGeneration'} or type(args['slotGeneration']) is not int
+                                        args=value['args'];command=value['command']
+                                        expected_args={'prepare_identity':{'hostId'},'prepare_staging':{'policyHash','keys'},
+                                            'preparation_chunk':{'preparationId','capsuleDigest','offset','length'}}.get(command,{'slotGeneration'})
+                                        if type(args) is not dict or set(args)!=expected_args:reject()
+                                        if 'slotGeneration' in expected_args and (type(args['slotGeneration']) is not int
                                                 or not 0<=args['slotGeneration']<2**53 or slot is None):reject()
+                                        if command in ('prepare_identity','prepare_staging') and (source is None or attached_archive is None or slot is not None
+                                                and slot.status()['slotState'] not in ('empty','drained')):reject()
                                     state['seq']=value['seq'];command=value['command']
                                     if command=='status':state['lease_deadline']=min(time.monotonic()+LEASE_SECONDS,service_end)
                                     result=dict(sceneId=scene_id,controllerExclusive=True,leaseSeconds=LEASE_SECONDS,daemonId=owner.observer.daemon_id,
@@ -436,6 +493,29 @@ def serve(scene_id):
                                         if attached_archive is None:reject()
                                         metadata=slot.inspect_attached(attached_archive,owner.observer.binding(),value['args']['slotGeneration'])
                                     result.update(writerSlot=metadata,slotGeneration=metadata['slotGeneration'],slotState=metadata['slotState'])
+                                    if command=='prepare_identity':
+                                        if preparation is None:preparation=PreparationOwnerV3(owner.observer,source['sourceSha'],source['archiveDigest'])
+                                        result['hello']=preparation.identity(args['hostId'])
+                                    if command=='prepare_staging':
+                                        if service_end-time.monotonic()<PREPARATION_RESPONSE_SECONDS:reject()
+                                        if preparation is None or type(args['keys']) is not dict or set(args['keys'])!={'config','image','declaration','archive','target'}:reject()
+                                        keys={}
+                                        for name,encoded in args['keys'].items():
+                                            if type(encoded) is not str or len(encoded)!=44:reject()
+                                            decoded_key=base64.b64decode(encoded,validate=True)
+                                            if len(decoded_key)!=32 or base64.b64encode(decoded_key).decode('ascii')!=encoded:reject()
+                                            keys[name]=decoded_key
+                                        result['preparation']=preparation.prepare(args['policyHash'],keys)
+                                    if preparation is not None:
+                                        prep_status=preparation.status()
+                                        result['preparationState']=prep_status['preparationState']
+                                        result['preparationIdentity']=prep_status['preparationIdentity']
+                                        result['preparation']=prep_status['capsule']
+                                    else:result.update(preparationState='disabled' if source is None or attached_archive is None else 'new',preparation=None,preparationIdentity=None)
+                                    if command=='preparation_chunk':
+                                        if preparation is None:reject()
+                                        result=dict(preparationChunk=preparation.chunk(args['preparationId'],args['capsuleDigest'],args['offset'],args['length']),
+                                            **{k:False for k in _FALSE})
                                     if command=='detach':state['release']=True
                                     if command=='closeScene':
                                         closing=True;slot_error=None
@@ -446,14 +526,31 @@ def serve(scene_id):
                                         if slot is not None:
                                             metadata=slot.status()
                                             result.update(writerSlot=metadata,slotGeneration=metadata['slotGeneration'],slotState=metadata['slotState'])
+                                        prep_error=None
+                                        if preparation is not None:
+                                            preparation_cleanup_attempted=True
+                                            try:
+                                                result.update(preparation.cleanup())
+                                                cleaned_status=preparation.status()
+                                                result.update(preparationState=cleaned_status['preparationState'],
+                                                    preparationIdentity=cleaned_status['preparationIdentity'],
+                                                    preparation=cleaned_status['capsule'])
+                                            except BaseException as error:prep_error=error
                                         result.update(owner.stop())
+                                        if prep_error is not None:raise prep_error
                                         if slot_error is not None:raise slot_error
                                     reply=dict(kind='scene-result-v3',**lease,seq=state['seq'],command=command,result=result)
                                 state['output'].extend(_frame(_signed(key,reply)))
+                                # A completed authenticated operation gets a fresh
+                                # bounded reply flush, never a renewed lease.
+                                state['flush_expires']=time.monotonic()+5
+                                if not state['buffer']:state['expires']=None
+                                if state.get('lease_deadline') is not None and time.monotonic()>=state['lease_deadline']:
+                                    state['release']=True
                                 if len(state['output'])>16384:reject()
                                 if state['release'] or closing:break
                         if connection is not None:
-                            selector.modify(connection,selectors.EVENT_READ|(selectors.EVENT_WRITE if state['output'] else 0),'client')
+                            selector.modify(connection,(0 if state['release'] else selectors.EVENT_READ)|(selectors.EVENT_WRITE if state['output'] else 0),'client')
                     except Exception:
                         if connection is not None:release(selector)
                         if closing:raise
@@ -469,18 +566,23 @@ def serve(scene_id):
                         del state['output'][:sent]
                     release(selector)
     finally:
-        primary=sys.exc_info()[1];failed=False
+        primary=sys.exc_info()[1];failed=False;cleanup_error=None
         actions=[]
         if connection is not None:actions.append(connection.close)
         if listener is not None:actions.append(listener.close)
         if slot is not None and not slot_cleanup_attempted and slot.status()['slotState'] not in ('empty','drained'):
             actions.append(lambda:slot.drain(slot.status()['slotGeneration']))
+        if preparation is not None and not preparation_cleanup_attempted:actions.append(preparation.cleanup)
         actions.extend((lambda:os.close(fd),owner.stop))
         for action in actions:
             try:action()
-            except Exception:failed=True
+            except BaseException as error:
+                failed=True
+                if cleanup_error is None:cleanup_error=error
         if failed:
-            if primary is None:reject()
+            if primary is None:
+                if not isinstance(cleanup_error,Exception):raise cleanup_error
+                reject()
             try:
                 if hasattr(primary,'add_note'):primary.add_note('scene service cleanup incomplete')
             except Exception:pass
