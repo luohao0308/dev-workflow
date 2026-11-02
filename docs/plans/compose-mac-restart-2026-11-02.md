@@ -142,3 +142,11 @@ producer与consumer必须是真实新进程且前者已wait/reap；consumer使�
 新增只读Git verifier：可信embedding提供本地repository，来源身份及原SHA取自重新认证的checkpoint；限定原dev-workflow发布来源与原代码发布白名单。固定原commit及其递归tree/blob，每个Git对象按原始类型/长度/内容重算SHA1 OID，不遍历parent历史、不依赖当前HEAD等于原SHA、不fetch、不执行源码或过滤器；禁替换对象、外部配置、hook/fsmonitor；任何partialClone/promisor配置（含本地include）在对象读取前拒绝，兼容不能识别no-lazy-fetch开关的旧Git，并禁传输协议。ZIP逐成员唯一且路径安全，完整匹配白名单regular blobs，拒缺项/额外项/symlink/加密/错误CRC/超限；兼容原writestr权限元数据。数量、深度、对象/总字节及读取deadline有界；timeout限定Git/ZIP阶段，前后私有材料认证保留原crypto/flock及filesystem阻塞边界，不宣称整个API硬期限。
 
 输出仅声明`publishedSourceArchiveVerified`与Git对象内容一致性，绑定原material/source/archive及manifest摘要；不宣称当前分支仍指向旧SHA、现时发布引用或业务source已重验。`sourceRevalidated`、writer排他、approvalReady、恢复/执行权限及production继续false。产品retained owner的启动、接管及清理authority不因本切片而成立。
+
+## 第十切片：独立owner下producer SIGKILL故障矩阵
+
+原真实Engine诊断仅覆盖producer正常退出。本轮新增独立严格入口，producer经原签名只读RPC完成材料重验和私有持久化后原子发布ready并同步后从原Popen管道发固定ACK，再停留等待；parent仅对自己原Popen执行SIGKILL并wait/reap，之后才可启动原native consumer。不能从JSON PID派生kill权限，ready或子进程身份/退出码/回收失败不得进入consumer。
+
+独立owner继续持有同一daemon、资源和见证，检查SIGKILL前后binding一致；新consumer完成live phase及新CAS草案重验，后续候选清理后拒绝、库存恢复及probe停止/宿主投影仍须全部通过。子阶段有共享deadline，失败清理仅自己的子进程，证据与正常退出场景分开。
+
+保持首create history为synthetic、实际fixture Engine写入有发生、产品writer派发及真实审批消费为零，所有恢复/执行权限false。不将该producer材料诊断冒充整个coordinator崩溃、真实已准入checkpoint或产品持久owner完成。

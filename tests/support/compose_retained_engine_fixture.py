@@ -10,6 +10,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import signal
+import selectors
+import stat
 import subprocess
 import sys
 import time
@@ -25,6 +28,7 @@ from deployment_compose_checkpoint_prepare_v3_host import CheckpointRecoveryPrep
 from deployment_compose_recovery_store import ComposeRecoveryStore
 
 ENTRYPOINT='compose_retained_engine_fixture.remote_main'
+CRASH_ENTRYPOINT='compose_retained_engine_fixture.crash_remote_main'
 
 
 def digest(raw):return hashlib.sha256(raw).hexdigest()
@@ -67,15 +71,112 @@ def consume(directory,*,cleaned=False):
         observer.close()
 
 
-def _child(mode,directory):
+def _child(mode,directory,*,deadline=None):
     completed=subprocess.run([sys.executable,str(Path(__file__).resolve()),mode,str(directory)],
-        capture_output=True,timeout=90,check=False)
+        capture_output=True,timeout=90 if deadline is None else _remaining(deadline),check=False)
     record(directory/(mode+'-stdout.private.json'),completed.stdout)
     record(directory/(mode+'-stderr.private.txt'),completed.stderr)
     if completed.returncode or completed.stderr:raise ValueError('retained-fixture-child-rejected:'+mode)
     value=json.loads(completed.stdout)
     if type(value) is not dict:raise ValueError('retained-fixture-child-result')
     return value
+
+
+def _remaining(deadline):
+    left=deadline-time.monotonic()
+    if left<=0:raise ValueError('retained-crash-stage-deadline')
+    return left
+
+
+def crash_produce(directory):
+    value=produce(directory)  # Actual reauthentication and durable validated inputs first.
+    raw=(directory/'validated-material.private.json').read_bytes()
+    ready=dict(kind='retained-producer-ready-v1',producerPid=os.getpid(),historyDigest=value['historyDigest'],
+               materialDigest=digest(raw))
+    for name in ('validated-material.private.json','validated-pins.private.json'):
+        fd=os.open(directory/name,os.O_RDONLY|os.O_NOFOLLOW)
+        try:os.fsync(fd)
+        finally:os.close(fd)
+    parent=os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:
+        os.fsync(parent)
+        from deployment_compose_restart_checkpoint_v3_host import publish
+        publish(parent,'producer-ready.private.json',canonical(ready))
+    finally:os.close(parent)
+    if os.write(sys.stdout.fileno(),b'R')!=1:raise ValueError('retained-ready-ack-write')
+    while True:time.sleep(1)
+
+
+def _wait_ready_ack(process,deadline):
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout,selectors.EVENT_READ)
+        while True:
+            if process.poll() is not None:raise ValueError('retained-producer-exited-before-ack')
+            if not selector.select(min(.05,_remaining(deadline))):continue
+            if os.read(process.stdout.fileno(),2)!=b'R':raise ValueError('retained-producer-ack-rejected')
+            if selector.select(0):raise ValueError('retained-producer-extra-ack')
+            return
+
+
+def _ready(directory,process):
+    path=directory/'producer-ready.private.json'
+    fd=os.open(path,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW)
+    try:
+        info=os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode)!=0o600 or info.st_uid!=os.getuid()
+                or info.st_nlink!=1 or not 0<info.st_size<=4096):raise ValueError('retained-ready-file')
+        raw=os.read(fd,4097)
+        from deployment_compose_recovery_phase_capsule_v3_host import decode
+        value=decode(raw)
+        if (type(value) is not dict or set(value)!={'kind','producerPid','historyDigest','materialDigest'}
+                or value['kind']!='retained-producer-ready-v1' or type(value['producerPid']) is not int
+                or value['producerPid']!=process.pid or process.poll() is not None):raise ValueError('retained-ready-process')
+        pins=json.loads((directory/'pins.private.json').read_text())
+        material=(directory/'validated-material.private.json').read_bytes()
+        if (digest(material)!=value['materialDigest'] or value['materialDigest']!=pins['expectedDigest']
+                or value['historyDigest']!=pins['expectedContext']['historyDigest']
+                or (directory/'validated-pins.private.json').read_bytes()!=canonical(pins)):
+            raise ValueError('retained-ready-material')
+        after=os.stat(path,follow_symlinks=False)
+        if (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns):
+            raise ValueError('retained-ready-changed')
+        return value
+    finally:os.close(fd)
+
+
+def _crash_producer(directory,*,deadline):
+    process=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'crash-produce',str(directory)],
+        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+    try:
+        _wait_ready_ack(process,deadline)
+        ready=_ready(directory,process)
+        # Only the original Popen is kill authority. The JSON PID is corroboration.
+        if process.poll() is not None:raise ValueError('retained-producer-exited-before-kill')
+        process.kill()
+        code=process.wait(timeout=_remaining(deadline))
+        if code!=-signal.SIGKILL:raise ValueError('retained-producer-wrong-signal')
+        return dict(producerPid=process.pid,producerExitMode='sigkill',producerSignal=int(signal.SIGKILL),
+                    producerExitCode=code,producerReadyVerified=True,historyDigest=ready['historyDigest'])
+    finally:
+        primary=sys.exc_info()[1];failed=False
+        if process.poll() is None:
+            for action in (process.kill,lambda:process.wait(timeout=5)):
+                try:action()
+                except Exception:failed=True
+        try:process.stdout.close()
+        except Exception:failed=True
+        if failed:
+            if primary is None:raise ValueError('retained-producer-cleanup-failed')
+            if hasattr(primary,'add_note'):primary.add_note('retained producer cleanup incomplete')
+
+
+def _producer_consumer(directory,*,crash=False,after_producer=None):
+    deadline=time.monotonic()+90 if crash else None
+    producer=_crash_producer(directory,deadline=deadline) if crash else _child('produce',directory)
+    if not crash:producer.update(producerExitMode='normal',producerSignal=None,producerExitCode=0)
+    if after_producer is not None:after_producer()
+    consumer=_child('consume',directory,deadline=deadline) if crash else _child('consume',directory)
+    return producer,consumer
 
 
 def _binding(root,daemon_id):
@@ -96,7 +197,7 @@ def _defaults(session):
     return result
 
 
-def workload(root,info,config):
+def workload(root,info,config,*,crash_producer=False):
     from compose_profile3_prepare_fixture import prepare_profile3
     from compose_retained_history_fixture import SyntheticClosedCreateHistory
     from deployment_compose_restart_material_v3_host import capture_material
@@ -133,10 +234,10 @@ def workload(root,info,config):
         record(directory/'config.private.json',canonical(child_config))
         before=(witness.store.root/'state.json').read_bytes()
         binding=_binding(root,info['ID'])
-        producer=_child('produce',directory)  # run() has waited/reaped before return.
-        if _binding(root,info['ID'])!=binding:raise ValueError('daemon-changed-after-producer')
-        session.store.close();session.store=None
-        consumer=_child('consume',directory)
+        def producer_exited():
+            if _binding(root,info['ID'])!=binding:raise ValueError('daemon-changed-after-producer')
+            session.store.close();session.store=None
+        producer,consumer=_producer_consumer(directory,crash=crash_producer,after_producer=producer_exited)
         if (consumer['consumerPid']==producer['producerPid'] or not consumer['draftVerified']
                 or consumer['daemonBindingDigest']!=digest(canonical(binding))
                 or _binding(root,info['ID'])!=binding):raise ValueError('retained-process-seam-rejected')
@@ -153,6 +254,7 @@ def workload(root,info,config):
         result=dict(success=True,realEngine=True,nativeEndpointIdentity=True,syntheticAdmissionHistory=True,
             realApprovalConsumptions=0,productWriterDispatches=0,fixtureEngineWritesPerformed=True,
             producerPid=producer['producerPid'],consumerPid=consumer['consumerPid'],producerExitedBeforeConsumer=True,
+            producerExitMode=producer['producerExitMode'],producerSignal=producer['producerSignal'],producerExitCode=producer['producerExitCode'],
             ownerPid=os.getpid(),daemonAliveAfterProducerExit=True,cleanedSceneRejected=True,
             sessionCleaned=True,apiInventoryRestored=True,inventoryDigest=inventory_digest,
             requestDigest=consumer['requestDigest'],historyDigest=consumer['historyDigest'],
@@ -181,28 +283,40 @@ def workload(root,info,config):
     return result
 
 
-def remote_main(config):
+def _run_remote(config,*,crash):
     import re
     from deployment_compose_isolated_daemon_probe import probe
     fields={'entrypoint','sourceSha','archiveDigest','hostId','channelNonce'}
-    if (type(config) is not dict or set(config)!=fields or any(type(config[key]) is not str for key in fields) or config['entrypoint']!=ENTRYPOINT
+    if (type(config) is not dict or set(config)!=fields or any(type(config[key]) is not str for key in fields) or config['entrypoint']!=(CRASH_ENTRYPOINT if crash else ENTRYPOINT)
             or re.fullmatch('[0-9a-f]{40}',config['sourceSha']) is None
             or any(re.fullmatch('[0-9a-f]{64}',config[key]) is None for key in ('archiveDigest','channelNonce'))
             or re.fullmatch('[A-Za-z0-9][A-Za-z0-9_.-]{0,127}',config['hostId']) is None):
         raise ValueError('retained-fixture-config-rejected')
-    result=probe(lambda root,info:workload(root,info,config),storage_driver='overlayfs',
+    result=probe(lambda root,info:workload(root,info,config,crash_producer=crash),storage_driver='overlayfs',
         workload_lifetime_seconds=3600,bind_to_owned_writer=False)
     summary=dict(success=result['completed'],remoteRoot=result['root'],sourceSha=config['sourceSha'],
         archiveDigest=config['archiveDigest'],daemonStopped=result['stopped'],
         productionSnapshotUnchanged=result['productionSnapshotUnchanged'],
         workload=result.get('workload'),failureReason=result.get('failureReason'),productionReady=False)
+    workload_result=result.get('workload')
+    summary.update(syntheticAdmissionHistory=True,realApprovalConsumptions=0,productWriterDispatches=0,
+        producerExitMode=workload_result.get('producerExitMode') if type(workload_result) is dict else None,
+        producerSignal=workload_result.get('producerSignal') if type(workload_result) is dict else None,
+        producerExitCode=workload_result.get('producerExitCode') if type(workload_result) is dict else None)
     record(Path(result['root'])/'retained-summary.private.json',canonical(summary))
     return summary
+
+
+def remote_main(config):return _run_remote(config,crash=False)
+
+
+def crash_remote_main(config):return _run_remote(config,crash=True)
 
 
 if __name__=='__main__':
     mode,destination=sys.argv[1:]
     directory=Path(destination).resolve(strict=True)
+    if mode=='crash-produce':crash_produce(directory);raise AssertionError('crash producer returned')
     if mode=='produce':value=produce(directory)
     elif mode in ('consume','reject-cleaned'):value=consume(directory,cleaned=mode=='reject-cleaned')
     else:raise ValueError('retained-fixture-mode-rejected')
