@@ -32,7 +32,7 @@ class PreparationTests(unittest.TestCase):
         self.observer=fixture.DaemonTests.observe(self)
         self.subject=preparation.PreparationOwnerV3(self.observer,'b'*40,'c'*64)
         self.keys={k:secrets.token_bytes(32) for k in ('config','image','declaration','archive','target')}
-        self.private={'fullConfig':['PRIVATE=body'],'marker':'capsule'};self.sessions=[]
+        self.private={'fullConfig':['PRIVATE=body'],'marker':'capsule','artifactServices':('native-dataclass-tuple',)};self.sessions=[]
         def prepare(root,info,**kwargs):
             self.assertEqual(info['DockerRootDir'],str(self.root/'data'))
             target=SimpleNamespace(socket=str(root/'docker.sock'),daemon_id=info['ID'])
@@ -60,7 +60,7 @@ class PreparationTests(unittest.TestCase):
             chunk=self.subject.chunk(meta['preparationId'],meta['capsuleDigest'],offset,7)
             self.assertEqual(chunk['offset'],offset);self.assertEqual(chunk['totalBytes'],meta['totalBytes'])
             part=base64.b64decode(chunk['dataBase64']);raw.extend(part);offset+=len(part)
-        self.assertEqual(hashlib.sha256(raw).hexdigest(),meta['capsuleDigest']);self.assertEqual(json.loads(raw),self.private)
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),meta['capsuleDigest']);self.assertEqual(json.loads(raw),preparation.live.private_json(self.private))
         self.assertNotIn('PRIVATE',json.dumps(meta));self.assertFalse(meta['approvalReady']);self.assertEqual(len(self.sessions),1)
         self.assertTrue(self.subject.cleanup()['preparationCleaned'])
 

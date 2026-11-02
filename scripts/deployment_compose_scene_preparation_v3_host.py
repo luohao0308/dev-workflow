@@ -109,7 +109,7 @@ class PreparationOwnerV3:
                 host_id=record['host'],expected_daemon_id=record['daemon'],keys=frozen_keys,policy_hash=policy_hash,
                 environment='staging',expiry_seconds=900,on_session_created=created)
             if session is not record['session']:reject()
-            raw=encode(live.private_capsule(session,session.prepared))
+            raw=encode(live.private_json(live.private_capsule(session,session.prepared)))
             if not 0<len(raw)<=4*1024*1024:reject()
             facts=[]
             class Capture:
