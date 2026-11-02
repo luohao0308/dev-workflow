@@ -1,5 +1,6 @@
 """Private readonly reconstruction; Unix Engine responses are explicit doubles."""
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import json
@@ -37,6 +38,29 @@ class CaptureTests(CapsuleTests):
         self.assertNotIn('targetCreateBody', repr(result))
         with self.assertRaises(FrozenInstanceError):result.phase_digest = 'x'
         return result
+
+    @contextmanager
+    def tracked_cas_fds(self):
+        # Track this call's native CAS instances and actual close operations.
+        # Other threads may independently close/reuse descriptor numbers.
+        owned=[];closed=[]
+        original_init=capture.ComposeRecoveryStore.__init__;native_close=os.close
+        def identity(fd):
+            info=os.fstat(fd)
+            return info.st_dev,info.st_ino
+        def initialize(store,*args,**kwargs):
+            original_init(store,*args,**kwargs)
+            owned.append((store,store._fd,identity(store._fd)))
+        def close(fd):
+            before=identity(fd)
+            result=native_close(fd)
+            closed.append((fd,before))
+            return result
+        with patch.object(capture.ComposeRecoveryStore,'__init__',initialize),patch.object(os,'close',close):
+            yield owned
+        for store,fd,opened_identity in owned:
+            self.assertIn((fd,opened_identity),closed,'this CAS directory descriptor was not closed')
+            self.assertIsNone(store._fd,'closed CAS retained its directory handle')
 
     def test_reopens_cas_and_performs_two_fresh_get_captures(self):
         capsule, kw = self.inputs()
@@ -111,29 +135,29 @@ class CaptureTests(CapsuleTests):
 
     def test_expiry_during_reads_timeout_and_cas_fd_cleanup(self):
         capsule, kw = self.inputs()
-        before = len(os.listdir('/dev/fd'))
         expiry = datetime.strptime(capsule['request']['expires_at'],'%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
         clock = unittest.mock.Mock()
         clock.now.side_effect = [datetime.now(timezone.utc), expiry+timedelta(seconds=1)]
-        with patch.object(capture,'datetime',clock), self.assertRaises(ValueError):
-            capture.reconstruct_initial_capture(encode(capsule), **kw)
-        with patch.object(capture.TrustedPhaseStateProducerV3,'_get',side_effect=TimeoutError('SECRET')), self.assertRaisesRegex(ValueError,'^compose-executor-capture-v3-rejected$'):
-            capture.reconstruct_initial_capture(encode(capsule), **kw)
-        self.assertEqual(len(os.listdir('/dev/fd')), before)
+        with self.tracked_cas_fds() as owned:
+            with patch.object(capture,'datetime',clock), self.assertRaises(ValueError):
+                capture.reconstruct_initial_capture(encode(capsule), **kw)
+            with patch.object(capture.TrustedPhaseStateProducerV3,'_get',side_effect=TimeoutError('SECRET')), self.assertRaisesRegex(ValueError,'^compose-executor-capture-v3-rejected$'):
+                capture.reconstruct_initial_capture(encode(capsule), **kw)
+        self.assertEqual(len(owned),2)
 
     def test_replaced_cas_root_is_rejected_and_fd_closed(self):
         capsule, kw = self.inputs()
         root = Path(kw['cas_root']); moved = self.root/'original-archive'
         original = capture.ComposeRecoveryStore._validate_root
-        before = len(os.listdir('/dev/fd'))
         def replaced(store):
             root.rename(moved); root.mkdir(mode=0o700)
             try: return original(store)
             finally:
                 root.rmdir(); moved.rename(root)
-        with patch.object(capture.ComposeRecoveryStore, '_validate_root', replaced), self.assertRaises(ValueError):
-            capture.reconstruct_initial_capture(encode(capsule), **kw)
-        self.assertEqual(len(os.listdir('/dev/fd')), before)
+        with self.tracked_cas_fds() as owned:
+            with patch.object(capture.ComposeRecoveryStore, '_validate_root', replaced), self.assertRaises(ValueError):
+                capture.reconstruct_initial_capture(encode(capsule), **kw)
+        self.assertEqual(len(owned),1)
         self.session.store.get(capsule['bundle']['baselineStateReference'])
         entry = root/capsule['bundle']['baselineStateReference']
         raw = entry.read_bytes()
@@ -142,6 +166,31 @@ class CaptureTests(CapsuleTests):
             with self.assertRaises(ValueError):capture.reconstruct_initial_capture(encode(capsule), **kw)
         finally: entry.write_bytes(raw)
         self.session.store.get(capsule['bundle']['baselineStateReference'])
+
+    def test_cas_fd_tracking_ignores_unrelated_closes_and_detects_native_close_omission(self):
+        capsule,kw=self.inputs()
+        unrelated=os.pipe()
+        try:
+            with self.tracked_cas_fds() as owned:
+                os.close(unrelated[0]);os.close(unrelated[1]);unrelated=()
+                with patch.object(capture.TrustedPhaseStateProducerV3,'_get',side_effect=TimeoutError),self.assertRaises(ValueError):
+                    capture.reconstruct_initial_capture(encode(capsule),**kw)
+            self.assertEqual(len(owned),1)
+        finally:
+            for fd in unrelated:os.close(fd)
+        leaked=[]
+        def omit_native_close(store):
+            if store._fd is not None:
+                leaked.append(store._fd);store._fd=None
+        try:
+            with self.assertRaisesRegex(AssertionError,'CAS directory descriptor was not closed'):
+                with self.tracked_cas_fds():
+                    with patch.object(capture.ComposeRecoveryStore,'close',omit_native_close),\
+                            patch.object(capture.TrustedPhaseStateProducerV3,'_get',side_effect=TimeoutError),self.assertRaises(ValueError):
+                        capture.reconstruct_initial_capture(encode(capsule),**kw)
+            self.assertEqual(len(leaked),1)
+        finally:
+            for fd in leaked:os.close(fd)
 
     @unittest.skipUnless(sys.platform == 'linux', 'real Linux fresh-exec CAS admission')
     def test_fresh_isolated_interpreter_reopens_linux_cas_get_only(self):
