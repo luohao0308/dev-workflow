@@ -115,7 +115,7 @@ def _owned_writer_binding():
 
 
 def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600,
-          bind_to_owned_writer=False):
+          bind_to_owned_writer=False, require_bound_stop=False):
     if workload is not None and not callable(workload):
         raise ValueError('trusted-diagnostic-callback-required')
     if (type(workload_lifetime_seconds) is not int
@@ -125,6 +125,9 @@ def probe(workload=None, *, storage_driver="vfs", workload_lifetime_seconds=600,
     if (type(bind_to_owned_writer) is not bool
             or bind_to_owned_writer and (workload is None or workload_lifetime_seconds!=3600)):
         raise ValueError('owned-writer-workload-required')
+    if (type(require_bound_stop) is not bool
+            or require_bound_stop and (bind_to_owned_writer or workload is None)):
+        raise ValueError('bound-stop-independent-workload-required')
     parent = _owned_writer_binding() if bind_to_owned_writer else None
     if os.getuid() != 0:
         raise ValueError('root-required-for-bounded-namespace-probe')
@@ -201,6 +204,7 @@ finally:
               'completed':False,'startupReady':False,'stopped':False,'unitCreationOutcomeUnknown':False,
               'workloadRequested':workload is not None}
     started = False
+    stop_guard = None
     try:
         if run('systemctl','show',unit,'--property=LoadState','--value').strip() != b'not-found':
             raise ValueError('transient-unit-already-exists')
@@ -224,6 +228,9 @@ finally:
             'sh','-c','ip link set lo up && exec python3 "$@"','sh',str(supervisor),str(root),
             *(['--owned-writer'] if parent is not None else []))
         started=True
+        if require_bound_stop:
+            from deployment_compose_daemon_stop_guard_v3_host import DaemonStopGuardV3
+            stop_guard=DaemonStopGuardV3(root)
         result['unitCreationOutcomeUnknown']=False
         if parent is not None and _owned_writer_binding()!=parent:
             raise ValueError('owned-writer-service-changed')
@@ -279,7 +286,15 @@ finally:
     finally:
         if started:
             try:
-                stopped=subprocess.run(['systemctl','stop',unit],capture_output=True,timeout=45)
+                if require_bound_stop:
+                    if stop_guard is None:raise ValueError('daemon-stop-origin-unavailable')
+                    if stop_guard.should_stop():
+                        stopped=subprocess.run(['systemctl','stop',unit],capture_output=True,timeout=45)
+                    else:
+                        from types import SimpleNamespace
+                        stopped=SimpleNamespace(returncode=0)
+                else:
+                    stopped=subprocess.run(['systemctl','stop',unit],capture_output=True,timeout=45)
                 status=subprocess.run(['systemctl','show',unit,'--property=LoadState','--property=ActiveState',
                     '--property=MainPID'],capture_output=True,timeout=10)
                 state=dict(line.split('=',1) for line in status.stdout.decode().splitlines() if '=' in line)
@@ -297,6 +312,11 @@ finally:
         except Exception as error:
             result['afterSnapshotFailureType']=type(error).__name__
             result['productionSnapshotUnchanged']=False
+        if stop_guard is not None:
+            try:stop_guard.close()
+            except Exception as error:
+                result['cleanupFailureType']=type(error).__name__
+                result['stopped']=False
         result['completed']=(result['startupReady'] and result['stopped']
                              and result['productionSnapshotUnchanged'] and not result['unitCreationOutcomeUnknown']
                              and (workload is None or result.get('workload',{}).get('success') is True))

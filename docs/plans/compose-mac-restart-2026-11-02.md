@@ -150,3 +150,13 @@ producer与consumer必须是真实新进程且前者已wait/reap；consumer使�
 独立owner继续持有同一daemon、资源和见证，检查SIGKILL前后binding一致；新consumer完成live phase及新CAS草案重验，后续候选清理后拒绝、库存恢复及probe停止/宿主投影仍须全部通过。子阶段有共享deadline，失败清理仅自己的子进程，证据与正常退出场景分开。
 
 保持首create history为synthetic、实际fixture Engine写入有发生、产品writer派发及真实审批消费为零，所有恢复/执行权限false。不将该producer材料诊断冒充整个coordinator崩溃、真实已准入checkpoint或产品持久owner完成。
+
+## 第十一切片：本地固定daemon owner的实际启动/退出接口
+
+新增Linux/root本地creator，自建固定隔离Python owner进程，不接受caller Popen、命令、unit、root或workload。owner复用原probe独立模式的真实namespace/containerd/dockerd启动与3600秒systemd上限；固定callback只交付hello并等待原控制管道STOP/EOF，不执行应用容器写入。原managed worker/pidfd及默认清理不变。
+
+start只在原Popen、nonce与封闭hello匹配后自建原生ObservedRecoveryDaemonV3，核验真实root/socket/PID-start/cgroup/boot/invocation；observer只读，停止权限仍由原creator保有。stop经原Popen发送STOP，等待probe finally结束、原daemon停止、命名宿主投影结果、干净EOF/退出码及stderr收尾，再独立verify_stopped。任一清理/协议/身份失败不得成功；只回收原owner进程，不据JSON PID/unit导入停止权限。原对象/PID/thread身份、复制/pickle及替换边界必须拒绝。
+
+这是独立于业务writer、由可信宿主issuer存活期间管理的实际daemon creator。控制管道EOF沿原finally清理；issuer或owner遭SIGKILL的最坏收尾仍依赖原systemd RuntimeMaxSec，不宣称持久接管、owner重启恢复、业务资源清理或产品准入已接通。随机unit由可信独占宿主管理保留，systemd没有原子compare-invocation-and-stop，此切片不承诺抵抗恶意root替换unit。
+
+验证采用真实本地pipe/Unix HTTP及明确kernel替身的边界用例，再在已发布源码上通过严格SSH完成空Engine实际start/stop及二次unit/PID/cgroup核查；不启动应用workload或消费审批，保留全部production/恢复权限false。
