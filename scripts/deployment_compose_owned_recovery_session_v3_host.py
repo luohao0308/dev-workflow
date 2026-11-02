@@ -27,6 +27,7 @@ from deployment_compose_response_loss_observation_v3_host import KIND, validate_
 
 _ISSUED = weakref.WeakKeyDictionary()
 _ORIGINS = weakref.WeakKeyDictionary()
+_SOURCE_ARCHIVES = weakref.WeakKeyDictionary()
 
 
 def reject():
@@ -65,6 +66,17 @@ def issued(session,process=None):
                 session.verify_daemon_stop,session.verify_resource_inventory,session.verify_host_snapshot,type(session),profile)
             or session._profile is not profile):reject()
     return session
+
+
+def session_source_archive(session):
+    issued(session)
+    record=_SOURCE_ARCHIVES.get(session)
+    if (session._profile is not profiles.NORMAL or session._closed or session._finished
+            or session._process.poll() is not None or record is None
+            or record[0]!=_ISSUED.get(session) or type(record[1]) is not bytes
+            or not 0<len(record[1])<=2*1024*1024
+            or hashlib.sha256(record[1]).hexdigest()!=session.archive_digest):reject()
+    return record[1]
 
 
 def writer_origin_record(session):
@@ -124,6 +136,7 @@ class OwnedRecoverySSHSessionV3:
             if type(self._process) is not subprocess.Popen:reject()
             _ISSUED[self]=(self._pid,self._thread,self._process,self.nonce,source_sha,self.archive_digest,
                 ssh_alias,verify_daemon_stop,verify_resource_inventory,verify_host_snapshot,type(self),profile)
+            if profile is profiles.NORMAL:_SOURCE_ARCHIVES[self]=(_ISSUED[self],archive)
             def drain(stderr_fd=fd):
                 size=0
                 try:
@@ -175,7 +188,7 @@ class OwnedRecoverySSHSessionV3:
             try:self._dispose_local()
             except Exception:self._cleanup_error_codes.append('local-dispose')
             self._closed=True
-            _ISSUED.pop(self,None)
+            _ISSUED.pop(self,None);_SOURCE_ARCHIVES.pop(self,None)
             try:self._save_cleanup_report()
             except Exception:
                 self._cleanup_error_codes.append('report-write')
@@ -510,7 +523,7 @@ class OwnedRecoverySSHSessionV3:
             except Exception as error:
                 self._cleanup_error_codes.append('local-dispose')
                 if failure is None:failure=error
-            finally:self._closed=True;_ISSUED.pop(self,None);_ORIGINS.pop(self,None)
+            finally:self._closed=True;_ISSUED.pop(self,None);_ORIGINS.pop(self,None);_SOURCE_ARCHIVES.pop(self,None)
             try:self._save_cleanup_report()
             except Exception as error:
                 self._cleanup_error_codes.append('report-write')

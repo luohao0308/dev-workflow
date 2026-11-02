@@ -132,3 +132,13 @@ prepare只在新CAS独占发布/读回、私有基线校验、重新实时captur
 producer与consumer必须是真实新进程且前者已wait/reap；consumer使用原生ObservedRecoveryDaemonV3，不patch systemd、proc/cgroup、peer、namespace、Engine响应或平台。必须绑定同一实际PID/start/invocation/socket/root，重验现有phase并调用原checkpoint草案准备器；旧archive CAS关闭后使用新CAS。检查旧producer退出时daemon仍活，fixture清理后候选缺失则后续只读核验拒绝，owner最终停止daemon并复核unit/cgroup及命名宿主投影。
 
 本轮产品writer、真实审批消费、session/admission、尾部CAS和恢复权限仍为零/false；真实保留daemon的产品生命周期、真实已准入checkpoint冷验收及跨Mac执行恢复继续待办。私有日志/完整inspect/密钥留在私有case，不入分支；报告分别记录真实Engine/native身份与synthetic历史，不能提升为daemon永久连续性或完整生产可用性证明。
+
+## 第九切片：原发布源码归档保管及冷读Git内容重验
+
+原session仅计算原ZIP摘要并发送，checkpoint只有摘要；重新ZIP不保证恢复原字节。本切片在module WeakKey中绑定原normal issued session/PID/thread/Popen/source/archive bytes，仅checkpoint已启用时，从该原记录独占发布`source-archive/archive.private.zip`，在原origin绑定之后、回调及第二review之前完成fsync/readback。默认/raw/diagnostic路径不新增归档落盘；失败不交付增强descriptor、不修复残片。
+
+冷读入口使用原reader seal及独立material/custody/context/witness/origin pins，按原context.archiveDigest读取私有原ZIP；前后重开原材料/历史及Guard身份，不能信reader可改缓存或相邻manifest，旧checkpoint缺原ZIP明确拒绝。归档保管不保存旧grant或执行能力。
+
+新增只读Git verifier：可信embedding提供本地repository，来源身份及原SHA取自重新认证的checkpoint；限定原dev-workflow发布来源与原代码发布白名单。固定原commit及其递归tree/blob，每个Git对象按原始类型/长度/内容重算SHA1 OID，不遍历parent历史、不依赖当前HEAD等于原SHA、不fetch、不执行源码或过滤器；禁替换对象、外部配置、hook/fsmonitor；任何partialClone/promisor配置（含本地include）在对象读取前拒绝，兼容不能识别no-lazy-fetch开关的旧Git，并禁传输协议。ZIP逐成员唯一且路径安全，完整匹配白名单regular blobs，拒缺项/额外项/symlink/加密/错误CRC/超限；兼容原writestr权限元数据。数量、深度、对象/总字节及读取deadline有界；timeout限定Git/ZIP阶段，前后私有材料认证保留原crypto/flock及filesystem阻塞边界，不宣称整个API硬期限。
+
+输出仅声明`publishedSourceArchiveVerified`与Git对象内容一致性，绑定原material/source/archive及manifest摘要；不宣称当前分支仍指向旧SHA、现时发布引用或业务source已重验。`sourceRevalidated`、writer排他、approvalReady、恢复/执行权限及production继续false。产品retained owner的启动、接管及清理authority不因本切片而成立。

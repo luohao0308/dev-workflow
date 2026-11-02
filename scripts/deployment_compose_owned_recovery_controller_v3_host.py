@@ -268,6 +268,9 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                         archive_digest=archive_digest, witness_store=store, witness_signer=signer)
                     checkpoint_result = bind_writer_origin(case, session=_managed, admission=admission,
                         checkpoint_descriptor=checkpoint_result)
+                    from deployment_compose_checkpoint_archive_v3_host import retain_source_archive
+                    checkpoint_result = retain_source_archive(case, session=_managed,
+                        checkpoint_descriptor=checkpoint_result)
                     # Local notification only. Its return value cannot admit an
                     # intent; a callback failure aborts before the second review.
                     _restart_checkpoint(json.loads(live.encode(checkpoint_result)))
