@@ -9,8 +9,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/'packs/deployment/scripts'),str(ROOT/'scripts')]
@@ -110,9 +111,16 @@ class IntentStatusV4Tests(unittest.TestCase):
 
     def test_one_second_lag_waits_without_accepting_future(self):
         now=int(time.time());self.changes={'issuedAt':now,'expiresAt':now+30}
-        with patch.object(status.time,'time',side_effect=[now,now-1,now]),patch.object(status.time,'sleep') as sleep:
+        clock=SimpleNamespace(time=Mock(side_effect=[now-1,now]),sleep=Mock())
+        transport=self.client._transport
+        def unrelated_wait(rpc):
+            # subprocess timeout polling and other threads use the shared
+            # stdlib clock. They must not consume this client's fake clock.
+            time.sleep(.001)
+            return transport(rpc)
+        with patch.object(status,'time',clock),patch.object(self.client,'_transport',side_effect=unrelated_wait):
             self.client.check_consumed_intent(self.request)
-        sleep.assert_called_once_with(1)
+        clock.sleep.assert_called_once_with(1)
 
     def test_response_cannot_outlive_exact_request_expiry(self):
         request=replace(self.request,expires_at=(datetime.now(timezone.utc)+timedelta(seconds=10)).strftime('%Y-%m-%dT%H:%M:%SZ'))
