@@ -61,7 +61,7 @@ class PreparationOwnerV3:
         binding=canonical(observer.binding())
         _RECORDS[self]=dict(owner=(os.getpid(),threading.get_ident()),observer=observer,binding=binding,
             root=Path(observer.root),daemon=observer.daemon_id,source=source_sha,archive=archive_digest,
-            state='new',identity=None,tls=None,session=None,raw=None,metadata=None,fileIdentity=None,host=None)
+            state='new',identity=None,tls=None,session=None,raw=None,metadata=None,fileIdentity=None,host=None,keys=None,product_pending=False)
 
     def __copy__(self):reject()
     def __deepcopy__(self,memo):reject()
@@ -96,7 +96,7 @@ class PreparationOwnerV3:
         if (record['state']!='identity' or not hex_value(policy_hash) or type(keys) is not dict
                 or set(keys)!={'config','image','declaration','archive','target'}
                 or any(type(value) is not bytes or len(value)!=32 for value in keys.values())):reject()
-        record['state']='preparing';frozen_keys=dict(keys)
+        record['state']='preparing';frozen_keys=dict(keys);record['keys']=frozen_keys
         try:
             actual_info=_fresh(record)
             def created(session):
@@ -147,6 +147,39 @@ class PreparationOwnerV3:
         finally:os.close(fd)
         return dict(preparationId=preparation_id,capsuleDigest=capsule_digest,totalBytes=len(raw),offset=offset,
             dataBase64=base64.b64encode(raw[offset:offset+length]).decode('ascii'),**{key:False for key in _FALSE})
+
+    def business_inputs(self):
+        """Borrow native private inputs inside the owning service thread only."""
+        record=_record(self)
+        if record['state']!='prepared' or record['raw'] is None or record['session'] is None:reject()
+        self.chunk(record['metadata']['preparationId'],record['metadata']['capsuleDigest'],0,1)
+        _fresh(record)
+        return dict(session=record['session'],capsule=record['raw'],tls=record['tls'],
+            hello=decode(record['identity']),daemonBinding=decode(record['binding']),keys=dict(record['keys']),metadata=decode(canonical(record['metadata'])))
+
+    def mark_product_pending(self):
+        record=_record(self)
+        if record['state']!='prepared' or record['product_pending'] or record['session'].unknown_write_result:reject()
+        record['product_pending']=True
+        record['session'].unknown_write_result=True
+
+    def _reconcile_closed_create(self,receipts):
+        # Only the fixed broker calls this after its pinned closure verifier.
+        record=_record(self);session=record['session']
+        if not record['product_pending'] or not session.unknown_write_result or type(receipts) is not dict:reject()
+        bundle=session.prepared['bundle'];creates=bundle.creation_operations()
+        if len(creates)!=1 or set(receipts)!={creates[0]['service']}:reject()
+        cid=receipts[creates[0]['service']]
+        if (not hex_value(cid) or cid in session.created_ids or cid in session.guard._base
+                or cid in session.guard._protected):reject()
+        operations=bundle.resolve_operations(receipts)
+        if len(operations)<2:reject()
+        _fresh(record)
+        session.guard.capture_phase(dict(phase_index=1,operation=operations[1],receipts=dict(receipts),
+            completed_operations=operations[:1]))
+        _fresh(record)
+        session.created_ids.append(cid)
+        session.unknown_write_result=False
 
     def cleanup(self):
         record=_record(self)

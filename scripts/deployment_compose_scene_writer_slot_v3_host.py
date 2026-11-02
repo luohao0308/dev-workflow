@@ -79,6 +79,30 @@ class SlotOwnerV3:
             record['state']='failed'
             raise
 
+    def reserve_create(self,expected_slot_generation):
+        """Internal fixed first-create allocation; never imports JSON ownership."""
+        record=_record(self);_generation(expected_slot_generation)
+        if record['generation']!=expected_slot_generation or record['state'] not in ('empty','drained'):reject()
+        record.update(generation=record['generation']+1,state='starting',unknown=True,owner=None,
+            origin=None,result=None,role='scene-create',receipt=None)
+        try:
+            from deployment_compose_scene_create_worker_v3_host import SceneCreateUnitV3
+            owner=SceneCreateUnitV3(record['archive'],record['source']);record['owner']=owner
+            if type(owner) is not SceneCreateUnitV3:reject()
+            owner.start(timeout=15)
+            origin=owner.capture_origin(timeout=5);parsed=validate_origin(origin)
+            if parsed['sourceSha']!=record['source'] or parsed['archiveDigest']!=record['archive']:reject()
+            record.update(state='waiting',unknown=False,origin=origin)
+            return _summary(record)
+        except BaseException:
+            record['state']='failed';raise
+
+    def borrow_create_unit(self):
+        record=_record(self)
+        from deployment_compose_scene_create_worker_v3_host import SceneCreateUnitV3
+        if record['role']!='scene-create' or record['state']!='waiting' or type(record['owner']) is not SceneCreateUnitV3:reject()
+        return record['owner']
+
     def inspect_attached(self,raw_archive,daemon_binding,expected_slot_generation):
         record=_record(self);_generation(expected_slot_generation)
         if (record['generation']!=expected_slot_generation or record['state'] not in ('empty','drained')
@@ -124,6 +148,9 @@ class SlotOwnerV3:
             return left
         try:
             expected_type=AttachReadUnitV3 if record['role']=='attach-read' else OwnedRecoveryUnitV3
+            if record['role']=='scene-create':
+                from deployment_compose_scene_create_worker_v3_host import SceneCreateUnitV3
+                expected_type=SceneCreateUnitV3
             if type(record['owner']) is not expected_type:reject()
             record['owner'].stop(timeout=budget(30))
             origin=record['origin']

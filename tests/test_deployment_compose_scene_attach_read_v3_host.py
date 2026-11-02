@@ -91,7 +91,8 @@ class WorkerTests(unittest.TestCase):
 class InspectSlotTests(unittest.TestCase):
     def test_success_requires_reply_and_original_drain_before_replacement(self):
         raw=b'fixed-read-distribution';sha=hashlib.sha256(raw).hexdigest()
-        class Unit(slots_fixture.FakeUnit):pass
+        class Unit(slots_fixture.FakeUnit):
+            fail_start=False;fail_stop=False
         Unit.instances=[]
         receipt=dict(readOnly=True,inventoryDigest='c'*64,authorityGranted=False,runtimePermit=False,productionReady=False)
         with patch.object(slots,'AttachReadUnitV3',Unit),patch.object(slots,'run_attached_read',return_value=receipt),\
@@ -101,7 +102,8 @@ class InspectSlotTests(unittest.TestCase):
             self.assertEqual(Unit.instances[0].calls,['start','origin','stop','close'])
     def test_bad_read_reply_keeps_slot_failed_until_explicit_drain(self):
         raw=b'fixed-read-distribution';sha=hashlib.sha256(raw).hexdigest()
-        class Unit(slots_fixture.FakeUnit):pass
+        class Unit(slots_fixture.FakeUnit):
+            fail_start=False;fail_stop=False
         Unit.instances=[]
         with patch.object(slots,'AttachReadUnitV3',Unit),patch.object(slots,'run_attached_read',side_effect=ValueError('bad-read')):
             subject=slots.SlotOwnerV3('a'*40,sha)

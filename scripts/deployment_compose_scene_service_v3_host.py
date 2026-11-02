@@ -33,6 +33,7 @@ ROOT_UID=0
 DOMAIN=b'dev-workflow:scene-control:v3\0'
 MAX_FRAME=8192
 LEASE_SECONDS=30
+BUSINESS_LEASE_SECONDS=120
 CLOSE_RESPONSE_SECONDS=420
 STOP_RESPONSE_SECONDS=CLOSE_RESPONSE_SECONDS
 RESERVE_RESPONSE_SECONDS=25
@@ -178,6 +179,7 @@ class SceneClientV3:
             if args is not None:request['args']=args
             _write(self._socket,_signed(self._handle.controlKey,request),end)
             if command=='closeScene':end=time.monotonic()+STOP_RESPONSE_SECONDS
+            elif command in ('start_first_create','finish_worker','reconcile_closure'):end=time.monotonic()+40
             elif command=='reserve_writer':end=time.monotonic()+RESERVE_RESPONSE_SECONDS
             elif command=='drain_writer':end=time.monotonic()+DRAIN_RESPONSE_SECONDS
             elif command=='inspect_attached_worker':end=time.monotonic()+INSPECT_RESPONSE_SECONDS
@@ -191,6 +193,18 @@ class SceneClientV3:
             return result
         except Exception:
             self._socket.close();self._closed=True;reject()
+
+    def start_first_create(self,**args):return self._call('start_first_create',args)
+    def poll_worker(self):return self._call('poll_worker',{})
+    def read_worker_chunk(self,attempt_id,message_digest,offset,length):
+        return self._call('read_worker_chunk',dict(attemptId=attempt_id,messageDigest=message_digest,offset=offset,length=length))
+    def begin_worker_reply(self,attempt_id,total_bytes,message_digest,rpc_id):
+        return self._call('begin_worker_reply',dict(attemptId=attempt_id,totalBytes=total_bytes,messageDigest=message_digest,rpcId=rpc_id))
+    def worker_reply_chunk(self,attempt_id,offset,data_base64):
+        return self._call('worker_reply_chunk',dict(attemptId=attempt_id,offset=offset,dataBase64=data_base64))
+    def commit_worker_reply(self,attempt_id):return self._call('commit_worker_reply',dict(attemptId=attempt_id))
+    def finish_worker(self,attempt_id):return self._call('finish_worker',dict(attemptId=attempt_id))
+    def reconcile_closure(self,certificate):return self._call('reconcile_closure',dict(certificate=certificate))
 
     def prepare_identity(self,host_id):return self._call('prepare_identity',{'hostId':host_id})
     def prepare_staging(self,policy_hash,keys):
@@ -249,7 +263,14 @@ def _install_distribution(scene_fd,raw):
     os.fsync(scene_fd)
 
 
-def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archive_bytes=None):
+def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archive_bytes=None,
+                business_witness_public_key=None,business_intent_public_key=None):
+    if (business_witness_public_key is None)!=(business_intent_public_key is None):reject()
+    if business_witness_public_key is not None:
+        from deployment_gate_witness import key_material
+        business_witness_public_key=key_material(business_witness_public_key)
+        business_intent_public_key=key_material(business_intent_public_key)
+        if business_witness_public_key==business_intent_public_key or writer_archive_bytes is None:reject()
     if (writer_source_sha is None)!=(writer_archive_digest is None):reject()
     if writer_source_sha is not None:
         if (type(writer_source_sha) is not str or re.fullmatch('[0-9a-f]{40}',writer_source_sha) is None
@@ -266,6 +287,12 @@ def start_scene(*,writer_source_sha=None,writer_archive_digest=None,writer_archi
         key=secrets.token_bytes(32)
         file=os.open('control.key',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
         with os.fdopen(file,'wb') as output:output.write(key);output.flush();os.fsync(output.fileno())
+        if business_witness_public_key is not None:
+            pins=_signed(key,dict(kind='scene-business-pins-v3',sceneId=scene_id,
+                witnessPublicKey=base64.b64encode(business_witness_public_key).decode(),
+                intentPublicKey=base64.b64encode(business_intent_public_key).decode()))
+            pins_fd=os.open('business-pins.private.json',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
+            with os.fdopen(pins_fd,'wb') as output:output.write(canonical(pins));output.flush();os.fsync(output.fileno())
         if writer_source_sha is not None:
             source=_signed(key,dict(kind='scene-loader-source-v3',sceneId=scene_id,
                 sourceSha=writer_source_sha,archiveDigest=writer_archive_digest))
@@ -348,10 +375,33 @@ def _loader_archive(fd,expected_digest,*,validate=False):
     finally:os.close(file)
 
 
+def _business_pins(fd,key,scene_id):
+    try:file=os.open('business-pins.private.json',os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=fd)
+    except FileNotFoundError:return None,None
+    try:
+        info=os.fstat(file);raw=os.read(file,16385)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid!=ROOT_UID or stat.S_IMODE(info.st_mode)!=0o600
+                or info.st_nlink!=1 or not 0<info.st_size<=16384 or len(raw)!=info.st_size):reject()
+        value=_verify(key,decode(raw))
+        if set(value)!={'kind','sceneId','witnessPublicKey','intentPublicKey'} or value['kind']!='scene-business-pins-v3' or value['sceneId']!=scene_id:reject()
+        from deployment_gate_witness import key_material
+        keys=[]
+        for name in ('witnessPublicKey','intentPublicKey'):
+            encoded=value[name]
+            if type(encoded) is not str:reject()
+            material=base64.b64decode(encoded,validate=True)
+            if key_material(material)!=material or base64.b64encode(material).decode()!=encoded:reject()
+            keys.append(material)
+        if keys[0]==keys[1]:reject()
+        return tuple(keys),(info.st_dev,info.st_ino,digest(raw))
+    finally:os.close(file)
+
+
 def serve(scene_id):
     units._environment();path=_path(scene_id);fd,identity=_directory(path)
     key,key_identity=_key(fd);listener=connection=None;owner=OwnedRecoveryDaemonHostV3();generation=0
-    service_end=time.monotonic()+2850;state=None;closing=False;socket_identity=None;slot_cleanup_attempted=False;preparation=None;preparation_cleanup_attempted=False
+    service_end=time.monotonic()+2850;state=None;closing=False;socket_identity=None;slot_cleanup_attempted=False;preparation=None;preparation_cleanup_attempted=False;broker=None;broker_cleanup_attempted=False
+    business_pins,business_identity=_business_pins(fd,key,scene_id)
     source,source_identity=_loader_source(fd,key,scene_id)
     attached_archive,archive_identity=_loader_archive(fd,source['archiveDigest'] if source is not None else None,validate=True)
     from deployment_compose_scene_writer_slot_v3_host import SlotOwnerV3
@@ -364,6 +414,7 @@ def serve(scene_id):
         try:
             if again!=identity or _key(fd)!=(key,key_identity):reject()
             if _loader_source(fd,key,scene_id)!=(source,source_identity):reject()
+            if _business_pins(fd,key,scene_id)!=(business_pins,business_identity):reject()
             if _loader_archive(fd,source['archiveDigest'] if source is not None else None)!=(attached_archive,archive_identity):reject()
             if socket_identity is not None:
                 info=os.stat('control.sock',dir_fd=fd,follow_symlinks=False)
@@ -373,6 +424,7 @@ def serve(scene_id):
     def release(selector):
         nonlocal connection,state
         if connection is not None:
+            if broker is not None:broker.controller_lost()
             selector.unregister(connection);connection.close();connection=None;state=None
     try:
         # Burn this identity before any daemon can be created. Neither stale
@@ -467,26 +519,34 @@ def serve(scene_id):
                                     reply=dict(kind='scene-lease-v3',**state['lease'],seq=0)
                                 else:
                                     lease=state['lease']
-                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk')
+                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')
                                     if (set(value)!=({'kind',*lease,'seq','command'}|({'args'} if extended else set())) or value['kind']!='scene-command-v3'
                                             or any(canonical(value[k])!=canonical(v) for k,v in lease.items()) or type(value['seq']) is not int
-                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk')):reject()
+                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')):reject()
                                     if time.monotonic()>=state['lease_deadline']:reject()
                                     if extended:
                                         args=value['args'];command=value['command']
                                         expected_args={'prepare_identity':{'hostId'},'prepare_staging':{'policyHash','keys'},
-                                            'preparation_chunk':{'preparationId','capsuleDigest','offset','length'}}.get(command,{'slotGeneration'})
+                                            'preparation_chunk':{'preparationId','capsuleDigest','offset','length'},
+                                            'start_first_create':{'preparationId','capsuleDigest','slotGeneration','policy','gateKeyBase64','requestHash','receiptHash','firstBinding'},
+                                            'poll_worker':set(),'read_worker_chunk':{'attemptId','messageDigest','offset','length'},
+                                            'begin_worker_reply':{'attemptId','totalBytes','messageDigest','rpcId'},
+                                            'worker_reply_chunk':{'attemptId','offset','dataBase64'},'commit_worker_reply':{'attemptId'},
+                                            'finish_worker':{'attemptId'},'reconcile_closure':{'certificate'}}.get(command,{'slotGeneration'})
                                         if type(args) is not dict or set(args)!=expected_args:reject()
                                         if 'slotGeneration' in expected_args and (type(args['slotGeneration']) is not int
                                                 or not 0<=args['slotGeneration']<2**53 or slot is None):reject()
                                         if command in ('prepare_identity','prepare_staging') and (source is None or attached_archive is None or slot is not None
                                                 and slot.status()['slotState'] not in ('empty','drained')):reject()
                                     state['seq']=value['seq'];command=value['command']
-                                    if command=='status':state['lease_deadline']=min(time.monotonic()+LEASE_SECONDS,service_end)
-                                    result=dict(sceneId=scene_id,controllerExclusive=True,leaseSeconds=LEASE_SECONDS,daemonId=owner.observer.daemon_id,
+                                    lease_seconds=(BUSINESS_LEASE_SECONDS if broker is not None and broker.status()['businessState']
+                                        in ('starting','active','terminal','transport-exited','closed') else LEASE_SECONDS)
+                                    if command=='status':state['lease_deadline']=min(time.monotonic()+lease_seconds,service_end)
+                                    result=dict(sceneId=scene_id,controllerExclusive=True,leaseSeconds=lease_seconds,daemonId=owner.observer.daemon_id,
                                         daemonBinding=owner.observer.binding(),
                                         generation=generation,**{k:False for k in _FALSE})
                                     metadata=slot.status() if slot is not None else dict(slotGeneration=0,slotState='disabled')
+                                    if broker is not None and command in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging'):reject()
                                     if command=='reserve_writer':metadata=slot.reserve(value['args']['slotGeneration'])
                                     if command=='drain_writer':metadata=slot.drain(value['args']['slotGeneration'])
                                     if command=='inspect_attached_worker':
@@ -516,9 +576,37 @@ def serve(scene_id):
                                         if preparation is None:reject()
                                         result=dict(preparationChunk=preparation.chunk(args['preparationId'],args['capsuleDigest'],args['offset'],args['length']),
                                             **{k:False for k in _FALSE})
+                                    business_commands=('start_first_create','poll_worker','read_worker_chunk','begin_worker_reply',
+                                        'worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')
+                                    if command in business_commands:
+                                        if business_pins is None or preparation is None or attached_archive is None:reject()
+                                        if command=='start_first_create':
+                                            if broker is not None:reject()
+                                            from deployment_compose_scene_create_broker_v3_host import SceneCreateBrokerV3
+                                            broker=SceneCreateBrokerV3(preparation,attached_archive,*business_pins,slot,scene_id)
+                                            state['lease_deadline']=min(time.monotonic()+BUSINESS_LEASE_SECONDS,service_end)
+                                            business_result=broker.start_first_create(args,generation)
+                                        else:
+                                            if broker is None:reject()
+                                            if command=='poll_worker':business_result=broker.poll_worker()
+                                            elif command=='read_worker_chunk':business_result=broker.read_worker_chunk(args['attemptId'],args['messageDigest'],args['offset'],args['length'])
+                                            elif command=='begin_worker_reply':business_result=broker.begin_worker_reply(args['attemptId'],args['totalBytes'],args['messageDigest'],args['rpcId'])
+                                            elif command=='worker_reply_chunk':business_result=broker.worker_reply_chunk(args['attemptId'],args['offset'],args['dataBase64'])
+                                            elif command=='commit_worker_reply':business_result=broker.commit_worker_reply(args['attemptId'])
+                                            elif command=='finish_worker':business_result=broker.finish_worker(args['attemptId'])
+                                            else:business_result=broker.reconcile_closure(args['certificate'])
+                                        result=dict(business=business_result,**{k:False for k in _FALSE})
+                                    elif broker is not None:result['business']=broker.status()
+                                    else:result['business']=dict(businessState='disabled' if business_pins is None else 'new',
+                                        witnessKeyHash=digest(business_pins[0]) if business_pins else None,
+                                        intentKeyHash=digest(business_pins[1]) if business_pins else None)
                                     if command=='detach':state['release']=True
                                     if command=='closeScene':
-                                        closing=True;slot_error=None
+                                        closing=True;slot_error=None;broker_error=None
+                                        if broker is not None:
+                                            broker_cleanup_attempted=True
+                                            try:broker.drain()
+                                            except BaseException as error:broker_error=error
                                         if slot is not None and slot.status()['slotState'] not in ('empty','drained'):
                                             slot_cleanup_attempted=True
                                             try:slot.drain(slot.status()['slotGeneration'])
@@ -537,6 +625,7 @@ def serve(scene_id):
                                                     preparation=cleaned_status['capsule'])
                                             except BaseException as error:prep_error=error
                                         result.update(owner.stop())
+                                        if broker_error is not None:raise broker_error
                                         if prep_error is not None:raise prep_error
                                         if slot_error is not None:raise slot_error
                                     reply=dict(kind='scene-result-v3',**lease,seq=state['seq'],command=command,result=result)
@@ -569,6 +658,7 @@ def serve(scene_id):
         primary=sys.exc_info()[1];failed=False;cleanup_error=None
         actions=[]
         if connection is not None:actions.append(connection.close)
+        if broker is not None and not broker_cleanup_attempted:actions.append(broker.drain)
         if listener is not None:actions.append(listener.close)
         if slot is not None and not slot_cleanup_attempted and slot.status()['slotState'] not in ('empty','drained'):
             actions.append(lambda:slot.drain(slot.status()['slotGeneration']))
