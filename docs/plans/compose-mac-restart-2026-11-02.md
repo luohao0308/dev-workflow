@@ -52,3 +52,17 @@
 冷读重开原OperationWitnessStoreV3，仅允许原只读dispatch及新nonce签名响应，交给原reopen_material继续完整认证。reader的PID/thread/对象身份和关闭状态须防复制、fork或外线程关闭原句柄；所有文件身份及权限前后重验。原writer已退出不构成独立终止证明，冷读成功也不能恢复执行。
 
 验收采用原managed controller及真实本地管道/HMAC/SSHSIG，在首create闭合并落盘后从原生回调保留独立pins，再故意拒绝第二审批，旧producer正常完成异常清理并退出，再由新进程读取；不得patch保存函数获取pins或从邻接manifest补造信任。并覆盖文件权限/链接/替换、错误外部pin、部分发布/重复发布、读后关闭或复制/fork，以及见证已推进时旧checkpoint拒绝；不产生第二次消费或Engine派发。读取保留原store阻塞flock边界，不声明全局硬期限。
+
+## 第三切片：Linux原writer身份与冷进程停止核验
+
+当前manager交付给Mac的六字段binding不含PID/startTicks及cgroup inode，不能从daemon身份或JSON猜出旧writer身份。先补Linux本地完整origin及独立冷读核验；Mac端的外层origin frame、nonce/旧六字段绑定和checkpoint接线后续单列。
+
+原OwnedRecoveryUnitV3在确定启动后，重新验证同boot、原InvocationID/PID/startTicks、原cgroup与parent inode，才能导出canonical只读origin。origin同时固定producer的`/proc/self/ns/pid` device/inode，并验证`/proc/self/stat`中的PID等于`os.getpid()`；consumer必须匹配同一PID namespace与一致的/proc视图，避免把不同命名空间中看不到PID误判为原进程死亡。源码/归档身份取原固定loader构造参数。未启动、启动不确定、PID/Invocation/cgroup/namespace替换均拒绝。
+
+相同数字PID不能证明相同namespace；[Linux pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)说明procfs按挂载者namespace呈现进程。实现据此再比较`/proc/1/ns/pid`与`/proc/self/ns/pid`，并在捕获前后核对原MainPID的namespace与producer一致；即使数字PID偶合也不能混合不同视图的身份。
+
+冷核验器显式接收原origin字节及外部固定digest/source/archive，不复活旧owner对象。只接受固定`dw-writer-host-<16hex>.service`命名范围，cgroup路径由名称派生；只读systemctl show、/proc和cgroup。当前boot须匹配，原PID须已消失（包括zombie或PID复用均拒绝），unit须为严格not-found或原Invocation明确停止态，原cgroup须已消失或同inode递归空。两次完整观测须稳定一致，任何权限、解析、状态推进或身份变化均拒绝；所有读共享原有界deadline。
+
+停止观测只说明原wrapper/cgroup在本次观测中已停止，不说明daemon、业务、现场新鲜或后续永不重启；所有执行/恢复权限保持false。描述性结果不能作为新admission或stop能力。
+
+测试覆盖原owner活着时捕获、旧producer停止退出后全新consumer只读核验、残留后代、PID/unit/cgroup复用、错pin与错误boot、PID namespace及/proc视图不匹配、观测期间变化、权限失败与deadline。真实专用Linux/root测试仅启动等待归档的原固定loader，不发送归档/config、不启动worker或Engine；原owner负责停止，新consumer不得执行任何启停命令。

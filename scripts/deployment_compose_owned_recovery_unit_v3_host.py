@@ -68,6 +68,7 @@ class OwnedRecoveryUnitV3:
     """
     def __init__(self, archive_digest, source_sha):
         self._code = recovery_bootstrap(archive_digest,source_sha)
+        self._source_sha, self._archive_digest = source_sha, archive_digest
         _environment()
         self._owner = os.getpid()
         self._boot_id = _boot()
@@ -187,6 +188,40 @@ class OwnedRecoveryUnitV3:
                 except Exception:
                     if hasattr(original,'add_note'):original.add_note('local wrapper cleanup unverified')
                 raise
+
+    def capture_origin(self, *, timeout=5):
+        self._check()
+        with self._lock:
+            self._check()
+            if (type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0 < timeout <= 30
+                    or not self._attempted or self.creation_outcome_unknown or self._stopped
+                    or self._process is None or self._process.poll() is not None):reject()
+            from deployment_compose_cold_writer_v3_host import pid_namespace, process_pid_namespace, validate_origin
+            from deployment_compose_witness_store import canonical
+            deadline = time.monotonic()+timeout
+            namespace = pid_namespace()
+            state = self._state(deadline)
+            if (state['LoadState']!='loaded' or state['ActiveState']!='active' or state['Delegate']!='yes'
+                    or state['ControlGroup']!=self._group or state['InvocationID']!=self._invocation
+                    or self._pid is None or state['MainPID']!=str(self._pid[0])
+                    or process_pid_namespace(self._pid[0])!=namespace
+                    or _pid_identity(state['MainPID'],self._group)!=self._pid
+                    or not self._same_group() or self._read('cgroup.type').strip()!='domain'
+                    or events(self._read('cgroup.events'))['populated']!=1):reject()
+            parent = self._id(os.fstat(self._parent))
+            raw = canonical(dict(schemaVersion=1,kind='compose-owned-writer-origin-v3',
+                sourceSha=self._source_sha,archiveDigest=self._archive_digest,unit=self.unit,
+                kernelBoot=self._boot_id,invocationId=self._invocation,mainPid=self._pid[0],
+                mainStartTicks=self._pid[1],cgroupDevice=self._identity[0],cgroupInode=self._identity[1],
+                parentDevice=parent[0],parentInode=parent[1],
+                pidNamespaceDevice=namespace[0],pidNamespaceInode=namespace[1]))
+            validate_origin(raw)
+            if (self._state(deadline)!=state or pid_namespace()!=namespace
+                    or process_pid_namespace(self._pid[0])!=namespace or not self._same_group()
+                    or _pid_identity(state['MainPID'],self._group)!=self._pid
+                    or self._process.poll() is not None):reject()
+            _left(deadline)
+            return raw
 
     def stop(self, *, timeout=30):
         self._check()
