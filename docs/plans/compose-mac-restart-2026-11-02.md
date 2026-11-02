@@ -40,3 +40,15 @@
 ## 后续执行恢复的未闭合边界
 
 可信密钥保管/登记、外部单调见证、旧writer独立终止证明、已停Engine的重新绑定与实时phase、全新session及新精确消费、尾部CAS须分别实现和验收。首切片不解除这些条件，不启动生产。
+
+## 第二切片：原controller捕获与本地私有保管
+
+将首切片接到原managed普通controller的仅本地可选`on_restart_checkpoint`回调：提供回调即启用捕获和私有保管；默认None保持原路径。原恢复phase验证通过后、第二次精确审批消费前保存材料，并通过回调交付一次独立descriptor/pins；回调只接收深复制的描述性摘要，不含body、key、grant。raw-Popen和固定诊断画像拒绝此扩展，不新增wire字段。defaults须从已经认证的原deploy capsule用原image HMAC派生逻辑重新得到，不能从声称的摘要猜测。
+
+材料与读取所需的gate/store密钥分开保存在本次Mac私有case中；见证签名私钥继续使用原来的独立文件，不复制进材料或公开摘要。只接受POSIX当前用户0700目录和0600普通单链接文件，全路径拒绝符号链接；完整临时写入、fsync、独占发布，不覆盖旧结果或修复残片。两文件不是事务，任意写入或目录fsync失败都不得交付descriptor，冷读拒绝不完整pair。保存或回调失败必须在第二审批前拒绝，并沿原controller异常/清理路径退出。
+
+冷读入口必须显式接收来自可信embedding的材料摘要、密钥保管文件摘要、六项context pin及见证公钥摘要；邻接manifest不自证。这是可信独占主机上的私有文件保管，不声称Keychain/KMS、抵抗主机管理员或全局单调存储登记。新增custody只保存历史重验所需gate/store密钥，不复制旧grant、OIDC、approval/consumption对象或intent签名私钥；原controller已有签名文件的生命周期不在本切片内改写。
+
+冷读重开原OperationWitnessStoreV3，仅允许原只读dispatch及新nonce签名响应，交给原reopen_material继续完整认证。reader的PID/thread/对象身份和关闭状态须防复制、fork或外线程关闭原句柄；所有文件身份及权限前后重验。原writer已退出不构成独立终止证明，冷读成功也不能恢复执行。
+
+验收采用原managed controller及真实本地管道/HMAC/SSHSIG，在首create闭合并落盘后从原生回调保留独立pins，再故意拒绝第二审批，旧producer正常完成异常清理并退出，再由新进程读取；不得patch保存函数获取pins或从邻接manifest补造信任。并覆盖文件权限/链接/替换、错误外部pin、部分发布/重复发布、读后关闭或复制/fork，以及见证已推进时旧checkpoint拒绝；不产生第二次消费或Engine派发。读取保留原store阻塞flock边界，不声明全局硬期限。

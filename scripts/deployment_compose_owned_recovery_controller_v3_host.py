@@ -99,7 +99,7 @@ def _completed_history(admission):
 def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha,
         archive_digest, host_id, normalization_version, review, on_review,
         trusted_boot_id, trusted_bind_digest, expected_root, expected_daemon_id,
-        expected_project, timeout=3600, _managed=None):
+        expected_project, timeout=3600, _managed=None, _restart_checkpoint=None):
     """Consume exactly deploy and recovery; callbacks only notify.
 
     Origin authentication is an embedding precondition, including the supplied
@@ -116,12 +116,15 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
         reject()
     store = thread = None
     completion_candidate=completion=None
+    checkpoint_result=None
     errors = _managed._errors if managed else []
     stop_drain = threading.Event()
     try:
         if (any(p is None or p.closed for p in (process.stdin,process.stdout,process.stderr))
                 or process.text_mode or process.poll() is not None
                 or not callable(on_review)
+                or (_restart_checkpoint is not None and (not managed
+                    or not callable(_restart_checkpoint) or _managed.diagnostic_profile is not None))
                 or type(timeout) not in (int,float) or not 0 < timeout <= 3600
                 or not isinstance(channel_nonce,str) or not re.fullmatch('[0-9a-f]{64}',channel_nonce)
                 or not isinstance(source_sha,str) or not re.fullmatch('[0-9a-f]{40}',source_sha)
@@ -251,6 +254,21 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     expected_host_id=host_id,expected_daemon_id=expected_daemon_id,expected_target=entry['request'].target,
                     expected_policy_hash=policy.identity_hash())
                 request = RequestV2.from_json(verified.request_bytes.decode('ascii'))
+                if _restart_checkpoint is not None:
+                    from deployment_compose_restart_checkpoint_v3_host import save_checkpoint
+                    defaults = {}
+                    for service in entry['bundle'].to_dict()['services']:
+                        name = service['name']; target = frozen['targetInputs'][name]
+                        derived = live.derive_defaults(target['image'], target['commitment'], keys['target'],
+                            **{key:target[key] for key in ('expected_image_id','expected_registry_digest','expected_architecture')})
+                        if target['commitment']['keyId'] != target['expected_key_id']:reject()
+                        defaults[name] = {key:derived[key] for key in live.ZERO_DEFAULTS}
+                    checkpoint_result = save_checkpoint(case, original_history=admission._history(entry),
+                        baseline_bytes=baseline, authenticated_image_defaults=defaults,
+                        archive_digest=archive_digest, witness_store=store, witness_signer=signer)
+                    # Local notification only. Its return value cannot admit an
+                    # intent; a callback failure aborts before the second review.
+                    _restart_checkpoint(json.loads(live.encode(checkpoint_result)))
                 approval,consumption,_ = review.consume_prepared(entry['bundle'],request,on_review)
                 remaining()
                 if process.poll() is not None:reject()
@@ -304,7 +322,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     **({'daemonStoppedVerified':_managed.daemon_stopped_verified,
                         'resourceInventoryRestored':_managed.resource_inventory_restored,
                         'hostSnapshotUnchangedVerified':_managed.host_snapshot_unchanged_verified,
-                        'daemonCleanupVerified':False} if managed else {}),**certificate_result)
+                        'daemonCleanupVerified':False} if managed else {}),**certificate_result,
+                    **({'restartCheckpoint':checkpoint_result} if checkpoint_result is not None else {}))
             else:
                 reject()
         reject()
@@ -345,7 +364,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
         if primary is None and cleanup_error is not None:raise cleanup_error
 
 
-def _drive_managed_recovery_protocol(private_root, *, session, review, on_review, timeout=3600):
+def _drive_managed_recovery_protocol(private_root, *, session, review, on_review, timeout=3600,
+        on_restart_checkpoint=None):
     """Use only a currently issued fixed-source owned SSH session, never JSON."""
     from deployment_compose_owned_recovery_session_v3_host import issued
     issued(session)
@@ -353,13 +373,15 @@ def _drive_managed_recovery_protocol(private_root, *, session, review, on_review
     try:
         _private_root(private_root)
         if not callable(on_review):reject()
+        if on_restart_checkpoint is not None and (not callable(on_restart_checkpoint)
+                or session.diagnostic_profile is not None):reject()
         session.begin(timeout)
         entered=True
         return _drive_recovery_protocol(private_root,process=session._process,channel_nonce=session.nonce,
             source_sha=session.source_sha,archive_digest=session.archive_digest,host_id=session.host_id,
             normalization_version=None,review=review,on_review=on_review,trusted_boot_id=None,
             trusted_bind_digest=None,expected_root=None,expected_daemon_id=None,expected_project=None,
-            timeout=timeout,_managed=session)
+            timeout=timeout,_managed=session,_restart_checkpoint=on_restart_checkpoint)
     finally:
         import sys
         primary=sys.exc_info()[1]

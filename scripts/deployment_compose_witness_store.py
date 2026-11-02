@@ -56,21 +56,26 @@ def pairs(items):
 
 
 class ComposeWitnessStore:
-    """Preprovisioned private directory; registration is never reset or repaired."""
-    def __init__(self, root, *, key):
+    """Preprovisioned private directory; registration is never reset or repaired.
+
+    create_lock=False requires an existing lock and never creates one.
+    """
+    def __init__(self, root, *, key, create_lock=True):
         self._dir = self._lock = None
         try:
             if (os.name != 'posix' or not isinstance(root, Path) or not root.is_absolute()
                     or '..' in root.parts or '.' in root.parts
                     or root.is_relative_to(Path(__file__).resolve().parents[1])
-                    or type(key) is not bytes or len(key) < 32):
+                    or type(key) is not bytes or len(key) < 32
+                    or type(create_lock) is not bool):
                 fail()
             self.root, self._key = root, key
             self._thread = threading.RLock()
             self._dir = self._open_root()
             self._root_id = self._directory_id(self._dir)
-            self._lock = os.open('witness.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                                 0o600, dir_fd=self._dir)
+            flags = os.O_RDWR | os.O_NOFOLLOW
+            flags |= os.O_CREAT if create_lock else os.O_NONBLOCK
+            self._lock = os.open('witness.lock', flags, 0o600, dir_fd=self._dir)
             self._lock_id = self._file_id(self._lock)
             os.fsync(self._dir)
         except Exception:
