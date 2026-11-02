@@ -26,6 +26,7 @@ from deployment_compose_v3_channel_worker import write_frame
 from deployment_compose_response_loss_observation_v3_host import KIND, validate_observation, observation_digest
 
 _ISSUED = weakref.WeakKeyDictionary()
+_ORIGINS = weakref.WeakKeyDictionary()
 
 
 def reject():
@@ -64,6 +65,15 @@ def issued(session,process=None):
                 session.verify_daemon_stop,session.verify_resource_inventory,session.verify_host_snapshot,type(session),profile)
             or session._profile is not profile):reject()
     return session
+
+
+def writer_origin_record(session):
+    issued(session)
+    record = _ORIGINS.get(session)
+    if (record is None or not record['ok'] or session._closed
+            or record['identity'] != (os.getpid(),threading.get_ident(),session._process,session.nonce,session._binding)
+            or session._hello_canonical != record['hello']):reject()
+    return record['raw'], record['identity'][4], record['hello']
 
 
 class OwnedRecoverySSHSessionV3:
@@ -230,9 +240,48 @@ class OwnedRecoverySSHSessionV3:
                 or value.get('channelNonce')!=self.nonce):reject()
         return value
 
+    def _accept_writer_origin(self,value):
+        from deployment_compose_cold_writer_v3_host import validate_origin
+        record=_ORIGINS.get(self)
+        if (record is None or record['seen'] or record['identity']!=
+                (os.getpid(),threading.get_ident(),self._process,self.nonce,self._binding)):reject()
+        record['seen']=True
+        if (set(value)!={'kind','channelNonce','binding','origin'}
+                or value['kind']!='manager-writer-origin' or value['channelNonce']!=self.nonce
+                or encode(value['binding'])!=self._binding):reject()
+        raw=encode(value['origin']);origin=validate_origin(raw);binding=json.loads(self._binding)
+        if any(origin[k]!=binding[k] for k in ('sourceSha','archiveDigest','unit','kernelBoot','invocationId')):reject()
+        return raw
+
+    def capture_writer_origin(self,timeout=5):
+        issued(self)
+        if (self._profile is not profiles.NORMAL or self._started or self._finished or self._closed
+                or self in _ORIGINS or type(timeout) not in (int,float)
+                or not math.isfinite(timeout) or not 0<timeout<=30):reject()
+        record=dict(ok=False,seen=False,hello=None,raw=None,
+            identity=(os.getpid(),threading.get_ident(),self._process,self.nonce,self._binding))
+        _ORIGINS[self]=record
+        original=self._deadline
+        self._deadline=min(original,time.monotonic()+timeout)
+        try:
+            self._send('manager-origin-request')
+            value=self._receive(timeout)
+            if value.get('kind')=='manager-stopped':
+                self._early_terminal=encode(value);reject()
+            raw=self._accept_writer_origin(value)
+            self._left()
+            record['raw']=raw;record['ok']=True
+            writer_origin_record(self)
+            return raw
+        except BaseException:
+            record['ok']=False
+            raise
+        finally:self._deadline=original
+
     def begin(self,timeout):
         issued(self)
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=3600 or self._started:reject()
+        if self in _ORIGINS:writer_origin_record(self)
         self._left();self._deadline=min(self._maximum,time.monotonic()+timeout)
         self._started=True
         self._send('manager-start')
@@ -305,6 +354,10 @@ class OwnedRecoverySSHSessionV3:
             if self._hello_identity is not None:reject()
             self._hello_identity=(frame.get('root'),frame.get('daemonId'))
             self._hello_canonical=encode({k:v for k,v in frame.items() if k not in ('kind','channelNonce')})
+            if self in _ORIGINS:
+                record=_ORIGINS[self]
+                if not record['ok'] or record['hello'] is not None:reject()
+                record['hello']=self._hello_canonical
         if self._profile is profiles.RESPONSE_LOSS and frame['kind'] in ('recovery-prepared-private','final'):reject()
         return frame
 
@@ -435,6 +488,8 @@ class OwnedRecoverySSHSessionV3:
                     if self._early_terminal is not None:
                         value=json.loads(self._early_terminal);self._early_terminal=None
                     else:value=self._receive(90 if self.verify_host_snapshot else 30)
+                    if value['kind']=='manager-writer-origin':
+                        self._accept_writer_origin(value);continue
                     if value['kind']==KIND:
                         self._accept_observation(value);continue
                     if value['kind']=='daemon-bound' and self.verify_daemon_stop and self._daemon_binding is None:
@@ -455,7 +510,7 @@ class OwnedRecoverySSHSessionV3:
             except Exception as error:
                 self._cleanup_error_codes.append('local-dispose')
                 if failure is None:failure=error
-            finally:self._closed=True;_ISSUED.pop(self,None)
+            finally:self._closed=True;_ISSUED.pop(self,None);_ORIGINS.pop(self,None)
             try:self._save_cleanup_report()
             except Exception as error:
                 self._cleanup_error_codes.append('report-write')

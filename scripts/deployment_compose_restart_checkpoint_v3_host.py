@@ -136,7 +136,8 @@ class _Guard:
             reject()
         read_file(witness, 'witness.lock', 4096)
         read_file(witness, 'state.json', 2 * 1024 * 1024)
-        for child, name in (('restart-material', 'material.private.json'), ('restart-custody', 'keys.private.json')):
+        for child, name in (('restart-material', 'material.private.json'), ('restart-custody', 'keys.private.json'),
+                            ('writer-origin', 'origin.private.json')):
             path = self.case / child
             if path in self.dirs and set(os.listdir(self.dirs[path][0])) != {name}:
                 reject()
@@ -201,14 +202,21 @@ class RestartCheckpointReaderV3:
         reject()
 
     def __init__(self, case, *, expected_material_digest, expected_custody_digest,
-                 expected_context, expected_witness_key_hash):
+                 expected_context, expected_witness_key_hash,
+                 expected_origin_material_digest=None, expected_origin_digest=None):
         self._owner = (os.getpid(), threading.get_ident())
         self._issuer = self
         self._closed = False
         self._guard = self._store = None
+        self._writer_origin = None
         try:
             pins = decode(canonical(expected_context))
             if not all(hex_value(x) for x in (expected_material_digest, expected_custody_digest, expected_witness_key_hash)):
+                reject()
+            if (expected_origin_material_digest is None) != (expected_origin_digest is None):
+                reject()
+            if expected_origin_material_digest is not None and not all(hex_value(x) for x in
+                    (expected_origin_material_digest, expected_origin_digest)):
                 reject()
             self._guard = guard = _Guard(case)
             for child in ('restart-material', 'restart-custody'):
@@ -237,6 +245,16 @@ class RestartCheckpointReaderV3:
             self._context = reopen_material(raw, expected_digest=expected_material_digest, expected_context=pins,
                 gate_key=keys[0], witness_public_key=public,
                 witness_transport=transport(guard, self._store, self._owned))
+            if expected_origin_material_digest is not None:
+                guard.add_dir(case / 'writer-origin')
+                artifact = guard.add_file(case / 'writer-origin', 'origin.private.json', 32768)
+                if digest(artifact) != expected_origin_material_digest:
+                    reject()
+                self._writer_origin = validate_writer_artifact(artifact,
+                    material_digest=expected_material_digest, custody_digest=expected_custody_digest,
+                    witness_key_hash=expected_witness_key_hash, context=pins,
+                    hello_digest=self._context.history._policy.scope_hash,
+                    origin_digest=expected_origin_digest)
             guard.check()
         except Exception:
             try:
@@ -255,6 +273,23 @@ class RestartCheckpointReaderV3:
         try:
             self._guard.check()
             return self._context
+        except Exception:
+            reject()
+
+    @property
+    def writer_origin(self):
+        self._owned()
+        try:
+            self._guard.check()
+            parent = self._guard.case / 'writer-origin'
+            if parent not in self._guard.dirs:
+                return None
+            raw, identity = read_file(self._guard.dirs[parent][0], 'origin.private.json', 32768)
+            if identity != self._guard.files[(parent, 'origin.private.json')][1]:
+                reject()
+            if canonical(decode(raw)['origin']) != self._writer_origin:
+                reject()
+            return self._writer_origin
         except Exception:
             reject()
 
@@ -328,6 +363,114 @@ def save_checkpoint(case, *, original_history, baseline_bytes, authenticated_ima
             if reader.context.snapshot.canonical != canonical(value['snapshot']):
                 reject()
         return result
+    except Exception:
+        reject()
+    finally:
+        if guard is not None:
+            primary = sys.exc_info()[1]
+            try:
+                guard.close()
+            except Exception:
+                if primary is None:
+                    reject()
+                note_cleanup(primary)
+
+
+_ORIGIN_FIELDS = {'schemaVersion', 'kind', 'materialDigest', 'custodyDigest', 'witnessKeyHash',
+                  'context', 'managerBinding', 'channelNonce', 'helloDigest', 'origin'}
+_BINDING_FIELDS = {'unit', 'kernelBoot', 'invocationId', 'sourceSha', 'archiveDigest', 'hostId'}
+
+
+def validate_writer_artifact(raw, *, material_digest, custody_digest, witness_key_hash,
+                             context, hello_digest, origin_digest):
+    from deployment_compose_cold_writer_v3_host import validate_origin
+    if type(raw) is not bytes or not 0 < len(raw) <= 32768:
+        reject()
+    value = decode(raw)
+    if (type(value) is not dict or set(value) != _ORIGIN_FIELDS
+            or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+            or value['kind'] != 'compose-checkpoint-writer-origin-v3'
+            or value['materialDigest'] != material_digest or value['custodyDigest'] != custody_digest
+            or value['witnessKeyHash'] != witness_key_hash or canonical(value['context']) != canonical(context)
+            or not hex_value(value['channelNonce']) or value['helloDigest'] != hello_digest
+            or not hex_value(value['helloDigest'])):
+        reject()
+    binding = value['managerBinding']
+    if type(binding) is not dict or set(binding) != _BINDING_FIELDS:
+        reject()
+    origin = canonical(value['origin'])
+    physical = validate_origin(origin)
+    if (digest(origin) != origin_digest
+            or any(binding[key] != physical[key] for key in
+                   ('unit', 'kernelBoot', 'invocationId', 'sourceSha', 'archiveDigest'))
+            or any(binding[key] != context[key] for key in ('sourceSha', 'archiveDigest', 'hostId'))):
+        reject()
+    return origin
+
+
+def bind_writer_origin(case, *, session, admission, checkpoint_descriptor):
+    """Bind only original live session/admission inputs; descriptor is never authority."""
+    from deployment_compose_owned_recovery_session_v3_host import issued, writer_origin_record
+    from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3
+    guard = None
+    try:
+        descriptor = decode(canonical(checkpoint_descriptor))
+        if (type(descriptor) is not dict or set(descriptor) !=
+                {'casePath', 'materialDigest', 'custodyDigest', 'context', 'witnessKeyHash'}):
+            reject()
+        def seal():
+            issued(session)
+            origin, binding, hello = writer_origin_record(session)
+            if (session.diagnostic_profile is not None or not session._started or session._finished
+                    or session._closed or session._early_terminal is not None
+                    or session._process.poll() is not None or hello is None
+                    or type(admission) is not MacLiveAdmissionV3 or admission._owner_pid != os.getpid()
+                    or admission._issuer is not admission or admission._root is None
+                    or admission._current is not admission._root or admission._pending is not None
+                    or admission._store.root.parent != case or descriptor['casePath'] != str(case)
+                    or descriptor['witnessKeyHash'] != digest(key_material(admission._public[0]))
+                    or admission._policy.scope_hash != digest(hello)):
+                reject()
+            parsed = decode(hello)
+            if any(parsed[key] != descriptor['context'][key] for key in
+                   ('sourceSha', 'archiveDigest', 'hostId', 'daemonId')):
+                reject()
+            entry = admission._root
+            return (origin, binding, hello, id(entry), entry['request'].digest(),
+                    entry['bundle'].canonical_bytes, admission._policy.identity_hash(),
+                    digest(key_material(admission._public[0])), digest(admission._key),
+                    id(admission._store), digest(admission._store._key))
+        frozen = seal()
+        with RestartCheckpointReaderV3(case, expected_material_digest=descriptor['materialDigest'],
+                expected_custody_digest=descriptor['custodyDigest'], expected_context=descriptor['context'],
+                expected_witness_key_hash=descriptor['witnessKeyHash']) as reader:
+            history = reader.context.history
+            if history._request.digest() != frozen[4] or history._bundle.canonical_bytes != frozen[5]:
+                reject()
+        origin, binding, hello = frozen[:3]
+        raw = canonical(dict(schemaVersion=1, kind='compose-checkpoint-writer-origin-v3',
+            materialDigest=descriptor['materialDigest'], custodyDigest=descriptor['custodyDigest'],
+            witnessKeyHash=descriptor['witnessKeyHash'], context=descriptor['context'],
+            managerBinding=decode(binding), channelNonce=session.nonce,
+            helloDigest=digest(hello), origin=decode(origin)))
+        validate_writer_artifact(raw, material_digest=descriptor['materialDigest'],
+            custody_digest=descriptor['custodyDigest'], witness_key_hash=descriptor['witnessKeyHash'],
+            context=descriptor['context'], hello_digest=digest(hello), origin_digest=digest(origin))
+        if seal() != frozen:
+            reject()
+        guard = _Guard(case)
+        os.mkdir('writer-origin', 0o700, dir_fd=guard.dirs[case][0])
+        os.fsync(guard.dirs[case][0])
+        guard.add_dir(case / 'writer-origin')
+        publish(guard.dirs[case / 'writer-origin'][0], 'origin.private.json', raw)
+        guard.close(); guard = None
+        with RestartCheckpointReaderV3(case, expected_material_digest=descriptor['materialDigest'],
+                expected_custody_digest=descriptor['custodyDigest'], expected_context=descriptor['context'],
+                expected_witness_key_hash=descriptor['witnessKeyHash'],
+                expected_origin_material_digest=digest(raw), expected_origin_digest=digest(origin)) as reader:
+            if reader.writer_origin != origin or seal() != frozen:
+                reject()
+        return dict(descriptor, writerOriginMaterialDigest=digest(raw), writerOriginDigest=digest(origin))
     except Exception:
         reject()
     finally:

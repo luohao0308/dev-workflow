@@ -66,3 +66,15 @@
 停止观测只说明原wrapper/cgroup在本次观测中已停止，不说明daemon、业务、现场新鲜或后续永不重启；所有执行/恢复权限保持false。描述性结果不能作为新admission或stop能力。
 
 测试覆盖原owner活着时捕获、旧producer停止退出后全新consumer只读核验、残留后代、PID/unit/cgroup复用、错pin与错误boot、PID namespace及/proc视图不匹配、观测期间变化、权限失败与deadline。真实专用Linux/root测试仅启动等待归档的原固定loader，不发送归档/config、不启动worker或Engine；原owner负责停止，新consumer不得执行任何启停命令。
+
+## 第四切片：认证外层origin交付与checkpoint绑定
+
+checkpoint启用时，原controller在`session.begin`前通过issued普通会话捕获一次origin。固定manager请求仅在未启动业务、normal且未尝试时受理，先burn尝试，再执行固定短预算的原owner.capture_origin；独立外层回执经原有有界client队列交付，不嵌套在worker-frame中，不改变原六/七字段binding或增加caller可选unit/PID/program。
+
+Mac验证会话nonce、完整binding及origin的source/archive/unit/boot/invocation；原session/PID/thread/process和规范化origin须由module级WeakKey seal保留。发送/接收/验证失败永久禁止重试与begin。提前terminal保留给close；close可验证排空一条已请求的pending origin，但不能为失败capture签发成功seal，半帧超时不能猜测恢复。manager处理同批client帧时有效stop先于昂贵origin捕获，origin回执未交付时拒绝start；同步捕获本身不声明可中途抢占。
+
+首create闭合phase验证后，checkpoint从原session seal取origin，与material/custody/witness摘要、六项context、完整manager binding及nonce绑定为独立私有artifact，不改原history material schema。独占发布并回读核验后才调用原native checkpoint回调交付增强描述；任何失败在第二review前沿原清理路径终止。
+
+冷reader仅在调用者提供独立外部origin artifact pin时读取并验证它，交叉核全部checkpoint/context/binding/source数据，输出raw Linux origin供后续只读停止核验；不从相邻文件自行推导信任，不恢复session或执行权限。未提供origin pin的旧reader保持原语义。
+
+测试覆盖默认无新帧、diag/raw拒绝、原对象/线程/复制/属性替换、partial send不重试、同批stop、pending回执排空、重复/嵌套伪帧、错pin/串场、producer退出后冷读。真实发布源码SSH stop-before-start只验证origin认证交付与关闭：不发送业务worker归档/config，不启动Engine，不消费审批，不能标成跨主机执行恢复。

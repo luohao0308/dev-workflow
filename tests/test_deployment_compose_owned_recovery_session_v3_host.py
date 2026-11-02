@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -53,6 +54,126 @@ class SessionTests(unittest.TestCase):
     def close_session(self):
         try:self.session.close()
         except Exception:pass
+
+    def test_origin_outer_reply_is_sealed_once_before_start_and_binding_shape_stays_six(self):
+        session=self.open('simple')
+        raw=session.capture_writer_origin()
+        value=json.loads(raw)
+        self.assertEqual(len(json.loads(session._binding)),6)
+        self.assertEqual(value['sourceSha'],session.source_sha)
+        self.assertEqual(value['archiveDigest'],session.archive_digest)
+        self.assertEqual(session_module.writer_origin_record(session),(raw,session._binding,None))
+        session._writer_origin=b'{}'  # A caller attribute is not the issuer seal.
+        self.assertEqual(session_module.writer_origin_record(session)[0],raw)
+        with self.assertRaises(ValueError):session.capture_writer_origin()
+        session.close()
+        self.assertTrue(session.cleanup_report()['managerReceiptVerified'])
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+        with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+
+    def test_origin_bad_outer_binding_nonce_source_and_nested_frames_fail_closed(self):
+        for attack in ('simple-origin-source','simple-origin-archive','simple-origin-unit',
+                'simple-origin-boot','simple-origin-invocation','simple-origin-bool',
+                'simple-origin-binding','simple-origin-nonce','simple-origin-extra','simple-origin-nested'):
+            with self.subTest(attack=attack):
+                session=self.open(attack)
+                with self.assertRaises(ValueError):session.capture_writer_origin()
+                with self.assertRaises(ValueError):session.capture_writer_origin()
+                with self.assertRaises(ValueError):session.begin(15)
+                with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+                self.close_session()
+                self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_origin_partial_send_is_single_attempt_and_cannot_begin(self):
+        session=self.open('simple')
+        with patch.object(session,'_send',side_effect=BrokenPipeError) as send:
+            with self.assertRaises(BrokenPipeError):session.capture_writer_origin()
+            with self.assertRaises(ValueError):session.capture_writer_origin()
+            with self.assertRaises(ValueError):session.begin(15)
+            self.assertEqual(send.call_count,1)
+        session.close()
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_origin_pending_reply_can_drain_without_promoting_failed_capture(self):
+        session=self.open('simple')
+        with patch.object(session,'_receive',side_effect=ValueError('interrupted-before-read')):
+            with self.assertRaisesRegex(ValueError,'interrupted-before-read'):session.capture_writer_origin()
+        with self.assertRaises(ValueError):session.begin(15)
+        with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+        session.close()
+        self.assertTrue(session.cleanup_report()['managerReceiptVerified'])
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_origin_half_reply_never_guesses_new_frame_boundary_or_stop_success(self):
+        session=self.open('simple')
+        def half(*args):
+            with selectors.DefaultSelector() as selector:
+                selector.register(session._process.stdout,selectors.EVENT_READ)
+                self.assertTrue(selector.select(5))
+                self.assertEqual(len(os.read(session._process.stdout.fileno(),2)),2)
+            raise ValueError('partial-origin-header')
+        with patch.object(session,'_receive',side_effect=half):
+            with self.assertRaisesRegex(ValueError,'partial-origin-header'):session.capture_writer_origin()
+        with self.assertRaises(ValueError):session.close()
+        report=session.cleanup_report()
+        self.assertFalse(report['managerReceiptVerified'])
+        self.assertTrue(report['localProcessReaped'])
+        self.assertFalse(report['completionPathSucceeded'])
+
+    def test_origin_duplicate_during_close_cannot_be_ignored(self):
+        session=self.open('simple-origin-duplicate')
+        session.capture_writer_origin()
+        with self.assertRaises(ValueError):session.close()
+        self.assertFalse(session.cleanup_report()['managerReceiptVerified'])
+
+    def test_origin_early_stop_is_preserved_only_for_verified_cleanup(self):
+        session=self.open('simple')
+        original=session._send
+        def stop_batch(kind,*args,**kwargs):
+            if kind!='manager-origin-request':return original(kind,*args,**kwargs)
+            import struct
+            frames=[dict(kind=name,channelNonce=session.nonce)
+                for name in ('manager-origin-request','manager-stop')]
+            payload=b''.join(struct.pack('!I',len(session_module.encode(f)))+session_module.encode(f) for f in frames)
+            self.assertEqual(os.write(session._process.stdin.fileno(),payload),len(payload))
+        with patch.object(session,'_send',side_effect=stop_batch):
+            with self.assertRaises(ValueError):session.capture_writer_origin()
+        self.assertIsNotNone(session._early_terminal)
+        with self.assertRaises(ValueError):session.begin(15)
+        session.close()
+        self.assertTrue(session.cleanup_report()['managerReceiptVerified'])
+        self.assertFalse(session.cleanup_report()['completionPathSucceeded'])
+
+    def test_origin_copy_foreign_thread_and_binding_or_hello_replacement_reject(self):
+        session=self.open('simple')
+        raw=session.capture_writer_origin()
+        with self.assertRaises(ValueError):copy.copy(session).capture_writer_origin()
+        failures=[]
+        def foreign():
+            try:session_module.writer_origin_record(session)
+            except ValueError:failures.append(True)
+        thread=threading.Thread(target=foreign);thread.start();thread.join(2)
+        self.assertEqual(failures,[True]);self.assertFalse(thread.is_alive())
+        with patch.object(session_module.os,'getpid',return_value=os.getpid()+1):
+            with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+        binding=session._binding
+        session._binding=session_module.encode(dict(json.loads(binding),unit='dw-writer-host-'+'9'*16+'.service'))
+        with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+        session._binding=binding
+        self.assertEqual(session_module.writer_origin_record(session)[0],raw)
+        session._hello_canonical=b'{}'
+        with self.assertRaises(ValueError):session_module.writer_origin_record(session)
+        with self.assertRaises(ValueError):session.begin(15)
+        session.close()
+
+    def test_origin_diagnostic_and_already_started_sessions_cannot_request(self):
+        session=self.open('simple',diagnostic=True)
+        with patch.object(session,'_send',side_effect=AssertionError('diagnostic origin requested')):
+            with self.assertRaises(ValueError):session.capture_writer_origin()
+        self.close_session()
+        session=self.open('simple-daemon-wait');session.begin(15)
+        with self.assertRaises(ValueError):session.capture_writer_origin()
+        self.close_session()
 
     def observation_session(self,attack='simple-observation',diagnostic=True):
         session=self.open(attack,diagnostic=diagnostic);session.begin(15);session.receive_worker()

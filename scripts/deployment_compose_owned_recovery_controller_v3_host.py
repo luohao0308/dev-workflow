@@ -255,7 +255,7 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     expected_policy_hash=policy.identity_hash())
                 request = RequestV2.from_json(verified.request_bytes.decode('ascii'))
                 if _restart_checkpoint is not None:
-                    from deployment_compose_restart_checkpoint_v3_host import save_checkpoint
+                    from deployment_compose_restart_checkpoint_v3_host import save_checkpoint, bind_writer_origin
                     defaults = {}
                     for service in entry['bundle'].to_dict()['services']:
                         name = service['name']; target = frozen['targetInputs'][name]
@@ -266,6 +266,8 @@ def _drive_recovery_protocol(private_root, *, process, channel_nonce, source_sha
                     checkpoint_result = save_checkpoint(case, original_history=admission._history(entry),
                         baseline_bytes=baseline, authenticated_image_defaults=defaults,
                         archive_digest=archive_digest, witness_store=store, witness_signer=signer)
+                    checkpoint_result = bind_writer_origin(case, session=_managed, admission=admission,
+                        checkpoint_descriptor=checkpoint_result)
                     # Local notification only. Its return value cannot admit an
                     # intent; a callback failure aborts before the second review.
                     _restart_checkpoint(json.loads(live.encode(checkpoint_result)))
@@ -375,6 +377,8 @@ def _drive_managed_recovery_protocol(private_root, *, session, review, on_review
         if not callable(on_review):reject()
         if on_restart_checkpoint is not None and (not callable(on_restart_checkpoint)
                 or session.diagnostic_profile is not None):reject()
+        if on_restart_checkpoint is not None:
+            session.capture_writer_origin()
         session.begin(timeout)
         entered=True
         return _drive_recovery_protocol(private_root,process=session._process,channel_nonce=session.nonce,

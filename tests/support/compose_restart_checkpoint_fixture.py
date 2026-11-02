@@ -84,10 +84,16 @@ def consume(descriptor):
             expected_material_digest=descriptor['materialDigest'],
             expected_custody_digest=descriptor['custodyDigest'],
             expected_context=descriptor['context'],
-            expected_witness_key_hash=descriptor['witnessKeyHash']) as reader:
+            expected_witness_key_hash=descriptor['witnessKeyHash'],
+            expected_origin_material_digest=descriptor.get('writerOriginMaterialDigest'),
+            expected_origin_digest=descriptor.get('writerOriginDigest')) as reader:
         context = reader.context
         assert context.snapshot.digest == descriptor['context']['historyDigest']
         summary = context.public_summary()
+        origin=reader.writer_origin
+        assert origin is not None
+        import hashlib
+        assert hashlib.sha256(origin).hexdigest()==descriptor['writerOriginDigest']
     try:
         context.history.capture()
     except ValueError:
@@ -97,7 +103,7 @@ def consume(descriptor):
     assert (case / 'witness/state.json').read_bytes() == before
     return dict(consumerPid=os.getpid(), summary=summary, witnessUnchanged=True,
         historicalTransportClosed=True, newApprovalConsumptions=0, engineRequests=0,
-        executionRecovered=False)
+        writerOriginBound=True,executionRecovered=False)
 
 
 if __name__ == '__main__':

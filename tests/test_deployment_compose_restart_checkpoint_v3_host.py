@@ -394,5 +394,86 @@ class ControllerCheckpointTests(unittest.TestCase):
                 expected_context=descriptor['context'], expected_witness_key_hash=descriptor['witnessKeyHash'])
 
 
+@unittest.skipUnless(os.name == 'posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
+                     'POSIX/OpenSSL/OpenSSH required')
+class WriterOriginArtifactTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from tests.support.compose_restart_checkpoint_fixture import produce
+        cls.temporary=tempfile.TemporaryDirectory(prefix='dw-writer-origin-artifact-')
+        cls.root=Path(cls.temporary.name).resolve();cls.root.chmod(0o700)
+        cls.produced=produce(cls.root)
+        cls.descriptor=cls.produced['descriptor'];cls.case=Path(cls.descriptor['casePath'])
+        cls.artifact=cls.case/'writer-origin/origin.private.json';cls.original=cls.artifact.read_bytes()
+
+    @classmethod
+    def tearDownClass(cls):cls.temporary.cleanup()
+
+    def tearDown(self):
+        self.artifact.write_bytes(self.original);self.artifact.chmod(0o600)
+
+    def reader(self,*,with_origin=True,**changes):
+        descriptor=self.descriptor
+        options=dict(expected_material_digest=descriptor['materialDigest'],
+            expected_custody_digest=descriptor['custodyDigest'],expected_context=descriptor['context'],
+            expected_witness_key_hash=descriptor['witnessKeyHash'])
+        if with_origin:
+            options.update(expected_origin_material_digest=descriptor['writerOriginMaterialDigest'],
+                expected_origin_digest=descriptor['writerOriginDigest'])
+        options.update(changes)
+        return checkpoint.RestartCheckpointReaderV3(self.case,**options)
+
+    def test_native_origin_pair_is_required_and_legacy_reader_does_not_self_trust(self):
+        with self.reader() as reader:
+            raw=reader.writer_origin
+            self.assertIsNotNone(raw)
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),self.descriptor['writerOriginDigest'])
+            self.assertEqual(json.loads(raw)['sourceSha'],self.descriptor['context']['sourceSha'])
+        with self.assertRaises(ValueError):reader.writer_origin
+        self.artifact.write_bytes(b'{}')
+        with self.assertRaises(ValueError):self.reader()
+        with self.reader(with_origin=False) as legacy:
+            self.assertIsNone(legacy.writer_origin)
+            self.assertTrue(legacy.context.historyAuthenticated)
+        with self.assertRaises(ValueError):
+            self.reader(expected_origin_digest=None)
+
+    def test_rehashed_origin_still_requires_checkpoint_context_and_binding_crosschecks(self):
+        value=json.loads(self.original)
+        candidates=[]
+        for field in ('materialDigest','custodyDigest','witnessKeyHash','helloDigest'):
+            changed=copy.deepcopy(value);changed[field]='0'*64;candidates.append(changed)
+        changed=copy.deepcopy(value);changed['context']['historyDigest']='0'*64;candidates.append(changed)
+        changed=copy.deepcopy(value);changed['managerBinding']['hostId']='foreign';candidates.append(changed)
+        changed=copy.deepcopy(value);changed['managerBinding']['invocationId']='0'*32;candidates.append(changed)
+        changed=copy.deepcopy(value);changed['origin']['mainPid']=True;candidates.append(changed)
+        changed=copy.deepcopy(value);changed['authorityGranted']=True;candidates.append(changed)
+        for index,candidate in enumerate(candidates):
+            raw=canonical(candidate);self.artifact.write_bytes(raw)
+            with self.subTest(index=index),self.assertRaises(ValueError):
+                self.reader(expected_origin_material_digest=hashlib.sha256(raw).hexdigest(),
+                    expected_origin_digest=hashlib.sha256(canonical(candidate['origin'])).hexdigest())
+
+    def test_origin_pin_file_replacement_and_cache_mutation_cannot_supply_a_new_origin(self):
+        with self.assertRaises(ValueError):
+            self.reader(expected_origin_digest='0'*64)
+        with self.reader() as reader:
+            reader._writer_origin=b'{}'
+            with self.assertRaises(ValueError):reader.writer_origin
+        with self.reader() as reader:
+            self.artifact.unlink();self.artifact.write_bytes(self.original);self.artifact.chmod(0o600)
+            with self.assertRaises(ValueError):reader.writer_origin
+
+    def test_origin_from_another_native_checkpoint_is_rejected(self):
+        from tests.support.compose_restart_checkpoint_fixture import produce
+        with tempfile.TemporaryDirectory(prefix='dw-other-writer-origin-') as directory:
+            root=Path(directory).resolve();root.chmod(0o700)
+            other=produce(root)['descriptor'];other_case=Path(other['casePath'])
+            self.artifact.write_bytes((other_case/'writer-origin/origin.private.json').read_bytes())
+            with self.assertRaises(ValueError):
+                self.reader(expected_origin_material_digest=other['writerOriginMaterialDigest'],
+                    expected_origin_digest=other['writerOriginDigest'])
+
+
 if __name__ == '__main__':
     unittest.main()

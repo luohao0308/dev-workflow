@@ -103,6 +103,13 @@ def main(attack,engine):
             self.process=subprocess.Popen([sys.executable,'-u',__file__,'--child',attack,engine],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
             return self.process
+        def capture_origin(self,**kwargs):
+            if attack=='simple-origin-capture-fails':raise ValueError('fixture-origin-capture-failed')
+            return original_encode(dict(schemaVersion=1,kind='compose-owned-writer-origin-v3',
+                sourceSha=initial['sourceSha'],archiveDigest=initial['archiveDigest'],
+                unit=self.unit,kernelBoot=self._boot_id,invocationId=self._invocation,
+                mainPid=self.process.pid,mainStartTicks=7,cgroupDevice=1,cgroupInode=2,
+                parentDevice=1,parentInode=3,pidNamespaceDevice=1,pidNamespaceInode=4))
         def stop(self,**kwargs):
             try:self.process.wait(timeout=.5)
             except subprocess.TimeoutExpired:self.process.kill();self.process.wait(timeout=3)
@@ -113,7 +120,23 @@ def main(attack,engine):
         def close(self):self._discard_local()
     original=manager.write_frame
     original_encode=manager.encode
+    origin_frames=[]
     def control(value):
+        if type(value) is dict and value.get('kind')=='manager-writer-origin':
+            origin_frames.append(json.loads(original_encode(value)))
+            changes={'simple-origin-source':('sourceSha','9'*40),
+                'simple-origin-archive':('archiveDigest','9'*64),
+                'simple-origin-unit':('unit','dw-writer-host-'+'9'*16+'.service'),
+                'simple-origin-boot':('kernelBoot','99999999-9999-9999-9999-999999999999'),
+                'simple-origin-invocation':('invocationId','9'*32),
+                'simple-origin-bool':('mainPid',True)}
+            if attack in changes:
+                key,replacement=changes[attack];value['origin'][key]=replacement
+            if attack=='simple-origin-binding':value['binding']=dict(value['binding'],hostId='other-host')
+            if attack=='simple-origin-nonce':value['channelNonce']='0'*64
+            if attack=='simple-origin-extra':value['extra']=True
+            if attack=='simple-origin-nested':
+                value=dict(kind='worker-frame',channelNonce=initial['channelNonce'],frame=value)
         if type(value) is dict and value.get('kind')=='manager-bound':
             if attack=='simple-profile-missing':value['binding'].pop('diagnosticProfile',None)
             if attack=='simple-profile-wrong':value['binding']['diagnosticProfile']='wrong-profile'
@@ -134,6 +157,8 @@ def main(attack,engine):
         return original_encode(value)
     def output(stream,value,**kwargs):
         if value.get('kind')=='manager-stopped':
+            if attack=='simple-origin-duplicate' and origin_frames:
+                original(stream,origin_frames[0],**kwargs)
             if attack=='simple-observation-digest':value['diagnosticObservationDigest']='9'*64
             if attack=='simple-observation-missing-digest':value.pop('diagnosticObservationDigest',None)
             if attack=='simple-profile-terminal':value['binding']=dict(value['binding'],diagnosticProfile='wrong-profile')

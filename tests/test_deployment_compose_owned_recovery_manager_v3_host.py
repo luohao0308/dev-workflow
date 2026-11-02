@@ -46,17 +46,25 @@ def fixture(mode,state):
     class Owner:
         def __init__(self,*args):
             self.unit='dw-writer-host-'+'2'*16+'.service'
-            self._boot_id='kernel-boot';self._invocation='3'*32
+            self._boot_id='11111111-1111-1111-1111-111111111111';self._invocation='3'*32
             self._stopped=False;self.transport_returncode=None;self.process=None
+            self.origin_calls=0
         def record(self):
             path=Path(state);temporary=path.with_name(path.name+'.new')
             temporary.write_text(json.dumps(dict(stopped=self._stopped,started=self.process is not None,
-                reaped=self.process is not None and self.process.poll() is not None)))
+                reaped=self.process is not None and self.process.poll() is not None,originCalls=self.origin_calls)))
             os.replace(temporary,path)
         def start(self,**kwargs):
             self.process=subprocess.Popen([sys.executable,'-u',__file__,'--worker',mode],
                 stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
             self.record();return self.process
+        def capture_origin(self,**kwargs):
+            self.origin_calls+=1;self.record()
+            return manager.encode(dict(schemaVersion=1,kind='compose-owned-writer-origin-v3',
+                sourceSha=config['sourceSha'],archiveDigest=config['archiveDigest'],
+                unit=self.unit,kernelBoot=self._boot_id,invocationId=self._invocation,
+                mainPid=self.process.pid,mainStartTicks=7,cgroupDevice=1,cgroupInode=2,
+                parentDevice=1,parentInode=3,pidNamespaceDevice=1,pidNamespaceInode=4))
         def stop(self,**kwargs):
             if mode=='stop-fails':raise ValueError('fixture-stop-failed')
             if self.process.poll() is None:self.process.kill()
@@ -109,6 +117,42 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.receive()['frame']['kind'],'final')
         terminal=self.receive();self.assertEqual(terminal['binding'],self.bound['binding'])
         self.done()
+
+    def test_origin_is_outer_once_only_and_never_dispatches_worker_archive(self):
+        self.start()
+        self.send('manager-origin-request')
+        reply=self.receive()
+        self.assertEqual(set(reply),{'kind','channelNonce','binding','origin'})
+        self.assertEqual(reply['kind'],'manager-writer-origin')
+        self.assertEqual(reply['binding'],self.bound['binding'])
+        self.assertEqual(reply['origin']['unit'],self.bound['binding']['unit'])
+        self.send('manager-origin-request')
+        state=self.done(expected=1)
+        self.assertTrue(state['stopped']);self.assertEqual(state['originCalls'],1)
+
+    def test_origin_same_batch_stop_wins_without_running_capture(self):
+        self.start()
+        frames=[dict(kind=kind,channelNonce=NONCE) for kind in ('manager-origin-request','manager-stop')]
+        payload=b''.join(struct.pack('!I',len(manager.encode(f)))+manager.encode(f) for f in frames)
+        self.assertEqual(os.write(self.process.stdin.fileno(),payload),len(payload))
+        self.assertEqual(self.receive()['kind'],'manager-stopped')
+        state=self.done()
+        self.assertEqual(state['originCalls'],0)
+        self.assertTrue(state['stopped'])
+
+    def test_origin_bad_nonce_cannot_hide_behind_same_batch_stop(self):
+        self.start()
+        frames=[dict(kind='manager-origin-request',channelNonce='0'*64),dict(kind='manager-stop',channelNonce=NONCE)]
+        payload=b''.join(struct.pack('!I',len(manager.encode(f)))+manager.encode(f) for f in frames)
+        self.assertEqual(os.write(self.process.stdin.fileno(),payload),len(payload))
+        state=self.done(expected=1)
+        self.assertTrue(state['stopped']);self.assertEqual(state['originCalls'],0)
+
+    def test_origin_diagnostic_request_is_refused_without_capture(self):
+        self.start('diagnostic')
+        self.send('manager-origin-request')
+        state=self.done(expected=1)
+        self.assertEqual(state['originCalls'],0)
 
     def test_profile_identity_and_wrong_fixed_entry_fail_before_owner_creation(self):
         config=dict(entrypoint=manager.MANAGER_ENTRYPOINT,channelNonce=NONCE,sourceSha='b'*40,

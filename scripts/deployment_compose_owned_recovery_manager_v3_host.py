@@ -114,6 +114,7 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
     nonce = config['channelNonce']
     total = count = 0
     start_requested = False
+    origin_attempted = False
     flags = []
     queues = {'client':bytearray(),'worker':bytearray()}
     def remaining(limit=30):
@@ -188,7 +189,18 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
                         reason='worker-eof';break
                     total+=len(raw)
                     if total>64*1024*1024:reject()
-                    for frame in decoder.feed(raw):
+                    batch=decoder.feed(raw)
+                    # Only an origin startup batch gains stop lookahead. Preserve legacy start/stop order.
+                    if side=='client-read' and not start_requested and any(f.get('kind')=='manager-origin-request' for f in batch):
+                        if count+len(batch)>4096 or any(f.get('channelNonce')!=nonce for f in batch):reject()
+                        for control in batch:
+                            if control.get('kind')=='manager-stop':
+                                if set(control)!={'kind','channelNonce'} or control.get('channelNonce')!=nonce:reject()
+                                reason='requested-stop';break
+                        if reason is not None:
+                            count+=len(batch)
+                            break
+                    for frame in batch:
                         count+=1
                         if count>4096 or frame.get('channelNonce')!=nonce:reject()
                         if side=='worker-read':
@@ -236,7 +248,18 @@ def _run(config,stdin,stdout,archive,*,timeout=3600,_profile):
                         kind=frame.get('kind')
                         if kind=='manager-stop' and set(frame)=={'kind','channelNonce'}:
                             reason='requested-stop';break
+                        if kind=='manager-origin-request':
+                            if (set(frame)!={'kind','channelNonce'} or diagnostic or start_requested or origin_attempted
+                                    or queues['worker'] or worker.buffer or worker.size is not None):reject()
+                            origin_attempted=True
+                            from deployment_compose_cold_writer_v3_host import validate_origin
+                            raw_origin=owner.capture_origin(timeout=min(5,remaining()))
+                            origin=validate_origin(raw_origin)
+                            if any(origin[k]!=binding[k] for k in ('sourceSha','archiveDigest','unit','kernelBoot','invocationId')):reject()
+                            queue('client',dict(kind='manager-writer-origin',channelNonce=nonce,binding=binding,origin=origin))
+                            continue
                         if kind=='manager-start' and set(frame)=={'kind','channelNonce'} and not start_requested:
+                            if origin_attempted and queues['client']:reject()
                             initial=dict({k:v for k,v in config.items() if k not in ('verifyDaemonStop','verifyResourceInventory','verifyHostSnapshot')},
                                 entrypoint=expected_worker,archiveBase64=base64.b64encode(archive).decode('ascii'))
                             queue('worker',initial)
