@@ -60,3 +60,15 @@ class SceneBindingTests(unittest.TestCase):
         with patch.object(checkpoint,'capture_scene_checkpoint',capture):
             result=run_case(self,scene_controller=True,scene_callback=lambda value:None,published_source=(self.source.sha,self.source.raw,self.source.repo))
         self.assertEqual(result['postCount'],1)
+
+    def test_wrong_gateway_nonce_rejects_before_dispatch(self):
+        import deployment_compose_scene_create_controller_v3_host as controller
+        import deployment_compose_scene_create_broker_v3_host as broker
+        original=controller.SceneCreateControllerV3.__init__
+        def initialize(subject,**kwargs):
+            kwargs['trusted_boot_id']='0'*32
+            original(subject,**kwargs)
+        with patch.object(controller.SceneCreateControllerV3,'__init__',initialize), patch.object(broker.SceneCreateBrokerV3,'start_first_create') as start:
+            with self.assertRaises(ValueError):
+                run_case(self,scene_controller=True,scene_callback=lambda value:None,published_source=(self.source.sha,self.source.raw,self.source.repo))
+            start.assert_not_called()

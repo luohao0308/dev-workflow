@@ -85,12 +85,13 @@ class SceneSecurityTests(unittest.TestCase):
     def test_resigned_cross_context_and_wrong_namespace_reject(self):
         original = self.binding.read_bytes()
         try:
-            for mutation in ('material', 'hello', 'origin', 'namespace'):
+            for mutation in ('material', 'hello', 'origin', 'kernel', 'namespace'):
                 with self.subTest(mutation=mutation):
                     artifact = json.loads(original)
                     if mutation == 'material': artifact['payload']['materialDigest'] = '0' * 64
                     if mutation == 'hello': artifact['payload']['hello']['hostId'] = 'other-host'
                     if mutation == 'origin': artifact['payload']['evidence']['writerOrigin']['sourceSha'] = '0' * 40
+                    if mutation == 'kernel': artifact['payload']['evidence']['daemonBinding']['kernelBoot'] = '87654321-4321-4321-8321-cba987654321'
                     raw = self.sign(artifact, 'other-namespace' if mutation == 'namespace'
                                     else 'dev-workflow-scene-checkpoint-v3')
                     self.binding.write_bytes(raw)

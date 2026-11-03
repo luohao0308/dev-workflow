@@ -31,7 +31,9 @@ from deployment_gate_witness import key_material
 
 def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None):
     processes=[];calls=[];origin_calls=[];pending_seen=[]
-    boot=facts['bootId'];boot='-'.join((boot[:8],boot[8:12],boot[12:16],boot[16:20],boot[20:]))
+    # Gateway lifetime and kernel boot are distinct identity domains.
+    boot='12345678-1234-4234-8234-123456789abc'
+    testcase.assertNotEqual(boot.replace('-',''),facts['bootId'])
     binding=dict(root=hello['root'],daemonId='daemon-one',kernelBoot=boot,unit=case.engine_root.name+'.service',invocationId='c'*32,cgroupDevice=1,cgroupInode=2,mainPid=123,mainStartTicks=1,daemonPid=124,daemonStartTicks=1)
     observer=object.__new__(ObservedRecoveryDaemonV3);observer.root=str(case.engine_root);observer.daemon_id='daemon-one'
     stack.enter_context(patch.object(ObservedRecoveryDaemonV3,'binding',return_value=binding))

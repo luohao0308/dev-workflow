@@ -127,8 +127,9 @@ def capture_scene_checkpoint(controller, certificate, final):
                        baselineStateDigest=entry['bundle'].to_dict()['baselineStateDigest'])
         evidence = decode(canonical(current['checkpointEvidence']))
         origin = _evidence(evidence, hello, context)
-        if (decode(origin)['kernelBoot'].replace('-', '') != controller._boot
-                or digest(canonical(hello)) != admission._policy.scope_hash):
+        # controller._boot pins the TLS gateway instance, not the Linux boot.
+        # _evidence independently binds the writer and daemon kernel identities.
+        if digest(canonical(hello)) != admission._policy.scope_hash:
             reject()
         SceneCreateControllerV3._owned(controller)
         if canonical(SceneCreateControllerV3._status(controller)['business']) != canonical(current):

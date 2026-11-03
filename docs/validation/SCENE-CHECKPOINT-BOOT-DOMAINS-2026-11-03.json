@@ -1,0 +1,41 @@
+{
+  "date": "2026-11-03",
+  "parentSourceSha": "11670b6bbb15148ac7ff8e7c68237aadbaed2d4e",
+  "problem": "gateway boot nonce incorrectly treated as Linux kernel boot UUID",
+  "fix": "retain original gateway/capsule checks and independent writer/daemon kernel binding; remove cross-domain equality",
+  "sourceFacts": [
+    "reader_host gateway boot_id is uuid.uuid4().hex",
+    "live_worker observerFacts authenticates gateway_info.bootId against observation",
+    "native writer and daemon share kernelBoot independently"
+  ],
+  "validation": {
+    "python310": {
+      "tests": 10,
+      "seconds": 67.672,
+      "result": "pass"
+    },
+    "python314Final": {
+      "tests": 5,
+      "seconds": 64.472,
+      "result": "pass"
+    }
+  },
+  "filesSha256": {
+    "scripts/deployment_compose_scene_checkpoint_v3_host.py": "d5446e153aa9b179b5b3831cfece260dfee0ebf6d27825eb8b76c7223dbbe449",
+    "tests/support/compose_scene_controller_integration_fixture.py": "56886fd6333363340bf15eecbe82a4c00e60cd59eb69cc2ec5b6a319d9ab80e8",
+    "tests/test_deployment_compose_scene_checkpoint_binding_v3_host.py": "8bd267d2e4e605f575aa3dcdf3e7fd9b2973e1aefea8ef7ceca8dc5c11f41c3c",
+    "tests/test_deployment_compose_scene_checkpoint_security_v3_host.py": "55dc5d6a2496b9e38aa6d025578c905ffd6a9901ae01d105fe5ad4565256381a"
+  },
+  "realAttempt": {
+    "sourceSha": "11670b6bbb15148ac7ff8e7c68237aadbaed2d4e",
+    "reviewRun": 41594957859,
+    "firstCreateReconciled": true,
+    "checkpointPublished": false,
+    "coldConsumerStarted": false,
+    "independentOriginalUnitsPidsCgroupsAbsent": true,
+    "originalCleanupReceiptVerified": false,
+    "productionSnapshotUnchanged": null,
+    "businessRerun": false
+  },
+  "productionReady": false
+}
