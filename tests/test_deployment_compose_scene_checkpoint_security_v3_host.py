@@ -159,6 +159,41 @@ class SceneSecurityTests(unittest.TestCase):
         finally:
             self.archive.write_bytes(original)
 
+    def test_scene_reader_binds_fresh_stop_observation_to_original_pins(self):
+        from tests import test_deployment_compose_cold_writer_ssh_v3_host as fixture
+        with self.reader() as reader, \
+                patch.object(fixture.bridge, 'published_cold_archive', return_value=fixture.ARCHIVE), \
+                patch.object(fixture.bridge, '_private_spawn', side_effect=lambda argv: fixture.peer('good')):
+            result = reader.observe_writer_stopped(verifier_source_sha=fixture.VERIFIER)
+            self.assertEqual(json.loads(result.checkpoint_binding), dict(
+                materialDigest=self.descriptor['materialDigest'],
+                originMaterialDigest=self.descriptor['sceneBindingDigest'],
+                historyDigest=self.descriptor['context']['historyDigest']))
+            self.assertTrue(result.writerStoppedObserved)
+            self.assertTrue(result.checkpointBound)
+            self.assertFalse(result.linuxQuiescenceVerified)
+            self.assertFalse(reader.context.recoveryAuthorized)
+
+    def test_scene_stop_rejects_wrong_remote_binding_and_midflight_file_change(self):
+        from tests import test_deployment_compose_cold_writer_ssh_v3_host as fixture
+        with self.reader() as reader, \
+                patch.object(fixture.bridge, 'published_cold_archive', return_value=fixture.ARCHIVE):
+            with patch.object(fixture.bridge, '_private_spawn', side_effect=lambda argv: fixture.peer('checkpoint')):
+                with self.assertRaises(ValueError):
+                    reader.observe_writer_stopped(verifier_source_sha=fixture.VERIFIER)
+            native = fixture.bridge.observe_origin_over_ssh
+            def changed(*args, **kwargs):
+                result = native(*args, **kwargs)
+                self.binding.chmod(0o644)
+                return result
+            try:
+                with patch.object(fixture.bridge, '_private_spawn', side_effect=lambda argv: fixture.peer('good')), \
+                        patch.object(fixture.bridge, 'observe_origin_over_ssh', changed):
+                    with self.assertRaises(ValueError):
+                        reader.observe_writer_stopped(verifier_source_sha=fixture.VERIFIER)
+            finally:
+                self.binding.chmod(0o600)
+
     def test_partial_publication_cannot_notify_or_redispatch(self):
         from tests.support.compose_scene_create_integration_fixture import run_case
         import deployment_compose_scene_checkpoint_v3_host as custody

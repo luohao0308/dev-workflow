@@ -369,6 +369,36 @@ class SceneCheckpointReaderV3:
         return VerifiedCheckpointPublishedSourceV3(manifest, context['sourceSha'], context['archiveDigest'],
             payload['materialDigest'], digest(manifest), len(json.loads(manifest)))
 
+    def observe_writer_stopped(self, *, verifier_source_sha, timeout=30):
+        """Fresh read-only SSH observation; no future writer fence or permit.
+
+        The origin-material pin names this scene's signed binding artifact.
+        Only the SSH phase is timed; original filesystem/crypto/flock limits
+        also apply to the authentication before and after that phase.
+        """
+        from deployment_compose_cold_writer_ssh_v3_host import (
+            observe_origin_over_ssh, RemoteWriterStopObservationV3)
+        payload, origin, archive = SceneCheckpointReaderV3._authenticate(self)
+        seal = _READERS[self]
+        context = payload['context']
+        binding = dict(materialDigest=payload['materialDigest'],
+            originMaterialDigest=seal[3], historyDigest=context['historyDigest'])
+        result = observe_origin_over_ssh(origin, expected_origin_digest=digest(origin),
+            host_id=context['hostId'], producer_source_sha=context['sourceSha'],
+            producer_archive_digest=context['archiveDigest'], verifier_source_sha=verifier_source_sha,
+            checkpoint_binding=binding, timeout=timeout)
+        if (SceneCheckpointReaderV3._authenticate(self) != (payload, origin, archive)
+                or _READERS.get(self) is not seal
+                or type(result) is not RemoteWriterStopObservationV3
+                or result.checkpoint_binding != canonical(binding) or result.checkpointBound is not True
+                or result.writerStoppedObserved is not True or result.sshDeliveryVerified is not True
+                or result.origin_digest != digest(origin) or result.host_id != context['hostId']
+                or result.producer_source_sha != context['sourceSha']
+                or result.producer_archive_digest != context['archiveDigest']
+                or result.verifier_source_sha != verifier_source_sha):
+            reject()
+        return result
+
     def close(self):
         if self._closed:
             if self._owner != (os.getpid(), threading.get_ident()): reject()

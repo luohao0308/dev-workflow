@@ -244,3 +244,10 @@ Mac controller 通过可选本地通知启用保存，回调必须在审批或�
 此切片只绑定历史 writer/停止记录与发布源码内容；不宣称新鲜 Linux 停止观测、实时 Engine phase、当前发布 ref、全局 writer 排他或恢复执行。真实保留 scene 冷验收、新 profile 审批/消费及 session/admission/尾部 CAS 继续后续推进。
 
 本地实现与验收已完成：独立进程冷读、真实 Git/ZIP、原生签名/材料、错误 pins/签名域/跨上下文、复制/线程/fork、失败 enter 回收、部分发布及完整帧大小均通过；3.10/3.14 定向回归见[本地证据](../validation/SCENE-CHECKPOINT-BINDING-LOCAL-2026-11-03.json)。本增量尚未发布，不将本地替身组合提升为真实 retained scene 或恢复执行验收。
+
+
+## 第十九切片：scene checkpoint 的原 writer 停止重验
+
+从原 scene 签名绑定及外部 pins 重新认证 writer origin，复用固定只读 SSH verifier；originMaterialDigest 在此显式表示 scene binding artifact 摘要，不导入 legacy normal session 权限。原材料/历史/文件在 SSH 前后均重验，检查原 reader 身份与全部响应 binding/source/host/origin 字段。原 SSH deadline 保留，文件/crypto/flock不宣称全局硬期限。观测结果只证明该原 writer 的读取时刻停止，不能授予未来排他、实时phase、admission或恢复执行。
+
+本地验证覆盖原subject/binding派生、原生pipe/SSHSIG材料与明确SSH/kernel/source分发替身、错误回显拒绝以及传输期间artifact变化拒绝；真实SSH证据另外记录。
