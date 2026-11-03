@@ -180,6 +180,7 @@ class SceneClientV3:
             _write(self._socket,_signed(self._handle.controlKey,request),end)
             if command=='closeScene':end=time.monotonic()+STOP_RESPONSE_SECONDS
             elif command in ('start_first_create','finish_worker','reconcile_closure'):end=time.monotonic()+40
+            elif command=='observe_closed_phase':end=time.monotonic()+25
             elif command=='reserve_writer':end=time.monotonic()+RESERVE_RESPONSE_SECONDS
             elif command=='drain_writer':end=time.monotonic()+DRAIN_RESPONSE_SECONDS
             elif command=='inspect_attached_worker':end=time.monotonic()+INSPECT_RESPONSE_SECONDS
@@ -195,6 +196,7 @@ class SceneClientV3:
             self._socket.close();self._closed=True;reject()
 
     def start_first_create(self,**args):return self._call('start_first_create',args)
+    def observe_closed_phase(self,request_nonce):return self._call('observe_closed_phase',dict(requestNonce=request_nonce))
     def poll_worker(self):return self._call('poll_worker',{})
     def read_worker_chunk(self,attempt_id,message_digest,offset,length):
         return self._call('read_worker_chunk',dict(attemptId=attempt_id,messageDigest=message_digest,offset=offset,length=length))
@@ -519,10 +521,10 @@ def serve(scene_id):
                                     reply=dict(kind='scene-lease-v3',**state['lease'],seq=0)
                                 else:
                                     lease=state['lease']
-                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')
+                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase')
                                     if (set(value)!=({'kind',*lease,'seq','command'}|({'args'} if extended else set())) or value['kind']!='scene-command-v3'
                                             or any(canonical(value[k])!=canonical(v) for k,v in lease.items()) or type(value['seq']) is not int
-                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')):reject()
+                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase')):reject()
                                     if time.monotonic()>=state['lease_deadline']:reject()
                                     if extended:
                                         args=value['args'];command=value['command']
@@ -532,7 +534,7 @@ def serve(scene_id):
                                             'poll_worker':set(),'read_worker_chunk':{'attemptId','messageDigest','offset','length'},
                                             'begin_worker_reply':{'attemptId','totalBytes','messageDigest','rpcId'},
                                             'worker_reply_chunk':{'attemptId','offset','dataBase64'},'commit_worker_reply':{'attemptId'},
-                                            'finish_worker':{'attemptId'},'reconcile_closure':{'certificate'}}.get(command,{'slotGeneration'})
+                                            'finish_worker':{'attemptId'},'reconcile_closure':{'certificate'},'observe_closed_phase':{'requestNonce'}}.get(command,{'slotGeneration'})
                                         if type(args) is not dict or set(args)!=expected_args:reject()
                                         if 'slotGeneration' in expected_args and (type(args['slotGeneration']) is not int
                                                 or not 0<=args['slotGeneration']<2**53 or slot is None):reject()
@@ -577,7 +579,7 @@ def serve(scene_id):
                                         result=dict(preparationChunk=preparation.chunk(args['preparationId'],args['capsuleDigest'],args['offset'],args['length']),
                                             **{k:False for k in _FALSE})
                                     business_commands=('start_first_create','poll_worker','read_worker_chunk','begin_worker_reply',
-                                        'worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure')
+                                        'worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase')
                                     if command in business_commands:
                                         if business_pins is None or preparation is None or attached_archive is None:reject()
                                         if command=='start_first_create':
@@ -594,8 +596,9 @@ def serve(scene_id):
                                             elif command=='worker_reply_chunk':business_result=broker.worker_reply_chunk(args['attemptId'],args['offset'],args['dataBase64'])
                                             elif command=='commit_worker_reply':business_result=broker.commit_worker_reply(args['attemptId'])
                                             elif command=='finish_worker':business_result=broker.finish_worker(args['attemptId'])
+                                            elif command=='observe_closed_phase':business_result=broker.observe_closed_phase(args['requestNonce'])
                                             else:business_result=broker.reconcile_closure(args['certificate'])
-                                        result=dict(business=business_result,**{k:False for k in _FALSE})
+                                        result=dict(**({'phaseObservation':business_result} if command=='observe_closed_phase' else {'business':business_result}),**{k:False for k in _FALSE})
                                     elif broker is not None:result['business']=broker.status()
                                     else:result['business']=dict(businessState='disabled' if business_pins is None else 'new',
                                         witnessKeyHash=digest(business_pins[0]) if business_pins else None,

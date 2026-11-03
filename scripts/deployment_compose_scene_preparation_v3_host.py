@@ -39,13 +39,18 @@ def _record(owner):
     return record
 
 
-def _fresh(record):
+def _fresh(record,end=None):
+    def budget(maximum):
+        if end is None:return maximum
+        remaining=min(maximum,end-time.monotonic())
+        if remaining<=0:reject()
+        return remaining
     held=record['observer'];held._root_same()
     if canonical(held.binding())!=record['binding']:reject()
-    fresh=ObservedRecoveryDaemonV3(str(record['root']),record['daemon'],kernel_boot=decode(record['binding'])['kernelBoot'])
+    fresh=ObservedRecoveryDaemonV3(str(record['root']),record['daemon'],kernel_boot=decode(record['binding'])['kernelBoot'],timeout=budget(15))
     try:
         if canonical(fresh.binding())!=record['binding']:reject()
-        info=fresh._request('/v1.45/info',time.monotonic()+5,[8*1024*1024])
+        info=fresh._request('/v1.45/info',time.monotonic()+budget(5),[8*1024*1024])
         if (type(info) is not dict or info.get('ID')!=record['daemon']
                 or info.get('DockerRootDir')!=str(record['root']/'data')
                 or canonical(fresh.binding())!=record['binding']):reject()
@@ -180,6 +185,26 @@ class PreparationOwnerV3:
         _fresh(record)
         session.created_ids.append(cid)
         session.unknown_write_result=False
+
+    def _observe_closed_create_phase(self,receipts,end):
+        """Only original prepared inputs select the GET-only phase subject."""
+        record=_record(self);session=record['session']
+        if (record['state']!='prepared' or session is None or not record['product_pending']
+                or session.unknown_write_result or type(receipts) is not dict):reject()
+        bundle=session.prepared['bundle'];creates=bundle.creation_operations()
+        if len(creates)!=1 or set(receipts)!={creates[0]['service']}:reject()
+        cid=receipts[creates[0]['service']]
+        if not hex_value(cid) or cid not in session.created_ids:reject()
+        operations=bundle.resolve_operations(receipts)
+        if len(operations)<2:reject()
+        context=dict(phase_index=1,operation=operations[1],receipts=dict(receipts),completed_operations=operations[:1])
+        _fresh(record,end)
+        remaining=end-time.monotonic()
+        if remaining<=0:reject()
+        phase,endpoint=ObservedRecoveryDaemonV3.capture_recovery_phase(record['observer'],bundle,
+            session.guard._base,context,expected_version=session.guard._version,timeout=min(30,remaining))
+        if canonical(record['observer'].binding())!=record['binding'] or time.monotonic()>=end:reject()
+        return phase,endpoint,canonical(session.guard._version),bundle.to_dict()['baselineStateDigest']
 
     def cleanup(self):
         record=_record(self)

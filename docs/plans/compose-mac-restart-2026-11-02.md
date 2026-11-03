@@ -251,3 +251,12 @@ Mac controller 通过可选本地通知启用保存，回调必须在审批或�
 从原 scene 签名绑定及外部 pins 重新认证 writer origin，复用固定只读 SSH verifier；originMaterialDigest 在此显式表示 scene binding artifact 摘要，不导入 legacy normal session 权限。原材料/历史/文件在 SSH 前后均重验，检查原 reader 身份与全部响应 binding/source/host/origin 字段。原 SSH deadline 保留，文件/crypto/flock不宣称全局硬期限。观测结果只证明该原 writer 的读取时刻停止，不能授予未来排他、实时phase、admission或恢复执行。
 
 本地验证覆盖原subject/binding派生、原生pipe/SSHSIG材料与明确SSH/kernel/source分发替身、错误回显拒绝以及传输期间artifact变化拒绝；真实SSH证据另外记录。
+
+
+## 第二十切片：原 scene issuer 的只读 live phase 摘要
+
+新命令仅接受随机nonce，原broker在reconciled后冻结已验证closure，并从其receipts派生phase1；原准备owner以guard._base和原版本调用ObservedDaemon的endpoint前后核验与双PhaseGuard扫描。15秒操作预算共享到_fresh构造/GET；原lease不续，沿用5秒flush。调用失败只拒本次观测，原闭合事实与清理责任保留。
+
+回复是小型phaseObservation envelope，包含closure、baseline/phase/endpoint摘要、完整endpoint及版本和全false权限；保持完整Unix/SSH帧8192上限。Mac先认证原材料/历史，再新建原source/ref gate通过的SSH连接，比较原scene/slot/daemon/closure，读取后立即detach并核原EOF/退出/stderr，再认证本地材料和历史。原deploy到期不妨碍历史只读观测，新的写授权另走新profile。
+
+该摘要是可信scene issuer已按原逻辑验证现场适用性的观测，不含完整phase_bytes，不能生成现有recovery context，也不授予fence、连续性、实时写准入或恢复执行。新RPC只支持包含本版本的分发scene，旧scene不热升级。真实存活scene验收仍需后续新场景/精确审批；本切片先完成本地Unix/PhaseGuard、协议、字段及生命周期边界验证。

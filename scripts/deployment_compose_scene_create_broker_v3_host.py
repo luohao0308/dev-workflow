@@ -12,6 +12,7 @@ import selectors
 import struct
 import threading
 import weakref
+import time
 from dataclasses import asdict
 
 from deployment_compose_witness_store import canonical
@@ -258,5 +259,31 @@ class SceneCreateBrokerV3:
         verified=verify_create_closure(certificate,public_key=r['intent'],expected=expected)
         receipts=verified['receiptMap']
         PreparationOwnerV3._reconcile_closed_create(r['preparation'],receipts)
+        r['closure']=canonical(verified)
         r['state']='reconciled'
         return self.status()
+
+
+    def observe_closed_phase(self,request_nonce):
+        r=_record(self)
+        if (not hex_value(request_nonce) or r['state']!='reconciled' or r.get('closure') is None
+                or r['terminal'] is None or r['stop'] is None):reject()
+        end=time.monotonic()+15
+        def seal():
+            if _record(self) is not r or r['state']!='reconciled':reject()
+            slot=r['slot'].status()
+            if (slot['slotState']!='drained' or slot['slotGeneration']!=r['generation']
+                    or slot['writerOriginDigest']!=digest(r['origin'])):reject()
+            return (r['closure'],r['terminal'],r['stop'],r['origin'],canonical(r['inputs']['daemonBinding']))
+        before=seal();closure=decode(r['closure'])
+        phase,endpoint,version,baseline=PreparationOwnerV3._observe_closed_create_phase(
+            r['preparation'],dict(closure['receiptMap']),end)
+        if seal()!=before or time.monotonic()>=end:reject()
+        endpoint_value=decode(endpoint)
+        if canonical(endpoint_value['daemonBinding'])!=before[4]:reject()
+        flags=('phaseFreshnessVerified','daemonContinuityVerified','writerQuiescenceVerified',
+            'authorityGranted','executionAvailable','runtimePermit','recoveryAuthorized','productionReady','sourceRevalidated')
+        return dict(schemaVersion=1,kind='scene-live-phase-summary-v3',requestNonce=request_nonce,
+            closure=closure,phaseIndex=1,baselineDigest=baseline,phaseDigest=digest(phase),
+            endpointBinding=endpoint_value,endpointBindingDigest=digest(endpoint),
+            normalizationVersion=decode(version),readOnly=True,**{key:False for key in flags})

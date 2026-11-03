@@ -399,6 +399,11 @@ class SceneCheckpointReaderV3:
             reject()
         return result
 
+    def observe_live_phase(self, *, handle):
+        """Observe original scene applicability; no raw phase or recovery permit."""
+        from deployment_compose_scene_live_phase_v3_host import observe_scene_live_phase
+        return observe_scene_live_phase(self, handle=handle)
+
     def close(self):
         if self._closed:
             if self._owner != (os.getpid(), threading.get_ident()): reject()

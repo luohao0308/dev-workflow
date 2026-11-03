@@ -29,7 +29,7 @@ from deployment_compose_witness_store import canonical
 from deployment_gate_witness import key_material
 
 
-def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None):
+def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None,after_reconciled=None):
     processes=[];calls=[];origin_calls=[];pending_seen=[]
     # Gateway lifetime and kernel boot are distinct identity domains.
     boot='12345678-1234-4234-8234-123456789abc'
@@ -140,6 +140,7 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
         else:
             final=controller.run_first_create(approval=approval,consumption=consumption,timeout=60,on_restart_checkpoint=checkpoint_callback,on_scene_checkpoint=scene_callback)
             testcase.assertEqual(final['businessState'],'reconciled');testcase.assertTrue(final['closureReconciled'])
+            if after_reconciled is not None:after_reconciled(broker,prep,session)
             testcase.assertEqual(pending_seen,[True]);testcase.assertFalse(session.unknown_write_result)
             testcase.assertEqual(len(clients),4 if checkpoint_callback is not None or scene_callback is not None else 3);testcase.assertEqual(calls.count('start_first_create'),1)
             testcase.assertIn('a'*64,session.created_ids);testcase.assertEqual(origin_calls,['stop','observe','close'])
