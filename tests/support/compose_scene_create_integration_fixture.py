@@ -61,32 +61,52 @@ class TLSLeafKernelDouble:
     def terminal_facts(self):return self.facts,self.response
 
 
-def run_case(testcase,attack='',*,scene_controller=False):
+def run_case(testcase,attack='',*,scene_controller=False,checkpoint_callback=None,scene_callback=None,published_source=None):
     case=LocalAcceptanceCase(testcase);stack=ExitStack();process=None;store=None
     try:
+        if scene_callback is not None and sys.platform=='darwin':
+            # Explicit Linux filesystem-namespace double on macOS: root identity
+            # stays /var/tmp while child I/O uses the native /private/var/tmp.
+            # The original CAS/Gate constructors and verification run unchanged.
+            class NamespaceRoot(type(Path())):
+                def __truediv__(self,name):
+                    return Path(super().__truediv__(name)).resolve()
+            stack.enter_context(patch.object(worker,'Path',NamespaceRoot))
         witness,public=live_key(case.root,'witness-signing');intent,intent_public=live_key(case.root,'intent-signing')
         tls=live.writer_tls(case.engine_root)
-        archive=b'fixed-scene-archive-integration';archive_digest=hashlib.sha256(archive).hexdigest()
-        hello=dict(root=str(case.engine_root),daemonId='daemon-one',sourceSha='b'*40,archiveDigest=archive_digest,hostId='host-one',
+        source_sha='b'*40 if published_source is None else published_source[0]
+        archive=b'fixed-scene-archive-integration' if published_source is None else published_source[1]
+        if published_source is not None:
+            import deployment_compose_profile3_prepare_ssh_probe as source
+            stack.enter_context(patch.object(source,'ROOT',published_source[2]))
+        archive_digest=hashlib.sha256(archive).hexdigest()
+        hello=dict(root=str(case.engine_spelling if scene_callback is not None else case.engine_root),daemonId='daemon-one',sourceSha=source_sha,archiveDigest=archive_digest,hostId='host-one',
             serverCertificateSha256=tls[2],writerCertificateSha256=tls[3])
         policy=GatePolicy('scene-test','scene-gate',hashlib.sha256(canonical(hello)).hexdigest(),tls[3],True,'0'*64,
             hashlib.sha256(key_material(public)).hexdigest(),operation_profile='compose-v3')
         keys={key:secrets.token_bytes(32) for key in live.KEYS};gate_key=secrets.token_bytes(32)
-        session=case.prepare(case.engine_root,{'ID':'daemon-one'},source_sha='b'*40,host_id='host-one',expected_daemon_id='daemon-one',
+        if published_source is not None:
+            import compose_profile3_prepare_fixture as preparation
+            native_prepare=preparation._prepare_observed
+            def prepare_source(*args,**kwargs):
+                kwargs['source_sha']=source_sha
+                return native_prepare(*args,**kwargs)
+            stack.enter_context(patch.object(preparation,'_prepare_observed',prepare_source))
+        session=case.prepare(case.engine_root,{'ID':'daemon-one'},source_sha=source_sha,host_id='host-one',expected_daemon_id='daemon-one',
             keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=900)
         prepared=session.prepared;bundle=prepared['bundle'];request=prepared['request']
         capsule=live.private_json(live.private_capsule(session,prepared));facts=[]
         class Capture:
-            config={'sourceSha':'b'*40,'archiveDigest':archive_digest}
+            config={'sourceSha':source_sha,'archiveDigest':archive_digest}
             def emit(self,kind,**data):facts.append(data)
-        live.emit_observer_facts(Capture(),session,prepared,case.engine_root)
+        live.emit_observer_facts(Capture(),session,prepared,case.engine_spelling if scene_callback is not None else case.engine_root)
         directory=case.root/'witness';directory.mkdir(mode=0o700);store=OperationWitnessStoreV3(directory,key=secrets.token_bytes(32))
         admission=MacLiveAdmissionV3(store=store,gate_policy=policy,gate_key=gate_key,witness_signer=witness,
             witness_public_key=public,intent_signer=intent,intent_public_key=intent_public)
         approval,consumption,_=case.review_adapter().consume_prepared(bundle,request,lambda value:None)
         if scene_controller:
             from tests.support.compose_scene_controller_integration_fixture import drive_scene
-            return drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts[0],attack)
+            return drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts[0],attack,checkpoint_callback=checkpoint_callback,scene_callback=scene_callback)
         binding=admission.register_intent(bundle,request,approval,consumption)
         from deployment_compose_coordinator_v3_host import digest
         refs=dict(requestHash=request.digest(),receiptHash=digest(asdict(consumption)),firstBinding=binding)
@@ -105,7 +125,7 @@ def run_case(testcase,attack='',*,scene_controller=False):
         stack.enter_context(patch.object(worker,'PrivateDaemon',side_effect=lambda root,info:SimpleNamespace(socket=str(root/'docker.sock'),daemon_id=info['ID'])))
         stack.enter_context(patch.object(worker.original,'OwnedCreateTransportV3',TLSLeafKernelDouble))
         stack.enter_context(patch.object(transport_module,'OwnedCreateTransportV3',TLSLeafKernelDouble))
-        config=dict(entrypoint=worker.ENTRYPOINT,sourceSha='b'*40,archiveDigest=archive_digest,channelNonce='d'*64,hostId='host-one',context=context)
+        config=dict(entrypoint=worker.ENTRYPOINT,sourceSha=source_sha,archiveDigest=archive_digest,channelNonce='d'*64,hostId='host-one',context=context)
         process=OwnedLocalProcess(lambda owned:worker.run(config,owned.input,owned.output))
         terminal=None;rpcs=[]
         while process.poll() is None:

@@ -216,3 +216,31 @@ Mac仅在原fresh consent、AuthenticatedHistory及精确首create六事件闭�
 本切片的组合验证使用真实TLS、SSHSIG、CAS、Gate、原审批消费/status/witness与phase guard；GitHub provider、Unix Engine、Linux kernel/原issuer隔离及组合测试的scene控制transport/startup明确为替身，原Unix/HMAC服务协议另由跨进程测试验证。不得将本地组合通过描述成真实Engine产品派发或真实GitHub审批验收。后续仍需已发布源码上的真实精确审批、首次业务create与原session清理验收、业务checkpoint持久化、跨Mac恢复、旧writer排他及新profile消费/尾部CAS；production与恢复执行权限继续false。
 
 Mac端额外使用固定SceneSSHClient适配器：原Linux SceneClient只支持本地Unix，不能把组合测试的transport替身当Mac接线。SSH转发端仅从原发布白名单ZIP加载固定remote_main，先用原Git对象/member verifier核保管ZIP，再核本地checkout及当前发布ref；ZIP时间戳不影响成员内容证明。严格host key/BatchMode、禁forwarding，控制key经stdio输入，ready/每条command/result/terminal均绑定nonce、序号及scene/source。远端只构造原生SceneClient，命令限原固定白名单，8KiB消息头先拒超限；不代签业务status/witness、不接任意代码或命令。detach/close需远端完整terminal、EOF、exit0、零stderr；Mac EOF只结束自己SSH及原控制连接，不据JSON PID/单位导入stop权限。原Unix/HMAC与实际SSH适配器分别验证，真实业务验收仍须新鲜精确审批。
+
+
+## 第十七切片：scene 闭合业务的只读 checkpoint 接线
+
+用户已确认按业务 checkpoint、同 scene 跨 Mac 恢复、完整故障矩阵、V4/GitLab 的顺序推进。首个实现增量限定为 scene 首 create 已闭合并由原准备 owner 完成 reconcile 后的认证材料保存；它不增加恢复执行接口。
+
+Mac controller 通过可选本地通知启用保存，回调必须在审批或任何产品写入之前验证；默认路径不保存材料。原 admission 提供 case、见证 store 与 signer，基线及镜像默认值只从已验证的原 capsule 派生，不接受调用者额外提供的路径、history、keys 或 defaults。固定目录/签名文件布局不兼容、已有发布材料等可预测错误应在写入前拒绝。
+
+复用原 save_checkpoint 的私有材料/密钥分离、独占 fsync 发布及 reader 验证；保存前后需重验原 controller/admission 身份、root/current/pending、request/bundle 与本次 closure 的 historyDigest/receiptMap。独立 pins 只由原生回调交付深拷贝；保存或回调失败不返回成功、不重新 create，不能抹除已完成事实或原 scene 的清理责任。
+
+验收覆盖默认路径、非法回调/不兼容布局零产品派发、真实 TLS/Gate/SSHSIG/CAS 的一次 create、保存/回调失败、原 producer 退出后的独立 reader 冷读，以及错误 pins、替换材料或见证推进拒绝。测试中的 provider/Engine/kernel/scene transport 替身必须明确列出，不冒充真实宿主验收。
+
+此增量的 writer_origin 仍为空，源码归档尚未通过 scene 专属身份绑定保管，phaseFreshnessVerified、linuxQuiescenceVerified 及恢复/执行权限仍为 false。后续需另做原 scene writer origin/停止观察与 closure 的认证绑定及源码保管，不能放宽旧 normal session 的 issued 检查来模拟接线。scene 租期有界，保存耗时本身不证明同场景持续存活。
+
+
+## 第十八切片：scene 专属 writer 身份与源码归档绑定
+
+沿用原 material checkpoint，新增独立 schema/SSHSIG namespace 的 scene 绑定，不放宽旧 normal session 的 writer-origin 认证。原 broker 仅在 closed/reconciled 后输出原 native writer origin、已完成的停止观测摘要和原 daemon binding；Mac 从认证连接读取并前后比较同一不可变闭合结果。
+
+原 controller 的显式 opt-in 在首笔产品派发前核对 source ZIP 与原 hello archiveDigest，并用已有 Git commit/tree/blob verifier 检查原 sourceSha 的准确成员内容。Git repository 只提供内容对象，不提供来源或执行授权；SSH 路径可从原 handle 复用归档。本地测试以明确 provider/Engine/kernel/control 替身和真实 Git/ZIP、TLS、签名、CAS 组合验证。
+
+原 intent signer 以新 namespace 签名 scene、attempt/preparation/capsule/slot、原 closure、material/custody/context、hello、origin、stop digest、daemon binding 和源码成员摘要。原材料与密钥仍复用原保存器，scene artifact 与 ZIP 独占私有落盘；独立 pins 经原回调交付，失败不重派 create、不修复或覆盖部分发布。
+
+独立 scene reader 包装原只读 reader，校验外部 artifact/key pins、专属签名、原 closure、原历史/基线与 source/context/origin/daemon 绑定。文件权限、链接/替换、错误 key/pin、旧历史/串场、部分发布、copy/thread/fork 等继续拒绝；新进程读取使用原生回调 pins，不能从相邻文件补造信任。源码成员再验证复用原纯 Git/ZIP verifier，旧 archive reader 仍拒绝 scene 包装对象。
+
+此切片只绑定历史 writer/停止记录与发布源码内容；不宣称新鲜 Linux 停止观测、实时 Engine phase、当前发布 ref、全局 writer 排他或恢复执行。真实保留 scene 冷验收、新 profile 审批/消费及 session/admission/尾部 CAS 继续后续推进。
+
+本地实现与验收已完成：独立进程冷读、真实 Git/ZIP、原生签名/材料、错误 pins/签名域/跨上下文、复制/线程/fork、失败 enter 回收、部分发布及完整帧大小均通过；3.10/3.14 定向回归见[本地证据](../validation/SCENE-CHECKPOINT-BINDING-LOCAL-2026-11-03.json)。本增量尚未发布，不将本地替身组合提升为真实 retained scene 或恢复执行验收。

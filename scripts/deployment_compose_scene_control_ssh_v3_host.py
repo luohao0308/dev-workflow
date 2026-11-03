@@ -16,6 +16,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 
 import deployment_compose_profile3_prepare_ssh_probe as source
 from deployment_compose_scene_service_v3_host import SceneClientV3,SceneHandleV3,MAX_FRAME,_frame,decode,canonical,_FALSE
@@ -23,6 +24,7 @@ from deployment_compose_v3_channel_worker import read_frame,write_frame
 
 ENTRYPOINT='deployment_compose_scene_control_ssh_v3_host._remote_main'
 END_TIMEOUT=5
+_ISSUED_CLIENTS=weakref.WeakKeyDictionary()
 _COMMANDS={'status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker',
     'prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker',
     'read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure'}
@@ -31,6 +33,25 @@ _BUDGETS={'closeScene':420,'reserve_writer':25,'drain_writer':40,'inspect_attach
 
 
 def reject():raise ValueError('compose-scene-control-ssh-v3-rejected') from None
+
+
+def _client_identity(client):
+    handle=client._handle;process=client._process
+    return (client._owner,id(handle),id(process),id(process.stdin),id(process.stdout),id(process.stderr),
+        client._nonce,handle.sceneId,handle.socketPath,hashlib.sha256(handle.controlKey).digest(),
+        handle.hostAlias,handle.sourceSha,hashlib.sha256(handle.archiveBytes).digest())
+
+
+def _issued_scene_ssh_client(client):
+    """Constructor provenance for checkpoint capture; copies cannot mint it."""
+    if type(client) is not SceneSSHClientV3 or _ISSUED_CLIENTS.get(client) is None:reject()
+    try:actual=_client_identity(client)
+    except Exception:reject()
+    if (client._owner!=(os.getpid(),threading.get_ident())
+            or _ISSUED_CLIENTS[client]!=actual
+            or any(name in client.__dict__ for name in
+                   ('status','_call','_owned','_read','_finish','close','detach'))):reject()
+    return _ISSUED_CLIENTS[client]
 
 
 @dataclass(frozen=True)
@@ -136,6 +157,7 @@ class SceneSSHClientV3(SceneClientV3):
             ready=self._read(20)
             if ready!=dict(kind='scene-control-ready-v3',channelNonce=self._nonce,sceneId=handle.sceneId,
                     sourceSha=handle.sourceSha,archiveDigest=digest):reject()
+            _ISSUED_CLIENTS[self]=_client_identity(self)
         except BaseException:
             self.close();raise
 

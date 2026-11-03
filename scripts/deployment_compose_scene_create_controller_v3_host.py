@@ -11,6 +11,7 @@ import math
 import os
 import threading
 import time
+import weakref
 
 from deployment_compose_scene_service_v3_host import SceneClientV3
 from deployment_compose_scene_control_ssh_v3_host import SceneSSHClientV3
@@ -20,6 +21,16 @@ from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_recovery_phase_capsule_v3_host import decode
 from deployment_compose_witness_store import canonical
 from deployment_compose_scene_create_certificate_v3_host import issue_create_closure
+
+_ISSUED=weakref.WeakKeyDictionary()
+
+
+def _fingerprint(controller):
+    return (id(controller._admission),id(controller._handle),controller._client_type,
+        controller._raw,canonical(controller._hello),tuple(sorted(controller._keys.items())),
+        controller._boot,controller._bind,controller._seal,controller._prep,controller._digest,
+        controller._request.digest(),controller._bundle.canonical_bytes)
+
 
 MAX_MESSAGE=4*1024*1024
 _METHODS={'intent':{'check'},'witness':{'read','check','events_after','chain_status','append_event'}}
@@ -47,11 +58,15 @@ class SceneCreateControllerV3:
             self._hello=decode(canonical(hello));self._keys=dict(integrity_keys)
             self._raw=capsule_bytes;self._prep=preparation_id;self._digest=capsule_digest
             self._boot=trusted_boot_id;self._bind=trusted_bind_digest
-            self._bundle,self._request=self._verify()
+            self._bundle,self._request=SceneCreateControllerV3._verify(self)
             self._seal=(admission._policy,admission._key,tuple(admission._public),tuple(admission._signers),admission._store)
+            _ISSUED[self]=(self._owner,_fingerprint(self))
         except Exception:reject()
 
     def _owned(self):
+        record=_ISSUED.get(self)
+        if (record is None or record!=(self._owner,_fingerprint(self))
+                or any(name in self.__dict__ for name in ('_owned','_status','_verify','run_first_create','_save_restart_checkpoint'))):reject()
         a=self._admission
         if (self._owner!=(os.getpid(),threading.get_ident()) or type(self._client) is not self._client_type
                 or self._client_type not in (SceneClientV3,SceneSSHClientV3) or self._client._handle is not self._handle
@@ -71,10 +86,22 @@ class SceneCreateControllerV3:
                 or business.get('intentKeyHash')!=digest(self._admission._public[1])):reject()
         return status
 
-    def run_first_create(self,*,review=None,on_review=None,approval=None,consumption=None,timeout=900):
+    def run_first_create(self,*,review=None,on_review=None,approval=None,consumption=None,timeout=900,on_restart_checkpoint=None,on_scene_checkpoint=None):
         try:
             self._owned()
             if self._attempted or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=900:reject()
+            if on_restart_checkpoint is not None and on_scene_checkpoint is not None:reject()
+            notify=on_scene_checkpoint if on_scene_checkpoint is not None else on_restart_checkpoint
+            if notify is not None:
+                if not callable(notify):reject()
+                case=self._admission._store.root.parent
+                if (self._admission._store.root!=case/'witness'
+                        or self._admission._signers[0]!=case/'witness-signing'
+                        or any((case/name).exists() or (case/name).is_symlink()
+                               for name in ('restart-material','restart-custody','scene-checkpoint'))):reject()
+            if on_scene_checkpoint is not None:
+                from deployment_compose_scene_checkpoint_v3_host import validate_scene_checkpoint_source
+                validate_scene_checkpoint_source(self)
             self._attempted=True;end=time.monotonic()+timeout
             def left():
                 if time.monotonic()>=end:reject()
@@ -155,6 +182,12 @@ class SceneCreateControllerV3:
                             or canonical(reopened['closedResult'])!=canonical(state['closedResult'])):reject()
                     final=self._client.reconcile_closure(certificate)['business'];left()
                     if final['businessState']!='reconciled':reject()
+                    if notify is not None:
+                        if on_scene_checkpoint is not None:
+                            from deployment_compose_scene_checkpoint_v3_host import capture_scene_checkpoint
+                            capture=capture_scene_checkpoint(self,certificate,final)
+                            self._save_restart_checkpoint(certificate,final,notify,left,scene_capture=capture)
+                        else:self._save_restart_checkpoint(certificate,final,notify,left)
                     return final
                 time.sleep(.01)
         except BaseException as error:
@@ -165,3 +198,49 @@ class SceneCreateControllerV3:
             except Exception:pass
             if isinstance(error,Exception):reject()
             raise
+
+    def _save_restart_checkpoint(self,certificate,final,notify,left,*,scene_capture=None):
+        """Read-only material custody; no writer-origin or source-archive seal."""
+        from deployment_compose_restart_checkpoint_v3_host import save_checkpoint
+        from deployment_compose_phase_guard_v3_host import baseline_state_bytes
+        from deployment_compose_live_ssh_v3_host import derive_defaults,ZERO_DEFAULTS
+        admission=self._admission;entry=admission._root
+        if entry is None or admission._current is not entry or admission._pending is not None:reject()
+        history=admission._history(entry);snapshot=history.capture()
+        payload=certificate['payload']
+        if (entry['request']!=self._request or entry['bundle'].canonical_bytes!=self._bundle.canonical_bytes
+                or payload['historyDigest']!=snapshot.digest
+                or canonical(payload['receiptMap'])!=canonical(dict(snapshot.snapshot['receiptMap']))):reject()
+        frozen=decode(self._raw);defaults={}
+        for service in entry['bundle'].to_dict()['services']:
+            name=service['name'];target=frozen['targetInputs'][name]
+            derived=derive_defaults(target['image'],target['commitment'],self._keys['target'],
+                **{key:target[key] for key in ('expected_image_id','expected_registry_digest','expected_architecture')})
+            if target['commitment']['keyId']!=target['expected_key_id']:reject()
+            defaults[name]={key:derived[key] for key in ZERO_DEFAULTS}
+        baseline=baseline_state_bytes({row['Id']:row for row in frozen['rawRows'].values()})
+        expected=canonical(final)
+        if canonical(self._status()['business'])!=expected:reject()
+        self._client.detach()
+        case=admission._store.root.parent
+        descriptor=save_checkpoint(case,original_history=history,baseline_bytes=baseline,
+            authenticated_image_defaults=defaults,archive_digest=self._hello['archiveDigest'],
+            witness_store=admission._store,witness_signer=admission._signers[0])
+        self._owned();left()
+        if (admission._root is not entry or admission._current is not entry or admission._pending is not None
+                or entry['request']!=self._request
+                or entry['bundle'].canonical_bytes!=self._bundle.canonical_bytes):reject()
+        if admission._history(entry).capture().canonical!=snapshot.canonical:reject()
+        if scene_capture is not None:
+            from deployment_compose_scene_checkpoint_v3_host import retain_scene_checkpoint
+            descriptor=retain_scene_checkpoint(scene_capture,descriptor)
+        # Local custody callbacks can outlast a scene connection lease. Keep
+        # them detached, then authenticate and recheck the same closed result.
+        notify(decode(canonical(descriptor)))
+        self._owned();left()
+        if (admission._root is not entry or admission._current is not entry or admission._pending is not None
+                or entry['request']!=self._request
+                or entry['bundle'].canonical_bytes!=self._bundle.canonical_bytes
+                or admission._history(entry).capture().canonical!=snapshot.canonical):reject()
+        self._client=self._client_type(self._handle)
+        if canonical(self._status()['business'])!=expected:reject()

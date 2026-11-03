@@ -78,6 +78,13 @@ class SceneCreateBrokerV3:
             result['closureChallenge']=dict(sceneId=r['scene'],attemptId=r['attempt'],attemptNonce=r['nonce'],
                 preparationId=meta['preparationId'],capsuleDigest=meta['capsuleDigest'],slotGeneration=r['generation'],
                 requestHash=r['request_hash'],bundleDigest=r['bundle_digest'])
+        if (r['state'] in ('closed','reconciled') and r.get('origin') is not None
+                and r['stop'] is not None and r['terminal'] is not None
+                and 'daemonBinding' in r['inputs']):
+            # These belong to this original attempt, even if the slot is later
+            # used by a different generation. Never read a replacement's facts.
+            result['checkpointEvidence']=dict(writerOrigin=decode(r['origin']),
+                stopObservationDigest=r['stop'],daemonBinding=decode(canonical(r['inputs']['daemonBinding'])))
         return result
 
     def start_first_create(self,args,lease_generation):

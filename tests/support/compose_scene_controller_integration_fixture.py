@@ -29,15 +29,17 @@ from deployment_compose_witness_store import canonical
 from deployment_gate_witness import key_material
 
 
-def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack):
+def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None):
     processes=[];calls=[];origin_calls=[];pending_seen=[]
-    binding=dict(root=str(case.engine_root),daemonId='daemon-one',kernelBoot='11111111-1111-1111-1111-111111111111')
+    boot=facts['bootId'];boot='-'.join((boot[:8],boot[8:12],boot[12:16],boot[16:20],boot[20:]))
+    binding=dict(root=hello['root'],daemonId='daemon-one',kernelBoot=boot,unit=case.engine_root.name+'.service',invocationId='c'*32,cgroupDevice=1,cgroupInode=2,mainPid=123,mainStartTicks=1,daemonPid=124,daemonStartTicks=1)
     observer=object.__new__(ObservedRecoveryDaemonV3);observer.root=str(case.engine_root);observer.daemon_id='daemon-one'
     stack.enter_context(patch.object(ObservedRecoveryDaemonV3,'binding',return_value=binding))
-    stack.enter_context(patch.object(preparation_module,'_fresh',return_value={'ID':'daemon-one','DockerRootDir':str(case.engine_root/'data')}))
+    stack.enter_context(patch.object(preparation_module,'_fresh',return_value={'ID':'daemon-one','DockerRootDir':hello['root']+'/data'}))
     prep=preparation_module.PreparationOwnerV3(observer,hello['sourceSha'],hello['archiveDigest'])
     raw=encode(capsule);path=case.engine_root/'scene-preparation';path.mkdir(mode=0o700)
     fd,identity=directory(path)
+    frame_sizes={}
     try:
         publish(fd,'capsule.private.json',raw);stored,file_identity=read_file(fd,'capsule.private.json',4*1024*1024)
         testcase.assertEqual(stored,raw)
@@ -46,7 +48,7 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
     record=preparation_module._RECORDS[prep]
     record.update(state='prepared',identity=canonical(hello),session=session,raw=raw,metadata=metadata,
         fileIdentity=(identity,file_identity),host=hello['hostId'],keys=keys)
-    stack.enter_context(patch.object(worker,'_fresh',return_value={'ID':'daemon-one','DockerRootDir':str(case.engine_root/'data')}))
+    stack.enter_context(patch.object(worker,'_fresh',return_value={'ID':'daemon-one','DockerRootDir':hello['root']+'/data'}))
     stack.enter_context(patch.object(worker.original,'preflight'))
     stack.enter_context(patch.object(worker,'PrivateDaemon',side_effect=lambda root,info:SimpleNamespace(socket=str(root/'docker.sock'),daemon_id=info['ID'])))
     stack.enter_context(patch.object(worker.original,'OwnedCreateTransportV3',TLSLeafKernelDouble))
@@ -78,13 +80,21 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
     stack.enter_context(patch.object(slot_module,'observe_stopped_writer',side_effect=observed))
     slot=slot_module.SlotOwnerV3(hello['sourceSha'],hello['archiveDigest']);scene='dw-scene-'+secrets.token_hex(8)
     broker=broker_module.SceneCreateBrokerV3(prep,archive,*admission._public,slot,scene)
+    from deployment_compose_scene_control_ssh_v3_host import SceneSSHClientV3,SceneSSHHandleV3
+    client_type=SceneClientV3 if scene_callback is None else SceneSSHClientV3
     clients=[];handle=SceneHandleV3(scene,str(case.root/'control.sock'),secrets.token_bytes(32))
+    if scene_callback is not None:
+        import deployment_compose_scene_control_ssh_v3_host as ssh_control
+        stack.enter_context(patch.object(ssh_control,'_issued_scene_ssh_client',lambda client:None))
+        handle=SceneSSHHandleV3(scene,'/var/tmp/'+scene+'/control.sock',handle.controlKey,hello['hostId'],hello['sourceSha'],archive)
+        stack.enter_context(patch.object(client_type,'detach',SceneClientV3.detach))
+        stack.enter_context(patch.object(client_type,'close',SceneClientV3.close))
     def new_client(subject,connection_handle):
         testcase.assertIs(connection_handle,handle);clients.append(subject)
         subject._handle=handle;subject._closed=False
         subject._owner=(os.getpid(),threading.get_ident());subject._socket=SimpleNamespace(close=lambda:broker.controller_lost())
-    stack.enter_context(patch.object(SceneClientV3,'__init__',new_client))
-    client=SceneClientV3(handle)
+    stack.enter_context(patch.object(client_type,'__init__',new_client))
+    client=client_type(handle)
     def call(subject,command,args=None):
         testcase.assertIn(subject,clients);testcase.assertFalse(subject._closed);calls.append(command);args=args or {}
         if command=='detach':return {}
@@ -108,7 +118,7 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
             value=broker.reconcile_closure(args['certificate'])
         else:raise AssertionError(command)
         return {'business':value}
-    stack.enter_context(patch.object(SceneClientV3,'_call',call))
+    stack.enter_context(patch.object(client_type,'_call',call))
     native_register=type(admission).register_intent
     def register(subject,*args,**kwargs):
         testcase.assertTrue(all(item._closed for item in clients))
@@ -126,13 +136,26 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
         if attack:
             with testcase.assertRaises(ValueError):controller.run_first_create(approval=approval,consumption={'consumed':True} if attack=='fake-consumption' else consumption,timeout=60)
         else:
-            final=controller.run_first_create(approval=approval,consumption=consumption,timeout=60)
+            final=controller.run_first_create(approval=approval,consumption=consumption,timeout=60,on_restart_checkpoint=checkpoint_callback,on_scene_checkpoint=scene_callback)
             testcase.assertEqual(final['businessState'],'reconciled');testcase.assertTrue(final['closureReconciled'])
             testcase.assertEqual(pending_seen,[True]);testcase.assertFalse(session.unknown_write_result)
-            testcase.assertEqual(len(clients),3);testcase.assertEqual(calls.count('start_first_create'),1)
+            testcase.assertEqual(len(clients),4 if checkpoint_callback is not None or scene_callback is not None else 3);testcase.assertEqual(calls.count('start_first_create'),1)
             testcase.assertIn('a'*64,session.created_ids);testcase.assertEqual(origin_calls,['stop','observe','close'])
             testcase.assertEqual(admission._history(admission._root).capture().snapshot['chainStatus']['activeSeq'],6)
             with testcase.assertRaises(ValueError):controller.run_first_create(approval=approval,consumption=consumption)
+            import deployment_compose_scene_service_v3_host as service
+            prepared_status=prep.status();slot_status=slot.status()
+            full_result=dict(sceneId=scene,controllerExclusive=True,leaseSeconds=30,daemonId=hello['daemonId'],
+                daemonBinding=binding,generation=2**53-1,**{key:False for key in service._FALSE})
+            full_result.update(writerSlot=slot_status,slotGeneration=slot_status['slotGeneration'],
+                slotState=slot_status['slotState'],preparationState=prepared_status['preparationState'],
+                preparationIdentity=prepared_status['preparationIdentity'],preparation=prepared_status['capsule'],
+                business=broker.status())
+            lease=dict(sceneId=scene,serverNonce='1'*64,clientNonce='2'*64,generation=2**53-1,leaseNonce='3'*64)
+            unix=service._signed(handle.controlKey,dict(kind='scene-result-v3',**lease,seq=2**53-1,command='status',result=full_result))
+            ssh=dict(kind='scene-control-result-v3',channelNonce='4'*64,seq=2**53-1,command='status',result=full_result)
+            frame_sizes=dict(unixFrameBytes=len(service._frame(unix))-4,sshFrameBytes=len(service._frame(ssh))-4)
+            testcase.assertLessEqual(max(frame_sizes.values()),service.MAX_FRAME)
             prep.cleanup();testcase.assertNotIn('a'*64,case.harness.rows)
         if attack:
             testcase.assertTrue(clients[-1]._closed)
@@ -141,7 +164,7 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
         expected_posts=0 if attack in ('fake-consumption','wrong-status-key','controller-lost') else 1
         testcase.assertEqual(len(posts),expected_posts)
         return dict(postCount=len(posts),controllerBrokerIntegrated=True,sceneAuthenticationTransportDouble=True,
-            mockEngine=True,mockGitHub=True,kernelIsolationDouble=True,commands=calls)
+            mockEngine=True,mockGitHub=True,kernelIsolationDouble=True,commands=calls,**frame_sizes)
     finally:
         try:
             broker.controller_lost()
