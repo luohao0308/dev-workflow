@@ -435,12 +435,27 @@ class GitHubLiveReviewV3:
                     with (session / 'consumption-started').open('x') as marker:
                         os.chmod(marker.name, 0o600)
                     def guard():
-                        _check_execution_reserve(request, approval, grant)
-                        if before_consume is not None:
-                            before_consume()
-                            if approval.validate(request) != grant:
-                                raise LiveReviewBlocked('Scene recovery consent changed before consumption')
+                        stage = 'initial-reserve'
+                        try:
                             _check_execution_reserve(request, approval, grant)
+                            if before_consume is not None:
+                                stage = 'scene-recheck'
+                                before_consume()
+                                stage = 'consent-recheck'
+                                if approval.validate(request) != grant:
+                                    raise LiveReviewBlocked('Scene recovery consent changed before consumption')
+                                stage = 'final-reserve'
+                                _check_execution_reserve(request, approval, grant)
+                        except Exception:
+                            if scene_recovery is not None:
+                                try:
+                                    fd = os.open(session/'consumption-preflight-failed.json',
+                                                 os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+                                    with os.fdopen(fd, 'w') as diagnostic:
+                                        diagnostic.write(canonical(dict(stage=stage, observedAt=int(time.time()))))
+                                except OSError:
+                                    pass
+                            raise
                     receipt = approval.consume(grant, request, before_consume=guard)
                     return approval, receipt, dict(runId=run['id'], url=selected['html_url'],
                         requestHash=request.digest(), privateSession=str(session), expiresAt=request.expires_at)

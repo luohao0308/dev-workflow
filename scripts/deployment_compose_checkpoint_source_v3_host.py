@@ -5,6 +5,7 @@ Only the original dev-workflow publication subset is checked. No fetch, checkout
 source execution, filters or archive reconstruction occurs.
 """
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 import hashlib
 import io
 import math
@@ -56,9 +57,7 @@ class _Git:
 
     def run(self,args,limit):
         self.left()
-        command=['/usr/bin/git','--no-replace-objects','-c','core.fsmonitor=false',
-            '-c','core.hooksPath=/dev/null','-c','protocol.allow=never','-C',str(self.repository),*args]
-        process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+        process=subprocess.Popen(self.command(*args),stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
             env=self.env,close_fds=True)
         output=bytearray();errors=bytearray()
         try:
@@ -81,15 +80,64 @@ class _Git:
                 process.kill();process.wait(timeout=2)
             process.stdout.close();process.stderr.close()
 
+    def command(self, *args):
+        return ['/usr/bin/git', '--no-replace-objects', '-c', 'core.fsmonitor=false',
+                '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', '-C', str(self.repository), *args]
+
     def origin(self):
         if self.run(['config','--no-includes','--local','--get-all','remote.origin.url'],4096)!=ORIGIN.encode()+b'\n':reject()
 
+    @contextmanager
+    def batch(self):
+        self.left()
+        process = subprocess.Popen(self.command('cat-file', '--batch'), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env, close_fds=True)
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                selector.register(process.stderr, selectors.EVENT_READ)
+                self._batch = process, selector, bytearray()
+                yield
+                process.stdin.close()
+                if process.wait(timeout=self.left()) or self._batch[2] or process.stdout.read(1) or process.stderr.read(1):
+                    reject()
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                stream.close()
+
+    def _fill_batch(self):
+        process, selector, buffer = self._batch
+        ready = selector.select(self.left())
+        if not ready or any(key.fileobj is process.stderr for key, _ in ready):
+            reject()
+        data = os.read(process.stdout.fileno(), 65536)
+        if not data:
+            reject()
+        buffer.extend(data)
+
     def object(self,kind,oid,limit):
         if re.fullmatch('[0-9a-f]{40}',oid) is None:reject()
-        size=self.run(['cat-file','-s',oid],32).strip()
-        if not size.isdigit() or int(size)>limit:reject()
-        raw=self.run(['cat-file',kind,oid],int(size))
-        if len(raw)!=int(size) or hashlib.sha1(kind.encode()+b' '+str(len(raw)).encode()+b'\0'+raw).hexdigest()!=oid:reject()
+        self.left()
+        process, _, buffer = self._batch
+        process.stdin.write(oid.encode('ascii') + b'\n')
+        process.stdin.flush()
+        while b'\n' not in buffer:
+            if len(buffer) >= 128:reject()
+            self._fill_batch()
+        end = buffer.index(b'\n')
+        header = bytes(buffer[:end]).split(b' ')
+        del buffer[:end+1]
+        if (end >= 128 or len(header) != 3 or header[:2] != [oid.encode('ascii'), kind.encode('ascii')]
+                or not header[2].isdigit() or int(header[2]) > limit):reject()
+        size = int(header[2])
+        while len(buffer) < size+1:
+            self._fill_batch()
+        raw = bytes(buffer[:size])
+        if buffer[size] != 10 or hashlib.sha1(kind.encode()+b' '+str(size).encode()+b'\0'+raw).hexdigest()!=oid:reject()
+        del buffer[:size+1]
         return raw
 
     def files(self,source_sha):
@@ -125,7 +173,9 @@ def _verify_archive(raw,*,repository,source_sha,archive_digest,timeout=15):
     if (type(raw) is not bytes or not 0<len(raw)<=MAX_ARCHIVE or digest(raw)!=archive_digest
             or type(source_sha) is not str or re.fullmatch('[0-9a-f]{40}',source_sha) is None
             or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30):reject()
-    git=_Git(repository,time.monotonic()+timeout);git.origin();files=git.files(source_sha)
+    git=_Git(repository,time.monotonic()+timeout);git.origin()
+    with git.batch():
+        files=git.files(source_sha)
     manifest=[];total=0
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         members=archive.infolist();names=[info.filename for info in members]

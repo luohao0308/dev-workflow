@@ -1,5 +1,6 @@
 """No network: live adapter transport boundaries are replaced privately."""
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -354,6 +355,8 @@ class LiveReviewTests(unittest.TestCase):
         post.assert_not_called()
         dispatch = next(self.root.rglob('dispatch.json')).read_text()
         self.assertNotIn('private recovery context', dispatch)
+        diagnostic = next(self.root.rglob('consumption-preflight-failed.json'))
+        self.assertEqual(json.loads(diagnostic.read_text())['stage'], 'scene-recheck')
 
     def test_scene_recovery_checks_consent_again_after_live_check(self):
         fixture, approval = self.ready_review(scene_recovery=True)
@@ -372,6 +375,8 @@ class LiveReviewTests(unittest.TestCase):
         recheck.assert_called_once()
         self.assertEqual(approval.validate.call_count, 2)
         post.assert_not_called()
+        diagnostic = next(self.root.rglob('consumption-preflight-failed.json'))
+        self.assertEqual(json.loads(diagnostic.read_text())['stage'], 'consent-recheck')
 
     def test_unknown_dispatch_never_retried(self):
         fixture, _, _ = self.prepared()

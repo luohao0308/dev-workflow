@@ -372,18 +372,26 @@ class GitHubActionsApproval:
             marker = 'refs/' + self._ledger_marker(request)
             # No automatic retry: both a duplicate and a lost response deny dispatch.
             self._consumed.add(request.digest())
+            preflight_stage = None
             def before_send():
+                nonlocal preflight_stage
+                preflight_stage = 'authority'
                 self._check_authority()
                 if before_consume is not None:
+                    preflight_stage = 'host-guard'
                     before_consume()
                 # All blocking authority and SDK reads precede these local checks.
+                preflight_stage = 'freshness'
                 self._match(request)
                 if time.time() >= min(self._grant_expiry(request), timestamp(grant.expires_at).timestamp()):
                     _deny('Authorization expired before grant consumption')
+                preflight_stage = None
             try:
                 value, _headers = self.client.request('POST', '/repos/' + self.policy.ledger_repository + '/git/refs',
                                             {'ref': marker, 'sha': self.policy.ledger_sha}, before_send=before_send)
             except Exception:
+                if preflight_stage is not None:
+                    _deny('Durable grant preflight rejected at ' + preflight_stage)
                 _deny('Durable grant consumption rejected or outcome unknown')
             if not isinstance(value, dict) or value.get('ref') != marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
                 _deny('Durable grant consumption not verified')
