@@ -404,6 +404,11 @@ class SceneCheckpointReaderV3:
         from deployment_compose_scene_live_phase_v3_host import observe_scene_live_phase
         return observe_scene_live_phase(self, handle=handle)
 
+    def capture_live_phase_snapshot(self, *, handle, download_timeout=120):
+        """Receive a sealed historical phase snapshot; no recovery authority."""
+        from deployment_compose_scene_phase_snapshot_v3_host import capture_scene_phase_snapshot
+        return capture_scene_phase_snapshot(self, handle=handle, download_timeout=download_timeout)
+
     def close(self):
         if self._closed:
             if self._owner != (os.getpid(), threading.get_ident()): reject()

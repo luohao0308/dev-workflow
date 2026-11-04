@@ -260,3 +260,21 @@ Mac controller 通过可选本地通知启用保存，回调必须在审批或�
 回复是小型phaseObservation envelope，包含closure、baseline/phase/endpoint摘要、完整endpoint及版本和全false权限；保持完整Unix/SSH帧8192上限。Mac先认证原材料/历史，再新建原source/ref gate通过的SSH连接，比较原scene/slot/daemon/closure，读取后立即detach并核原EOF/退出/stderr，再认证本地材料和历史。原deploy到期不妨碍历史只读观测，新的写授权另走新profile。
 
 该摘要是可信scene issuer已按原逻辑验证现场适用性的观测，不含完整phase_bytes，不能生成现有recovery context，也不授予fence、连续性、实时写准入或恢复执行。新RPC只支持包含本版本的分发scene，旧scene不热升级。真实存活scene验收仍需后续新场景/精确审批；本切片先完成本地Unix/PhaseGuard、协议、字段及生命周期边界验证。
+
+
+## 第二十一切片准备：有界完整 phase 快照（尚未实现）
+
+当前64d945d冻结等待真实摘要验收，不修改该检出。下一片仅增加原broker私有单快照（canonical rows/resources，总字节不超过4MiB）、capture nonce与snapshotId/digest/total描述符、4096字节chunk小envelope。成功新capture才替换缓存并拒旧ID，失败不把旧缓存当新观测。chunk只读缓存不再读Engine；完整Unix/HMAC与SSH帧仍限8192。下载仅通过原status合法续租，独立120秒总预算，不无限续租。
+
+Mac完整接收后核长度/canonical/digest/endpoint及原scene/closure/material/history前后绑定，先验证SSH EOF/exit0/零stderr再本地复验。输出独立已签发、PID/thread/字节seal绑定的ScenePhaseSnapshot类型；缓存只证明历史快照完整，freshness/fence/admission/执行权限均false。不得用任意frozen dataclass冒充证明。
+
+后续另建snapshot-draft入口消费已认证全量观察；旧CheckpointRecoveryPreparationHostV3会现场重采样且其store依赖Linux，不能塞假native observer或把缓存改称旧verify_context成功。新草案仍需新观察、排他、精确审批和admission/尾部CAS。覆盖乱序/混快照/超限/替换/超时/文件与历史变更/SSH收尾/伪造或复制签发对象拒绝，并验证chunk无Engine调用及业务写。此处仅准备方案，不声明实现或验收。
+
+
+## 第二十一切片：有界完整phase快照传输
+
+在原broker中保管单个canonical rows/resources快照（最多4MiB），新capture仅原nonce输入并复用原live phase扫描与closure/slot绑定；成功后才原子替换缓存、旧ID拒绝。chunk接口只接受snapshotId、phaseDigest、offset、length，严格排bool、每块至多4096字节，小envelope完整Unix/HMAC与SSH帧仍限8192；chunk不采样Engine、不写业务、不续租。
+
+Mac在原reader/pins/history认证后建立原source/ref绑定的SSH，先status、capture，再顺序读完整chunks并核精确长度/base64/canonical/完整SHA、原闭合receipts对应rows及原network/volume范围。通过原完整status每10秒合法续租，时间从status发起前计；所有RPC前后和返回对象前核120秒结果接受预算。原单次I/O、源码/签名/锁及cleanup保持各自边界，不声称API硬120秒返回。原SSH detach/EOF/退出0/零stderr和材料/history后验全部成功后才签发对象。
+
+ScenePhaseSnapshotV3采用eq=False、原PID/thread/weak-reader及所有字段（含类型与false flags）的私有签发seal；直接构造/replace/copy/fork/线程/关闭reader/改flags均不成为有效证明。快照只证明历史字节与原issuer关联，不能作为freshness/fence/admission/恢复执行；新snapshot-draft入口后续独立接，不造假native observer喂旧准备器。

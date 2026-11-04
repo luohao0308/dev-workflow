@@ -73,6 +73,29 @@ def _status(client, payload, descriptor):
         reject()
 
 
+def _validate_observation(value, nonce, payload, origin):
+    context = payload['context']; closure = payload['closure']['payload']
+    if (type(value) is not dict or set(value) != _FIELDS
+            or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+            or value['kind'] != 'scene-live-phase-summary-v3' or value['requestNonce'] != nonce
+            or type(value['phaseIndex']) is not int or value['phaseIndex'] != 1
+            or canonical(value['closure']) != canonical(closure)
+            or value['baselineDigest'] != context['baselineStateDigest'] or value['readOnly'] is not True
+            or any(value[key] is not False for key in _FALSE)
+            or any(not hex_value(value[key]) for key in ('phaseDigest', 'endpointBindingDigest'))):
+        reject()
+    endpoint = value['endpointBinding']; version = value['normalizationVersion']
+    if (type(endpoint) is not dict or set(endpoint) != _ENDPOINT
+            or canonical(endpoint['daemonBinding']) != canonical(payload['evidence']['daemonBinding'])
+            or digest(canonical(endpoint)) != value['endpointBindingDigest']
+            or type(version) is not dict or set(version) != {'Version', 'GitCommit'}
+            or any(type(v) is not str or not v for v in version.values())
+            or canonical(endpoint['normalizationVersion']) != canonical(version)
+            or canonical(endpoint['pidNamespace']) != canonical([decode(origin)['pidNamespaceDevice'], decode(origin)['pidNamespaceInode']])
+            or canonical(endpoint['pidNamespace']) != canonical(endpoint['daemonPidNamespace'])):
+        reject()
+
+
 def observe_scene_live_phase(reader, *, handle):
     from deployment_compose_scene_checkpoint_v3_host import SceneCheckpointReaderV3, _READERS
     from deployment_compose_scene_control_ssh_v3_host import (
@@ -91,25 +114,7 @@ def observe_scene_live_phase(reader, *, handle):
         nonce = secrets.token_hex(32)
         reply = SceneClientV3.observe_closed_phase(client, nonce)
         value = reply['phaseObservation']
-        if (type(value) is not dict or set(value) != _FIELDS
-                or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
-                or value['kind'] != 'scene-live-phase-summary-v3' or value['requestNonce'] != nonce
-                or type(value['phaseIndex']) is not int or value['phaseIndex'] != 1
-                or canonical(value['closure']) != canonical(closure)
-                or value['baselineDigest'] != context['baselineStateDigest'] or value['readOnly'] is not True
-                or any(value[key] is not False for key in _FALSE)
-                or any(not hex_value(value[key]) for key in ('phaseDigest', 'endpointBindingDigest'))):
-            reject()
-        endpoint = value['endpointBinding']; version = value['normalizationVersion']
-        if (type(endpoint) is not dict or set(endpoint) != _ENDPOINT
-                or canonical(endpoint['daemonBinding']) != canonical(payload['evidence']['daemonBinding'])
-                or digest(canonical(endpoint)) != value['endpointBindingDigest']
-                or type(version) is not dict or set(version) != {'Version', 'GitCommit'}
-                or any(type(v) is not str or not v for v in version.values())
-                or canonical(endpoint['normalizationVersion']) != canonical(version)
-                or canonical(endpoint['pidNamespace']) != canonical([decode(origin)['pidNamespaceDevice'], decode(origin)['pidNamespaceInode']])
-                or canonical(endpoint['pidNamespace']) != canonical(endpoint['daemonPidNamespace'])):
-            reject()
+        _validate_observation(value, nonce, payload, origin)
         _issued_scene_ssh_client(client)
         # Close and verify the owned relay before doing expensive local signing
         # and history checks, so no idle scene lease is assumed to survive them.

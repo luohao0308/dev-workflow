@@ -264,26 +264,58 @@ class SceneCreateBrokerV3:
         return self.status()
 
 
-    def observe_closed_phase(self,request_nonce):
+    def _closed_phase_seal(self):
+        r=_record(self)
+        if (r['state']!='reconciled' or r.get('closure') is None
+                or r['terminal'] is None or r['stop'] is None):reject()
+        slot=r['slot'].status()
+        if (slot['slotState']!='drained' or slot['slotGeneration']!=r['generation']
+                or slot['writerOriginDigest']!=digest(r['origin'])):reject()
+        return (r['closure'],r['terminal'],r['stop'],r['origin'],canonical(r['inputs']['daemonBinding']))
+
+    def _capture_closed_phase(self,request_nonce):
         r=_record(self)
         if (not hex_value(request_nonce) or r['state']!='reconciled' or r.get('closure') is None
                 or r['terminal'] is None or r['stop'] is None):reject()
         end=time.monotonic()+15
-        def seal():
-            if _record(self) is not r or r['state']!='reconciled':reject()
-            slot=r['slot'].status()
-            if (slot['slotState']!='drained' or slot['slotGeneration']!=r['generation']
-                    or slot['writerOriginDigest']!=digest(r['origin'])):reject()
-            return (r['closure'],r['terminal'],r['stop'],r['origin'],canonical(r['inputs']['daemonBinding']))
-        before=seal();closure=decode(r['closure'])
+        before=self._closed_phase_seal();closure=decode(r['closure'])
         phase,endpoint,version,baseline=PreparationOwnerV3._observe_closed_create_phase(
             r['preparation'],dict(closure['receiptMap']),end)
-        if seal()!=before or time.monotonic()>=end:reject()
+        if self._closed_phase_seal()!=before or time.monotonic()>=end:reject()
         endpoint_value=decode(endpoint)
         if canonical(endpoint_value['daemonBinding'])!=before[4]:reject()
         flags=('phaseFreshnessVerified','daemonContinuityVerified','writerQuiescenceVerified',
             'authorityGranted','executionAvailable','runtimePermit','recoveryAuthorized','productionReady','sourceRevalidated')
-        return dict(schemaVersion=1,kind='scene-live-phase-summary-v3',requestNonce=request_nonce,
+        summary=dict(schemaVersion=1,kind='scene-live-phase-summary-v3',requestNonce=request_nonce,
             closure=closure,phaseIndex=1,baselineDigest=baseline,phaseDigest=digest(phase),
             endpointBinding=endpoint_value,endpointBindingDigest=digest(endpoint),
             normalizationVersion=decode(version),readOnly=True,**{key:False for key in flags})
+
+        return summary,phase,before
+
+    def observe_closed_phase(self,request_nonce):
+        summary,_,_=self._capture_closed_phase(request_nonce)
+        return summary
+
+    def capture_closed_phase_snapshot(self,request_nonce):
+        summary,raw,seal=self._capture_closed_phase(request_nonce)
+        if type(raw) is not bytes or not 0<len(raw)<=MAX_MESSAGE:reject()
+        value=decode(raw)
+        if type(value) is not dict or set(value)!={'rows','resources'} or canonical(value)!=raw:reject()
+        snapshot_id=secrets.token_hex(32)
+        cache=dict(snapshotId=snapshot_id,phaseDigest=summary['phaseDigest'],raw=raw,seal=seal)
+        if digest(raw)!=cache['phaseDigest'] or self._closed_phase_seal()!=seal:reject()
+        _record(self)['phase_snapshot']=cache
+        return dict(observation=summary,snapshotId=snapshot_id,totalBytes=len(raw),chunkBytes=4096)
+
+    def read_closed_phase_chunk(self,snapshot_id,phase_digest,offset,length):
+        r=_record(self);seal=self._closed_phase_seal();cache=r.get('phase_snapshot')
+        if (not hex_value(snapshot_id) or not hex_value(phase_digest) or cache is None
+                or cache['snapshotId']!=snapshot_id or cache['phaseDigest']!=phase_digest
+                or cache['seal']!=seal or type(offset) is not int or type(length) is not int
+                or not 0<length<=4096):reject()
+        raw=cache['raw']
+        if (type(raw) is not bytes or not 0<len(raw)<=MAX_MESSAGE or not 0<=offset<len(raw)
+                or digest(raw)!=phase_digest):reject()
+        return dict(snapshotId=snapshot_id,phaseDigest=phase_digest,totalBytes=len(raw),offset=offset,
+            dataBase64=base64.b64encode(raw[offset:offset+length]).decode('ascii'))
