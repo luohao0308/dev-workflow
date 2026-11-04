@@ -101,7 +101,10 @@ class Profile3StepExecutor:
         self._owned_launch_material = None
         check_witness_capacity(bundle)
         v = bundle.to_dict(); identity = v['identity']
-        if (request.plan_hash != bundle.digest or request.profile_id != PROFILE
+        from deployment_compose_approval_v3_host import SCENE_RECOVERY_PROFILE
+        scene_stop = request.profile_id == SCENE_RECOVERY_PROFILE
+        if (request.plan_hash != bundle.digest or request.profile_id not in (PROFILE, SCENE_RECOVERY_PROFILE)
+                or (scene_stop and request.operation != 'recovery')
                 or request.profile_version != '3' or request.production is not False
                 or request.max_uses != 1 or request.host_id != identity['hostId']
                 or request.daemon_id != identity['daemonId']
@@ -121,6 +124,7 @@ class Profile3StepExecutor:
         self._pin, self._socket, self._timeout = server_certificate_sha256, docker_socket, timeout
         self._client = None; self._blocked = False; self._index = 0
         self._resume = None
+        self._scene_stop = scene_stop
         self._lock = threading.Lock()
         self._evidence = []
         self._control_timeout = control_timeout
@@ -145,7 +149,12 @@ class Profile3StepExecutor:
                 gate_policy=gate_policy)
         elif request.operation == 'recovery':
             from deployment_compose_startup_fence_v3_host import Profile3RecoveryFenceV3
-            if type(startup_fence) is not Profile3RecoveryFenceV3:
+            if scene_stop:
+                from deployment_compose_scene_recovery_worker_v3_host import SceneFirstStopFenceV3
+                fence_type = SceneFirstStopFenceV3
+            else:
+                fence_type = Profile3RecoveryFenceV3
+            if type(startup_fence) is not fence_type:
                 reject()
             self._resume = startup_fence.activate(bundle=bundle, request=request,
                 binding=registered_binding, intent_authority=intent_authority,
@@ -183,6 +192,13 @@ class Profile3StepExecutor:
         if self._owned_transport is not None and (phase_index != 0 or receipts or completed_operations or operation.get('phase') != 'create'):
             reject()
         operation = deepcopy(operation); receipts = deepcopy(receipts)
+        if self._scene_stop:
+            phases = self._resume['scenePhases']
+            ordered = self.bundle.resolve_operations(self._resume['receiptMap'])
+            if (type(phase_index) is not int or not 1 <= phase_index <= len(phases)
+                    or operation.get('phase') != phases[phase_index-1] or receipts != self._resume['receiptMap']
+                    or canonical(completed_operations) != canonical(ordered[:phase_index])):
+                reject()
         if phase_index != self._index or operation['method'] not in ('POST', 'DELETE'):
             reject()
         expected = (self.bundle.creation_operations() if operation['phase'] == 'create'

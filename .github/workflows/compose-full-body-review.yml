@@ -10,7 +10,7 @@ on:
         default: launch
         required: true
       public_payload:
-        description: 'Canonical public JSON only: request and bundle.public_review(); never private bodies'
+        description: 'Canonical public request and review, with scene recovery digests when applicable'
         type: string
         required: true
 permissions:

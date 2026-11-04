@@ -22,6 +22,7 @@ from release_host import GitHubActionsApproval, HostPolicy, _deny, timestamp
 
 AUDIENCE = 'dev-workflow-compose-full-body-v3-host'
 PROFILE = 'compose-application-batch-v1'
+SCENE_RECOVERY_PROFILE = 'compose-scene-recovery-intent-v3'
 HASH = re.compile(r'[0-9a-f]{64}\Z')
 
 
@@ -94,6 +95,8 @@ class FullBodyApprovalPolicyV3(HostPolicy):
 
 
 class GitHubFullBodyApprovalV3(GitHubActionsApproval):
+    profile_id = PROFILE
+    policy_type = FullBodyApprovalPolicyV3
     request_type = RequestV2
     operations = frozenset(('deploy', 'rollback', 'recovery'))
     audience = AUDIENCE
@@ -103,7 +106,7 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
     grant_namespace = 'github-compose-full-body-authorization-v3'
 
     def __init__(self, client, oidc_token, requests, policy, *, verifier=None):
-        if type(policy) is not FullBodyApprovalPolicyV3:
+        if type(policy) is not self.policy_type:
             _deny('Explicit Compose approval policy required')
         super().__init__(client, oidc_token, requests, policy, verifier=verifier)
 
@@ -145,7 +148,7 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
         if type(request) is not RequestV2 or self._requests.get(request.digest()) != request:
             _deny('Compose operation differs from reviewed request')
         p = self.policy
-        if (request.operation != p.operation or request.profile_id != PROFILE
+        if (request.operation != p.operation or request.profile_id != self.profile_id
                 or request.profile_version != p.profile_version
                 or request.source.provider_id != 'github.com'
                 or request.source.origin != 'https://github.com/' + p.target_repository + '.git'
@@ -184,3 +187,45 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
     def check_consumed_intent(self, request):
         """Recheck live consent and consumed ledger only; never admit execution."""
         return GitHubActionsApproval.guard(self, request)
+
+
+@dataclass(frozen=True, kw_only=True)
+class SceneRecoveryApprovalPolicyV3(FullBodyApprovalPolicyV3):
+    expected_observation_hash: str
+    expected_scene_review_hash: str
+
+    def __post_init__(self):
+        super().__post_init__()
+        if (self.operation != 'recovery' or len(self.components) != 1
+                or any(type(value) is not str or not HASH.fullmatch(value) for value in
+                       (self.expected_observation_hash, self.expected_scene_review_hash))):
+            _deny('Invalid trusted scene recovery approval policy')
+
+
+class GitHubSceneRecoveryApprovalV3(GitHubFullBodyApprovalV3):
+    profile_id = SCENE_RECOVERY_PROFILE
+    policy_type = SceneRecoveryApprovalPolicyV3
+    operations = frozenset(('recovery',))
+    ledger_namespace = 'workflow-compose-scene-recovery-v3'
+    grant_namespace = 'github-compose-scene-recovery-v3'
+
+    def _match(self, request):
+        super()._match(request)
+        if request.observation_hash != self.policy.expected_observation_hash:
+            _deny('Scene recovery context differs from trusted host policy')
+
+    def _ledger_marker(self, request):
+        # A second approved run for the same immutable request shares this ref.
+        return 'tags/' + self.ledger_namespace + '/' + request.digest()
+
+    def consume(self, grant, request, *, before_consume=None):
+        receipt = super().consume(grant, request, before_consume=before_consume)
+        self._scene_receipt = receipt
+        return receipt
+
+    def verify_consumption_receipt(self, request, receipt):
+        if (type(receipt) is not FullBodyConsumptionEvidenceV3
+                or receipt is not getattr(self, '_scene_receipt', None)
+                or receipt.request_hash != request.digest()):
+            _deny('Original scene recovery consumption receipt required')
+        self.check_consumed_intent(request)

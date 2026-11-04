@@ -14,7 +14,7 @@ import threading
 import time
 import weakref
 
-from deployment_compose_scene_live_phase_v3_host import _status, _validate_observation
+from deployment_compose_scene_live_phase_v3_host import _observe_scene_live_phase, _status, _validate_observation
 from deployment_compose_recovery_phase_capsule_v3_host import decode
 from deployment_compose_witness_store import canonical, hex_value
 
@@ -84,9 +84,84 @@ def _snapshot_record(value, reader=None):
 
 
 def validate_scene_phase_snapshot(value, *, reader):
-    """For future draft-only consumers; reauthenticate the original issuer seal."""
+    """Reauthenticate the original issuer seal before consuming the bytes."""
     _snapshot_record(value, reader)
     return value.phase_bytes, value.descriptor_bytes
+
+
+def prepare_snapshot_recovery_draft(reader, *, snapshot):
+    """Build private planning bytes and a redacted review from historical evidence."""
+    from deployment_compose_restart_material_v3_host import _prefix
+    from deployment_compose_scene_checkpoint_v3_host import SceneCheckpointReaderV3
+
+    if type(reader) is not SceneCheckpointReaderV3:
+        reject()
+    phase_bytes, descriptor_bytes = validate_scene_phase_snapshot(snapshot, reader=reader)
+    checkpoint = reader.context
+    history = checkpoint.history
+    prefix = _prefix(history, checkpoint.snapshot)
+    bundle = history._bundle
+    # The authenticated V3 prefix is exactly one closed create.
+    remaining = bundle.resolve_operations(prefix['receiptMap'])[1:]
+    descriptor = decode(descriptor_bytes)
+
+    review = {
+        'schemaVersion': 1,
+        'kind': 'compose-scene-snapshot-recovery-draft-v3',
+        'draftOnly': True,
+        'sceneId': snapshot.scene_id,
+        'snapshotId': snapshot.snapshot_id,
+        'checkpointMaterialDigest': snapshot.material_digest,
+        'sceneBindingDigest': snapshot.scene_binding_digest,
+        'originalBundleDigest': bundle.digest,
+        'originalRequestHash': history._request.digest(),
+        'historyDigest': snapshot.history_digest,
+        'baselineStateDigest': snapshot.baseline_digest,
+        'phaseDigest': snapshot.phase_digest,
+        'endpointBindingDigest': snapshot.endpoint_binding_digest,
+        'startWriteIndex': 1,
+        'slotGeneration': descriptor['observation']['closure']['slotGeneration'],
+        'nextOperationPhase': remaining[0]['phase'],
+        'nextOperationDigest': remaining[0]['requestDigest'],
+        'blockers': ['fresh-phase-and-source-validation', 'writer-fence-and-daemon-continuity',
+                     'fresh-approval', 'admission-and-tail-CAS'],
+        **dict.fromkeys(('phaseFreshnessVerified', 'sourceRevalidated', 'daemonContinuityVerified',
+                        'writerQuiescenceVerified', 'approvalReady', 'authorityGranted',
+                        'executionAvailable', 'runtimePermit', 'recoveryAuthorized', 'productionReady'), False),
+    }
+    draft = canonical(dict(review, receiptMap=prefix['receiptMap'], knownWritePrefix=prefix['knownPrefix'],
+                           closedTail=prefix['closedTail'], remainingOperations=remaining,
+                           historicalPhaseSnapshot=decode(phase_bytes),
+                           phaseSnapshotDescriptor=descriptor))
+    validate_scene_phase_snapshot(snapshot, reader=reader)
+    return {'draft_bytes': draft, 'review': dict(review, draftDigest=digest(draft))}
+
+
+def _first_write_pins(review):
+    return {key: review[key] for key in ('historyDigest', 'slotGeneration', 'nextOperationDigest',
+                                        'phaseDigest', 'endpointBindingDigest')}
+
+
+def recheck_snapshot_recovery_draft(reader, *, snapshot, expected_draft_digest, handle):
+    """Point-in-time comparison through the original published-source SSH gate."""
+    if not hex_value(expected_draft_digest):
+        reject()
+    review = prepare_snapshot_recovery_draft(reader, snapshot=snapshot)['review']
+    if review['draftDigest'] != expected_draft_digest:
+        reject()
+
+    first_write = _first_write_pins(review)
+    live, writer_stop_digest = _observe_scene_live_phase(reader, handle=handle, first_write=first_write)
+    if (live.scene_id != snapshot.scene_id or live.history_digest != snapshot.history_digest
+            or live.baseline_digest != snapshot.baseline_digest or live.phase_digest != snapshot.phase_digest
+            or live.endpoint_binding_digest != snapshot.endpoint_binding_digest):
+        reject()
+    validate_scene_phase_snapshot(snapshot, reader=reader)
+    return dict(review, kind='compose-scene-snapshot-draft-recheck-v3', livePhaseMatchesDraft=True,
+                sourceSha=handle.sourceSha, publishedSourceCheckedOnAttach=True,
+                originalWriterStoppedBeforeAndAfter=True, writerStopObservationDigest=writer_stop_digest,
+                firstWriteBindingDigest=digest(canonical(first_write)),
+                liveObservationDigest=digest(live.observation_bytes))
 
 
 def _phase_shape(raw, bundle, baseline, payload):

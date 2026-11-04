@@ -24,7 +24,8 @@ import urllib.request
 
 sys.dont_write_bytecode=True
 sys.path.insert(0,str(Path(__file__).resolve().parent))
-from deployment_compose_approval_v3_host import AUDIENCE, PROFILE, FullBodyApprovalPolicyV3
+from deployment_compose_approval_v3_host import (
+    AUDIENCE, PROFILE, SCENE_RECOVERY_PROFILE, FullBodyApprovalPolicyV3, SceneRecoveryApprovalPolicyV3)
 from deployment_contract_v2 import RequestV2
 from release_host import bundle_digest
 from deployment_compose_bundle_v3 import ExecutionBundleV3
@@ -35,6 +36,7 @@ REF='refs/heads/feat/compose-validation-20261028'
 WORKFLOW='.github/workflows/compose-full-body-review.yml'
 MAX_PAYLOAD=32768
 FIELDS={'schema','issuedAt','request','policy','review','requestHash','policyHash','reviewHash','bundleHash'}
+SCENE_FIELDS={'sceneId','historyDigest','nextOperationDigest','firstWriteBindingDigest','contextDigest'}
 REVIEW_FIELDS={'bundleDigest','profile','profileVersion','identity','expiresAt','services',
                'protectedContainers','operations','blockers'}
 HASH=re.compile(r'[0-9a-f]{64}\Z')
@@ -149,19 +151,35 @@ def _validate_review(review,request):
 
 def _values(payload,env,now):
     identity=identities(env)
-    _closed(payload,{'request','review'})
+    if type(payload) is not dict or set(payload) not in ({'request','review'}, {'request','review','sceneRecovery'}):
+        raise ValueError('Invalid closed public shape')
     request=RequestV2.from_json(canonical(payload['request']))
-    if (request.profile_id!=PROFILE or request.profile_version!='3' or request.production is not False
+    scene=request.profile_id==SCENE_RECOVERY_PROFILE
+    if (request.profile_id not in (PROFILE, SCENE_RECOVERY_PROFILE) or scene!=('sceneRecovery' in payload)
+            or request.profile_version!='3' or request.production is not False
             or request.target.runtime!='compose' or not re.fullmatch(r'dw-[A-Za-z0-9][A-Za-z0-9._-]{0,124}',request.target.namespace)
             or request.environment!='staging' or request.max_uses!=1
             or request.source.provider_id!='github.com' or request.source.project_path!=REPOSITORY
             or request.source.origin!='https://github.com/'+REPOSITORY+'.git'
             or request.source.project_id!=REPOSITORY_ID
-            or (request.operation=='deploy' and request.source.source_sha!=env['GITHUB_SHA'])):
+            or ((scene or request.operation=='deploy') and request.source.source_sha!=env['GITHUB_SHA'])):
         raise ValueError('Unsupported public request scope')
     request.ensure_fresh(now,maximum_seconds=1800)
     _validate_review(payload['review'],request)
-    policy=FullBodyApprovalPolicyV3(**identity,expires_at=request.expires_at,approval_environment='compose-review',
+    policy_type=FullBodyApprovalPolicyV3
+    if scene:
+        projection=payload['sceneRecovery']
+        _closed(projection,SCENE_FIELDS)
+        if (request.operation!='recovery' or len(request.components)!=1
+                or type(projection['sceneId']) is not str
+                or not re.fullmatch(r'dw-scene-[0-9a-f]{16}',projection['sceneId'])
+                or projection['historyDigest']!=request.history_hash
+                or projection['contextDigest']!=request.observation_hash):
+            raise ValueError('Scene recovery review differs from request')
+        for field in SCENE_FIELDS-{'sceneId'}:_hex(projection[field])
+        identity.update(expected_observation_hash=request.observation_hash, expected_scene_review_hash=digest(projection))
+        policy_type=SceneRecoveryApprovalPolicyV3
+    policy=policy_type(**identity,expires_at=request.expires_at,approval_environment='compose-review',
         operation=request.operation,profile_version='3',source_sha=request.source.source_sha,target=request.target,
         deployment_environment='staging',production=False,daemon_id=request.daemon_id,host_id=request.host_id,
         components=request.components,protected_components=request.protected_components,policy_hash=request.policy_hash,
@@ -172,43 +190,55 @@ def _values(payload,env,now):
 def prepare(raw,env,now=None):
     now=parse_stamp(stamp(now or datetime.now(timezone.utc)))
     payload=_parse(raw,MAX_PAYLOAD);request,policy=_values(payload,env,now)
-    return dict(schema=1,issuedAt=stamp(now),request=asdict(request),policy=asdict(policy),review=payload['review'],
+    result=dict(schema=1,issuedAt=stamp(now),request=asdict(request),policy=asdict(policy),review=payload['review'],
         requestHash=request.digest(),policyHash=digest(asdict(policy)),reviewHash=digest(payload['review']),
         bundleHash=bundle_digest([request],policy.expires_at,policy.bundle_context()))
+    if 'sceneRecovery' in payload:result['sceneRecovery']=payload['sceneRecovery']
+    return result
 
 
 def verify(raw,env,now=None):
-    value=_parse(raw,65536);_closed(value,FIELDS)
+    value=_parse(raw,65536)
+    if type(value) is not dict or set(value) not in (FIELDS,FIELDS|{'sceneRecovery'}):
+        raise ValueError('Invalid public artifact shape')
     if type(value['schema']) is not int or value['schema']!=1:raise ValueError('Invalid public artifact schema')
     now=now or datetime.now(timezone.utc);issued=parse_stamp(value['issuedAt'])
     if not issued<=now<issued+timedelta(minutes=30):
         raise ValueError('Public artifact expired or issued in future')
-    payload=canonical(dict(request=value['request'],review=value['review']))
+    payload=canonical({key:value[key] for key in ('request','review','sceneRecovery') if key in value})
     expected=prepare(payload,env,issued)
     if canonical(expected)!=raw:raise ValueError('Public artifact differs from workflow scope')
     request,policy=_values(_parse(payload,MAX_PAYLOAD),env,now)
     return request,policy,value['bundleHash']
 
 
-def verify_prepared_review(raw,env,expected_bundle,expected_request,now=None):
+def verify_prepared_review(raw,env,expected_bundle,expected_request,now=None,*,expected_scene_recovery=None):
     """Required host boundary before approval consumption; self hashes prove nothing."""
     request,policy,approval_hash=verify(raw,env,now)
+    artifact=_parse(raw,65536)
     if (type(expected_bundle) is not ExecutionBundleV3 or type(expected_request) is not RequestV2
             or expected_request.plan_hash!=expected_bundle.digest
             or request!=expected_request
-            or canonical(_parse(raw,65536)['review'])!=canonical(expected_bundle.public_review())):
+            or canonical(artifact['review'])!=canonical(expected_bundle.public_review())
+            or canonical(artifact.get('sceneRecovery'))!=canonical(expected_scene_recovery)):
         raise ValueError('Public review differs from trusted private preparation')
     return request,policy,approval_hash
 
 
 def summary(raw,env):
     request,_,approval_hash=verify(raw,env)
-    review=_parse(raw,65536)['review']
+    artifact=_parse(raw,65536)
+    review=artifact['review']
     images='\n'.join('- '+s['name']+' ('+s['finalName']+', original '+s['baselineContainerId']+'): '
         +s['baselineImageId']+' -> '+s['targetImageId'] for s in review['services'])
-    counts={phase:sum(op['phase']==phase for op in review['operations'])
+    scene=artifact.get('sceneRecovery')
+    operations=review['operations'][1:] if scene is not None else review['operations']
+    counts={phase:sum(op['phase']==phase for op in operations)
             for phase in ('create','stop','delete','rename','start','readiness')}
-    order=', '.join(op['phase']+':'+op['service'] for op in review['operations'])
+    order=', '.join(op['phase']+':'+op['service'] for op in operations)
+    scene_text='' if scene is None else ('Retained scene: '+scene['sceneId']+'; closed history: '+scene['historyDigest']
+        +'; first stop request: '+scene['nextOperationDigest']+'; first write binding: '+scene['firstWriteBindingDigest']
+        +'; recovery context: '+scene['contextDigest']+'.\n\n')
     return ('Full-body v3 public review. Workflow checks public shape only; host must verify against its private prepared intent.\n\n'
         +'Physical scope: host '+request.host_id+'; daemon '+request.daemon_id+'; project '+request.target.namespace+'; staging; production=false.\n\n'
         +'Services: '+', '.join(request.components)+'; protected services: '+(', '.join(request.protected_components) or '(none)')+'.\n\n'
@@ -216,6 +246,7 @@ def summary(raw,env):
         +'Immutable image changes (original -> target):\n\n'+images+'\n\n'
         +'Phase counts: '+', '.join(phase+'='+str(count) for phase,count in counts.items())+'.\n\n'
         +'Phase order: '+order+'.\n\n'
+        +scene_text
         +'Application source SHA: '+request.source.source_sha+'; review workflow SHA: '+env['GITHUB_SHA']+'; operation: '+request.operation+'; request expiry: '+request.expires_at+'; maximum uses: 1.\n\n'
         +'Approving grants intent consent for the trusted host to perform this listed staging operation. Fresh runtime guards, phase checks, and host admission remain required.\n\n'
         +'Exact new human approval comment: `dev-workflow approve '+approval_hash+'`\n\n'

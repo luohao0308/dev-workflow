@@ -66,6 +66,33 @@ class FullBodyReviewTests(unittest.TestCase):
         self.assertNotIn('Env',contract.canonical(self.artifact))
         self.assertNotIn('HostConfig',contract.canonical(self.artifact))
 
+    def test_scene_recovery_review_pins_exact_public_projection(self):
+        recovery=replace(self.request,operation='recovery',profile_id=contract.SCENE_RECOVERY_PROFILE,history_hash='1'*64)
+        projection=dict(sceneId='dw-scene-'+'a'*16,historyDigest=recovery.history_hash,
+                        nextOperationDigest='2'*64,firstWriteBindingDigest='3'*64,
+                        contextDigest=recovery.observation_hash)
+        payload=dict(self.payload,request=asdict(recovery),sceneRecovery=projection)
+        artifact=contract.prepare(contract.canonical(payload),self.env,self.now)
+        raw=contract.canonical(artifact)
+        _,policy,approval_hash=contract.verify_prepared_review(raw,self.env,self.bundle,recovery,self.now,
+                                                               expected_scene_recovery=projection)
+        self.assertIs(type(policy),contract.SceneRecoveryApprovalPolicyV3)
+        self.assertEqual(policy.expected_scene_review_hash,contract.digest(projection))
+        self.assertIn('Phase order: stop:web',contract.summary(raw,self.env))
+        self.assertIn('dev-workflow approve '+approval_hash,contract.summary(raw,self.env))
+        with self.assertRaises(ValueError):
+            contract.verify_prepared_review(raw,self.env,self.bundle,recovery,self.now)
+        changed=dict(projection,nextOperationDigest='4'*64)
+        changed_artifact=contract.prepare(contract.canonical(dict(payload,sceneRecovery=changed)),self.env,self.now)
+        self.assertNotEqual(changed_artifact['bundleHash'],artifact['bundleHash'])
+        with self.assertRaises(ValueError):
+            contract.verify_prepared_review(contract.canonical(changed_artifact),self.env,self.bundle,recovery,self.now,
+                                            expected_scene_recovery=projection)
+        for malformed in (dict(projection,contextDigest='0'*64),dict(projection,historyDigest='0'*64),
+                          dict(projection,rawContext={}),None):
+            with self.subTest(malformed=malformed),self.assertRaises(ValueError):
+                contract.prepare(contract.canonical(dict(payload,sceneRecovery=malformed)),self.env,self.now)
+
     def test_rehashed_public_review_tampering_rejected_by_private_host(self):
         for mutation in ('body','protected','host','request'):
             payload=deepcopy(self.payload)

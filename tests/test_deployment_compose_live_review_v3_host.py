@@ -201,7 +201,7 @@ class LiveReviewTests(unittest.TestCase):
         env['protection_rules'][0]['reviewers'][0]['reviewer']['id'] = 1
         with self.assertRaises(live.LiveReviewBlocked): self.host._environment()
 
-    def prepared(self):
+    def prepared(self, *, scene_recovery=False):
         from tests.test_deployment_compose_full_body_review_contract import FullBodyReviewTests
         from dataclasses import asdict, replace
         from deployment_compose_full_body_review_contract import prepare, canonical
@@ -217,12 +217,21 @@ class LiveReviewTests(unittest.TestCase):
                    html_url='https://github.com/' + live.REPOSITORY + '/actions/runs/123',
                    status='in_progress')
         self.host.source_sha = run['head_sha']
-        raw = canonical(prepare(canonical(dict(request=asdict(fixture.request),
-                                review=fixture.bundle.public_review())), env)).encode('ascii')
+        if scene_recovery:
+            from deployment_compose_approval_v3_host import SCENE_RECOVERY_PROFILE
+            fixture.request = replace(fixture.request, operation='recovery',
+                                      profile_id=SCENE_RECOVERY_PROFILE, history_hash='1'*64)
+            fixture.projection = dict(sceneId='dw-scene-'+'a'*16, historyDigest=fixture.request.history_hash,
+                                      nextOperationDigest='2'*64, firstWriteBindingDigest='3'*64,
+                                      contextDigest=fixture.request.observation_hash)
+        payload = dict(request=asdict(fixture.request), review=fixture.bundle.public_review())
+        if scene_recovery:
+            payload['sceneRecovery'] = fixture.projection
+        raw = canonical(prepare(canonical(payload), env)).encode('ascii')
         return fixture, run, raw
 
-    def ready_review(self, *, dispatch_delay_seconds=0):
-        fixture, run, raw = self.prepared()
+    def ready_review(self, *, dispatch_delay_seconds=0, scene_recovery=False):
+        fixture, run, raw = self.prepared(scene_recovery=scene_recovery)
         from datetime import timedelta
         anchor = fixture.preparation_now + timedelta(seconds=dispatch_delay_seconds)
         real_datetime = live.datetime
@@ -314,6 +323,55 @@ class LiveReviewTests(unittest.TestCase):
         with self.assertRaises(live.LiveReviewBlocked):self.host.consume_prepared(fixture.bundle,fixture.request,Mock())
         post.assert_not_called()
         self.assertEqual(len(list(self.root.rglob('consumption-started'))),1)
+
+    def test_scene_recovery_drift_at_consumption_edge_prevents_ledger_post(self):
+        from types import SimpleNamespace
+        from unittest.mock import PropertyMock
+        import deployment_compose_scene_recovery_intent_v3_host as intent
+        from deployment_compose_scene_checkpoint_v3_host import SceneCheckpointReaderV3
+
+        fixture, approval = self.ready_review(scene_recovery=True)
+        reader = object.__new__(SceneCheckpointReaderV3)
+        review = dict(fixture.projection, recoveryContextDigest=fixture.request.observation_hash)
+        callback, post = Mock(), Mock()
+
+        def consume(grant, request, *, before_consume):
+            before_consume()
+            post()
+
+        approval.consume.side_effect = consume
+        with patch.object(SceneCheckpointReaderV3, 'context', new_callable=PropertyMock,
+                          return_value=SimpleNamespace(history=SimpleNamespace(_bundle=fixture.bundle))), \
+                patch.object(intent, 'verify_scene_recovery_intent',
+                             side_effect=[review, ValueError('scene drift')]) as recheck:
+            with self.assertRaisesRegex(ValueError, 'scene drift'):
+                self.host.consume_scene_recovery(reader, snapshot=object(), expected_draft_digest='4'*64,
+                    handle=object(), expected_request_digest=fixture.request.digest(), request=fixture.request,
+                    context_bytes=b'private recovery context', on_review=callback)
+        self.assertEqual(recheck.call_count, 2)
+        self.assertEqual(callback.call_args.args[0]['sceneRecovery'], fixture.projection)
+        self.assertIs(type(self.host._approval.call_args.args[2]), live.SceneRecoveryApprovalPolicyV3)
+        post.assert_not_called()
+        dispatch = next(self.root.rglob('dispatch.json')).read_text()
+        self.assertNotIn('private recovery context', dispatch)
+
+    def test_scene_recovery_checks_consent_again_after_live_check(self):
+        fixture, approval = self.ready_review(scene_recovery=True)
+        recheck, post = Mock(), Mock()
+        grant = approval.validate.return_value
+        approval.validate.side_effect = [grant, object()]
+
+        def consume(grant, request, *, before_consume):
+            before_consume()
+            post()
+
+        approval.consume.side_effect = consume
+        with self.assertRaisesRegex(live.LiveReviewBlocked, 'consent changed'):
+            self.host._consume_prepared(fixture.bundle, fixture.request, Mock(),
+                scene_recovery=fixture.projection, before_consume=recheck)
+        recheck.assert_called_once()
+        self.assertEqual(approval.validate.call_count, 2)
+        post.assert_not_called()
 
     def test_unknown_dispatch_never_retried(self):
         fixture, _, _ = self.prepared()

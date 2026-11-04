@@ -379,7 +379,7 @@ def scope_bind_paths(scope):
 
 
 def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, keys,
-                           trusted_boot_id, trusted_bind_digest):
+                           trusted_boot_id, trusted_bind_digest, historical=False):
     """Reconstruct commitments before publishing any review.
 
     Boot and bind pins must come from the controller's owned-host provenance
@@ -387,14 +387,17 @@ def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, key
     validates captured material; Linux retains responsibility for live rechecks.
     """
     try:
-        if (hello['sourceSha'] != source_sha or hello['hostId'] != ssh_alias
+        if (type(historical) is not bool or hello['sourceSha'] != source_sha or hello['hostId'] != ssh_alias
                 or not re.fullmatch('[0-9a-f]{32}', trusted_boot_id)):
             reject()
         value = capsule['bundle']
         request = RequestV2.from_json(encode(capsule['request']).decode('ascii'))
         from datetime import datetime, timezone
         expires = datetime.strptime(request.expires_at, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-        if not 0 < (expires-datetime.now(timezone.utc)).total_seconds() <= 900:
+        if historical:
+            if request.operation != 'deploy':
+                reject()
+        elif not 0 < (expires-datetime.now(timezone.utc)).total_seconds() <= 900:
             reject()
         project = value['identity']['project']
         if (not project.startswith('dw-restore-') or request.host_id != ssh_alias

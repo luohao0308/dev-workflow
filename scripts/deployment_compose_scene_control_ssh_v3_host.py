@@ -27,11 +27,11 @@ END_TIMEOUT=5
 _ISSUED_CLIENTS=weakref.WeakKeyDictionary()
 _COMMANDS={'status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker',
     'prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker',
-    'read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase',
+    'read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase','observe_stopped_writer_phase','confirm_recovery_worker',
     'capture_closed_phase_snapshot','read_closed_phase_chunk'}
 _BUDGETS={'closeScene':420,'reserve_writer':25,'drain_writer':40,'inspect_attached_worker':60,
     'prepare_identity':90,'prepare_staging':1200,'start_first_create':40,'finish_worker':40,'reconcile_closure':40,'observe_closed_phase':25,
-    'capture_closed_phase_snapshot':25}
+    'capture_closed_phase_snapshot':25,'observe_stopped_writer_phase':30,'confirm_recovery_worker':55}
 
 
 def reject():raise ValueError('compose-scene-control-ssh-v3-rejected') from None

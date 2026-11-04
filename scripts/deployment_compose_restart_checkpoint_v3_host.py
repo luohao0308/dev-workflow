@@ -43,7 +43,7 @@ def _reader_fingerprint(reader):
             digest(context.baseline_bytes), context.material_digest)
 
 
-def _sealed_reader(reader):
+def _sealed_reader(reader, *, expected_witness_state=None):
     if type(reader) is not RestartCheckpointReaderV3:
         reject()
     RestartCheckpointReaderV3._owned(reader)
@@ -51,7 +51,7 @@ def _sealed_reader(reader):
     if (seal is None or seal[0] != (os.getpid(), threading.get_ident())
             or _reader_fingerprint(reader) != seal[3]):
         reject()
-    reader._guard.check()
+    reader._guard.check(expected_witness_state=expected_witness_state)
     return seal
 
 
@@ -149,7 +149,7 @@ class _Guard:
         self.files[(parent, name)] = (limit, ident)
         return raw
 
-    def check(self):
+    def check(self, *, expected_witness_state=None):
         for path, (fd, expected) in self.dirs.items():
             fresh, actual = directory(path)
             try:
@@ -159,6 +159,8 @@ class _Guard:
             finally:
                 os.close(fresh)
         for (parent, name), (limit, expected) in self.files.items():
+            if expected_witness_state is not None and (parent, name) == (self.case / 'witness', 'state.json'):
+                expected = expected_witness_state
             if read_file(self.dirs[parent][0], name, limit)[1] != expected:
                 reject()
         witness = self.dirs[self.case / 'witness'][0]

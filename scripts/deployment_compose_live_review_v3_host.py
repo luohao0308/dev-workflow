@@ -22,7 +22,8 @@ from deployment_compose_full_body_review_contract import (
     verify_prepared_review)
 from deployment_compose_bundle_v3 import ExecutionBundleV3
 from deployment_contract_v2 import RequestV2
-from deployment_compose_approval_v3_host import GitHubFullBodyApprovalV3
+from deployment_compose_approval_v3_host import (
+    PROFILE, GitHubFullBodyApprovalV3, GitHubSceneRecoveryApprovalV3, SceneRecoveryApprovalPolicyV3)
 from release_github import GitHubClient, GitHubUnavailable, MAX_RESPONSE
 from release_host import timestamp
 
@@ -244,7 +245,9 @@ class GitHubLiveReviewV3:
 
     def _approval(self, token, request, policy):
         # Deliberately no verifier override: real issuer/JWKS verification is mandatory.
-        return GitHubFullBodyApprovalV3(self.client, token, [request], policy)
+        approval_type = (GitHubSceneRecoveryApprovalV3 if type(policy) is SceneRecoveryApprovalPolicyV3
+                         else GitHubFullBodyApprovalV3)
+        return approval_type(self.client, token, [request], policy)
 
     def _get(self, suffix):
         return self.client.request('GET', '/repos/' + REPOSITORY + suffix)[0]
@@ -313,6 +316,37 @@ class GitHubLiveReviewV3:
         return raw
 
     def consume_prepared(self, bundle, request, on_review):
+        if type(request) is not RequestV2 or request.profile_id != PROFILE:
+            raise LiveReviewBlocked('Explicit full-body profile required')
+        return self._consume_prepared(bundle, request, on_review)
+
+    def consume_scene_recovery(self, reader, *, snapshot, expected_draft_digest, handle,
+                               expected_request_digest, request, context_bytes, on_review):
+        from deployment_compose_scene_checkpoint_v3_host import SceneCheckpointReaderV3
+        from deployment_compose_scene_recovery_intent_v3_host import (
+            scene_recovery_public_review, verify_scene_recovery_intent)
+
+        if (type(reader) is not SceneCheckpointReaderV3 or type(request) is not RequestV2
+                or request.source.source_sha != self.source_sha or not callable(on_review)):
+            raise LiveReviewBlocked('Exact scene recovery preparation required')
+
+        def current_projection():
+            review = verify_scene_recovery_intent(reader, snapshot=snapshot,
+                expected_draft_digest=expected_draft_digest, handle=handle,
+                expected_request_digest=expected_request_digest, request=request, context_bytes=context_bytes)
+            return scene_recovery_public_review(review)
+
+        projection = current_projection()
+        bundle = reader.context.history._bundle
+
+        def before_consume():
+            if current_projection() != projection:
+                raise LiveReviewBlocked('Scene recovery review changed before consumption')
+
+        return self._consume_prepared(bundle, request, on_review,
+                                      scene_recovery=projection, before_consume=before_consume)
+
+    def _consume_prepared(self, bundle, request, on_review, *, scene_recovery=None, before_consume=None):
         if type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2 or not callable(on_review):
             raise LiveReviewBlocked('Exact prepared types required')
         if request.plan_hash != bundle.digest:
@@ -326,8 +360,11 @@ class GitHubLiveReviewV3:
             raise LiveReviewBlocked('Request expired')
         session = self.root / ('review-' + request.digest())
         session.mkdir(mode=0o700)  # Exclusive: never replay an ambiguous launch.
+        public = dict(request=asdict(request), review=bundle.public_review())
+        if scene_recovery is not None:
+            public['sceneRecovery'] = scene_recovery
         payload = canonical(dict(ref=REF.removeprefix('refs/heads/'), inputs=dict(mode='launch',
-            public_payload=canonical(dict(request=asdict(request), review=bundle.public_review())))))
+            public_payload=canonical(public))))
         payload_path = session / 'dispatch.json'
         with payload_path.open('x') as output:
             os.chmod(payload_path, 0o600)
@@ -354,7 +391,8 @@ class GitHubLiveReviewV3:
                         if candidate is None:
                             continue
                         try:
-                            verified = verify_prepared_review(candidate.decode('ascii'), self._env(run), bundle, request)
+                            verified = verify_prepared_review(candidate.decode('ascii'), self._env(run), bundle, request,
+                                                              expected_scene_recovery=scene_recovery)
                         except ValueError:
                             continue
                         matches.append((run, candidate, verified))
@@ -362,11 +400,14 @@ class GitHubLiveReviewV3:
                     raise LiveReviewBlocked('Multiple matching review runs')
                 if matches:
                     selected, raw, (_, policy, approval_hash) = matches[0]
-                    on_review(dict(url=selected['html_url'], comment='dev-workflow approve ' + approval_hash,
+                    notice = dict(url=selected['html_url'], comment='dev-workflow approve ' + approval_hash,
                         operation=request.operation, requestHash=request.digest(), expiresAt=request.expires_at,
                         host=request.host_id, daemon=request.daemon_id, project=request.target.namespace,
                         components=list(request.components), imagechanges=bundle.public_review()['services'],
-                        runId=selected['id']))
+                        runId=selected['id'])
+                    if scene_recovery is not None:
+                        notice['sceneRecovery'] = dict(scene_recovery)
+                    on_review(notice)
             if selected is not None:
                 run = self._get('/actions/runs/' + str(selected['id']))
                 if any(run.get(k) != selected.get(k) for k in ('id', 'head_sha', 'run_attempt', 'event', 'path', 'actor')):
@@ -380,7 +421,8 @@ class GitHubLiveReviewV3:
                                         session / 'sealed')
                 if cipher is not None:
                     self._environment()
-                    _, policy, _ = verify_prepared_review(raw.decode('ascii'), self._env(run), bundle, request)
+                    _, policy, _ = verify_prepared_review(raw.decode('ascii'), self._env(run), bundle, request,
+                                                           expected_scene_recovery=scene_recovery)
                     _private(self.key, 0o600)
                     result = self._command(['/usr/bin/openssl', 'cms', '-decrypt', '-inform', 'DER',
                         '-in', str(session / 'sealed/oidc.cms.der'), '-inkey', str(self.key)])
@@ -392,8 +434,14 @@ class GitHubLiveReviewV3:
                     _check_execution_reserve(request, approval, grant)
                     with (session / 'consumption-started').open('x') as marker:
                         os.chmod(marker.name, 0o600)
-                    receipt = approval.consume(grant, request,
-                        before_consume=lambda: _check_execution_reserve(request, approval, grant))
+                    def guard():
+                        _check_execution_reserve(request, approval, grant)
+                        if before_consume is not None:
+                            before_consume()
+                            if approval.validate(request) != grant:
+                                raise LiveReviewBlocked('Scene recovery consent changed before consumption')
+                            _check_execution_reserve(request, approval, grant)
+                    receipt = approval.consume(grant, request, before_consume=guard)
                     return approval, receipt, dict(runId=run['id'], url=selected['html_url'],
                         requestHash=request.digest(), privateSession=str(session), expiresAt=request.expires_at)
             time.sleep(min(5, max(0, deadline - time.time())))

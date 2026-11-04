@@ -186,7 +186,7 @@ class PhaseGuardV3:
         if row['Config']['Labels']['com.docker.compose.service'] != s['name']:
             _fail()
 
-    def _context(self, snapshot):
+    def _context(self, snapshot, *, terminal=False):
         snapshot = _plain(snapshot)
         if set(snapshot) != {'phase_index', 'operation', 'receipts', 'completed_operations'}:
             _fail()
@@ -204,6 +204,12 @@ class PhaseGuardV3:
         if len(set(ids)) != len(ids) or set(ids) & forbidden:
             _fail()
         ops = self._bundle.resolve_operations(receipts) if len(receipts) == len(creates) else creates
+        if terminal:
+            if (len(receipts) != len(creates) or snapshot['operation'] is not None
+                    or not _same(done, ops) or type(snapshot['phase_index']) is not int
+                    or snapshot['phase_index'] != sum(o['method'] != 'GET' for o in ops)):
+                _fail()
+            return done, receipts
         if len(done) >= len(ops) or not _same(done, ops[:len(done)]):
             _fail()
         op = ops[len(done)]
@@ -213,10 +219,10 @@ class PhaseGuardV3:
             _fail()
         return done, receipts
 
-    def capture_phase(self, snapshot):
+    def capture_phase(self, snapshot, *, terminal=False):
         """Return private immutable phase facts after two fresh matching reads."""
         try:
-            done, receipts = self._context(snapshot)
+            done, receipts = self._context(snapshot, terminal=terminal)
             first = deepcopy(self._capture(done, receipts))
             second = deepcopy(self._capture(done, receipts))
             if not _same(first, second):

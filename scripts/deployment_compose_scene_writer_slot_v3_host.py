@@ -103,6 +103,74 @@ class SlotOwnerV3:
         if record['role']!='scene-create' or record['state']!='waiting' or type(record['owner']) is not SceneCreateUnitV3:reject()
         return record['owner']
 
+    def _start_recovery_unit(self, expected_slot_generation, archive, deadline):
+        from deployment_compose_scene_recovery_worker_v3_host import SceneRecoveryStartupUnitV3
+
+        record = _record(self)
+        _generation(expected_slot_generation)
+        if (record['generation'] != expected_slot_generation or record['state'] != 'drained'
+                or type(archive) is not bytes or not 0 < len(archive) <= 2*1024*1024
+                or hashlib.sha256(archive).hexdigest() != record['archive']):
+            reject()
+
+        def remaining(limit):
+            budget = min(limit, deadline - time.monotonic())
+            if budget <= 0:
+                reject()
+            return budget
+
+        remaining(10)
+        record.update(generation=record['generation']+1, state='starting', unknown=True, owner=None,
+                      origin=None, result=None, role='scene-recovery-startup', receipt=None)
+        try:
+            owner = SceneRecoveryStartupUnitV3(record['archive'], record['source'])
+            record['owner'] = owner
+            owner.start(timeout=remaining(10))
+            origin = owner.capture_origin(timeout=remaining(3))
+            parsed = validate_origin(origin)
+            if parsed['sourceSha'] != record['source'] or parsed['archiveDigest'] != record['archive']:
+                reject()
+            record.update(state='waiting', unknown=False, origin=origin)
+            return owner, record
+        except BaseException as primary:
+            self._failed_recovery_unit(record, primary)
+            raise
+
+    def _failed_recovery_unit(self, record, primary):
+        from deployment_compose_restart_checkpoint_v3_host import note_cleanup
+
+        record['state'] = 'failed'
+        if record['owner'] is not None:
+            try:
+                self._drain(record, time.monotonic()+30)
+            except BaseException:
+                note_cleanup(primary)
+
+    def start_recovery_relay(self, expected_slot_generation, archive, *, deadline, **inputs):
+        from deployment_compose_scene_recovery_worker_v3_host import send_startup
+
+        owner, record = self._start_recovery_unit(expected_slot_generation, archive, deadline)
+        try:
+            config = send_startup(owner, archive, deadline=deadline, relay=True, **inputs)
+        except BaseException as primary:
+            self._failed_recovery_unit(record, primary)
+            raise
+        return owner, record['generation'], config['channelNonce']
+
+    def verify_recovery_startup(self, expected_slot_generation, archive, *, deadline, **inputs):
+        """Start the fixed recovery unit for a startup check and drain it."""
+        from deployment_compose_scene_recovery_worker_v3_host import run_startup
+
+        owner, record = self._start_recovery_unit(expected_slot_generation, archive, deadline)
+        try:
+            ready = run_startup(owner, archive, deadline=deadline, **inputs)
+        except BaseException as primary:
+            self._failed_recovery_unit(record, primary)
+            raise
+        stopped = self._drain(record, time.monotonic()+30)
+        return dict(ready=ready, workerStopped=True, slotGeneration=stopped['slotGeneration'],
+                    writerOriginDigest=stopped['writerOriginDigest'])
+
     def inspect_attached(self,raw_archive,daemon_binding,expected_slot_generation):
         record=_record(self);_generation(expected_slot_generation)
         if (record['generation']!=expected_slot_generation or record['state'] not in ('empty','drained')
@@ -151,6 +219,9 @@ class SlotOwnerV3:
             if record['role']=='scene-create':
                 from deployment_compose_scene_create_worker_v3_host import SceneCreateUnitV3
                 expected_type=SceneCreateUnitV3
+            if record['role']=='scene-recovery-startup':
+                from deployment_compose_scene_recovery_worker_v3_host import SceneRecoveryStartupUnitV3
+                expected_type=SceneRecoveryStartupUnitV3
             if type(record['owner']) is not expected_type:reject()
             record['owner'].stop(timeout=budget(30))
             origin=record['origin']

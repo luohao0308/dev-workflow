@@ -229,7 +229,7 @@ def validate_result(method, request, result):
             fail()
 
 
-def dispatch_request(store, method, request):
+def dispatch_request(store, method, request, *, expected_state_identity=None):
     """Host-only unsigned dispatch; embedding must authenticate caller first."""
     try:
         request = deepcopy(request); validate_request(method, request)
@@ -243,11 +243,14 @@ def dispatch_request(store, method, request):
         elif method == 'events_after':
             result = store.events_after(binding, seq=request['seq'], head=request['head'])
         elif method == 'append_event':
+            state_pin = {} if expected_state_identity is None else {'expected_state_identity': expected_state_identity}
             result = store.append_event(binding, expected_seq=request['expectedSeq'], expected_head=request['expectedHead'],
                                         event=request['event'], external_material=decode_material(request['externalMaterialBase64']),
-                                        boot_nonce=request['bootNonce'], rpc_nonce=request['rpcNonce'])
+                                        boot_nonce=request['bootNonce'], rpc_nonce=request['rpcNonce'], **state_pin)
         else:
-            result = store.transition_successor(binding, expected_seq=request['expectedSeq'], expected_head=request['expectedHead'], childBinding=request['childBinding'])
+            state_pin = {} if expected_state_identity is None else {'expected_state_identity': expected_state_identity}
+            result = store.transition_successor(binding, expected_seq=request['expectedSeq'], expected_head=request['expectedHead'],
+                                                childBinding=request['childBinding'], **state_pin)
         validate_result(method, request, result)
         return dict(schemaVersion=1, method=method, binding=binding, requestDigest=request_digest(method, request),
                     bootNonce=request['bootNonce'], rpcNonce=request['rpcNonce'], result=deepcopy(result),

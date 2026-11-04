@@ -61,7 +61,7 @@ class TLSLeafKernelDouble:
     def terminal_facts(self):return self.facts,self.response
 
 
-def run_case(testcase,attack='',*,scene_controller=False,checkpoint_callback=None,scene_callback=None,published_source=None,after_reconciled=None):
+def run_case(testcase,attack='',*,scene_controller=False,checkpoint_callback=None,scene_callback=None,published_source=None,after_reconciled=None,scene_stop=False):
     case=LocalAcceptanceCase(testcase);stack=ExitStack();process=None;store=None
     try:
         if scene_callback is not None and sys.platform=='darwin':
@@ -106,7 +106,7 @@ def run_case(testcase,attack='',*,scene_controller=False,checkpoint_callback=Non
         approval,consumption,_=case.review_adapter().consume_prepared(bundle,request,lambda value:None)
         if scene_controller:
             from tests.support.compose_scene_controller_integration_fixture import drive_scene
-            return drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts[0],attack,checkpoint_callback=checkpoint_callback,scene_callback=scene_callback,after_reconciled=after_reconciled)
+            return drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts[0],attack,checkpoint_callback=checkpoint_callback,scene_callback=scene_callback,after_reconciled=after_reconciled,scene_stop=scene_stop)
         binding=admission.register_intent(bundle,request,approval,consumption)
         from deployment_compose_coordinator_v3_host import digest
         refs=dict(requestHash=request.digest(),receiptHash=digest(asdict(consumption)),firstBinding=binding)

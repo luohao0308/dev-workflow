@@ -29,7 +29,7 @@ from deployment_compose_witness_store import canonical
 from deployment_gate_witness import key_material
 
 
-def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None,after_reconciled=None):
+def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsule,hello,keys,archive,facts,attack,checkpoint_callback=None,scene_callback=None,after_reconciled=None,scene_stop=False):
     processes=[];calls=[];origin_calls=[];pending_seen=[]
     # Gateway lifetime and kernel boot are distinct identity domains.
     boot='12345678-1234-4234-8234-123456789abc'
@@ -140,11 +140,39 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
         else:
             final=controller.run_first_create(approval=approval,consumption=consumption,timeout=60,on_restart_checkpoint=checkpoint_callback,on_scene_checkpoint=scene_callback)
             testcase.assertEqual(final['businessState'],'reconciled');testcase.assertTrue(final['closureReconciled'])
+            if scene_stop == 'response-loss':
+                server=next(fn.__self__ for fn,args,kwargs in case.harness._cleanups if getattr(fn,'__name__','')=='shutdown')
+                handler=server.RequestHandlerClass
+                original_post=handler.do_POST
+                def stop_without_response(subject):
+                    if '/stop?' not in subject.path:
+                        return original_post(subject)
+                    case.harness.calls.append(('POST',subject.path))
+                    subject.rfile.read(int(subject.headers.get('Content-Length','0')))
+                    subject.close_connection=True
+                stack.enter_context(patch.object(handler,'do_POST',stop_without_response))
             if after_reconciled is not None:after_reconciled(broker,prep,session)
-            testcase.assertEqual(pending_seen,[True]);testcase.assertFalse(session.unknown_write_result)
+            testcase.assertEqual(pending_seen,[True])
+            testcase.assertEqual(session.unknown_write_result,scene_stop in ('response-loss','readiness-failure'))
             testcase.assertEqual(len(clients),4 if checkpoint_callback is not None or scene_callback is not None else 3);testcase.assertEqual(calls.count('start_first_create'),1)
             testcase.assertIn('a'*64,session.created_ids);testcase.assertEqual(origin_calls,['stop','observe','close'])
-            testcase.assertEqual(admission._history(admission._root).capture().snapshot['chainStatus']['activeSeq'],6)
+            if scene_stop:
+                chain=admission._store.chain_status(admission._root['first'])
+                full=scene_stop in ('full-recovery','readiness-failure')
+                expected=('blocked',4,1) if scene_stop=='response-loss' else ('closed',6,4 if full else 2 if scene_stop=='through-delete' else 1)
+                testcase.assertEqual((chain['activePhase'],chain['activeSeq'],len(chain['lineage'])),expected)
+                writes=[call for call in case.harness.calls if call[0] in ('POST','DELETE') and '/containers/' in call[1]]
+                testcase.assertEqual(len(writes),5 if full else 3 if scene_stop=='through-delete' else 2)
+                testcase.assertIn('/stop?',writes[1][1])
+                if scene_stop=='through-delete' or full:
+                    testcase.assertEqual(writes[2][0],'DELETE')
+                    testcase.assertEqual(writes[2][1].split('/')[-1].split('?')[0],
+                                         session.prepared['bundle'].to_dict()['services'][0]['baselineContainerId'])
+                if full:
+                    testcase.assertIn('/rename?',writes[3][1])
+                    testcase.assertTrue(writes[4][1].endswith('/start'))
+            else:
+                testcase.assertEqual(admission._history(admission._root).capture().snapshot['chainStatus']['activeSeq'],6)
             with testcase.assertRaises(ValueError):controller.run_first_create(approval=approval,consumption=consumption)
             import deployment_compose_scene_service_v3_host as service
             prepared_status=prep.status();slot_status=slot.status()
@@ -159,7 +187,8 @@ def drive_scene(testcase,case,stack,admission,approval,consumption,session,capsu
             ssh=dict(kind='scene-control-result-v3',channelNonce='4'*64,seq=2**53-1,command='status',result=full_result)
             frame_sizes=dict(unixFrameBytes=len(service._frame(unix))-4,sshFrameBytes=len(service._frame(ssh))-4)
             testcase.assertLessEqual(max(frame_sizes.values()),service.MAX_FRAME)
-            prep.cleanup();testcase.assertNotIn('a'*64,case.harness.rows)
+            if scene_stop not in ('response-loss','readiness-failure'):
+                prep.cleanup();testcase.assertNotIn('a'*64,case.harness.rows)
         if attack:
             testcase.assertTrue(clients[-1]._closed)
             testcase.assertEqual(slot.status()['slotState'],'empty' if attack=='fake-consumption' else 'drained')

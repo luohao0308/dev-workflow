@@ -315,7 +315,7 @@ class MacLiveAdmissionV3:
             if self._unseal(data,'proof')!=dict(generation=scope['binding']['generation'],head=previous):reject()
         return event,actual,attempt,finish
 
-    def _append(self,request,scope):
+    def _append(self,request,scope,*,expected_state_identity=None):
         records=self._store.events_after(scope['binding'],seq=0,head=ZERO)
         view=self._store.read(scope['binding'])
         if (view['active'] is not True or request['expectedSeq']!=len(records)
@@ -332,7 +332,7 @@ class MacLiveAdmissionV3:
         if len(records)<3:self._consent(scope['entry'])
         # dispatch_request/store validate witness sequence, binding, material hash,
         # nonce, event grammar and CAS cursor before the single persisted mutation.
-        return dispatch_request(self._store,'append_event',request)
+        return dispatch_request(self._store,'append_event',request,expected_state_identity=expected_state_identity)
 
     def _transition(self,request,scope):
         if scope['entry'] is not self._current:reject()

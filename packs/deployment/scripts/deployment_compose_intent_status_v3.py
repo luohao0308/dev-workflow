@@ -47,10 +47,11 @@ def encode(value):
     return raw
 
 
-def validate_request(request, expected):
+def validate_request(request, expected, *, scene_recovery=False):
+    profile = 'compose-scene-recovery-intent-v3' if scene_recovery else 'compose-application-batch-v1'
     if (type(expected) is not RequestV2 or expected.profile_version != '3'
             or expected.production is not False
-            or expected.profile_id != 'compose-application-batch-v1'
+            or expected.profile_id != profile or (scene_recovery and expected.operation != 'recovery')
             or type(request) is not dict or set(request) != REQUEST_FIELDS
             or type(request['schemaVersion']) is not int or request['schemaVersion'] != 1
             or request['purpose'] != 'check-consumed-intent-v3'
@@ -59,7 +60,7 @@ def validate_request(request, expected):
         fail()
 
 
-def _approval_type():
+def _approval_type(scene_recovery=False):
     # Load only the distribution-owned sibling host script; never a supplied path.
     path = Path(__file__).resolve().parents[3] / 'scripts/deployment_compose_approval_v3_host.py'
     name = 'deployment_compose_approval_v3_host'
@@ -72,14 +73,14 @@ def _approval_type():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    return module.GitHubFullBodyApprovalV3
+    return module.GitHubSceneRecoveryApprovalV3 if scene_recovery else module.GitHubFullBodyApprovalV3
 
 
-def issue_intent_status(approval, registered_request, rpc_request, *, now=None):
+def issue_intent_status(approval, registered_request, rpc_request, *, now=None, scene_recovery=False):
     """Unsigned status after live authority/ledger recheck; caller authenticates first."""
     try:
-        validate_request(rpc_request, registered_request)
-        if (type(approval) is not _approval_type()
+        validate_request(rpc_request, registered_request, scene_recovery=scene_recovery)
+        if (type(approval) is not _approval_type(scene_recovery)
                 or registered_request not in approval.requests):
             fail()
         approval.check_consumed_intent(registered_request)
@@ -97,11 +98,11 @@ def issue_intent_status(approval, registered_request, rpc_request, *, now=None):
 
 
 class IntentStatusClientV3:
-    def __init__(self, expected_request: RequestV2, public_key, transport):
+    def __init__(self, expected_request: RequestV2, public_key, transport, *, scene_recovery=False):
         try:
             self._expected = expected_request
             self._boot = secrets.token_hex(32)
-            validate_request(self._request(), expected_request)
+            validate_request(self._request(), expected_request, scene_recovery=scene_recovery)
             self._public = key_material(public_key)
             if not callable(transport):
                 fail()

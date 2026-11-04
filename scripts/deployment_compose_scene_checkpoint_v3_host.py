@@ -165,14 +165,21 @@ def _verify_signature(artifact, expected_key_hash):
     if type(artifact) is not dict or set(artifact) != {'payload', 'intentPublicKey', 'signature'}:
         reject()
     payload = artifact['payload']
-    if (type(payload) is not dict or set(payload) != _PAYLOAD
-            or type(payload['schemaVersion']) is not int or payload['schemaVersion'] != 1
+    if (type(payload) is not dict or type(payload.get('schemaVersion')) is not int
+            or payload['schemaVersion'] not in (1, 2)
+            or set(payload) != (_PAYLOAD | {'witnessStore'} if payload['schemaVersion'] == 2 else _PAYLOAD)
             or payload['kind'] != 'compose-scene-checkpoint-binding-v3'
             or any(not hex_value(payload[k]) for k in
                    ('materialDigest', 'custodyDigest', 'witnessKeyHash', 'sourceManifestDigest'))
             or type(artifact['intentPublicKey']) is not str or type(artifact['signature']) is not str
             or len(artifact['intentPublicKey']) > 4096 or len(artifact['signature']) > 8192):
         reject()
+    if payload['schemaVersion'] == 2:
+        pins = payload['witnessStore']
+        if (type(pins) is not dict or set(pins) != {'directory', 'lock', 'state'}
+                or any(type(pin) is not list or len(pin) != 2
+                       or any(type(part) is not int or part < 0 for part in pin) for pin in pins.values())):
+            reject()
     public = key_material(base64.b64decode(artifact['intentPublicKey'], validate=True))
     if digest(public) != expected_key_hash:
         reject()
@@ -210,12 +217,19 @@ def retain_scene_checkpoint(token, descriptor):
         with _open_material(case, descriptor) as reader:
             if reader.context.snapshot.canonical != record['snapshot']:
                 reject()
-        payload = dict(schemaVersion=1, kind='compose-scene-checkpoint-binding-v3',
+        _capture(token)
+        guard = _Guard(case)
+        store = admission._store
+        witness = case / 'witness'
+        if (guard.dirs[witness][1] != store._root_id
+                or guard.files[(witness, 'witness.lock')][1][:2] != store._lock_id):
+            reject()
+        store_pins = dict(directory=list(store._root_id), lock=list(store._lock_id),
+                          state=list(guard.files[(witness, 'state.json')][1][:2]))
+        payload = dict(schemaVersion=2, kind='compose-scene-checkpoint-binding-v3', witnessStore=store_pins,
             **{k: descriptor[k] for k in ('materialDigest', 'custodyDigest', 'witnessKeyHash', 'context')},
             hello=decode(record['hello']), closure=decode(record['closure']),
             evidence=decode(record['evidence']), sourceManifestDigest=digest(manifest))
-        _capture(token)
-        guard = _Guard(case)
         signer = admission._signers[1]
         if signer.parent != case:
             reject()
@@ -408,6 +422,38 @@ class SceneCheckpointReaderV3:
         """Receive a sealed historical phase snapshot; no recovery authority."""
         from deployment_compose_scene_phase_snapshot_v3_host import capture_scene_phase_snapshot
         return capture_scene_phase_snapshot(self, handle=handle, download_timeout=download_timeout)
+
+    def prepare_snapshot_recovery_draft(self, *, snapshot):
+        """Describe the remaining operations from a snapshot issued to this reader."""
+        from deployment_compose_scene_phase_snapshot_v3_host import prepare_snapshot_recovery_draft
+        return prepare_snapshot_recovery_draft(self, snapshot=snapshot)
+
+    def recheck_snapshot_recovery_draft(self, *, snapshot, expected_draft_digest, handle):
+        """Compare a new read-only scene observation to a reviewed draft."""
+        from deployment_compose_scene_phase_snapshot_v3_host import recheck_snapshot_recovery_draft
+        return recheck_snapshot_recovery_draft(self, snapshot=snapshot,
+            expected_draft_digest=expected_draft_digest, handle=handle)
+
+    def prepare_scene_recovery_intent(self, *, snapshot, expected_draft_digest, handle, expires_at):
+        """Build the exact request for a separate scene recovery approval profile."""
+        from deployment_compose_scene_recovery_intent_v3_host import prepare_scene_recovery_intent
+        return prepare_scene_recovery_intent(self, snapshot=snapshot, expected_draft_digest=expected_draft_digest,
+            handle=handle, expires_at=expires_at)
+
+    def verify_scene_recovery_intent(self, *, snapshot, expected_draft_digest, handle,
+                                     expected_request_digest, request, context_bytes):
+        """Recheck the original scene for an externally pinned approval candidate."""
+        from deployment_compose_scene_recovery_intent_v3_host import verify_scene_recovery_intent
+        return verify_scene_recovery_intent(self, snapshot=snapshot, expected_draft_digest=expected_draft_digest,
+            handle=handle, expected_request_digest=expected_request_digest, request=request, context_bytes=context_bytes)
+
+    def admit_scene_recovery(self, *, snapshot, expected_draft_digest, handle,
+                             expected_request_digest, request, context_bytes, approval, receipt):
+        """Activate the exact approved successor in this scene's witness store."""
+        from deployment_compose_scene_recovery_admission_v3_host import admit_scene_recovery
+        return admit_scene_recovery(self, snapshot=snapshot, expected_draft_digest=expected_draft_digest,
+            handle=handle, expected_request_digest=expected_request_digest, request=request,
+            context_bytes=context_bytes, approval=approval, receipt=receipt)
 
     def close(self):
         if self._closed:

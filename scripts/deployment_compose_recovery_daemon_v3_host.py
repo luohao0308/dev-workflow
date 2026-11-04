@@ -278,7 +278,7 @@ class ObservedRecoveryDaemonV3:
         units._left(deadline)
         return encode(value)
 
-    def capture_recovery_phase(self,bundle,baseline_rows,phase_context,*,expected_version,timeout=15):
+    def capture_recovery_phase(self,bundle,baseline_rows,phase_context,*,expected_version,timeout=15,terminal=False):
         from copy import deepcopy
         import json
         from urllib.parse import quote
@@ -289,7 +289,8 @@ class ObservedRecoveryDaemonV3:
             if (type(bundle) is not ExecutionBundleV3 or bundle.to_dict()['identity']['daemonId']!=self.daemon_id
                     or type(expected_version) is not dict or set(expected_version)!={'Version','GitCommit'}
                     or any(type(v) is not str or not v for v in expected_version.values())
-                    or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30):reject()
+                    or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30
+                    or type(terminal) is not bool):reject()
             deadline=time.monotonic()+timeout;budget=[16*1024*1024]
             version=deepcopy(expected_version);baseline=deepcopy(baseline_rows);context=_plain(phase_context)
             value=bundle.to_dict()
@@ -302,9 +303,9 @@ class ObservedRecoveryDaemonV3:
                 {'/v1.45/volumes/'+quote(m['Name'],safe='') for row in baseline.values() for m in row['Mounts'] if m['Type']=='volume'})
             def read(path):return self._request(path,deadline,budget,phase_paths=paths)
             guard=PhaseGuardV3(bundle,baseline,read_json=read,daemon_version=version,expected_docker_root=self.root+'/data')
-            guard._context(context)
+            guard._context(context, terminal=terminal)
             before=self._phase_endpoint(deadline,budget,paths,version)
-            phase=encode(_plain(guard.capture_phase(context)))
+            phase=encode(_plain(guard.capture_phase(context, terminal=terminal)))
             if self._phase_endpoint(deadline,budget,paths,version)!=before:reject()
             units._left(deadline)
             return phase,before

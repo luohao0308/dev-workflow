@@ -206,6 +206,36 @@ class PreparationOwnerV3:
         if canonical(record['observer'].binding())!=record['binding'] or time.monotonic()>=end:reject()
         return phase,endpoint,canonical(session.guard._version),bundle.to_dict()['baselineStateDigest']
 
+    def _reconcile_closed_scene_delete(self, receipts, *, terminal_digest=None):
+        """Release the deleted baseline from cleanup after observing its absence."""
+        record = _record(self)
+        session = record['session']
+        if (record['state'] != 'prepared' or not record['product_pending'] or session is None
+                or not session.unknown_write_result):
+            reject()
+        bundle = session.prepared['bundle']
+        operations = bundle.resolve_operations(receipts)
+        if operations[2]['phase'] != 'delete' or operations[3]['phase'] != 'rename':
+            reject()
+        _fresh(record)
+        if terminal_digest is None:
+            session.guard.capture_phase(dict(phase_index=3, operation=operations[3], receipts=receipts,
+                                             completed_operations=operations[:3]))
+        else:
+            from deployment_compose_phase_guard_v3_host import _plain
+
+            phase = session.guard.capture_phase(dict(phase_index=sum(op['method'] != 'GET' for op in operations),
+                                                      operation=None, receipts=receipts,
+                                                      completed_operations=operations), terminal=True)
+            if digest(canonical(_plain(phase))) != terminal_digest:
+                reject()
+        _fresh(record)
+        service = bundle.to_dict()['services'][0]
+        deleted = service['baselineContainerId']
+        if deleted in session.created_ids:
+            session.created_ids.remove(deleted)
+        session.unknown_write_result = False
+
     def cleanup(self):
         record=_record(self)
         if record['state']=='cleaned':return dict(preparationCleaned=True,**{key:False for key in _FALSE})

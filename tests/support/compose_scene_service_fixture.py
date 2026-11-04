@@ -59,6 +59,34 @@ if sys.argv[1]=='serve':
             if len(sys.argv)>8 and sys.argv[8]=='fail-prep':raise ValueError('unknown-write')
             self.state='cleaned';return dict(preparationCleaned=True)
     prep.PreparationOwnerV3=Preparation
+    if len(sys.argv)>8 and sys.argv[8]=='writer-phase':
+        import deployment_compose_scene_create_broker_v3_host as business
+
+        class Broker:
+            def __init__(self,*args):pass
+            def start_first_create(self,args,generation):return self.status()
+            def status(self):return dict(businessState='reconciled')
+            def controller_lost(self):pass
+            def drain(self):pass
+            def observe_stopped_writer_phase(self,nonce,first_write,*,recovery_handoff=None,lease_generation=None):
+                result = dict(phaseObservation=dict(requestNonce=nonce),writerOriginDigest='1'*64,
+                            writerStopObservationDigest='2'*64,
+                            firstWriteBindingDigest=scene.digest(scene.canonical(first_write)))
+                if recovery_handoff is not None:
+                    result['recoveryHandoffDigest']=scene.digest(scene.canonical(recovery_handoff['payload']))
+                    result['recoveryWorkerNonce']='3'*64
+                return result
+            def confirm_recovery_worker(self,proof,generation,*,launch=False,relay=False,execute=False,
+                                        through_delete=False,full_recovery=False):
+                result=dict(workerProofDigest=scene.digest(scene.canonical(proof)),generation=generation)
+                if launch:
+                    result['workerStartupDigest']='4'*64
+                if relay or execute:
+                    result['workerRelay']=dict(attemptId='5'*64,channelNonce='6'*64)
+                return result
+
+        scene._business_pins=lambda *args:((b'witness',b'intent'),None)
+        business.SceneCreateBrokerV3=Broker
     scene.OwnedRecoveryDaemonHostV3=Owner
     scene.serve(sys.argv[3])
 elif sys.argv[1]=='client':

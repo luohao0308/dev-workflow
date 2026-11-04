@@ -58,3 +58,45 @@ class RelayTests(unittest.TestCase):
     else:client.detach()
    self.assertTrue(client._closed)
   self.connect().close_scene();self.assertEqual(self.process.wait(timeout=5),0)
+
+
+@unittest.skipUnless(os.name=='posix','POSIX Unix sockets and pipes required')
+class WriterPhaseRelayTests(unittest.TestCase):
+ writer_source_enabled=True
+ attach_archive=True
+ setUp=service_fixture.SceneTests.setUp
+ cleanup_service=service_fixture.SceneTests.cleanup_service
+ connect=RelayTests.connect
+
+ def test_writer_phase_command_round_trips_through_relay_and_authenticated_service(self):
+  with self.connect() as client:
+   client.prepare_identity('host-one')
+   keys={key:b'k'*32 for key in ('config','image','declaration','archive','target')}
+   meta=client.prepare_staging('c'*64,keys)['preparation']
+   client.start_first_create(preparationId=meta['preparationId'],capsuleDigest=meta['capsuleDigest'],
+       slotGeneration=0,policy={},gateKeyBase64='',requestHash='a'*64,receiptHash='b'*64,firstBinding={})
+   first_write={'nextOperationDigest':'3'*64}
+   result=client.observe_stopped_writer_phase('d'*64,first_write)
+   self.assertEqual(result['writerPhaseObservation'],
+       dict(phaseObservation=dict(requestNonce='d'*64),writerOriginDigest='1'*64,writerStopObservationDigest='2'*64,
+            firstWriteBindingDigest=service_fixture.scene.digest(relay.canonical(first_write))))
+   self.assertTrue(all(result[key] is False for key in relay._FALSE))
+   handoff={'payload': {'sceneId': self.scene_id}, 'signature': 'test'}
+   staged=client.observe_stopped_writer_phase('d'*64,first_write,recovery_handoff=handoff)
+   self.assertEqual(staged['writerPhaseObservation']['recoveryHandoffDigest'],
+                    service_fixture.scene.digest(relay.canonical(handoff['payload'])))
+   proof={'test':'proof'}
+   confirmed=client.confirm_recovery_worker(proof)['workerConfirmation']
+   self.assertEqual(confirmed['workerProofDigest'],service_fixture.scene.digest(relay.canonical(proof)))
+   launched=client.confirm_recovery_worker(proof,launch=True)['workerConfirmation']
+   self.assertEqual(launched['workerStartupDigest'],'4'*64)
+   relayed=client.confirm_recovery_worker(proof,relay=True)['workerConfirmation']
+   self.assertEqual(relayed['workerRelay'],dict(attemptId='5'*64,channelNonce='6'*64))
+   executing=client.confirm_recovery_worker(proof,execute=True)['workerConfirmation']
+   self.assertEqual(executing['workerRelay'],relayed['workerRelay'])
+   deleting=client.confirm_recovery_worker(proof,execute=True,through_delete=True)['workerConfirmation']
+   self.assertEqual(deleting['workerRelay'],executing['workerRelay'])
+   complete=client.confirm_recovery_worker(proof,execute=True,through_delete=True,full_recovery=True)['workerConfirmation']
+   self.assertEqual(complete['workerRelay'],executing['workerRelay'])
+   client.close_scene()
+  self.assertEqual(self.process.wait(timeout=5),0)

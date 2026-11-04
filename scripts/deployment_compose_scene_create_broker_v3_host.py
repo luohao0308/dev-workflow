@@ -14,6 +14,7 @@ import threading
 import weakref
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 from deployment_compose_witness_store import canonical
 from deployment_compose_recovery_phase_capsule_v3_host import decode
@@ -25,6 +26,7 @@ from deployment_compose_v3_channel_worker import write_frame,LIMIT
 from deployment_compose_operation_witness_client_v3 import encode
 from deployment_compose_scene_preparation_v3_host import PreparationOwnerV3
 from deployment_compose_scene_writer_slot_v3_host import SlotOwnerV3
+from deployment_compose_cold_writer_v3_host import observe_stopped_writer
 
 MAX_MESSAGE=4*1024*1024
 _RECORDS=weakref.WeakKeyDictionary()
@@ -130,7 +132,8 @@ class SceneCreateBrokerV3:
             unit=r['slot'].borrow_create_unit();r['unit']=unit;r['process']=unit._process
             r['origin']=canonical(allocated['writerOrigin']);r['generation']=allocated['slotGeneration']
             write_frame(r['process'].stdin,config,timeout=5)
-            r.update(state='active',request_hash=request.digest(),bundle_digest=bundle.digest)
+            r.update(state='active',request_hash=request.digest(),bundle_digest=bundle.digest,
+                     recoveryGateKey=gate_key,recoveryGatePolicy=policy)
             return self.status()
         except BaseException:
             r['state']='failed';raise
@@ -159,8 +162,23 @@ class SceneCreateBrokerV3:
                     if value.get('kind')=='rpc':
                         if (set(value)!={'kind','channelNonce','rpcId','service','method','request'} or type(value['rpcId']) is not int
                                 or value['rpcId']!=r['last_rpc']+1 or value['rpcId']>4096
-                                or value['method'] not in {'intent':{'check'},'witness':{'read','check','events_after','chain_status','append_event'}}.get(value['service'],set())):reject()
+                                or value['method'] not in self._worker_methods(r).get(value['service'],set())):reject()
+                        if 'stopStatus' not in r and 'relayTerminal' in r and (value['rpcId'], value['service'], value['method']) not in (
+                                (1, 'intent', 'check'), (2, 'witness', 'check')):
+                            reject()
+                        if 'stopStatus' in r and value['rpcId'] > (256 if r['fullRecovery'] else 128):reject()
                         r['last_rpc']=value['rpcId'];r['pending']=(raw,value)
+                    elif 'relayTerminal' in r:
+                        if 'stopStatus' in r:
+                            from deployment_compose_scene_recovery_worker_v3_host import stop_terminal
+                            terminal_digest = value.get('terminalPhaseDigest')
+                            if r['fullRecovery'] and not hex_value(terminal_digest):reject()
+                            if not r['fullRecovery'] and terminal_digest is not None:reject()
+                            if (not hex_value(value.get('head')) or raw != canonical(stop_terminal(
+                                    r['nonce'], r['proofDigest'], value['head'], r['stopStatus'],
+                                    through_delete=r['throughDelete'], terminal_digest=terminal_digest))):reject()
+                        elif raw != r['relayTerminal']:reject()
+                        r['terminal']=raw;r['state']='terminal';p.stdin.close()
                     elif value.get('kind')=='scene-create-closed':
                         required={'kind','channelNonce','requestHash','bundleDigest','historyDigest','receiptMap','history',
                             'authorityGranted','runtimePermit','recoveryAuthorized','productionReady'}
@@ -176,29 +194,67 @@ class SceneCreateBrokerV3:
                     if code!=0:reject()
                     r['state']='transport-exited'
 
+    def _worker_record(self):
+        r = _record(self)
+        active = r.get('recoveryRelay')
+        if active is None:
+            return r
+        if active['unit']._process is not active['process']:
+            reject()
+        return active
+
+    @staticmethod
+    def _worker_methods(record):
+        witness = {'read','check','events_after','chain_status','append_event'}
+        if record.get('throughDelete') is True:
+            witness.add('transition_successor')
+        return {'intent': {'check'}, 'witness': witness}
+
+    def _worker_status(self, record):
+        if 'relayTerminal' not in record:
+            return self.status()
+        return dict(attemptId=record['attempt'], pendingNonce=record['nonce'], businessState=record['state'])
+
     def poll_worker(self):
-        r=_record(self)
+        r=self._worker_record()
         try:self._pump(r)
         except BaseException:r['state']='failed';raise
-        result=self.status()
+        result=self._worker_status(r)
         if r['pending'] is not None:
             raw,value=r['pending'];result['message']=dict(attemptId=r['attempt'],messageDigest=digest(raw),totalBytes=len(raw),
                 rpcId=value['rpcId'],service=value['service'],method=value['method'])
         if r['terminal'] is not None:
             terminal=decode(r['terminal'])
-            result['closedResult']={key:terminal[key] for key in ('requestHash','bundleDigest','historyDigest','receiptMap')}
+            if 'relayTerminal' in r:
+                result['relayDigest'] = digest(r['terminal'])
+                if 'stopStatus' in r:
+                    head_key = 'startHead' if r['fullRecovery'] else 'deleteHead' if r['throughDelete'] else 'stopHead'
+                    result[head_key] = terminal['head']
+                    if r['fullRecovery']:
+                        result['terminalPhaseDigest'] = terminal['terminalPhaseDigest']
+            else:
+                result['closedResult']={key:terminal[key] for key in ('requestHash','bundleDigest','historyDigest','receiptMap')}
             result['terminalMessage']=dict(attemptId=r['attempt'],messageDigest=digest(r['terminal']),totalBytes=len(r['terminal']))
         return result
 
     def finish_worker(self,attempt_id):
-        r=_record(self)
+        r=self._worker_record()
         if attempt_id!=r['attempt'] or r['state']!='transport-exited':reject()
-        self.drain();r['state']='closed'
-        return self.status()
+        self.drain()
+        if 'stopStatus' in r:
+            original = _record(self)
+            if r['throughDelete']:
+                PreparationOwnerV3._reconcile_closed_scene_delete(
+                    original['preparation'], decode(original['closure'])['receiptMap'],
+                    terminal_digest=decode(r['terminal']).get('terminalPhaseDigest'))
+            else:
+                original['inputs']['session'].unknown_write_result = False
+        r['state']='closed'
+        return self._worker_status(r)
 
     def read_worker_chunk(self,attempt_id,message_digest,offset,length):
-        r=_record(self)
-        if attempt_id!=r['attempt']:reject()
+        r=self._worker_record()
+        if attempt_id!=r['attempt'] or r['state'] in ('failed','frozen'):reject()
         if r['pending'] is not None and digest(r['pending'][0])==message_digest:raw=r['pending'][0]
         elif r['terminal'] is not None and digest(r['terminal'])==message_digest:raw=r['terminal']
         else:reject()
@@ -208,22 +264,22 @@ class SceneCreateBrokerV3:
             dataBase64=base64.b64encode(raw[offset:offset+length]).decode())
 
     def begin_worker_reply(self,attempt_id,total_bytes,message_digest,rpc_id):
-        r=_record(self)
+        r=self._worker_record()
         if (r['state']!='active' or attempt_id!=r['attempt'] or r['pending'] is None or r['staged'] is not None
                 or type(total_bytes) is not int or not 0<total_bytes<=MAX_MESSAGE or not hex_value(message_digest)
                 or type(rpc_id) is not int or rpc_id!=r['pending'][1]['rpcId']):reject()
         r['staged']=dict(raw=bytearray(),total=total_bytes,digest=message_digest,rpc=rpc_id)
-        return self.status()
+        return self._worker_status(r)
 
     def worker_reply_chunk(self,attempt_id,offset,data_base64):
-        r=_record(self);staged=r['staged'];raw=_b64(data_base64)
+        r=self._worker_record();staged=r['staged'];raw=_b64(data_base64)
         if (r['state']!='active' or attempt_id!=r['attempt'] or staged is None or type(offset) is not int
                 or offset!=len(staged['raw']) or not 0<len(raw)<=4096 or offset+len(raw)>staged['total']):reject()
         staged['raw'].extend(raw)
         return dict(attemptId=attempt_id,receivedBytes=len(staged['raw']),**{k:False for k in _FALSE})
 
     def commit_worker_reply(self,attempt_id):
-        r=_record(self);staged=r['staged']
+        r=self._worker_record();staged=r['staged']
         if r['state']!='active' or attempt_id!=r['attempt'] or staged is None:reject()
         raw=bytes(staged['raw'])
         if len(raw)!=staged['total'] or digest(raw)!=staged['digest']:reject()
@@ -233,20 +289,20 @@ class SceneCreateBrokerV3:
         try:write_frame(r['process'].stdin,value,timeout=5)
         except BaseException:r['state']='failed';raise
         r['pending']=None;r['staged']=None
-        return self.status()
+        return self._worker_status(r)
 
     def drain(self):
-        r=_record(self)
-        if r['stop'] is not None:return self.status()
+        r=self._worker_record()
+        if r['stop'] is not None:return self._worker_status(r)
         if r['unit'] is None and r['slot'].status()['slotState'] in ('empty','drained'):return self.status()
         stopped=r['slot'].drain(r['generation'])
         r['stop']=stopped['stopObservationDigest']
         if r['state'] not in ('terminal','transport-exited','closed','reconciled'):r['state']='frozen'
         r['pending']=None;r['staged']=None
-        return self.status()
+        return self._worker_status(r)
 
     def controller_lost(self):
-        r=_record(self)
+        r=self._worker_record()
         if r['state'] not in ('new','closed','reconciled'):self.drain();r['state']='frozen'
 
     def reconcile_closure(self,certificate):
@@ -269,15 +325,16 @@ class SceneCreateBrokerV3:
         if (r['state']!='reconciled' or r.get('closure') is None
                 or r['terminal'] is None or r['stop'] is None):reject()
         slot=r['slot'].status()
-        if (slot['slotState']!='drained' or slot['slotGeneration']!=r['generation']
+        if (slot['slotState']!='drained' or slot['slotRole']!='scene-create'
+                or slot['creationOutcomeUnknown'] is not False or slot['slotGeneration']!=r['generation']
                 or slot['writerOriginDigest']!=digest(r['origin'])):reject()
         return (r['closure'],r['terminal'],r['stop'],r['origin'],canonical(r['inputs']['daemonBinding']))
 
-    def _capture_closed_phase(self,request_nonce):
+    def _capture_closed_phase(self,request_nonce,*,end=None):
         r=_record(self)
         if (not hex_value(request_nonce) or r['state']!='reconciled' or r.get('closure') is None
                 or r['terminal'] is None or r['stop'] is None):reject()
-        end=time.monotonic()+15
+        end=time.monotonic()+15 if end is None else end
         before=self._closed_phase_seal();closure=decode(r['closure'])
         phase,endpoint,version,baseline=PreparationOwnerV3._observe_closed_create_phase(
             r['preparation'],dict(closure['receiptMap']),end)
@@ -296,6 +353,125 @@ class SceneCreateBrokerV3:
     def observe_closed_phase(self,request_nonce):
         summary,_,_=self._capture_closed_phase(request_nonce)
         return summary
+
+    def observe_stopped_writer_phase(self, request_nonce, first_write, *, recovery_handoff=None, lease_generation=None):
+        """Validate the exact first recovery write against the live original scene."""
+        if not hex_value(request_nonce) or type(first_write) is not dict:reject()
+        first_write = dict(first_write)
+        end = time.monotonic() + 25
+        seal = self._closed_phase_seal()
+        origin = seal[3]
+        origin_digest = digest(origin)
+        inputs = _record(self)['inputs']
+        hello = inputs['hello']
+        closure = decode(seal[0])
+        bundle = inputs['session'].prepared['bundle']
+        operation = bundle.resolve_operations(closure['receiptMap'])[1]
+        pinned = dict(historyDigest=closure['historyDigest'], slotGeneration=closure['slotGeneration'],
+                      nextOperationDigest=operation['requestDigest'])
+        observed_fields = ('phaseDigest', 'endpointBindingDigest')
+        if (operation['phase'] != 'stop' or set(first_write) != set(pinned) | set(observed_fields)
+                or canonical({key:first_write[key] for key in pinned}) != canonical(pinned)
+                or any(not hex_value(first_write[key]) for key in observed_fields)):reject()
+        if recovery_handoff is not None:
+            from deployment_compose_scene_recovery_handoff_v3_host import check_expiry, verify
+            record = _record(self)
+            if 'recoveryHandoff' in record:reject()
+            request = verify(recovery_handoff, public_key=record['intent'], scene_id=record['scene'],
+                             nonce=request_nonce, first_write=first_write, original=inputs['session'].prepared['request'],
+                             bundle=bundle, history=decode(seal[1])['history'])
+
+        def observe():
+            budget = min(5, end - time.monotonic())
+            if budget <= 0:reject()
+            result = observe_stopped_writer(origin, expected_digest=origin_digest,
+                expected_source_sha=hello['sourceSha'], expected_archive_digest=hello['archiveDigest'],
+                timeout=budget)
+            if (result.writerStoppedObserved is not True or result.origin_digest != origin_digest
+                    or not hex_value(result.observation_digest)):reject()
+            return result.observation_digest
+
+        stopped_before = observe()
+        if self._closed_phase_seal() != seal:reject()
+        summary, _, _ = self._capture_closed_phase(request_nonce, end=min(time.monotonic() + 15, end - 5))
+        stopped_after = observe()
+        if (stopped_before != stopped_after or self._closed_phase_seal() != seal
+                or any(summary[key] != first_write[key] for key in observed_fields)
+                or time.monotonic() >= end):reject()
+        result = dict(phaseObservation=summary, writerOriginDigest=origin_digest,
+                      writerStopObservationDigest=stopped_after, firstWriteBindingDigest=digest(canonical(first_write)))
+        if recovery_handoff is not None:
+            payload = recovery_handoff['payload']
+            check_expiry(payload)
+            request.ensure_fresh(datetime.now(timezone.utc), maximum_seconds=1800)
+            if payload['writerStopObservationDigest'] != stopped_after or time.monotonic() >= end:reject()
+            record['recoveryHandoff'] = canonical(dict(certificate=recovery_handoff, firstWrite=first_write))
+            record['recoveryHandoffLease'] = lease_generation
+            record['recoveryWorkerNonce'] = secrets.token_hex(32)
+            result['recoveryHandoffDigest'] = digest(canonical(payload))
+            result['recoveryWorkerNonce'] = record['recoveryWorkerNonce']
+        return result
+
+    def confirm_recovery_worker(self, proof, lease_generation, *, launch=False, relay=False, execute=False,
+                                through_delete=False, full_recovery=False):
+        from deployment_compose_scene_recovery_worker_v3_host import relay_terminal, verify_worker_proof
+
+        record = _record(self)
+        seal = self._closed_phase_seal()
+        if (record.get('recoveryHandoffLease') != lease_generation
+                or record.get('recoveryWorkerNonce') is None):reject()
+        nonce = record.pop('recoveryWorkerNonce')
+        if (any(type(mode) is not bool for mode in (launch, relay, execute, through_delete, full_recovery))
+                or sum((launch, relay, execute)) > 1 or through_delete and not execute
+                or full_recovery and not through_delete):reject()
+        staged = decode(record['recoveryHandoff'])
+        certificate = staged['certificate']
+        handoff = certificate['payload']
+        verified = verify_worker_proof(proof, handoff=handoff, nonce=nonce,
+                                      intent_key=record['intent'], witness_key=record['witness'])
+        if self._closed_phase_seal() != seal:reject()
+        record['recoveryWorkerProofDigest'] = verified
+        record['recoveryWorkerProof'] = canonical(proof)
+        result = dict(workerProofDigest=verified, recoveryHandoffDigest=digest(canonical(handoff)))
+        if launch:
+            deadline = time.monotonic() + proof['intent']['payload']['expiresAt'] - time.time()
+            startup = record['slot'].verify_recovery_startup(record['generation'], record['archive'],
+                daemon_binding=decode(seal[4]), certificate=certificate, proof=proof, nonce=nonce,
+                intent_key=record['intent'], witness_key=record['witness'], proof_digest=verified, deadline=deadline)
+            record['recoveryWorkerStartup'] = canonical(startup)
+            result['workerStartupDigest'] = digest(record['recoveryWorkerStartup'])
+        elif relay or execute:
+            deadline = time.monotonic() + proof['intent']['payload']['expiresAt'] - time.time()
+            stop_context = None
+            if execute:
+                inputs = record['inputs']
+                session = inputs['session']
+                closure = decode(seal[0])
+                if session.unknown_write_result:reject()
+                stop_context = dict(capsule=base64.b64encode(inputs['capsule']).decode('ascii'),
+                    hello=inputs['hello'], bootId=inputs['metadata']['observerFacts']['bootId'],
+                    keys={key:base64.b64encode(value).decode('ascii') for key,value in inputs['keys'].items()},
+                    policy=asdict(record['recoveryGatePolicy']), gateKey=base64.b64encode(record['recoveryGateKey']).decode('ascii'),
+                    firstWrite=staged['firstWrite'], receiptMap=closure['receiptMap'], writerOrigin=decode(seal[3]),
+                    version=decode(canonical(session.guard._version)), throughDelete=through_delete, fullRecovery=full_recovery)
+                # No cleanup can infer ownership while a write result is uncertain.
+                session.unknown_write_result = True
+            unit, generation, channel_nonce = record['slot'].start_recovery_relay(
+                record['generation'], record['archive'], daemon_binding=decode(seal[4]), certificate=certificate,
+                proof=proof, nonce=nonce, intent_key=record['intent'], witness_key=record['witness'], deadline=deadline,
+                stop_context=stop_context)
+            attempt = secrets.token_hex(32)
+            record['recoveryRelay'] = dict(state='active', unit=unit, process=unit._process, generation=generation,
+                nonce=channel_nonce, attempt=attempt, slot=record['slot'], stop=None, pending=None, staged=None,
+                terminal=None, buffer=bytearray(), stdout_eof=False, stderr_eof=False, last_rpc=0,
+                relayTerminal=canonical(relay_terminal(channel_nonce, verified)))
+            if execute:
+                index = 4 if full_recovery else 2 if through_delete else 1
+                operation = session.prepared['bundle'].resolve_operations(closure['receiptMap'])[index]
+                record['recoveryRelay'].update(stopStatus=operation['expectedStatus'], proofDigest=verified,
+                                               throughDelete=through_delete, fullRecovery=full_recovery)
+            result['workerRelay'] = dict(attemptId=attempt, channelNonce=channel_nonce)
+        return result
 
     def capture_closed_phase_snapshot(self,request_nonce):
         summary,raw,seal=self._capture_closed_phase(request_nonce)

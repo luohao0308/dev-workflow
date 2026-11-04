@@ -235,7 +235,8 @@ class OperationWitnessStoreV3(ComposeWitnessStore):
             fail()
         return value
 
-    def append_event(self, binding, *, expected_seq, expected_head, event, boot_nonce, rpc_nonce, external_material=None):
+    def append_event(self, binding, *, expected_seq, expected_head, event, boot_nonce, rpc_nonce,
+                     external_material=None, expected_state_identity=None):
         if type(expected_seq) is not int or not all(hex_value(v) for v in (expected_head, boot_nonce, rpc_nonce)):
             fail()
         event = deepcopy(event)
@@ -243,6 +244,10 @@ class OperationWitnessStoreV3(ComposeWitnessStore):
             fail()
         encoded = external_material_base64(event, external_material)
         with self._locked():
+            if expected_state_identity is not None:
+                current = os.stat('state.json', dir_fd=self._dir, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != expected_state_identity:
+                    fail()
             state = self._read(); scope = self._find(state, binding)
             if scope is not state['scopes'][-1] or self._cursor(scope) != (expected_seq, expected_head):
                 fail()
@@ -264,9 +269,14 @@ class OperationWitnessStoreV3(ComposeWitnessStore):
                 fail()
             return deepcopy(scope['events'][seq:])
 
-    def transition_successor(self, parentBinding, *, expected_seq, expected_head, childBinding):
+    def transition_successor(self, parentBinding, *, expected_seq, expected_head, childBinding,
+                             expected_state_identity=None):
         child = binding_value(childBinding)
         with self._locked():
+            if expected_state_identity is not None:
+                current = os.stat('state.json', dir_fd=self._dir, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != expected_state_identity:
+                    fail()
             state = self._read(); parent = self._find(state, parentBinding)
             if (type(expected_seq) is not int or not hex_value(expected_head) or parent is not state['scopes'][-1]
                     or self._cursor(parent) != (expected_seq, expected_head) or self._phase(parent)[0] != 'closed'

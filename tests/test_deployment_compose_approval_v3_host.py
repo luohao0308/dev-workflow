@@ -41,6 +41,43 @@ def request(**changes):
     return RequestV2(**dict(values, **changes))
 
 
+class SceneRecoveryLedgerTests(unittest.TestCase):
+    def test_second_approved_run_cannot_consume_same_request(self):
+        recovery=request(operation='recovery',profile_id=host.SCENE_RECOVERY_PROFILE,
+                         history_hash='1'*64,components=('web',))
+        first_policy=host.SceneRecoveryApprovalPolicyV3(
+            **vars(policy(operation='recovery',expected_history_hash=recovery.history_hash,components=('web',))),
+            expected_observation_hash=recovery.observation_hash,expected_scene_review_hash='2'*64)
+
+        def approved(config):
+            client=Client(config,[recovery])
+            env=client.data.pop('/repos/sample/host/environments/release')
+            env['name']='compose-review'
+            client.data['/repos/sample/host/environments/compose-review']=env
+            run='/repos/sample/host/actions/runs/123'
+            review=client.data.pop(run+'/approvals')
+            review[0]['environments'][0]['name']='compose-review'
+            new_run=run.removesuffix('123')+str(config.run_id)
+            client.data[new_run]=dict(client.data.pop(run),id=config.run_id)
+            client.data[new_run+'/approvals']=review
+            token=dict(claims(config),aud=host.AUDIENCE)
+            return host.GitHubSceneRecoveryApprovalV3(client,'signed',[recovery],config,verifier=lambda _: token)
+
+        first=approved(first_policy)
+        second=approved(replace(first_policy,run_id=456))
+        self.assertNotEqual(first.bundle_hash,second.bundle_hash)
+        second.client.markers=first.client.markers
+        grant=first.validate(recovery)
+        first.consume(grant,recovery)
+        first.check_consumed_intent(recovery)
+        self.assertEqual(list(first.client.markers),['tags/workflow-compose-scene-recovery-v3/'+recovery.digest()])
+        with self.assertRaises(AuthorizationUnavailable):
+            second.consume(second.validate(recovery),recovery)
+        with self.assertRaises(AuthorizationUnavailable):
+            second.check_consumed_intent(recovery)
+        self.assertEqual(len(first.client.markers),1)
+
+
 class ComposeApprovalTests(unittest.TestCase):
     def setUp(self):
         self.req = request()

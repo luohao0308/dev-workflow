@@ -358,6 +358,9 @@ class GitHubActionsApproval:
         expires = datetime.fromtimestamp(self._grant_expiry(request), timezone.utc).isoformat()
         return self.grant_type(self.grant_namespace + ':' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
 
+    def _ledger_marker(self, request):
+        return 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+
     def consume(self, grant, request, *, before_consume=None):
         """Consume once, optionally checking a trusted SDK guard at the CAS edge."""
         if before_consume is not None and not callable(before_consume):
@@ -366,7 +369,7 @@ class GitHubActionsApproval:
             expected = self.validate(request)
             if type(grant) is not self.grant_type or grant != expected or request.digest() in self._consumed:
                 _deny('Grant changed or already consumed')
-            marker = 'refs/tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+            marker = 'refs/' + self._ledger_marker(request)
             # No automatic retry: both a duplicate and a lost response deny dispatch.
             self._consumed.add(request.digest())
             def before_send():
@@ -393,7 +396,7 @@ class GitHubActionsApproval:
         self._check_authority()
         if request.digest() not in self._verified_consumptions:
             _deny('Mutation requires consumed grant')
-        marker = 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+        marker = self._ledger_marker(request)
         value = self._get('/repos/' + self.policy.ledger_repository + '/git/ref/' + marker)
         if value.get('ref') != 'refs/' + marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
             _deny('Durable grant ledger changed')

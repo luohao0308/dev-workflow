@@ -43,10 +43,11 @@ class SceneTests(unittest.TestCase):
                 patch.object(scene,'_peer',return_value=(os.getpid(),os.getuid(),os.getgid()))):
             item.start();self.addCleanup(item.stop)
         self.script=ROOT/'tests/support/compose_scene_service_fixture.py'
+        mode = next((mode for test, mode in [('failed_drain', 'fail-drain'), ('failed_preparation', 'fail-prep'),
+                                             ('writer_phase', 'writer-phase')] if test in self._testMethodName), '')
         self.process=subprocess.Popen([sys.executable,str(self.script),'serve',str(self.base),self.scene_id,str(self.marker),'6' if 'slow_stop' in self._testMethodName else '0',
              '.2' if ('idle_lease' in self._testMethodName or 'long_preparation' in self._testMethodName) else '30','0',
-             'fail-drain' if 'failed_drain' in self._testMethodName else ('fail-prep' if 'failed_preparation' in self._testMethodName else ''),
-             '.4' if 'long_preparation' in self._testMethodName else '0'],
+             mode,'.4' if 'long_preparation' in self._testMethodName else '0'],
             stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.addCleanup(self.cleanup_service)
         end=time.monotonic()+5
