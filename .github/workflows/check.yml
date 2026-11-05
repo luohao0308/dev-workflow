@@ -2,10 +2,17 @@ name: Checks
 
 on:
   push:
+    # The retained-scene verifier needs distinct full push and PR runs.
+    branches: [main, feat/compose-validation-20261028]
   pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   python-and-bash:
+    timeout-minutes: 120
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -23,6 +30,7 @@ jobs:
 
   powershell-integration:
     runs-on: windows-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
