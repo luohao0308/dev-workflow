@@ -1,0 +1,68 @@
+{
+  "date": "2026-11-04",
+  "parentSourceSha": "64d945da0e3710cf9be7601e3e325d1111f908b3",
+  "scope": "bounded full historical phase snapshot transport; no recovery authority",
+  "validation": {
+    "python310Combined": {
+      "tests": 29,
+      "seconds": 88.034,
+      "result": "pass"
+    },
+    "python314Core": {
+      "tests": 8,
+      "seconds": 48.77,
+      "result": "pass"
+    },
+    "python314FinalAcceptanceBudget": {
+      "tests": 2,
+      "seconds": 28.892,
+      "result": "pass"
+    },
+    "review": "CLEAR",
+    "AST": "pass",
+    "diffWhitespace": "pass"
+  },
+  "filesSha256": {
+    "docs/plans/compose-mac-restart-2026-11-02.md": "8902357d2b74f532090f2847018ec8f343b52fa382fbe19e82f9545da77d6fab",
+    "scripts/deployment_compose_scene_checkpoint_v3_host.py": "034de67327e460351053168a86ec4981727b0ec63f2dd3bed8a465487f643695",
+    "scripts/deployment_compose_scene_control_ssh_v3_host.py": "48503002b1796bf79c3d294c5f19a0eaa6ac79a6a3357fed5acfdb69aef388e2",
+    "scripts/deployment_compose_scene_create_broker_v3_host.py": "2edeb61e7f919cdebbe2422a55e06b9cd35a39a046ade74c15f03646634ed1a7",
+    "scripts/deployment_compose_scene_live_phase_v3_host.py": "4388f7d0b06b219f66502096f8b71da83f6d10fa32b6ce540a7cd5c6b340c7c2",
+    "scripts/deployment_compose_scene_service_v3_host.py": "eef70877b0469ebb7b7eeac7765cf0ed4eaed6512827659e318713700b2d3365",
+    "scripts/deployment_compose_scene_phase_snapshot_v3_host.py": "7f8a60016655ba93f1b5706c0642b0090b8a0513be7430e3549a98fd9667c783",
+    "tests/test_deployment_compose_scene_live_phase_v3_host.py": "c180328fde96ce6fdece6205853c0f2200ed40b58e627587e21da9415009d3d0",
+    "tests/test_deployment_compose_scene_phase_snapshot_v3_host.py": "70024900c24bf71b79dc31fd5d473fb9c12cdc16946bfce9a5d21c5f43543725"
+  },
+  "limits": {
+    "serverCacheBytes": 4194304,
+    "singleCachedSnapshot": true,
+    "chunkBytes": 4096,
+    "wireFrameBytes": 8192,
+    "downloadAcceptanceSeconds": 120,
+    "heartbeatStatusSeconds": 10,
+    "globalHardDeadlineClaimed": false
+  },
+  "evidence": {
+    "chunkDoesNotReadEngine": true,
+    "failedCapturePreservesPriorSnapshotButDoesNotReturnItAsNew": true,
+    "oldIdRejectedAfterReplacement": true,
+    "strictChunkLengthAndCanonicalBase64": true,
+    "rawSHAAndCanonicalRowsResourcesSubjectVerified": true,
+    "ownedSSHClosesBeforeIssuance": true,
+    "originalPinsHistoryReverified": true,
+    "sealedSnapshotOwnerAndAllTypedFields": true,
+    "copyReplaceThreadForkClosedReaderAndFlagMutationReject": true,
+    "badTailOrUncleanDetachDoesNotIssueSnapshot": true
+  },
+  "doubles": [
+    "GitHub provider",
+    "scene/SSH startup and transport in Mac binding tests",
+    "kernel endpoint; native PhaseGuard/Unix reads covered independently"
+  ],
+  "realFullSnapshotAcceptance": "pending new exact-source CI and fresh original scene/request approval",
+  "phaseFreshnessVerified": false,
+  "writerQuiescenceVerified": false,
+  "authorityGranted": false,
+  "recoveryAuthorized": false,
+  "productionReady": false
+}

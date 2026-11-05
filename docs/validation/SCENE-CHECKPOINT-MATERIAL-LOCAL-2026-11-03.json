@@ -1,0 +1,89 @@
+{
+  "date": "2026-11-03",
+  "status": "local read-only scene checkpoint wiring verified; real acceptance pending",
+  "publication": "local workspace only; not committed or published",
+  "scope": "first closed create material custody; no writer-origin or source-archive custody",
+  "filesSha256": {
+    "scripts/deployment_compose_scene_create_controller_v3_host.py": "73de6e6cdbb4460e48ffa584d16a06a9b651617524e2b3d56cd14f4903a316a3",
+    "tests/support/compose_scene_create_integration_fixture.py": "3e6e2b08e8fd3ce9357670a3ce82934fed3f9be5db48535188ee23fcfc0813c7",
+    "tests/support/compose_scene_controller_integration_fixture.py": "ca5721791b748082eabd1809fdcc0c8a49d642df19ff5b5f4e1dc404f128e4c6",
+    "tests/support/compose_scene_checkpoint_exit_fixture.py": "42dedaeaf25a515d71ad61ff3f9dc5119c80ef7f38c8330df5ba19d0b1287095",
+    "tests/test_deployment_compose_scene_checkpoint_v3_host.py": "1c6a5ff3effa72833dbac9fb485139eb44507699d16eeee92e20da8187d2685b",
+    "tests/test_deployment_compose_scene_checkpoint_exit_v3_host.py": "ec0da4e0c64f51a2051f578d8be3a0895392a806f78d206ec00c4d9e49e2d621"
+  },
+  "validation": {
+    "python310": {
+      "controller_and_checkpoint": {
+        "tests": 10,
+        "seconds": 139.547,
+        "result": "pass"
+      },
+      "final_callback_binding_mutation": {
+        "tests": 1,
+        "seconds": 10.047,
+        "result": "pass"
+      }
+    },
+    "python314": {
+      "checkpoint_and_process_exit": {
+        "tests": 6,
+        "seconds": 90.916,
+        "result": "pass"
+      },
+      "final_binding_mutation_and_process_exit": {
+        "tests": 2,
+        "seconds": 30.125,
+        "result": "pass"
+      },
+      "existing_checkpoint_source_regressions": {
+        "tests": 36,
+        "seconds": 163.396,
+        "result": "pass"
+      }
+    },
+    "pythonAST": "425 files passed",
+    "bashSyntax": "pass",
+    "diffCheck": "pass",
+    "bashIntegration": "not completed: optional installer regression stopped after 6 minutes; installers and installed overlays unchanged in this increment"
+  },
+  "evidence": {
+    "originalProducerExitedBeforeConsumer": true,
+    "originalWitnessUnchanged": true,
+    "nativeTLSGateSSHSIGCAS": true,
+    "productCreateCountPerSuccessfulFixture": 1,
+    "invalidCallbackAndExistingMaterialZeroDispatch": true,
+    "saveOrCallbackFailureNoRedispatch": true,
+    "callbackRunsDetached": true,
+    "callbackAdmissionMutationRejected": true,
+    "writerOriginBound": false,
+    "sourceArchiveBound": false,
+    "phaseFreshnessVerified": false,
+    "linuxQuiescenceVerified": false,
+    "executionRecovered": false
+  },
+  "doubles": [
+    "GitHub approval provider",
+    "Unix Engine",
+    "Linux kernel/issuer isolation",
+    "scene authentication transport/startup"
+  ],
+  "initialTestFailures": [
+    {
+      "cause": "dispatch spy counted the fixture deliberate rejected second start as an actual dispatch",
+      "resolution": "count only successful original start calls"
+    },
+    {
+      "cause": "test patch of inherited __new__ left constructor slot behavior changed for later tests",
+      "resolution": "observe original save callback on its controller instead of patching class allocation"
+    }
+  ],
+  "remaining": [
+    "scene-specific authenticated writer origin/stop and closure binding",
+    "scene-specific source archive custody",
+    "real retained scene checkpoint and cold-process acceptance",
+    "new recovery approval/consumption/session/admission/tail CAS"
+  ],
+  "productionReady": false,
+  "recoveryAuthorized": false,
+  "executionAvailable": false
+}

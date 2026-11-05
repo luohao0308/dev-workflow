@@ -23,6 +23,9 @@ from release_execute import AuthorizationUnavailable, Grant, Receipt, Request, O
 
 ISSUER = 'https://token.actions.githubusercontent.com'
 AUDIENCE = 'dev-workflow-release-host'
+_NOT_PREFETCHED = object()
+_AUTHORITY_ROLES = ('host-repository', 'target-repository', 'ledger-repository',
+                    'oidc-subject', 'workflow-run', 'protected-environment', 'approvals')
 
 
 def bundle_digest(requests, expires_at, context=None):
@@ -198,6 +201,10 @@ class GitHubActionsApproval:
     def _grant_expiry(self, request):
         return self._expires
 
+    def _prefetch_authority(self):
+        # Default hosts retain sequential reads and their original early rejects.
+        return None
+
     def __init__(self, client, oidc_token, requests, policy: HostPolicy, *, verifier=None):
         self.client, self.token, self.policy = client, oidc_token, policy
         self.requests = tuple(requests)
@@ -239,25 +246,41 @@ class GitHubActionsApproval:
         mismatches = tuple(key for key, value in expected.items() if claims.get(key) != value)
         if mismatches:
             _deny('OIDC workflow identity does not match trusted policy', mismatch_fields=mismatches)
+        prefetched = self._prefetch_authority()
+        if prefetched is not None:
+            if type(prefetched) is not dict or set(prefetched) != set(_AUTHORITY_ROLES):
+                _deny('Invalid GitHub authority batch')
+            try:
+                # Own one JSON snapshot for this check only; never retain client
+                # response objects or reuse consent across authority checks.
+                prefetched = json.loads(json.dumps(prefetched, allow_nan=False))
+            except (TypeError, ValueError, OverflowError):
+                _deny('Invalid GitHub authority batch')
+            if any(type(prefetched[role]) is not (list if role == 'approvals' else dict)
+                   for role in _AUTHORITY_ROLES):
+                _deny('Invalid GitHub authority batch')
+        def read(role, path):
+            return self._get(path) if prefetched is None else prefetched[role]
         host_repository = None
-        for slug, identity in ((policy.host_repository, policy.host_repository_id),
-                               (policy.target_repository, policy.target_repository_id),
-                               (policy.ledger_repository, policy.ledger_repository_id)):
-            repo = self._get('/repos/' + slug)
+        for role, slug, identity in (('host-repository', policy.host_repository, policy.host_repository_id),
+                                    ('target-repository', policy.target_repository, policy.target_repository_id),
+                                    ('ledger-repository', policy.ledger_repository, policy.ledger_repository_id)):
+            repo = read(role, '/repos/' + slug)
             if repo.get('id') != identity or repo.get('full_name') != slug:
                 _deny('GitHub repository identity changed')
             if slug == policy.host_repository:
                 host_repository = repo
-        self._verify_subject(claims, host_repository)
+        self._verify_subject(claims, host_repository,
+                             _NOT_PREFETCHED if prefetched is None else prefetched['oidc-subject'])
         run_path = '/repos/' + policy.host_repository + '/actions/runs/' + str(policy.run_id)
-        run = self._get(run_path)
+        run = read('workflow-run', run_path)
         if (run.get('id') != policy.run_id or run.get('run_attempt') != 1 or run.get('head_sha') != policy.workflow_sha
                 or run.get('status') != 'in_progress' or run.get('event') != 'workflow_dispatch'
                 or run.get('repository', {}).get('id') != policy.host_repository_id
                 or str(run.get('actor', {}).get('id')) != claims.get('actor_id')):
             _deny('Workflow run does not match authenticated execution')
         approval_environment = self._approval_environment()
-        environment = self._get('/repos/' + policy.host_repository + '/environments/' + approval_environment)
+        environment = read('protected-environment', '/repos/' + policy.host_repository + '/environments/' + approval_environment)
         if (type(environment.get('id')) is not int or environment['id'] <= 0
                 or environment.get('name') != approval_environment):
             _deny('Protected environment identity changed')
@@ -269,7 +292,7 @@ class GitHubActionsApproval:
         ids = [item.get('reviewer', {}).get('id') for item in reviewers if item.get('type') == 'User']
         if (len(ids) != len(reviewers) or not ids or set(ids) != set(policy.reviewer_ids)):
             _deny('Protected environment reviewer policy changed')
-        reviews = self._get(run_path + '/approvals')
+        reviews = read('approvals', run_path + '/approvals')
         if not isinstance(reviews, list):
             _deny('Run approval history unavailable')
         if any(review.get('state') == 'rejected' and any(item.get('id') == environment.get('id') for item in review.get('environments', [])) for review in reviews):
@@ -286,11 +309,12 @@ class GitHubActionsApproval:
         if time.time() >= self._expires:
             _deny('Authorization expired during authority verification')
 
-    def _verify_subject(self, claims, repository):
+    def _verify_subject(self, claims, repository, settings=_NOT_PREFETCHED):
         # Repository API settings select the exact format. Neither a token's
         # appearance nor project-controlled data may choose a weaker subject.
         policy = self.policy
-        settings = self._get('/repos/' + policy.host_repository + '/actions/oidc/customization/sub')
+        if settings is _NOT_PREFETCHED:
+            settings = self._get('/repos/' + policy.host_repository + '/actions/oidc/customization/sub')
         if (not isinstance(settings, dict) or settings.get('use_default') is not True
                 or ('include_claim_keys' in settings and settings['include_claim_keys'] != [])):
             _deny('Custom OIDC subject templates are unsupported')
@@ -334,6 +358,9 @@ class GitHubActionsApproval:
         expires = datetime.fromtimestamp(self._grant_expiry(request), timezone.utc).isoformat()
         return self.grant_type(self.grant_namespace + ':' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
 
+    def _ledger_marker(self, request):
+        return 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+
     def consume(self, grant, request, *, before_consume=None):
         """Consume once, optionally checking a trusted SDK guard at the CAS edge."""
         if before_consume is not None and not callable(before_consume):
@@ -342,21 +369,29 @@ class GitHubActionsApproval:
             expected = self.validate(request)
             if type(grant) is not self.grant_type or grant != expected or request.digest() in self._consumed:
                 _deny('Grant changed or already consumed')
-            marker = 'refs/tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+            marker = 'refs/' + self._ledger_marker(request)
             # No automatic retry: both a duplicate and a lost response deny dispatch.
             self._consumed.add(request.digest())
+            preflight_stage = None
             def before_send():
+                nonlocal preflight_stage
+                preflight_stage = 'authority'
                 self._check_authority()
                 if before_consume is not None:
+                    preflight_stage = 'host-guard'
                     before_consume()
                 # All blocking authority and SDK reads precede these local checks.
+                preflight_stage = 'freshness'
                 self._match(request)
                 if time.time() >= min(self._grant_expiry(request), timestamp(grant.expires_at).timestamp()):
                     _deny('Authorization expired before grant consumption')
+                preflight_stage = None
             try:
                 value, _headers = self.client.request('POST', '/repos/' + self.policy.ledger_repository + '/git/refs',
                                             {'ref': marker, 'sha': self.policy.ledger_sha}, before_send=before_send)
             except Exception:
+                if preflight_stage is not None:
+                    _deny('Durable grant preflight rejected at ' + preflight_stage)
                 _deny('Durable grant consumption rejected or outcome unknown')
             if not isinstance(value, dict) or value.get('ref') != marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
                 _deny('Durable grant consumption not verified')
@@ -369,7 +404,7 @@ class GitHubActionsApproval:
         self._check_authority()
         if request.digest() not in self._verified_consumptions:
             _deny('Mutation requires consumed grant')
-        marker = 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
+        marker = self._ledger_marker(request)
         value = self._get('/repos/' + self.policy.ledger_repository + '/git/ref/' + marker)
         if value.get('ref') != 'refs/' + marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
             _deny('Durable grant ledger changed')

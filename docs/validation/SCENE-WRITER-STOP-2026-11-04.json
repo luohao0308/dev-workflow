@@ -1,0 +1,31 @@
+{
+  "date": "2026-11-04",
+  "scope": "scene checkpoint-bound read-only original writer stop observation",
+  "validation": {
+    "python310": {
+      "tests": 17,
+      "seconds": 50.078,
+      "result": "pass"
+    },
+    "python314": {
+      "tests": 17,
+      "seconds": 58.316,
+      "result": "pass"
+    },
+    "AST": "pass",
+    "diffWhitespace": "pass",
+    "review": "CLEAR"
+  },
+  "filesSha256": {
+    "scripts/deployment_compose_scene_checkpoint_v3_host.py": "2d81da73bcf8884d7ebb2cf7f25e737049c1467027ffcf8e26eee1b840b4fbde",
+    "tests/test_deployment_compose_scene_checkpoint_security_v3_host.py": "4f8d3a005348598e3f43bc7632a4d7e89a05741a171d4a099bfa42c6b97c03b6",
+    "docs/plans/compose-mac-restart-2026-11-02.md": "715f6b0954482816165218ccc8e73f3cb1631e761da65372fbd9da011f87503c"
+  },
+  "realSSHObservation": "pending publication source/ref check",
+  "newBusinessRequests": 0,
+  "newApprovalConsumptions": 0,
+  "globalWriterFenceVerified": false,
+  "phaseFreshnessVerified": false,
+  "recoveryAuthorized": false,
+  "productionReady": false
+}
