@@ -25,6 +25,47 @@ import deployment_compose_scene_live_phase_v3_host as phase
 from deployment_compose_scene_create_certificate_v3_host import CHALLENGE
 from deployment_compose_witness_store import canonical
 from deployment_compose_recovery_phase_capsule_v3_host import decode
+from deployment_compose_scene_service_v3_host import SceneClientV3
+
+
+class SceneRecoveryRelayDiagnosticsTests(unittest.TestCase):
+    def test_distinguishes_authorization_timeout_from_oversized_reply(self):
+        attempt, nonce = '1'*64, '2'*64
+        frame = dict(kind='rpc', channelNonce=nonce, rpcId=1, service='intent', method='check', request={})
+        raw = canonical(frame)
+        message = dict(attemptId=attempt, messageDigest=phase.digest(raw), totalBytes=len(raw),
+                       rpcId=1, service='intent', method='check')
+        state = dict(business=dict(attemptId=attempt, pendingNonce=nonce, businessState='active', message=message))
+        chunk = dict(business=dict(attemptId=attempt, messageDigest=message['messageDigest'],
+                                   totalBytes=len(raw), offset=0, dataBase64=base64.b64encode(raw).decode('ascii')))
+        proof = dict(intent=dict(payload=dict(expiresAt=120)))
+
+        for authorize_seconds, reply_bytes, expected in (
+            (20, 1, r'relay deadline at reply preparation for intent\.check after 0 completed RPCs .*intent=20\.000s'),
+            (0, 8192, r'relay reply exceeds 8192 bytes'),
+        ):
+            with self.subTest(expected=expected):
+                now = 100
+
+                def authorize(service, method, request):
+                    nonlocal now
+                    self.assertEqual((service, method, request), ('intent', 'check', {}))
+                    now += authorize_seconds
+                    return {'value': 'a'*reply_bytes}
+
+                with (
+                    patch.object(phase.time, 'monotonic', side_effect=lambda: now),
+                    patch.object(phase.time, 'time', return_value=100),
+                    patch.object(ssh, '_issued_scene_ssh_client'),
+                    patch.object(SceneClientV3, 'poll_worker', return_value=state),
+                    patch.object(SceneClientV3, 'read_worker_chunk', return_value=chunk),
+                    patch.object(SceneClientV3, 'begin_worker_reply') as begin,
+                ):
+                    with self.assertRaisesRegex(ValueError, expected):
+                        phase._drive_recovery_relay(
+                            object(), dict(attemptId=attempt, channelNonce=nonce), proof, '3'*64, authorize,
+                        )
+                    begin.assert_not_called()
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),

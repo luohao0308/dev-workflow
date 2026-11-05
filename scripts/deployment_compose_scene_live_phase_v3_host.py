@@ -224,16 +224,34 @@ def _drive_recovery_relay(client, relay, proof, proof_digest, authorize, *, stop
     attempt, nonce = relay['attemptId'], relay['channelNonce']
     expected_terminal = digest(canonical(relay_terminal(nonce, proof_digest)))
     expiry = proof['intent']['payload']['expiresAt']
-    deadline = time.monotonic() + expiry - time.time()
+    started = time.monotonic()
+    deadline = started + expiry - time.time()
     if stop_verifier is not None:
-        deadline = time.monotonic() + (180 if full_recovery else 150 if through_delete else 90)
+        deadline = started + (180 if full_recovery else 150 if through_delete else 90)
     exchanges = (('intent', 'check'), ('witness', 'check'))
     allowed = {'intent': {'check'}, 'witness': {'read', 'check', 'chain_status', 'events_after', 'append_event'}}
     if through_delete:
         allowed['witness'].add('transition_successor')
     message_limit = 4*1024*1024 if stop_verifier is not None else 8192
     next_rpc = 0
-    while time.monotonic() < deadline:
+    authorization_seconds = {'intent': 0.0, 'witness': 0.0}
+
+    def check_deadline(stage):
+        now = time.monotonic()
+        if now >= deadline:
+            elapsed = now - started
+            intent = authorization_seconds['intent']
+            witness = authorization_seconds['witness']
+            other = max(0.0, elapsed - intent - witness)
+            raise ValueError(
+                f'compose-scene-live-phase-v3-rejected: relay deadline at {stage} '
+                f'after {next_rpc} completed RPCs '
+                f'(elapsed={elapsed:.3f}s, intent={intent:.3f}s, '
+                f'witness={witness:.3f}s, other={other:.3f}s)'
+            ) from None
+
+    while True:
+        check_deadline('worker poll')
         _issued_scene_ssh_client(client)
         state = SceneClientV3.poll_worker(client)['business']
         if state['attemptId'] != attempt or state['pendingNonce'] != nonce:
@@ -276,8 +294,7 @@ def _drive_recovery_relay(client, relay, proof, proof_digest, authorize, *, stop
             reject()
         raw = bytearray()
         while len(raw) < size:
-            if time.monotonic() >= deadline:
-                reject()
+            check_deadline('request read')
             chunk = SceneClientV3.read_worker_chunk(client, attempt, message['messageDigest'], len(raw), 4096)['business']
             data = base64.b64decode(chunk['dataBase64'], validate=True)
             if (chunk['attemptId'] != attempt or chunk['messageDigest'] != message['messageDigest']
@@ -293,15 +310,18 @@ def _drive_recovery_relay(client, relay, proof, proof_digest, authorize, *, stop
                 or frame['rpcId'] != next_rpc+1 or (frame['service'], frame['method']) != pair):
             reject()
         _issued_scene_ssh_client(client)
+        authorization_started = time.monotonic()
         response = authorize(frame['service'], frame['method'], frame['request'])
+        authorization_seconds[pair[0]] += time.monotonic() - authorization_started
         reply = canonical(dict(kind='reply', channelNonce=nonce, rpcId=frame['rpcId'], response=response))
-        if time.monotonic() >= deadline or len(reply) > message_limit:
-            reject()
+        check_deadline(f'reply preparation for {pair[0]}.{pair[1]}')
+        if len(reply) > message_limit:
+            raise ValueError(
+                f'compose-scene-live-phase-v3-rejected: relay reply exceeds {message_limit} bytes'
+            ) from None
         SceneClientV3.begin_worker_reply(client, attempt, len(reply), digest(reply), frame['rpcId'])
         for offset in range(0, len(reply), 4096):
-            if time.monotonic() >= deadline:
-                reject()
+            check_deadline(f'reply transfer for {pair[0]}.{pair[1]}')
             SceneClientV3.worker_reply_chunk(client, attempt, offset, base64.b64encode(reply[offset:offset+4096]).decode('ascii'))
         SceneClientV3.commit_worker_reply(client, attempt)
         next_rpc += 1
-    reject()
