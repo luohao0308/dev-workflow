@@ -104,6 +104,8 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 
 通用历史与恢复准备器可显式选择 `ancestry_profile='bounded-recovery-v1'`，在最多八代的祖先链上以新请求接续已闭合的恢复前缀，并在 successor CAS 前核验全链容量。该模式已通过单服务和双服务多代本地执行测试，受管 scene、进程崩溃接管及跨代持久化材料继续单独实现和验收。
 
+独立多代材料 reader 可在新进程重建并重新认证整条祖先链，随后使用原认证 CAS 准备新请求。本地测试覆盖三代双服务、回滚基线，以及检查点发布进程被 SIGKILL 后的新 consumer 冷读；完整 coordinator 和 scene-owner 的崩溃接管按[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)继续推进。
+
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。

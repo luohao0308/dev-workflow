@@ -44,7 +44,7 @@
 
 旧 schema 1/2 继续按原分段语义处理。多代恢复上下文使用独立 schema 2 和 ancestry profile 字段。字节准入、scope 和事件容量必须在 successor CAS 前纳入全部祖先；累计全局 scope 数与当前 bundle 的写入索引分别计算。
 
-此阶段使用通用 SDK 与原有回调式 writer 停止证明。受管 scene 的旧胶囊、首 create 检查点与固定四笔尾部仍按原契约读取。跨进程的多代材料与 scene-owner 接管需要后续接线。
+此阶段使用通用 SDK 与原有回调式 writer 停止证明。受管 scene 的旧胶囊、首 create 检查点与固定四笔尾部仍按原契约读取。冷读后的实际 worker 接续与 scene-owner 接管需要后续接线。
 
 ## 多代 SDK 验证进度
 
@@ -56,7 +56,19 @@
 
 最终十五项多代用例在 Python 3.10 / 3.14 各通过，相关历史、恢复准备、fence 与字节预算的四十项既有用例在两版通过。多代代码经独立复审，回调一致性缺陷修复后复审通过。Python AST 与 diff 空白检查通过。
 
-第一版允许根 deploy 发起 rollback，然后对该 rollback 发起 recovery。已恢复部署再发起新 rollback 的准备接线，以及 schema-3 的持久化材料、整个 coordinator 崩溃和 scene-owner 重启接管，继续作为后续工作。
+第一版允许根 deploy 发起 rollback，然后对该 rollback 发起 recovery。已恢复部署再发起新 rollback 的准备接线、整个 coordinator 崩溃和 scene-owner 重启接管，继续作为后续工作。
+
+## 多代材料冷读
+
+`deployment_compose_bounded_restart_material_v3_host.capture_material/reopen_material` 使用独立的 `compose-bounded-restart-material-v3` 格式，保存 root 到 leaf 的每代请求、bundle、消费摘要、首 scope、已审父快照以及各 bundle 的基线和默认值。材料限制八个节点及 16 MiB，只接受当前逻辑操作已闭合且未完成的前缀。
+
+捕获和重建均核对每代与认证 segments 的顺序、请求/回执摘要、父历史摘要和首 binding。全部祖先共享源、目标、宿主、daemon、环境、组件集合、policy 以及独立配置的验证密钥。回滚使用其独立 bundle 与基线。默认值通过请求的域隔离 plan hash 查找后重新构造校验。
+
+调用方分别保存材料和独立 digest/context pins，并在新进程外部配置 Gate key、公钥和只读见证 transport。返回历史重新认证全部祖先并逐字节比较快照，可进入显式模式的现有恢复准备器。原认证 CAS 及其外部 key 仍须独立保留。
+
+测试覆盖三代双服务冷读后准备新请求、回滚后的两套基线、伪造/重排/缺失祖先、已知 scope 的错误首 binding、错密钥和 pin、输入回调期间变更、只读 transport 及 producer 正常退出或真实 SIGKILL 后的新 consumer。子进程用例使用复制的测试见证与测试签名材料，验证的是检查点发布进程退出后的只读重建。真实 coordinator、writer 停止与 scene-owner 接管另行验证。
+
+新模块十项测试在 Python 3.10 / 3.14 各通过，最终加强的完整前缀拒绝用例在两版另行通过。AST、diff 空白检查和独立架构复审通过。
 
 ## 验证
 
