@@ -99,6 +99,7 @@ else:raise AssertionError('forged issuer accepted')
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertEqual(result.stdout.strip(),'kernel-command-rejected')
 
+    @unittest.skipUnless(os.name=='posix','POSIX framed bootstrap required')
     def test_fixed_bootstrap_rejects_wrong_pins_before_import(self):
         code=source.diagnostic_bootstrap('a'*40,'b'*64)
         compile(code,'<bootstrap>','exec')
