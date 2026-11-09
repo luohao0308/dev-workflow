@@ -276,6 +276,40 @@ class ParallelAuthorityTests(unittest.TestCase):
             self.assertEqual(first.request_hash, self.req.digest())
             sequential.assert_not_called()
 
+    def test_scene_recovery_uses_fresh_batches_and_rechecks_consumed_ledger(self):
+        self.req = request(operation='recovery', profile_id=host.SCENE_RECOVERY_PROFILE,
+                           history_hash='1'*64, components=('web',))
+        self.policy = host.SceneRecoveryApprovalPolicyV3(
+            **vars(policy(operation='recovery', expected_history_hash=self.req.history_hash, components=('web',))),
+            expected_observation_hash=self.req.observation_hash, expected_scene_review_hash='2'*64)
+        self.claims = dict(claims(self.policy), aud=host.AUDIENCE)
+        self.client = self.client_for([self.req])
+
+        def request_live(_client, *args, **kwargs):
+            return self.client.request(*args, **kwargs)
+
+        with self.batch_patch(), mock.patch.object(self.live._ReadRetryGitHubClient, 'request',
+                                                  autospec=True, side_effect=request_live) as direct:
+            approval = host.GitHubSceneRecoveryApprovalV3(
+                self.live_client, 'signed', [self.req], self.policy,
+                verifier=lambda _: copy.deepcopy(self.claims))
+            receipt = approval.consume(approval.validate(self.req), self.req)
+            approval.verify_consumption_receipt(self.req, receipt)
+            self.assertEqual(len(self.batches), 5)
+            self.assertTrue(all(len(queries) == 7 for queries in self.batches))
+            self.assertEqual([call.args[1] for call in direct.call_args_list], ['POST', 'GET'])
+            self.assertIn('workflow-compose-scene-recovery-v3/', direct.call_args_list[-1].args[2])
+
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.verify_consumption_receipt(self.req, replace(receipt))
+            self.assertEqual(len(self.batches), 5)
+
+            self.client.data['/repos/sample/host/actions/runs/123/approvals'][0]['comment'] = 'revoked'
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.verify_consumption_receipt(self.req, receipt)
+            self.assertEqual(len(self.batches), 6)
+            self.assertEqual(direct.call_count, 2)
+
     def test_invalid_jwt_or_claims_never_start_batch(self):
         with self.batch_patch() as fetch:
             with self.assertRaises(AuthorizationUnavailable):

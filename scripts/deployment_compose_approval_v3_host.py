@@ -116,7 +116,7 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
     def _prefetch_authority(self):
         # Only this distribution's exact live client opts into parallel reads.
         # Fake clients and other protocol versions keep the base read sequence.
-        if type(self) is not GitHubFullBodyApprovalV3:
+        if type(self) not in (GitHubFullBodyApprovalV3, GitHubSceneRecoveryApprovalV3):
             return None
         name = 'deployment_compose_live_review_v3_host'
         path = DISTRIBUTION / 'scripts/deployment_compose_live_review_v3_host.py'
