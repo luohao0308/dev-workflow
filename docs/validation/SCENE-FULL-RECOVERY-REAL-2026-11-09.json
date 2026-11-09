@@ -1,0 +1,47 @@
+{
+  "date": "2026-11-09",
+  "sourceSha": "0c4b34043154d9623f675563af36b0ac59b79589",
+  "scope": "one isolated Compose V3 service, same retained Linux scene, original Mac process exits before new consumer",
+  "ciRuns": {
+    "push": 42558597015,
+    "pull_request": 42558601036,
+    "attempt": 1,
+    "allTenJobsPassed": true
+  },
+  "approvalRuns": {
+    "create": 42569757342,
+    "recovery": 42570119734,
+    "bothApproved": true
+  },
+  "realApprovalConsumptions": 2,
+  "productWriterDispatches": 5,
+  "producerExitedBeforeConsumer": true,
+  "sameRetainedScene": true,
+  "recoveryComplete": true,
+  "recoveryStatus": {
+    "stop": 204,
+    "delete": 204,
+    "rename": 204,
+    "start": 204
+  },
+  "admissionToVerifiedWorkerResultSeconds": 176.636,
+  "timingMethod": "local private artifact mtimes, includes setup and verification; not relay-only duration",
+  "preparationCleaned": true,
+  "daemonStoppedVerified": true,
+  "productionSnapshotUnchanged": true,
+  "freshIndependentSSH": {
+    "units": 4,
+    "allInactiveAndNotFound": true,
+    "pidsAbsent": true,
+    "cgroupsAbsent": true
+  },
+  "productionReady": false,
+  "privateEvidenceSha256": {
+    "result": "8f9c14e1f7b05e5eb3eedf55953b14a3456bfd31c6a3752af4b2e04c5a1c00aa",
+    "closed": "524531185987ee5d0d10766fef20eb3080131dc4977a3b1295b47af8e7b56085",
+    "cold-consumer": "4e51b7595802017e7348545bc0fe374c97bef9fb0cdc3bfd272ada7f510dc1d2",
+    "recovery-worker-result": "c9ec3ddde0d2f064026c0c709c6667503aa67617396803fdcd0de66b6e333317",
+    "recovery-terminal-chain": "79ddce643c436469eb53d8823de51a996c9cc02952e5a59a094473c9176cac6a",
+    "independent-ssh": "298b43167be243120af0f15cd5a4cd08f8fa42a93858aff839ae87113a354665"
+  }
+}

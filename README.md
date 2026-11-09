@@ -98,6 +98,10 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `deployment` | 离线计划、可信采集/授权 SDK 与固定 Docker API 单组件替换后端 | 按环境审核部署/回滚；真实执行仅限已配置的可信宿主，非生产就绪 |
 | `release` | 可选版本策略、发布准备、执行计划、GitHub Tag / Release provider 与受信 Actions 宿主 | 需要按 SHA 或 SemVer 发布的项目；本地 CLI 仅准备，真实执行需配置独立可信宿主 |
 
+开发分支的单服务 Compose V3 跨 Mac 进程恢复已在 `0c4b340` 完成真实隔离验收。原进程退出后，新进程通过独立恢复审批完成四笔恢复写入、健康检查、见证闭合和清理。支持范围与验收来源见[恢复计划](docs/plans/compose-mac-restart-2026-11-02.md)和[真实证据](docs/validation/SCENE-FULL-RECOVERY-REAL-2026-11-09.json)。普通项目 CLI 的执行可用性与生产就绪状态仍需按受信宿主和项目分别判断。
+
+通用批次 SDK 的受信宿主可提供按服务的 readiness 回调，并在完整回执表就绪后执行终态双采样。双服务部署与新授权回滚、九个已闭合写入切点恢复的本地组合验证和后续跨进程、多代恢复范围见[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)。
+
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。
