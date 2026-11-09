@@ -27,7 +27,11 @@ class NativeSourceTests(unittest.TestCase):
                 'tests/test_deployment_compose_native_writer_lifecycle_v3_host.py'):
                 zipped.writestr(name,b'# fixture\n')
             for name,value in extra:
-                zipped.writestr(name,value)
+                # Preserve intentionally invalid raw names on Windows too;
+                # ZipInfo(name) normalizes backslashes before writing there.
+                info=zipfile.ZipInfo('placeholder.py')
+                info.filename=info.orig_filename=name
+                zipped.writestr(info,value)
         return output.getvalue()
 
     def test_closed_archive_members_and_modes(self):
@@ -38,6 +42,8 @@ class NativeSourceTests(unittest.TestCase):
         with self.assertRaises(ValueError):source.archive_files(self.archive((('tests/__init__.py',b'collision'),)))
         with self.assertRaises(ValueError):source.archive_files(b'')
         with self.assertRaises(zipfile.BadZipFile):source.archive_files(self.archive()[:50])
+        with patch.object(zipfile.os,'sep','\\'),self.assertRaises(ValueError):
+            source.archive_files(self.archive((('tests\\test_x.py',b''),)))
 
     def test_source_receipts_cannot_be_constructed_or_copied(self):
         with self.assertRaises(ValueError):source.LoadedNativeSourceV3()
