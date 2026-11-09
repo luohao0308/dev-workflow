@@ -24,6 +24,10 @@
 
 相关恢复及既有 worker 测试在 Python 3.10 / 3.14 各 34 项通过，新增双服务与参数拒绝用例在两版各 7 项通过。最终依赖与回滚顺序断言另行定向验证。AST 和 diff 空白检查通过。
 
+`deployment_compose_batch_restart_material_v3_host.capture_material/reopen_material` 使用独立 material kind，支持 root deploy 任意已闭合且未完成的多服务前缀。新 reader 从外部固定的 digest/context、公钥、Gate key 与只读 witness transport 重建认证历史。旧 reader 拒绝 batch kind。八项 batch 用例与十二项旧材料用例在 Python 3.10 / 3.14 均通过。
+
+已验证九个双服务前缀冷读后进入原恢复准备器，以及第一笔 create 后和最后一个服务启动前的真实 producer 子进程退出、新 consumer 进程只读认证。该子进程用例复制测试见证并配置测试签名材料，证明材料跨进程重验。原认证 CAS 到恢复准备器的组合接线另行验证，原 CAS 的独立外部 key 仍须可用；缺失基线或 key 错误会拒绝准备新请求。
+
 ## 后续契约约束
 
 - 不能仅移除 services 数量或 parent 深度检查。每层验证必须同时理解累计前缀、局部分段、祖先容量和当前活跃尾部。
@@ -31,6 +35,16 @@
 - 现有见证全链容量为 32 个 scope 和 256 个事件。部署、回滚与后续恢复必须计入累计容量，在写入前拒绝超限。
 - 不确定写入、未闭合见证、复制或回退的状态、错祖先和现场漂移均须在后继写入前拒绝。
 - 生产镜像来源、迁移、备份恢复及受信宿主登记单独验收。
+
+## 多代 SDK 契约
+
+历史对象与恢复准备器显式选择 `ancestry_profile='bounded-recovery-v1'`。该模式的历史使用 schema 3，全局 `scopes` 包含全部祖先记录，`segments` 描述每代的请求、bundle、消费摘要、父历史摘要、全局 scope 区间和本次逻辑操作的起始写入索引。
+
+恢复沿用最近一代的 bundle、基线、累计写入前缀和回执。回滚使用新 bundle，逻辑写入索引从零开始，原部署的 scopes 仍计入全局链与容量。恢复中的再次恢复必须取得新请求、新消费回执及新 successor，绑定最近一代完整快照。深度上限为八，拒绝环、重复请求和重复 binding。
+
+旧 schema 1/2 继续按原分段语义处理。多代恢复上下文使用独立 schema 2 和 ancestry profile 字段。字节准入、scope 和事件容量必须在 successor CAS 前纳入全部祖先；累计全局 scope 数与当前 bundle 的写入索引分别计算。
+
+此阶段使用通用 SDK 与原有回调式 writer 停止证明。受管 scene 的旧胶囊、首 create 检查点与固定四笔尾部仍按原契约读取。跨进程的多代材料与 scene-owner 接管需要后续接线。
 
 ## 验证
 
