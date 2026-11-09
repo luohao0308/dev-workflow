@@ -102,7 +102,7 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 
 通用批次 SDK 的受信宿主可提供按服务的 readiness 回调，并在完整回执表就绪后执行终态双采样。独立批次检查点材料支持任意已闭合未完成前缀的只读重认证，再由原认证 CAS 和恢复准备器生成新请求。双服务部署与新授权回滚、九个写入切点的本地组合验证，以及多代恢复范围见[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)。
 
-通用历史与恢复准备器可显式选择 `ancestry_profile='bounded-recovery-v1'`，在最多八代的祖先链上以新请求接续已闭合的恢复前缀，并在 successor CAS 前核验全链容量。该模式已通过单服务和双服务多代本地执行测试，受管 scene、进程崩溃接管及跨代持久化材料继续单独实现和验收。
+通用历史与恢复准备器可显式选择 `ancestry_profile='bounded-recovery-v1'`，在最多八代的祖先链上以新请求接续已闭合的恢复前缀，并在 successor CAS 前核验全链容量。该模式已通过单服务和双服务多代本地执行测试，受管 scene 和完整进程崩溃接管继续单独实现和验收。
 
 独立多代材料 reader 可在新进程重建并重新认证整条祖先链，随后使用原认证 CAS 准备新请求。本地测试覆盖三代双服务、回滚基线，以及检查点发布进程被 SIGKILL 后的新 consumer 冷读；完整 coordinator 和 scene-owner 的崩溃接管按[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)继续推进。
 
