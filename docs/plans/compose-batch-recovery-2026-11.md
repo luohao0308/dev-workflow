@@ -70,6 +70,20 @@
 
 新模块十项测试在 Python 3.10 / 3.14 各通过，最终加强的完整前缀拒绝用例在两版另行通过。AST、diff 空白检查和独立架构复审通过。
 
+## 冷恢复 SDK 执行
+
+`ColdRecoveryHostV3` 从独立固定的材料、摘要、context、公钥和 Gate key 重建历史。宿主另行配置原认证 CAS、同一个读写 Unix Engine socket、daemon root/version pins、readiness 和 writer 停止检查。构造器使用该 socket 建立 producer 和 PhaseGuard。
+
+`prepare_intent()` 保存固定的新请求与上下文。宿主取得对应的新审批后调用 `execute(approval, ...)`，入口内部验证并消费这笔授权，保留原始消费回执。随后通过原 RecoveryFence 核对 writer 停止、当前现场和全局容量，激活准确后继。
+
+写入见证 factory 独立配置。CAS 后、Engine 写入前，原只读见证必须观测到同一个活跃空子 scope。终态核验使用完整回执、PhaseGuard 的两次采样，以及前后相同的签名历史。失败时 `inspect_history()` 可供宿主只读核对已建立的子历史；未知或未闭合范围继续拒绝 checkpoint。
+
+公开方法限定原 PID/线程并在加锁前拒绝复制或 fork 复用。一次准备或执行失败后保持 blocked/spent。输入、准备器和 guard 元数据以及运行时 TLS 元数据在回调前后核对，回调修改状态后抛异常也不会恢复执行机会。
+
+十八项用例在 Python 3.10 / 3.14 均通过。跨进程用例由第一代恢复实际闭合第二个 create，检查点发布进程退出后，新 consumer 经正常 SDK 入口消费新授权并完成第二代恢复的八笔剩余写入。父进程通过原见证独立认证三代历史及十个 scope。
+
+测试中的 Engine、GitHub、source 和 writer 停止观测使用明确替身，实际运行 Gate、签名、HMAC、mTLS、Unix HTTP 与 CAS。受管 Linux worker/scene-owner 的原生身份登记、强杀后的独立停止证明和生产接入继续单独实现和验收。AST、diff 空白检查和独立代码复审通过。
+
 ## 验证
 
 首片使用真实本机签名、HMAC、mTLS、Unix socket 和 Gate。新双服务组合用例中的 GitHub、Docker Engine、phase observations 和 readiness 使用测试替身。此结果单列为本地受信 embedding 组合验证。九切点恢复测试复用现有签名历史、CAS、PhaseGuard 与执行器，Engine 与 GitHub 使用替身。后续真实场景必须按源码 SHA、两套 CI、新审批和清理回执留证。
