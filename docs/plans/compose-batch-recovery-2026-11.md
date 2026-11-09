@@ -84,6 +84,16 @@
 
 测试中的 Engine、GitHub、source 和 writer 停止观测使用明确替身，实际运行 Gate、签名、HMAC、mTLS、Unix HTTP 与 CAS。受管 Linux worker/scene-owner 的原生身份登记、强杀后的独立停止证明和生产接入继续单独实现和验收。AST、diff 空白检查和独立代码复审通过。
 
+## 原生 writer 生命周期登记
+
+可选 `NativeWriterLifecycleV3` 在冷执行入口实际消费新授权后、CAS 与派发前，登记当前受管 Linux systemd MainPID。登记绑定入口内部的原回执、请求、父历史及实际建立的子历史，完成或失败后才能发布已闭合且未完成前缀的检查点。调用方不能用任意 origin 与历史配对。
+
+记录与多代材料存入原认证 CAS 并读回核对。新进程从独立 descriptor、外部密钥与原只读见证加载 `NativeCheckpointStopObserver`，每次重新检查原 unit、invocation、PID start ticks、boot、namespace 和 cgroup 身份；prepare、审批消费与原全局 quiescence 检查前后的接点均保持新鲜核验。该观测只证明登记的原 writer 停止，原有全局排他检查仍必需。
+
+新增十项用例与既有十八项冷执行用例在 Python 3.10 / 3.14 全部通过。准确源码 `5aa09784debaec74328be82a2457a88f0adefed2` 的真实 Linux 隔离诊断通过：原管理器与检查点的 MainPID/origin 一致，存活 writer 被新 consumer 拒绝，原管理器停止并回收后，新 consumer 成功核验。已闭合逻辑索引为九。Engine 与 GitHub 为测试替身，真实 Docker 写入为零；源码加载器验真、全局排他与生产就绪均未授权。证据见 [Linux 诊断记录](../validation/NATIVE-WRITER-LIFECYCLE-2026-11-09.json)。
+
+后续继续实现源归档保管与加载器验真、覆盖恢复写入的替代 writer 排他，以及 scene-owner 重启接管和真实 Engine 的多代恢复联合验收。
+
 ## 验证
 
 首片使用真实本机签名、HMAC、mTLS、Unix socket 和 Gate。新双服务组合用例中的 GitHub、Docker Engine、phase observations 和 readiness 使用测试替身。此结果单列为本地受信 embedding 组合验证。九切点恢复测试复用现有签名历史、CAS、PhaseGuard 与执行器，Engine 与 GitHub 使用替身。后续真实场景必须按源码 SHA、两套 CI、新审批和清理回执留证。
