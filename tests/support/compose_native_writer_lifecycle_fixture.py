@@ -52,6 +52,21 @@ def write_private(path, raw):
         stream.write(raw)
 
 
+def retain_parent_owned_temporaries(owned, temporaries):
+    """The diagnostic manager removes these fixtures after its fresh cold read.
+
+    SIGTERM in the fixed loader unwinds Python normally. TemporaryDirectory's
+    at-exit cleanup would otherwise remove the retained CAS/signers too early.
+    """
+    owned = owned.resolve()
+    for temporary in temporaries:
+        if (type(temporary) is not tempfile.TemporaryDirectory
+                or not Path(temporary.name).resolve().is_relative_to(owned)):
+            raise ValueError('only parent-owned diagnostic fixtures may outlive producer')
+    for temporary in temporaries:
+        temporary._finalizer.detach()
+
+
 def produce(directory, source_sha, archive_digest, *, loaded_source=None):
     from tests import test_deployment_compose_cold_recovery_v3_host as sdk
     from tests.test_deployment_compose_native_writer_lifecycle_v3_host import NativeLifecycleTests
@@ -75,6 +90,8 @@ def produce(directory, source_sha, archive_digest, *, loaded_source=None):
     transport = kwargs['witness_transport']
     scope = dict(zip(transport.__code__.co_freevars,(cell.cell_contents for cell in transport.__closure__)))
     witness = scope['h']
+    if loaded_source is not None:
+        retain_parent_owned_temporaries(owned,(helper.temp,witness.temp,sdk.ColdRecoveryTests.temp))
     record = json.loads(host._store.get(descriptor['recordReference']))
     if record['origin']['mainPid']!=os.getpid():
         raise ValueError('checkpoint did not bind current managed MainPID')

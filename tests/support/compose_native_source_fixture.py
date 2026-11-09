@@ -101,7 +101,10 @@ def run(archive, source_sha, archive_digest, *, kill_producer=False):
         command = [sys.executable,'-I','-S',str(ROOT/'tests/support/compose_native_writer_lifecycle_fixture.py'),
                    'observe',str(directory/'consumer.private.json')]
         def observe():
-            return json.loads(subprocess.run(command,capture_output=True,text=True,check=True,timeout=45).stdout)
+            reply = subprocess.run(command,capture_output=True,text=True,timeout=45)
+            if reply.returncode:
+                raise RuntimeError('isolated consumer failed: '+reply.stderr[-6000:])
+            return json.loads(reply.stdout)
         active = observe()
         if not active['nativeRejected'] or active['writerStoppedObserved']:
             raise ValueError('active archive-loaded writer accepted')
