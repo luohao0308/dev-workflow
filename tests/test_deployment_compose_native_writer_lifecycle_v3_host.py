@@ -50,7 +50,7 @@ class NativeLifecycleTests(unittest.TestCase):
         sdk.ColdRecoveryTests.tearDownClass()
 
     @staticmethod
-    def partial_host(attack='readiness-failure', *, writer_source_sha=SOURCE, writer_archive_digest=ARCHIVE, allowed_engine_root=None):
+    def partial_host(attack='readiness-failure', *, writer_source_sha=SOURCE, writer_archive_digest=ARCHIVE, allowed_engine_root=None, loaded_source=None):
         helper = sdk.ColdRecoveryTests('test_failed_readiness_retains_inspectable_closed_history')
         helper.setUp()
         saved = []
@@ -58,7 +58,7 @@ class NativeLifecycleTests(unittest.TestCase):
         def construct(*args,**kwargs):
             if allowed_engine_root is not None and not Path(kwargs['docker_socket']).resolve().is_relative_to(Path(allowed_engine_root).resolve()):
                 raise ValueError('diagnostic Engine must be inside original private root')
-            lifecycle = native.NativeWriterLifecycleV3(writer_source_sha=writer_source_sha,writer_archive_digest=writer_archive_digest,store=kwargs['store'])
+            lifecycle = native.NativeWriterLifecycleV3(writer_source_sha=writer_source_sha,writer_archive_digest=writer_archive_digest,store=kwargs['store'],loaded_source=loaded_source)
             host = original(*args,**kwargs,native_lifecycle=lifecycle)
             saved.append((host,lifecycle,(args,kwargs)))
             return host
@@ -98,6 +98,73 @@ class NativeLifecycleTests(unittest.TestCase):
         options['native_stop_observer'] = observer
         return ColdRecoveryHostV3(old._store.get(descriptor['materialReference']),
             **dict(options,expected_digest=descriptor['materialDigest'],expected_context=descriptor['context']))
+
+    def test_schema2_archive_rechecked_after_signed_callbacks_and_on_observation(self):
+        from tests.test_deployment_compose_native_source_v3_host import NativeSourceTests
+        import deployment_compose_native_source_v3_host as source
+        _,old,_,_ = self.fixture
+        raw = NativeSourceTests().archive()
+        archive_digest = hashlib.sha256(raw).hexdigest()
+        reference = old._store.put(raw)
+        facts = dict(profile=source.PROFILE,sourceSha=SOURCE,archiveDigest=archive_digest,archiveReference=reference,
+            channelNonce='b'*64,entrypoint=source.ENTRYPOINT,loaderArchiveVerified=True)
+        record = json.loads(old._store.get(self.descriptor['recordReference']))
+        record.update(schemaVersion=2,loadedSource=facts,writerArchiveDigest=archive_digest)
+        record['origin']['archiveDigest']=archive_digest
+        record['originDigest']=hashlib.sha256(canonical(record['origin'])).hexdigest()
+        payload=canonical(record)
+        descriptor=dict(self.descriptor,schemaVersion=2,loadedSource=facts,writerArchiveDigest=archive_digest,
+            originDigest=record['originDigest'],recordReference=old._store.put(payload),recordDigest=hashlib.sha256(payload).hexdigest())
+        original = old._store.get
+        changed = []
+        def get(key):
+            return b'archive removed' if changed and key==reference else original(key)
+        original_transport = old._reader.history._client._transport
+        def transport(*args):
+            result = original_transport(*args)
+            changed.append(True)
+            return result
+        with patch.object(old._store,'get',side_effect=get):
+            with self.assertRaises(ValueError):
+                native.load_native_checkpoint(descriptor,store=old._store,gate_key=b'g'*32,pub=old._public,readonly_transport=transport)
+        changed.clear()
+        observer = self.load(descriptor)
+        consumer = self.consumer(observer,descriptor)
+        changed.append(True)
+        with patch.object(old._store,'get',side_effect=get),self.assertRaises(ValueError):
+            observer.observe_for(consumer)
+
+    def test_source_archive_cas_drift_after_final_record_publication_rejects(self):
+        import deployment_compose_native_source_v3_host as source
+        from tests.test_deployment_compose_native_source_v3_host import NativeSourceTests
+        raw = NativeSourceTests().archive()
+        archive_digest = hashlib.sha256(raw).hexdigest()
+        native_origin = json.loads(origin())
+        native_origin['archiveDigest'] = archive_digest
+        receipt = object()
+        with patch.object(source,'check_loaded_source',return_value=dict(source=SOURCE,archive_digest=archive_digest)), \
+             patch.object(native,'_capture_current_origin',return_value=canonical(native_origin)):
+            helper,host,_,_ = self.partial_host(writer_archive_digest=archive_digest,loaded_source=receipt)
+            self.addCleanup(helper.doCleanups)
+            reference = host._store.put(raw)
+            facts = dict(profile=source.PROFILE,sourceSha=SOURCE,archiveDigest=archive_digest,archiveReference=reference,
+                channelNonce='b'*64,entrypoint=source.ENTRYPOINT,loaderArchiveVerified=True)
+            real_put, real_get = host._store.put, host._store.get
+            corrupted = []
+            def put(value):
+                result = real_put(value)
+                if value.startswith(b'{') and json.loads(value).get('kind')=='compose-native-writer-checkpoint-v3':
+                    corrupted.append(True)
+                return result
+            def get(key):
+                if corrupted and key==reference:
+                    return b'corrupt archive'
+                return real_get(key)
+            with patch.object(source,'retain_loaded_source',return_value=facts), \
+                 patch.object(host._store,'put',side_effect=put),patch.object(host._store,'get',side_effect=get):
+                with self.assertRaises(ValueError):
+                    host.capture_native_checkpoint(**self.checkpoint_maps(host))
+            self.assertTrue(corrupted)
 
     def test_native_preflight_failure_does_not_consume_approval(self):
         helper = sdk.ColdRecoveryTests('test_active_writer_rejects_before_cas')

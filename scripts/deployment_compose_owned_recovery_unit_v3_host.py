@@ -66,7 +66,9 @@ class OwnedRecoveryUnitV3:
     Caller must not send initial archive/config until start() returns. Its pipe
     process is the local systemd-run transport, never an SSH-host identity proof.
     """
-    def __init__(self, archive_digest, source_sha):
+    def __init__(self, archive_digest, source_sha, *, disable_site=False):
+        if type(disable_site) is not bool:reject()
+        self._disable_site = disable_site
         self._code = recovery_bootstrap(archive_digest,source_sha)
         self._source_sha, self._archive_digest = source_sha, archive_digest
         _environment()
@@ -154,7 +156,7 @@ class OwnedRecoveryUnitV3:
                 '--property=Delegate=yes','--property=KillMode=control-group',
                 '--property=RuntimeMaxSec=3700','--property=TimeoutStopSec=15',
                 '--property=SendSIGKILL=yes','--property=Restart=no','--',
-                '/usr/bin/python3','-I','-u','-c',self._code]
+                '/usr/bin/python3',*(['-I','-S','-u'] if self._disable_site else ['-I','-u']),'-c',self._code]
             self.creation_outcome_unknown = True
             try:
                 self._process = _spawn(argv)

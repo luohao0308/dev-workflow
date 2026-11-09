@@ -52,7 +52,7 @@ def write_private(path, raw):
         stream.write(raw)
 
 
-def produce(directory, source_sha, archive_digest):
+def produce(directory, source_sha, archive_digest, *, loaded_source=None):
     from tests import test_deployment_compose_cold_recovery_v3_host as sdk
     from tests.test_deployment_compose_native_writer_lifecycle_v3_host import NativeLifecycleTests
     owned = directory/'owned-temp'
@@ -60,7 +60,7 @@ def produce(directory, source_sha, archive_digest):
     tempfile.tempdir = str(owned)
     sdk.ColdRecoveryTests.setUpClass()
     helper,host,lifecycle,(args,kwargs) = NativeLifecycleTests.partial_host(
-        writer_source_sha=source_sha,writer_archive_digest=archive_digest,allowed_engine_root=directory)
+        writer_source_sha=source_sha,writer_archive_digest=archive_digest,allowed_engine_root=directory,loaded_source=loaded_source)
     import deployment_compose_native_writer_lifecycle_v3_host as native
     if (type(native._capture_current_origin) is not types.FunctionType
             or native._capture_current_origin.__module__!='deployment_compose_native_writer_lifecycle_v3_host'

@@ -106,20 +106,21 @@ class NativeWriterRegistrationV3:
 
 
 class NativeWriterLifecycleV3:
-    __slots__ = ('_source','_archive','_store','_owner','__weakref__')
+    __slots__ = ('_source','_archive','_store','_owner','_loaded_source','__weakref__')
 
-    def __init__(self, *, writer_source_sha, writer_archive_digest, store):
+    def __init__(self, *, writer_source_sha, writer_archive_digest, store, loaded_source=None):
         if (type(writer_source_sha) is not str or re.fullmatch('[a-f0-9]{40}',writer_source_sha) is None
                 or not hex_value(writer_archive_digest)):
             reject()
+        self._loaded_source = loaded_source
         self._source, self._archive, self._store = writer_source_sha, writer_archive_digest, store
         self._owner = (os.getpid(),threading.get_ident())
-        _LIFECYCLES[self] = self._owner, writer_source_sha, writer_archive_digest, _store_seal(store)
+        _LIFECYCLES[self] = self._owner, writer_source_sha, writer_archive_digest, _store_seal(store), id(loaded_source)
 
     def _sealed_config(self):
         seal = _LIFECYCLES.get(self)
         if (type(self) is not NativeWriterLifecycleV3 or seal is None
-                or seal != (self._owner,self._source,self._archive,_store_seal(self._store))
+                or seal != (self._owner,self._source,self._archive,_store_seal(self._store),id(self._loaded_source))
                 or self._owner[0] != os.getpid()):
             reject()
         return seal
@@ -128,6 +129,11 @@ class NativeWriterLifecycleV3:
         seal = NativeWriterLifecycleV3._sealed_config(self)
         if self._owner != (os.getpid(),threading.get_ident()):
             reject()
+        if self._loaded_source is not None:
+            from deployment_compose_native_source_v3_host import check_loaded_source
+            source = check_loaded_source(self._loaded_source)
+            if source['source']!=self._source or source['archive_digest']!=self._archive:
+                reject()
         return seal
 
     def preflight(self, host):
@@ -222,15 +228,26 @@ class NativeWriterLifecycleV3:
             requestHash=child._request.digest(),bundleDigest=child._bundle.digest,receiptHash=child._receipt,
             firstBinding=child._client.binding,witnessKeyHash=child._client.key_hash,policyHash=child._policy.identity_hash(),
             closedTail=decode(snapshot.canonical)['closedTail'],writeIndex=len(snapshot.snapshot['knownPrefix']),**_FLAGS)
+        source_facts = None
+        if self._loaded_source is not None:
+            from deployment_compose_native_source_v3_host import retain_loaded_source
+            source_facts = retain_loaded_source(self._loaded_source,self._store)
+            value['schemaVersion'] = 2
+            value['loadedSource'] = source_facts
         payload = canonical(value)
         reference = self._store.put(payload)
         if (self._store.get(reference)!=payload or child.capture().canonical!=snapshot.canonical
                 or child._ancestry_fingerprint()!=fingerprint or _capture_current_origin(self._source,self._archive)!=origin):
             reject()
         self._record(registration,host)
-        return dict(schemaVersion=1,kind='compose-native-writer-checkpoint-descriptor-v3',recordReference=reference,
+        descriptor = dict(schemaVersion=1,kind='compose-native-writer-checkpoint-descriptor-v3',recordReference=reference,
             recordDigest=digest(payload),materialReference=material_reference,materialDigest=digest(raw),context=decode(canonical(context)),
             originDigest=digest(origin),writerSourceSha=self._source,writerArchiveDigest=self._archive)
+        if source_facts is not None:
+            from deployment_compose_native_source_v3_host import verify_retained_source
+            verify_retained_source(source_facts,self._store)
+            descriptor.update(schemaVersion=2,loadedSource=source_facts)
+        return descriptor
 
 
 class NativeCheckpointStopObserver:
@@ -269,6 +286,9 @@ class NativeCheckpointStopObserver:
                 or _context(history,host._reader.snapshot,record['context']['archiveDigest'])!=record['context']
                 or history.capture().canonical!=state['snapshot']):
             reject()
+        if record['schemaVersion']==2:
+            from deployment_compose_native_source_v3_host import verify_retained_source
+            verify_retained_source(record['loadedSource'],state['store'])
         result = cold.observe_stopped_writer(state['origin'],expected_digest=record['originDigest'],
             expected_source_sha=record['writerSourceSha'],expected_archive_digest=record['writerArchiveDigest'])
         if (type(result) is not cold.StoppedWriterObservationV3 or result.origin_digest!=record['originDigest']
@@ -277,14 +297,17 @@ class NativeCheckpointStopObserver:
                     'linuxQuiescenceVerified','authorityGranted','runtimePermit','recoveryAuthorized','productionReady'))
                 or history.capture().canonical!=state['snapshot']):
             reject()
+        if record['schemaVersion']==2:
+            from deployment_compose_native_source_v3_host import verify_retained_source
+            verify_retained_source(record['loadedSource'],state['store'])
         return result
 
 
 def load_native_checkpoint(descriptor, *, store, gate_key, pub, readonly_transport):
-    if type(descriptor) is not dict or set(descriptor)!=_DESCRIPTOR:
+    if type(descriptor) is not dict or set(descriptor)!=(_DESCRIPTOR | ({'loadedSource'} if descriptor.get('schemaVersion')==2 else set())):
         reject()
     pins = decode(canonical(descriptor))
-    if (type(pins['schemaVersion']) is not int or pins['schemaVersion']!=1
+    if (type(pins['schemaVersion']) is not int or pins['schemaVersion'] not in (1,2)
             or pins['kind']!='compose-native-writer-checkpoint-descriptor-v3'
             or any(not hex_value(pins[key]) for key in ('recordReference','recordDigest','materialReference','materialDigest','originDigest','writerArchiveDigest'))):
         reject()
@@ -293,11 +316,17 @@ def load_native_checkpoint(descriptor, *, store, gate_key, pub, readonly_transpo
     if digest(raw_record)!=pins['recordDigest']:
         reject()
     record = decode(raw_record)
-    if (type(record) is not dict or set(record)!=_RECORD or type(record['schemaVersion']) is not int
-            or record['schemaVersion']!=1 or record['kind']!='compose-native-writer-checkpoint-v3'
+    if (type(record) is not dict or set(record)!=(_RECORD | ({'loadedSource'} if pins['schemaVersion']==2 else set())) or type(record['schemaVersion']) is not int
+            or record['schemaVersion']!=pins['schemaVersion'] or record['kind']!='compose-native-writer-checkpoint-v3'
             or not hex_value(record['nonce']) or any(record[key] is not False for key in _FLAGS)
             or any(record[key]!=pins[key] for key in ('materialReference','materialDigest','context','originDigest','writerSourceSha','writerArchiveDigest'))):
         reject()
+    if pins['schemaVersion']==2:
+        from deployment_compose_native_source_v3_host import verify_retained_source
+        if (record['loadedSource']!=pins['loadedSource'] or record['loadedSource']['sourceSha']!=record['writerSourceSha']
+                or record['loadedSource']['archiveDigest']!=record['writerArchiveDigest']):
+            reject()
+        verify_retained_source(record['loadedSource'],store)
     origin = canonical(record['origin'])
     native = cold.validate_origin(origin)
     if (digest(origin)!=record['originDigest'] or native['sourceSha']!=record['writerSourceSha']
@@ -316,6 +345,8 @@ def load_native_checkpoint(descriptor, *, store, gate_key, pub, readonly_transpo
             or len(value['knownPrefix'])!=record['writeIndex'] or _store_seal(store)!=seal
             or canonical(descriptor)!=canonical(pins)):
         reject()
+    if pins['schemaVersion']==2:
+        verify_retained_source(record['loadedSource'],store)
     result = object.__new__(NativeCheckpointStopObserver)
     _OBSERVERS[result] = dict(owner=(os.getpid(),threading.get_ident()),store=store,store_seal=seal,
                               record=record,origin=origin,snapshot=snapshot.canonical)
