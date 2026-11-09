@@ -65,7 +65,9 @@ class NativeSourceTests(unittest.TestCase):
                 root=root,root_seal=source._root_seal(root),files=MappingProxyType({path.name:b'# original'}),
                 source='a'*40,archive_digest='b'*64)
             source._ISSUED[receipt]=MappingProxyType(state)
-            with patch.object(source,'_actual_command',return_value=['fixed']),patch.object(source,'_start_ticks',return_value=123),patch.dict(sys.modules,{},clear=True):
+            # Retain stdlib modules: pathlib on Python 3.12 imports ntpath lazily.
+            modules={name:module for name,module in sys.modules.items() if name!='tests' and not name.startswith('tests.')}
+            with patch.object(source,'_actual_command',return_value=['fixed']),patch.object(source,'_start_ticks',return_value=123),patch.dict(sys.modules,modules,clear=True):
                 public=source.check_loaded_source(receipt);public['source']='forged'
                 self.assertEqual(source.check_loaded_source(receipt)['source'],'a'*40)
                 with self.assertRaises(ValueError):source.check_loaded_source(copy.copy(receipt))
