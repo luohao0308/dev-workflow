@@ -91,7 +91,11 @@ def produce(directory, source_sha, archive_digest, *, loaded_source=None):
     scope = dict(zip(transport.__code__.co_freevars,(cell.cell_contents for cell in transport.__closure__)))
     witness = scope['h']
     if loaded_source is not None:
-        retain_parent_owned_temporaries(owned,(helper.temp,witness.temp,sdk.ColdRecoveryTests.temp))
+        from tests.test_deployment_compose_recovery_host import _TEMP_ROOTS
+        archives = tuple(t for t in _TEMP_ROOTS if Path(t.name).resolve()==Path(host._store._root))
+        if len(archives)!=1:
+            raise ValueError('original diagnostic CAS temporary owner required')
+        retain_parent_owned_temporaries(owned,(helper.temp,witness.temp,sdk.ColdRecoveryTests.temp,*archives))
     record = json.loads(host._store.get(descriptor['recordReference']))
     if record['origin']['mainPid']!=os.getpid():
         raise ValueError('checkpoint did not bind current managed MainPID')
