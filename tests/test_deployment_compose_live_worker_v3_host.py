@@ -26,6 +26,14 @@ def config():
 
 @unittest.skipUnless(os.name == 'posix', 'owned POSIX pipes, namespaces and TLS files')
 class WorkerTests(unittest.TestCase):
+    def test_invalid_readiness_probe_rejected_before_consumption(self):
+        channel = Mock()
+        with self.assertRaises(ValueError):
+            worker.execute_operation(channel, None, None, None, None, None, None, None, None,
+                                     readiness_probe=True)
+        channel.receive.assert_not_called()
+        channel.rpc.assert_not_called()
+
     def test_fixed_probe_only_enters_network_and_has_limits(self):
         cmd=worker.probe_command('dw-live-probe-'+'a'*32+'.service',123,
             dict(backend='172.20.0.2',peer='172.20.0.3'),dict(backend='3.13.2',peer='3.12.9'),'dw-restore-'+'a'*24)

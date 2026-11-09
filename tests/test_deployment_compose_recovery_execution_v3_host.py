@@ -266,5 +266,29 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     def test_recovery_after_rename(self): self.run_recovery(4)
     def test_recovery_after_first_start_rechecks_dependency_readiness(self): self.run_recovery(9,two_services=True)
 
+    def test_two_services_recover_after_first_create(self):
+        self.run_recovery(1, two_services=True)
+
+    def test_two_services_recover_after_all_creates(self):
+        self.run_recovery(2, two_services=True)
+
+    def test_two_services_recover_after_dependent_stop(self):
+        self.run_recovery(3, two_services=True)
+
+    def test_two_services_recover_after_all_stops(self):
+        self.run_recovery(4, two_services=True)
+
+    def test_two_services_recover_after_dependent_delete(self):
+        self.run_recovery(5, two_services=True)
+
+    def test_two_services_recover_after_all_deletes(self):
+        self.run_recovery(6, two_services=True)
+
+    def test_two_services_recover_after_dependency_rename(self):
+        self.run_recovery(7, two_services=True)
+
+    def test_two_services_recover_after_all_renames(self):
+        self.run_recovery(8, two_services=True)
+
     def test_unhealthy_prior_start_blocks_dependent_before_write(self):
         self.run_recovery(9,two_services=True,fail_resumed_readiness=True)
