@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "kind": "blog-production-frontend-preparation",
+  "scope": "readonly-plan-and-intent-consent-sdk",
+  "project": "luohao-blog-prod",
+  "selectedService": "frontend",
+  "bodyDigest": "dfcfee4ae2ebd76c9c3b418cf6146926ae1d37f79019eaef68a827a73664e6df",
+  "liveSshPreparationPassed": true,
+  "independentIdentityPinsMatched": true,
+  "protectedContainerInventoryCount": 14,
+  "protectedStaticConfigurationVerified": false,
+  "exactHostConfigRetained": true,
+  "omittedFieldsRetained": true,
+  "localTests": {
+    "python3.10": {
+      "newTests": 18,
+      "relatedCompatibilityTests": 32,
+      "total": 50,
+      "result": "passed"
+    },
+    "python3.14": {
+      "newTests": 18,
+      "relatedCompatibilityTests": 32,
+      "total": 50,
+      "result": "passed"
+    }
+  },
+  "independentReview": "CLEAR",
+  "productionBusinessWrites": 0,
+  "realApprovalDispatched": false,
+  "realConsentConsumed": false,
+  "productionWorkflowAvailable": false,
+  "runtimeWorkerAvailable": false,
+  "productionDeploymentExecuted": false,
+  "productionRollbackExecuted": false,
+  "engineReconstructionVerified": false,
+  "freshnessVerified": false,
+  "authorityGranted": false,
+  "runtimePermit": false,
+  "executionAvailable": false,
+  "productionReady": false
+}
