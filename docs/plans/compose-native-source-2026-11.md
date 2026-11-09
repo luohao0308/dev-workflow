@@ -19,3 +19,11 @@
 覆盖错 SHA/digest、成员缺失或篡改、错误入口、非原始发行对象、复制/跨线程/fork、导入路径或归档漂移，以及 CAS 篡改；验证旧 schema/profile 兼容。Python 3.10 和 3.14 定向验证后运行完整 CI。
 
 真实 Linux 隔离验收必须从准确源码构建并验证归档，通过固定 systemd unit 的 stdio 启动；工作目录不能提供模块。由原管理器核对 MainPID/origin，存活 writer 拒绝，停止后新 consumer 成功重验保管归档和检查点。Engine/GitHub 使用明确替身，真实 Docker 写入为零。保留源码 SHA、归档摘要、测试结果和清理结果。
+
+## 已完成验证（2026-11-10）
+
+源码 `5b41bc6f4118907c57838022fdedf20fe9469c0f` 的固定诊断 profile 归档与 Git tree/blob 内容完整一致。真实 Linux 正常停止与 pidfd SIGKILL 两轮均通过：实际隔离 loader 发行凭据、原管理器 MainPID/origin 一致、存活 writer 拒绝、停止后新 consumer 重验 schema-2 历史与保管归档，逻辑索引九，父目录清理完成，真实 Docker 写入零。
+
+相关 67 项回归在 Python 3.10 / 3.14 均通过，各跳过 Linux /proc 和既有 native-unit 环境检查两项；新增普通子进程退出保管回归在两版通过。Linux Python 3.12 的七项源码/保管回归全部通过，无跳过。正常退出时保管 CAS 的测试临时目录由父管理器统一清理，避免解释器退出 finalizer 先于冷读删除材料。AST、diff 检查及独立架构复审通过。
+
+证据见 [固定归档与强杀验收](../validation/NATIVE-SOURCE-LOADER-2026-11-10.json)。本片是固定诊断入口接入 SDK 的源码保管；通用生产 worker 协议和全局排他/owner 接管继续待办。完整 CI 在最终文档提交上另行核对。

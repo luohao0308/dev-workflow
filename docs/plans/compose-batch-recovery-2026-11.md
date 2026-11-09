@@ -92,7 +92,7 @@
 
 新增十项用例与既有十八项冷执行用例在 Python 3.10 / 3.14 全部通过。准确源码 `5aa09784debaec74328be82a2457a88f0adefed2` 的真实 Linux 隔离诊断通过：原管理器与检查点的 MainPID/origin 一致，存活 writer 被新 consumer 拒绝，原管理器停止并回收后，新 consumer 成功核验。已闭合逻辑索引为九。Engine 与 GitHub 为测试替身，真实 Docker 写入为零；源码加载器验真、全局排他与生产就绪均未授权。证据见 [Linux 诊断记录](../validation/NATIVE-WRITER-LIFECYCLE-2026-11-09.json)。
 
-后续继续实现源归档保管与加载器验真、覆盖恢复写入的替代 writer 排他，以及 scene-owner 重启接管和真实 Engine 的多代恢复联合验收。
+固定诊断入口的源归档保管与实际 loader 绑定现已实现，通过真实 Linux 正常停止与 SIGKILL 后的新进程冷读，见[源码归档保管](compose-native-source-2026-11.md)。通用生产 worker 协议、覆盖恢复写入的替代 writer 排他，以及 scene-owner 重启接管和真实 Engine 的多代恢复联合验收继续推进。
 
 ## 验证
 
