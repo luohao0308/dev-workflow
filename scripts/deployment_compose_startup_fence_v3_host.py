@@ -91,7 +91,8 @@ class Profile3StartupFenceV3:
                     reject()
                 from deployment_compose_witness_budget_v3_host import check_witness_byte_capacity
                 check_witness_byte_capacity(bundle, request, gate_policy,
-                    consumption_receipt_hash, binding, prior_snapshot=current)
+                    consumption_receipt_hash, binding, prior_snapshot=current,
+                    ancestry_profile=self._history._ancestry_profile)
                 intent_authority.check_consumed_intent(request)
                 operation = bundle.creation_operations()[0]
                 snapshot = immutable(dict(phase_index=0, operation=operation,
@@ -179,7 +180,8 @@ class Profile3RecoveryFenceV3:
                     reject()
                 from deployment_compose_witness_budget_v3_host import check_witness_byte_capacity
                 check_witness_byte_capacity(bundle, request, gate_policy,
-                    consumption_receipt_hash, binding, prior_snapshot=live)
+                    consumption_receipt_hash, binding, prior_snapshot=live,
+                    ancestry_profile=self._preparation._ancestry_profile)
                 intent_authority.check_consumed_intent(request)
                 parent = witness_client_factory(tail['binding'])
                 if (type(parent) is not OperationWitnessClientV3

@@ -46,6 +46,18 @@
 
 此阶段使用通用 SDK 与原有回调式 writer 停止证明。受管 scene 的旧胶囊、首 create 检查点与固定四笔尾部仍按原契约读取。跨进程的多代材料与 scene-owner 接管需要后续接线。
 
+## 多代 SDK 验证进度
+
+显式模式已实现于历史、恢复准备、witness 容量准入和 startup fence。单服务和双服务均验证了 deploy → recovery₁ 部分完成 → recovery₂ 完成，执行通过真实 Gate、签名、mTLS 和 Unix HTTP，Engine/GitHub 与 writer 停止证明使用测试替身。
+
+回滚前缀可产生新的恢复请求，保持回滚 bundle 的逻辑索引。部署十个 scope 加一个回滚 create 的历史计入全局容量，恢复请求的起始索引为一；预计完整链共二十个 scope。容量限制降为十九时，真实 recovery fence 在 CAS 与授权核验前拒绝。已有回滚再次恢复请求的准备已验证，完整该路径的真实 Engine 执行仍待后续验收。
+
+十五项多代用例覆盖祖先篡改、循环和重复、错 key/policy/epoch、旧契约拒绝、活跃尾部的逻辑索引、深度八的前置拒绝，以及读取回调在最终签名响应后修改祖先或切换模式时拒绝。完整祖先指纹由纯内存数据构成，在首次回调前和最后回调后核对。
+
+最终十五项多代用例在 Python 3.10 / 3.14 各通过，相关历史、恢复准备、fence 与字节预算的四十项既有用例在两版通过。多代代码经独立复审，回调一致性缺陷修复后复审通过。Python AST 与 diff 空白检查通过。
+
+第一版允许根 deploy 发起 rollback，然后对该 rollback 发起 recovery。已恢复部署再发起新 rollback 的准备接线，以及 schema-3 的持久化材料、整个 coordinator 崩溃和 scene-owner 重启接管，继续作为后续工作。
+
 ## 验证
 
 首片使用真实本机签名、HMAC、mTLS、Unix socket 和 Gate。新双服务组合用例中的 GitHub、Docker Engine、phase observations 和 readiness 使用测试替身。此结果单列为本地受信 embedding 组合验证。九切点恢复测试复用现有签名历史、CAS、PhaseGuard 与执行器，Engine 与 GitHub 使用替身。后续真实场景必须按源码 SHA、两套 CI、新审批和清理回执留证。

@@ -100,7 +100,9 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 
 开发分支的单服务 Compose V3 跨 Mac 进程恢复已在 `0c4b340` 完成真实隔离验收。原进程退出后，新进程通过独立恢复审批完成四笔恢复写入、健康检查、见证闭合和清理。支持范围与验收来源见[恢复计划](docs/plans/compose-mac-restart-2026-11-02.md)和[真实证据](docs/validation/SCENE-FULL-RECOVERY-REAL-2026-11-09.json)。普通项目 CLI 的执行可用性与生产就绪状态仍需按受信宿主和项目分别判断。
 
-通用批次 SDK 的受信宿主可提供按服务的 readiness 回调，并在完整回执表就绪后执行终态双采样。双服务部署与新授权回滚、九个已闭合写入切点恢复的本地组合验证和后续跨进程、多代恢复范围见[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)。
+通用批次 SDK 的受信宿主可提供按服务的 readiness 回调，并在完整回执表就绪后执行终态双采样。独立批次检查点材料支持任意已闭合未完成前缀的只读重认证，再由原认证 CAS 和恢复准备器生成新请求。双服务部署与新授权回滚、九个写入切点的本地组合验证，以及多代恢复范围见[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)。
+
+通用历史与恢复准备器可显式选择 `ancestry_profile='bounded-recovery-v1'`，在最多八代的祖先链上以新请求接续已闭合的恢复前缀，并在 successor CAS 前核验全链容量。该模式已通过单服务和双服务多代本地执行测试，受管 scene、进程崩溃接管及跨代持久化材料继续单独实现和验收。
 
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 

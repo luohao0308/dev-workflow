@@ -1,4 +1,7 @@
-"""Prepare a new recovery request for a signed, closed partial root deployment.
+"""Prepare a new recovery request for a signed, closed partial deployment.
+
+The optional bounded-recovery-v1 profile also prepares a fresh generation from
+its matching cumulative history, including an interrupted root-deploy rollback.
 
 Private contexts contain full phase facts. This module issues no capability,
 renews no old grant and exposes no resume or execution API.
@@ -8,7 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 
-from deployment_compose_history_v3_host import AuthenticatedHistoryV3, AuthenticatedHistorySnapshotV3, pairs
+from deployment_compose_history_v3_host import AuthenticatedHistoryV3, AuthenticatedHistorySnapshotV3, pairs, ANCESTRY_PROFILE, MAX_ANCESTRY_DEPTH
 from deployment_compose_recovery_store import ComposeRecoveryStore
 from deployment_compose_phase_guard_v3_host import PhaseGuardV3, baseline_state_digest, _plain
 from deployment_compose_phase_state_v3_host import TrustedPhaseStateProducerV3
@@ -26,15 +29,18 @@ def reject():
 
 
 class RecoveryPreparationHostV3:
-    def __init__(self, *, original_history, store, phase_guard, readiness):
+    def __init__(self, *, original_history, store, phase_guard, readiness, ancestry_profile=None):
         try:
-            if (type(original_history) is not AuthenticatedHistoryV3
-                    or original_history._request.operation != 'deploy'
-                    or original_history._parent is not None
+            if (not (ancestry_profile is None or type(ancestry_profile) is str and ancestry_profile == ANCESTRY_PROFILE)
+                    or type(original_history) is not AuthenticatedHistoryV3
+                    or original_history._ancestry_profile != ancestry_profile
+                    or (ancestry_profile is None and (original_history._request.operation != 'deploy'
+                                                     or original_history._parent is not None))
                     or type(store) is not ComposeRecoveryStore
                     or type(phase_guard) is not PhaseGuardV3 or not callable(readiness)
                     or phase_guard._bundle.canonical_bytes != original_history._bundle.canonical_bytes):
                 reject()
+            self._ancestry_profile = ancestry_profile
             self._history,self._store,self._guard,self._ready=original_history,store,phase_guard,readiness
             self._bundle,self._original=original_history._bundle,original_history._request
             self._baseline()
@@ -62,15 +68,18 @@ class RecoveryPreparationHostV3:
         value=json.loads(snapshot.canonical,object_pairs_hook=pairs)
         bundle=self._bundle.to_dict()
         tail=value['closedTail'];status=value['chainStatus']
+        if self._ancestry_profile and len(value['segments']) >= MAX_ANCESTRY_DEPTH:
+            reject()
         k=len(value['knownPrefix'])
         total=sum(op['phase'] != 'readiness' for op in bundle['operations'])
-        if (type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+        scope_count = len(value['scopes']) if self._ancestry_profile else k
+        if (type(value['schemaVersion']) is not int or value['schemaVersion'] != (3 if self._ancestry_profile else 1)
                 or value['bundleDigest'] != self._bundle.digest
                 or value['originalRequestHash'] != self._original.digest()
                 or value['sourceArchiveRef'] != bundle['archiveReference']
                 or value['blocker'] is not None or value['pending'] is not None
-                or not 0 < k < total or len(value['scopes']) != k
-                or len(status['lineage'])+1 != k or status['activePhase'] != 'closed'
+                or not 0 < k < total or (self._ancestry_profile is None and len(value['scopes']) != k)
+                or len(status['lineage'])+1 != scope_count or status['activePhase'] != 'closed'
                 or tail != dict(binding=status['activeBinding'],seq=status['activeSeq'],head=status['activeHead'])
                 or any(scope['seq'] != 6 for scope in value['scopes'])):
             reject()
@@ -99,6 +108,8 @@ class RecoveryPreparationHostV3:
             historyDigest=snapshot.digest,startWriteIndex=k,receiptMap=receipts,
             knownWritePrefix=value['knownPrefix'],completedOperations=completed,nextOperation=next_operation,
             currentPhaseSnapshot=phase,recoveryNonce=nonce,expiresAt=expires_at)
+        if self._ancestry_profile:
+            result.update(schemaVersion=2, kind='compose-bounded-recovery-context-v3', ancestryProfile=self._ancestry_profile)
         return result,snapshot
 
     def prepare_intent(self, *, operation_nonce, expires_at):
@@ -125,7 +136,7 @@ class RecoveryPreparationHostV3:
                 reject()
             raw=self._store.get(reference)
             context=json.loads(raw,object_pairs_hook=pairs)
-            if (type(context) is not dict or set(context) != _FIELDS or canonical(context) != raw
+            if (type(context) is not dict or set(context) != (_FIELDS | {'ancestryProfile'} if self._ancestry_profile else _FIELDS) or canonical(context) != raw
                     or hashlib.sha256(raw).hexdigest() != request.observation_hash):
                 reject()
             expected=replace(self._original,operation='recovery',history_hash=reviewed_history.digest,
