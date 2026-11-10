@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "kind": "blog-production-review-wiring",
+  "date": "2026-11-10",
+  "scope": "review-contract-workflow-and-controller",
+  "productionWorkflow": "production-frontend-review.yml",
+  "workflowRef": "refs/heads/main",
+  "approvalEnvironment": "compose-review",
+  "newTests": 18,
+  "relatedTests": 18,
+  "totalTestsPerPython": 36,
+  "pythonVersions": [
+    "3.10",
+    "3.14"
+  ],
+  "localResult": "passed",
+  "realCryptography": [
+    "CMS encryption/decryption",
+    "RSA signed OIDC verification"
+  ],
+  "githubApi": "test-double",
+  "independentReview": "CLEAR",
+  "remoteReadOnlyChecks": {
+    "mainWorkflowPresent": false,
+    "mainEnvironmentEligible": false,
+    "registeredPolicyConfigured": false,
+    "requiredReviewerId": 84822776,
+    "preventSelfReview": true,
+    "canAdminsBypass": false
+  },
+  "realApprovalDispatched": false,
+  "realConsentConsumed": false,
+  "remoteSettingsChanged": false,
+  "productionBusinessWrites": 0,
+  "runtimePermit": false,
+  "executionAvailable": false,
+  "productionReady": false
+}

@@ -12,16 +12,28 @@
 2. 接入独立生产登记、精确审批、范围排他和固定 worker。沿用原 Gate/签名见证/CAS，不能改 production=False 或伪装 dw- 项目。先提供可审核生产请求与不可变回退版本，再进入一次性执行。
 3. 在真实业务窗口执行同镜像 frontend 替换和独立新审批回滚，核对 Caddy 解析、HTTP 业务响应以及其余十四个容器、卷、网络的保护投影。未知写入立即冻结，不能自动重试或重放。后端迁移和 owner 崩溃接管继续单列。
 
-第一片为当前实施范围。不能将只读计划、内容摘要或普通 SSH 权限当作已准入的生产执行能力。尚未进行生产容器创建、停止、删除、回滚或强杀。证据保持私有，本地旧博客工作目录的既有产品改动不触碰。
+第一片已完成；当前已补齐第二片的审核工作流和控制器代码，原生生产 writer 接线继续待办。不能将只读计划、内容摘要或普通 SSH 权限当作已准入的生产执行能力。尚未进行生产容器创建、停止、删除、回滚或强杀。证据保持私有，本地旧博客工作目录的既有产品改动不触碰。
 
 ## 本轮实现与验证
 
 新增 `deployment_compose_production_frontend_v3_host` 与 `deployment_compose_blog_frontend_preflight_v1_host`：固定只读 SSH 采集同一 frontend、校验独立 daemon/container/image/source pins，完整保留无限资源、重启和日志策略、网络别名及省略字段。私有输出限定外部新建目录，使用目录 FD 防止路径置换。网络静态请求、未知配置、错误镜像类型、暂停/重启/死亡基线均拒绝。镜像 ArgsEscaped 仅显式保留，实际重建仍待 Engine 验证。
 
-新增 `deployment_compose_production_frontend_approval_v1_host`：独立 profile/audience、业务博客仓库及实际 authority ledger ID、运行时与业务源码 SHA 分别绑定，生成一次性 production=true 的精确 deploy 意图。首片明确拒绝 rollback/recovery 工厂和运行时 guard。它是审批 SDK，尚无可用 production 审核工作流或生产 writer；RSA/OIDC 测试的平台读写为替身，未在真实账本消费授权。
+新增 `deployment_compose_production_frontend_approval_v1_host`：独立 profile/audience、业务博客仓库及实际 authority ledger ID、运行时与业务源码 SHA 分别绑定，生成一次性 production=true 的精确 deploy 意图。首片明确拒绝 rollback/recovery 工厂和运行时 guard。它是审批 SDK；后续审核工作流代码已补齐，但尚未发布启用，生产 writer 继续待办；RSA/OIDC 测试的平台读写为替身，未在真实账本消费授权。
 
 18 项新增测试和 32 项相关兼容测试在 Python 3.10 / 3.14 各通过，共每版 50 项。独立复审 CLEAR。真实 SSH 入口重验线上前端，生成同一 body digest，记录其余 14 个容器 ID；仅清单不等于它们完整配置/生命周期已获保护证明。Caddy upstream 为 frontend:3000，尚未执行切换。
 
 只读调用：`python3 scripts/deployment_compose_blog_frontend_preflight_v1_host.py --pins /absolute/private/pins.json --output /absolute/private/new-directory`。路径须绝对且不含符号链接；输出目录必须新建且在源码树外。pins 精确字段为 hostId、daemonId、project、service、containerId、containerName、imageId、sourceSha。示例不提供任何执行开关。
 
-后续是独立审核工作流、宿主登记/范围排他、跨项目且不要求 Health 的保护清单 guard，以及保留旧实例至新实例验证成功的操作顺序。不能沿用实验链先删除旧实例再验证 readiness 的顺序开展本次生产测试。
+后续是审核工作流发布启用、宿主登记/范围排他、跨项目且不要求 Health 的保护清单 guard，以及保留旧实例至新实例验证成功的操作顺序。不能沿用实验链先删除旧实例再验证 readiness 的顺序开展本次生产测试。
+
+## 生产审核工作流与控制器
+
+`production-frontend-review.yml` 固定 main 和 compose-review 环境，调用独立 production review contract，按已登记的 DW_PROD_FRONTEND_POLICY_HASH 重新生成精确请求。业务博客源码 SHA 和运行时工作流 SHA 分别绑定。公开摘要列出 production=true、准确宿主/daemon、当前容器、同镜像、其他容器 ID、有效期和执行缺口；不上传私有 create body。
+
+控制器 `GitHubProductionFrontendReviewV1.request_prepared_review` 先核原私有计划、main 发布 SHA、受保护环境、分支政策和注册策略，然后只派发一次。固定 gh API 命令从 stdin 接收冻结的公开 payload，不按可替换路径重读文件。匹配唯一且准确的审核运行后，验证公开产物并在内存解密 OIDC；返回真实 approval/grant 给后续 worker，不自行消费账本。原实验派发/消费入口在新控制器上显式拒绝。未知派发结果不重试，已知 artifact 下载失败明确报错。
+
+真实 CMS/RSA 回环以及 run/配置/回调漂移、错误 artifact、复制/线程/fork、跨请求混用、旧入口、重复派发及加密输出置换的回归通过。新增 18 项及相关 18 项，共 36 项在 Python 3.10 / 3.14 各通过；独立复审 CLEAR。GitHub/JWKS 为明确替身，未运行真实审批。
+
+2026-11-10 的 GitHub 只读检查确认：main 尚无本工作流，compose-review 仅允许 feat/compose-validation-20261028，DW_PROD_FRONTEND_POLICY_HASH 尚未配置。审核环境的唯一 reviewer 为 84822776，prevent_self_review=true，禁止管理员绕过。main/分支政策/策略登记尚未满足，控制器应在 POST 前拒绝；本轮未修改这些远端设置。先完成宿主排他、保护对象 guard、保留旧实例的切换及失败恢复路径，再对具体的发布/配置步骤和精确业务请求进行实际审批。
+
+本片不放开旧 production=False 守卫，不提供 rollback/recovery，不证明生产 writer 或部署/回滚链路已可用。证据见 [审核接线记录](../validation/BLOG-PRODUCTION-REVIEW-WIRING-2026-11-10.json)。
