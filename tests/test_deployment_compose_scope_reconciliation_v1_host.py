@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import os
@@ -64,6 +65,11 @@ class ScopeReconciliationTests(unittest.TestCase):
         self.assertEqual(record['evidence'], self.evidence)
         self.assertEqual(record['observation'], self.observation)
         self.assertEqual(record['signer'], self.signer_digest)
+        receipt = self.journal.parent / ('reconciliation-' + record['proof'] + '.json')
+        retained = json.loads(receipt.read_bytes())
+        self.assertEqual(retained['approval'], self.approval)
+        self.assertEqual(base64.b64decode(retained['signature'], validate=True), self.signature)
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
         with self.assertRaises(scope.ScopeBlocked):
             self.reconcile()
         with self.assertRaisesRegex(scope.ScopeBlocked, 'already recorded'):
@@ -124,7 +130,11 @@ class ScopeReconciliationTests(unittest.TestCase):
             scope.acquire_scope(self.registration, 'c' * 64)
 
     def test_complete_visible_record_is_synced_before_a_new_lease_is_issued(self):
-        with patch.object(scope.os, 'fsync', side_effect=OSError('fixture fsync failure')):
+        def unsynced(fd, line):
+            os.write(fd, line)
+            raise OSError('fixture journal fsync failure')
+
+        with patch.object(recovery, '_append', unsynced):
             with self.assertRaises(OSError):
                 self.reconcile()
         self.assertEqual(json.loads(self.journal.read_bytes().splitlines()[-1])['state'],

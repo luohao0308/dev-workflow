@@ -3,14 +3,17 @@
 The trusted host embedding pins the signer and supplies a fresh evidence
 observer. This module provides neither a CLI nor an automatic recovery policy.
 """
+import base64
 import hashlib
+import os
 from pathlib import Path
+import stat
 import subprocess
 import tempfile
 import time
 
 from deployment_compose_production_scope_v1_host import (
-    MAX_BYTES, ScopeBlocked, ScopeRegistrationV1, _append, _history, _line,
+    MAX_BYTES, ScopeBlocked, ScopeRegistrationV1, _append, _directory, _history, _line,
     _locked_pending_scope, _read,
 )
 from deployment_compose_witness_store import canonical, hex_value
@@ -60,14 +63,48 @@ def _verify_signature(material, signature, public_key):
             _reject()
 
 
+def _retain_approval(registration, proof, expected, signature, public_key):
+    raw = canonical(dict(approval=expected, signature=base64.b64encode(signature).decode('ascii'),
+                         publicKey=public_key.decode('ascii')))
+    root, identity = _directory(registration.root)
+    try:
+        if identity != registration.root_identity:
+            _reject()
+        name = 'reconciliation-' + proof + '.json'
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = os.open(name, flags | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=root)
+        except FileExistsError:
+            fd = os.open(name, flags | os.O_RDONLY, dir_fd=root)
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                        or info.st_size != len(raw) or os.read(fd, len(raw) + 1) != raw):
+                    _reject()
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        else:
+            try:
+                if os.write(fd, raw) != len(raw):
+                    _reject()
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        os.fsync(root)
+    finally:
+        os.close(root)
+
+
 def reconcile_pending_scope(registration, request_digest, *, approval, signature,
                             public_key, trusted_signer_digest, observe_live_digest):
     """Append one signed operator disposition after a locked evidence recheck.
 
-    The embedding retains the signed approval and independently supplies the
-    trusted signer digest and the callback returning a fresh, stable live
-    observation digest. The incident evidence digest binds the historical
-    report separately. A successful return certifies journal closure only.
+    The embedding independently supplies the trusted signer digest and a
+    callback returning a fresh, stable live observation digest. The incident
+    evidence digest binds the historical report separately. A successful
+    return certifies journal closure only.
     A torn line remains blocked. If sync fails after a complete append, a
     later acquisition must sync the journal before issuing another lease.
     """
@@ -101,6 +138,9 @@ def reconcile_pending_scope(registration, request_digest, *, approval, signature
                       observation=observation, signer=trusted_signer_digest)
         line = _line(record)
         if len(raw) + len(line) > MAX_BYTES:
+            _reject()
+        _retain_approval(registration, proof, expected, signature, key)
+        if _read(registration, fd) != raw or time.time() >= expiry:
             _reject()
         _append(fd, line)
         persisted = _read(registration, fd)
