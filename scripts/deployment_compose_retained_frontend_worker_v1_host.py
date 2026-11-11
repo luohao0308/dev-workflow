@@ -24,6 +24,7 @@ from deployment_compose_retained_phase_v1_host import (
     FrontendNotReady, original_projection, restored_phase, switched_phase, verify_phase,
 )
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
+from deployment_compose_retained_intent_relay_v1_host import RetainedIntentClientV1, IntentRelayRejected
 from deployment_compose_witness_store import canonical, hex_value, pairs
 from release_execute import AuthorizationUnavailable
 from release_host import timestamp
@@ -44,7 +45,7 @@ class RetainedReadinessFailed(RetainedWorkerBlocked):
 class RetainedFrontendWorkerV1:
     def __init__(self, private_plan, *, operation_nonce, observer, registration,
                  writer_source_sha, writer_archive_digest, policy_hash, witness_transport_factory,
-                 readiness, readiness_timeout=60):
+                 readiness, readiness_timeout=60, loaded_source=None):
         if (hasattr(self, '_owner') or type(observer) is not HostSnapshotV3 or type(registration) is not ScopeRegistrationV1
                 or not hex_value(policy_hash) or not callable(witness_transport_factory)
                 or not callable(readiness) or type(readiness_timeout) not in (int, float)
@@ -54,6 +55,8 @@ class RetainedFrontendWorkerV1:
         self._observer, self._registration = observer, registration
         self._runtime = (writer_source_sha, writer_archive_digest)
         self._origin = _capture_current_origin(*self._runtime)
+        self._loaded_source = loaded_source
+        self._verify_source()
         self._policy_hash = policy_hash
         self._factory, self._readiness = witness_transport_factory, readiness
         self._readiness_timeout = readiness_timeout
@@ -107,6 +110,16 @@ class RetainedFrontendWorkerV1:
         if (os.getpid(), threading.current_thread()) != self._owner or self._state == 'closed':
             raise RetainedWorkerBlocked('production-worker-owner-mismatch')
 
+    def _verify_source(self):
+        if self._loaded_source is None:
+            return
+        from deployment_compose_retained_source_v1_host import check_loaded_source
+
+        facts = check_loaded_source(self._loaded_source)
+        if (facts['sourceSha'], facts['archiveDigest'], facts['originDigest']) != (
+                *self._runtime, hashlib.sha256(self._origin).hexdigest()):
+            raise RetainedWorkerBlocked('production-loaded-source-mismatch')
+
     def _get(self, path):
         return self._observer._get(path, time.monotonic() + 5, [2 * 1024 * 1024])
 
@@ -115,6 +128,7 @@ class RetainedFrontendWorkerV1:
 
     def _observe(self, *, require_ready=False, refresh_candidate=False):
         self._check_owner()
+        self._verify_source()
         if _capture_current_origin(*self._runtime) != self._origin:
             raise RetainedWorkerBlocked('production-writer-identity-changed')
         if self._lease is not None:
@@ -174,8 +188,15 @@ class RetainedFrontendWorkerV1:
         return self._review_for(rollback=True)
 
     def _authorize(self, approval, grant, request, review, first):
-        if (type(approval) is not GitHubProductionFrontendApprovalV2
-                or approval.policy.workflow_sha != self._runtime[0]):
+        relayed = type(approval) is RetainedIntentClientV1
+        if relayed:
+            binding = approval.binding
+            if (binding.runtime_sha, binding.archive_digest, binding.origin_digest, binding.protection_digest) != (
+                    self._runtime[0], self._runtime[1], hashlib.sha256(self._origin).hexdigest(),
+                    self._protection_digest):
+                raise RetainedWorkerBlocked('retained-production-intent-binding-mismatch')
+        elif (type(approval) is not GitHubProductionFrontendApprovalV2
+              or approval.policy.workflow_sha != self._runtime[0]):
             raise RetainedWorkerBlocked('retained-production-approval-required')
         expected = prepare_production_frontend_request(
             review, policy_hash=self._policy_hash, expires_at=request.expires_at, operation=request.operation,
@@ -189,7 +210,10 @@ class RetainedFrontendWorkerV1:
             if self._observe() != self._observation:
                 raise RetainedWorkerBlocked('retained-production-preflight-drift')
 
-        receipt = approval.consume(grant, request, before_consume=preflight)
+        if relayed:
+            receipt = approval.consume(grant, request, before_consume=preflight, generation=self._lease.generation)
+        else:
+            receipt = approval.consume(grant, request, before_consume=preflight)
         preflight()
         receipt_hash = digest(asdict(receipt))
         execution_digest = digest(dict(plan=self._plan.digest, approvedReview=request.plan_hash,
@@ -200,6 +224,13 @@ class RetainedFrontendWorkerV1:
             raise RetainedWorkerBlocked('retained-production-witness-transport-mismatch')
         expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         return transport, receipt_hash, execution_digest, expires_at
+
+    @staticmethod
+    def _step_expiry(approval, request, expires_at):
+        checked = approval.check_consumed_intent(request)
+        if type(approval) is RetainedIntentClientV1:
+            return min(expires_at, checked)
+        return expires_at
 
     def _write(self, transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at):
         def guard():
@@ -240,7 +271,8 @@ class RetainedFrontendWorkerV1:
         first = self._plan.create()
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, first)
         self._parent = request.digest()
-        raw, witness = self._write(transport, approval, request, first, 0, receipt_hash, execution_digest, expires_at)
+        first_expiry = self._step_expiry(approval, request, expires_at)
+        raw, witness = self._write(transport, approval, request, first, 0, receipt_hash, execution_digest, first_expiry)
         response = json.loads(raw, object_pairs_hook=pairs)
         candidate = response['Id']
         self._plan._candidate(candidate)
@@ -253,12 +285,12 @@ class RetainedFrontendWorkerV1:
             try:
                 # A denial here precedes any new witness reservation or Docker
                 # request. Only this known closed prefix can get a new approval.
-                approval.check_consumed_intent(request)
-            except AuthorizationUnavailable:
+                step_expiry = self._step_expiry(approval, request, expires_at)
+            except (AuthorizationUnavailable, IntentRelayRejected):
                 if self._prefix and self._observe() == self._observation:
                     self._state = 'restoration-ready'
                 raise
-            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
+            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, step_expiry)
             witnesses.append(witness)
             self._prefix = index
             self._phase = switched_phase(self._plan, index)
@@ -282,7 +314,8 @@ class RetainedFrontendWorkerV1:
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, operations[0])
         witnesses = []
         for index, operation in enumerate(operations):
-            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
+            step_expiry = self._step_expiry(approval, request, expires_at)
+            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, step_expiry)
             witnesses.append(witness)
             self._phase = restored_phase(self._plan, self._phase, operation)
             self._observation = self._observe()

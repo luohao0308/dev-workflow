@@ -35,6 +35,14 @@ class RetainedWorkerTests(unittest.TestCase):
     def setUp(self):
         host_fixture.HostTests.setUp(self)
         original, image, options = material()
+        if getattr(self, 'fixed_production_network', False):
+            networks = original['NetworkSettings']['Networks']
+            original_network, = networks
+            endpoint = networks.pop(original_network)
+            name = 'luohao-blog-prod_default'
+            networks[name] = endpoint
+            original['HostConfig']['NetworkMode'] = name
+            options['network_ids'] = {name: endpoint['NetworkID']}
         options['protected_container_ids'] = [self.row['Id']]
         identity = options['expected_identity']
         identity.update(hostId='host', daemonId='production-one')
