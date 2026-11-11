@@ -21,6 +21,10 @@ from deployment_gateway import GatePolicy
 
 CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
              'witnessPublicKey', 'gateKey', 'caddyId', 'networkId'}
+BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
+FAILURE_STAGES = frozenset(('parse-request', 'validate-intent', 'execute-worker', 'prepare-restore'))
+# Leave time for the controller to close the session after its 15-minute review wait.
+REVIEW_COMMAND_TIMEOUT = 1020
 
 
 def reject():
@@ -119,37 +123,42 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
             channel.emit('prepared', review=deploy_review, writerCertificateSha256=writer_pin)
 
             def execute(frame, review, operation):
-                request = RequestV2.from_json(encode(frame['request']).decode('ascii'))
-                if request.operation != operation:
-                    reject()
-                binding = RetainedIntentBindingV1(nonce, source['sourceSha'], source['archiveDigest'],
-                    source['originDigest'], review['retainedCutover']['protectionDigest'])
-                client = RetainedIntentClientV1(request, binding=binding, public_key=intent_public,
-                    transport=lambda rpc: channel.rpc('intent', 'authorize', rpc), consume_transport=channel.consume)
-                grant = client.validate(request)
-                result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
+                stage = 'parse-request'
+                try:
+                    request = RequestV2.from_json(encode(frame['request']).decode('ascii'))
+                    if request.operation != operation:
+                        reject()
+                    stage = 'validate-intent'
+                    binding = RetainedIntentBindingV1(nonce, source['sourceSha'], source['archiveDigest'],
+                        source['originDigest'], review['retainedCutover']['protectionDigest'])
+                    client = RetainedIntentClientV1(request, binding=binding, public_key=intent_public,
+                        transport=lambda rpc: channel.rpc('intent', 'authorize', rpc), consume_transport=channel.consume)
+                    grant = client.validate(request)
+                    stage = 'execute-worker'
+                    result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
+                except Exception:
+                    return stage
                 channel.emit('executed', result=result)
+                return None
 
-            kind, frame = channel.receive(('execute', {'request'}), ('finish', set()))
+            kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
+                                          timeout=REVIEW_COMMAND_TIMEOUT)
             if kind == 'finish':
                 return
-            try:
-                execute(frame, deploy_review, 'deploy')
-            except Exception:
-                # Only a worker-owned, exact closed prefix can yield a restore
-                # review. An uncertain request leaves the scope journal pending.
-                pass
+            failure = execute(frame, deploy_review, 'deploy')
+            # Only a worker-owned, exact closed prefix can yield a restore
+            # review. An uncertain request leaves the scope journal pending.
             try:
                 restore_review = worker.restore_review()
             except Exception:
-                channel.emit('blocked', knownPrefix=False)
+                channel.emit('blocked', knownPrefix=False, failureStage=failure or 'prepare-restore')
                 return
             channel.emit('restore-prepared', review=restore_review)
-            kind, frame = channel.receive(('execute', {'request'}), ('finish', set()))
+            kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
+                                          timeout=REVIEW_COMMAND_TIMEOUT)
             if kind == 'execute':
-                try:
-                    execute(frame, restore_review, 'rollback')
-                except Exception:
-                    channel.emit('blocked', knownPrefix=False)
+                failure = execute(frame, restore_review, 'rollback')
+                if failure is not None:
+                    channel.emit('blocked', knownPrefix=False, failureStage=failure)
         finally:
             worker.close()
