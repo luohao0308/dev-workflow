@@ -219,6 +219,41 @@ def _history(raw, registration):
     return len(records) // 2 + 1, requests
 
 
+def inspect_pending_scope(registration, request_digest):
+    """Read an exact, abandoned journal tail under the registered inode lock."""
+    if (type(registration) is not ScopeRegistrationV1 or not hex_value(request_digest)
+            or not _pin_pair(registration.root_identity) or not _pin_pair(registration.journal_identity)):
+        _block('Independent production scope and request pins required')
+    _header(registration.host_id, registration.project, registration.daemon_id)
+    root_fd, identity = _directory(registration.root)
+    try:
+        if identity != registration.root_identity:
+            _block('Production scope directory changed')
+        fd = _open_journal(root_fd, _name(registration.project), os.O_RDONLY)
+    finally:
+        os.close(root_fd)
+    try:
+        with _bound_root(registration, fd):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _block('Production scope already has a live writer')
+        raw = _read(registration, fd)
+        if not raw.endswith(b'\n'):
+            _block('Invalid production scope journal tail')
+        prefix, _, tail = raw[:-1].rpartition(b'\n')
+        generation, requests = _history(prefix + b'\n', registration)
+        if request_digest in requests or tail != canonical(dict(
+                state='started', generation=generation, request=request_digest)):
+            _block('Production scope tail differs from requested attempt')
+        if _read(registration, fd) != raw:
+            _block('Production scope journal changed during review')
+        return dict(generation=generation, requestHash=request_digest,
+                    journalDigest=hashlib.sha256(raw).hexdigest())
+    finally:
+        _close_journal(fd)
+
+
 @dataclass
 class _Session:
     fd: int
