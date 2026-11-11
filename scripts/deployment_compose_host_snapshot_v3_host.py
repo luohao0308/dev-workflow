@@ -13,7 +13,9 @@ import re
 import socket
 import stat
 import struct
+import threading
 import time
+import weakref
 
 import deployment_runtime as runtime
 import deployment_compose_owned_recovery_unit_v3_host as units
@@ -22,6 +24,8 @@ from deployment_compose_resource_inventory_v3_host import inventory,PATHS
 from deployment_compose_host_commands_v3_host import capture_network,read_systemd
 
 PROFILE='linux-docker-host-projection-v1'
+FRONTEND_PROTECTION_PROFILE='linux-docker-production-frontend-protection-v1'
+_FRONTEND_PROTECTIONS=weakref.WeakKeyDictionary()
 _RUN=Path('/run')
 _UID=0
 _SERVICE=('Id','LoadState','ActiveState','SubState','MainPID','ControlGroup','InvocationID')
@@ -165,11 +169,11 @@ class HostSnapshotV3:
         self._local()
         return value
 
-    def _scan(self,deadline,budget):
+    def _scan(self,deadline,budget,*,include_definitions=False):
         self._fresh(deadline)
         info=self._get('/v1.45/info',deadline,budget)
         if (type(info) is not dict or info.get('ID')!=self._info_id or info.get('DockerRootDir')!=self._data_root):reject()
-        resources=inventory(lambda path:self._get(path,deadline,budget))
+        resources=inventory(lambda path:self._get(path,deadline,budget),include_definitions=include_definitions)
         if len(resources['containers'])>64:reject()
         containers=[]
         for cid in resources['containers']:
@@ -198,8 +202,9 @@ class HostSnapshotV3:
         return encode(dict(profile=PROFILE,endpointDigest=hashlib.sha256(self._endpoint).hexdigest(),
             resources=resources,containers=containers,network=network))
 
-    def _capture(self,deadline,budget):
-        first=self._scan(deadline,budget);second=self._scan(deadline,budget)
+    def _capture(self,deadline,budget,*,include_definitions=False):
+        first=self._scan(deadline,budget,include_definitions=include_definitions)
+        second=self._scan(deadline,budget,include_definitions=include_definitions)
         if first!=second:reject()
         units._left(deadline)
         return first
@@ -220,3 +225,75 @@ class HostSnapshotV3:
         if os.getpid()!=self._owner:reject()
         self._closed=True
         if self._fd is not None:os.close(self._fd);self._fd=None
+
+
+def _frontend_projection(snapshot, original_id, protected_ids, candidate_id):
+    expected = set(protected_ids) | {original_id}
+    if candidate_id is not None:
+        if (type(candidate_id) is not str or not re.fullmatch('[0-9a-f]{64}', candidate_id)
+                or candidate_id in expected):
+            reject()
+        expected.add(candidate_id)
+    resources = snapshot['resources']
+    rows = snapshot['containers']
+    if set(resources['containers']) != expected or {row['id'] for row in rows} != expected:
+        reject()
+    resources = {key: value for key, value in resources.items() if key != 'containers'}
+    definitions = {}
+    for network_id, definition in resources['networkDefinitions'].items():
+        network = dict(definition)
+        if 'Containers' in network:
+            members = network['Containers']
+            if members is not None and type(members) is not dict:
+                reject()
+            network['Containers'] = {
+                key: value for key, value in (members or {}).items()
+                if key != original_id and key != candidate_id
+            }
+        definitions[network_id] = network
+    resources['networkDefinitions'] = definitions
+    return encode(dict(
+        profile=FRONTEND_PROTECTION_PROFILE,
+        endpointDigest=snapshot['endpointDigest'],
+        resources=resources,
+        containers=[row for row in rows if row['id'] in protected_ids],
+        network=snapshot['network'],
+    ))
+
+
+class ProductionFrontendProtectionV1:
+    """Observe the whole host while allowing only a retained original and one candidate.
+
+    The trusted worker supplies the exact candidate ID from its create receipt.
+    This projection records Docker resource definitions, not volume contents.
+    """
+    __slots__ = ('__weakref__',)
+
+    def __init__(self, observer, *, daemon_id, original_id, protected_ids, timeout=20):
+        if (type(self) is not ProductionFrontendProtectionV1 or type(observer) is not HostSnapshotV3
+                or self in _FRONTEND_PROTECTIONS
+                or type(daemon_id) is not str or daemon_id!=observer._info_id
+                or type(original_id) is not str or not re.fullmatch('[0-9a-f]{64}',original_id)
+                or type(protected_ids) is not tuple or not 1<=len(protected_ids)<=63
+                or any(type(item) is not str or not re.fullmatch('[0-9a-f]{64}',item) for item in protected_ids)
+                or tuple(sorted(set(protected_ids)))!=protected_ids or original_id in protected_ids):
+            reject()
+        baseline = _frontend_projection(self._observe(observer,timeout),original_id,protected_ids,None)
+        _FRONTEND_PROTECTIONS[self] = ((os.getpid(),threading.get_ident()),observer,original_id,protected_ids,baseline)
+
+    @staticmethod
+    def _observe(observer,timeout):
+        observer._check()
+        if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=20:
+            reject()
+        return json.loads(observer._capture(time.monotonic()+timeout,[32*1024*1024],include_definitions=True))
+
+    def verify(self, *, candidate_id=None, timeout=20):
+        state = _FRONTEND_PROTECTIONS.get(self)
+        if state is None or state[0]!=(os.getpid(),threading.get_ident()):
+            reject()
+        _,observer,original,protected,baseline=state
+        current=_frontend_projection(self._observe(observer,timeout),original,protected,candidate_id)
+        if current!=baseline:
+            reject()
+        return hashlib.sha256(current).hexdigest()

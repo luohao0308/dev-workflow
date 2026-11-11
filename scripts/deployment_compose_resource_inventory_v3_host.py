@@ -22,13 +22,21 @@ def _items(value,key,pattern):
     return sorted(result)
 
 
-def inventory(read_json):
+def inventory(read_json, *, include_definitions=False):
     """Only the observer's bound reader is used by the manager, never caller data."""
     containers=_items(read_json(CONTAINERS),'Id','[0-9a-f]{64}')
     images=_items(read_json(IMAGES),'Id','sha256:[0-9a-f]{64}')
-    networks=_items(read_json(NETWORKS),'Id','[0-9a-f]{64}')
+    network_rows=read_json(NETWORKS)
+    networks=_items(network_rows,'Id','[0-9a-f]{64}')
     volumes=read_json(VOLUMES)
     if (type(volumes) is not dict or 'Volumes' not in volumes or 'Warnings' not in volumes
             or volumes['Warnings'] is not None and volumes['Warnings']!=[]):reject()
     names=_items(volumes['Volumes'],'Name','[A-Za-z0-9][A-Za-z0-9_.-]{0,254}')
-    return dict(containers=containers,images=images,networks=networks,volumes=names)
+    result=dict(containers=containers,images=images,networks=networks,volumes=names)
+    if include_definitions:
+        result['networkDefinitions']={row['Id']:row for row in network_rows}
+        result['volumeDefinitions']={
+            row['Name']: {key:value for key,value in row.items() if key!='UsageData'}
+            for row in volumes['Volumes']
+        }
+    return result

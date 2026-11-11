@@ -37,3 +37,15 @@
 2026-11-10 的 GitHub 只读检查确认：main 尚无本工作流，compose-review 仅允许 feat/compose-validation-20261028，DW_PROD_FRONTEND_POLICY_HASH 尚未配置。审核环境的唯一 reviewer 为 84822776，prevent_self_review=true，禁止管理员绕过。main/分支政策/策略登记尚未满足，控制器应在 POST 前拒绝；本轮未修改这些远端设置。先完成宿主排他、保护对象 guard、保留旧实例的切换及失败恢复路径，再对具体的发布/配置步骤和精确业务请求进行实际审批。
 
 本片不放开旧 production=False 守卫，不提供 rollback/recovery，不证明生产 writer 或部署/回滚链路已可用。证据见 [审核接线记录](../validation/BLOG-PRODUCTION-REVIEW-WIRING-2026-11-10.json)。
+
+## 部署锁、全宿主保护与保留旧容器的切换（2026-11-11）
+
+`deployment_compose_production_scope_v1_host` 在已登记的宿主私有目录中为每个 Compose 项目固定一份持久日志。执行器核对目录与日志 inode，取得 `flock` 后先同步写入启动记录。原执行线程完成终态核验后登记证明摘要，再释放锁。强杀会释放进程锁，未结束的记录仍会阻止新执行器。该机制覆盖使用同一登记的执行器，依赖可信的本地持久存储。
+
+`ProductionFrontendProtectionV1` 复用原生 Docker 端点及双采样，要求原容器一直保留，新增项仅限创建回执登记的候选 ID。其他容器的配置摘要和生命周期记录、镜像库存、网络与卷配置、宿主网络投影必须一致。健康日志会滚动，因此比较不依赖健康日志。执行器仍需独立核对原容器与候选的阶段状态以及 Caddy 入口。
+
+`prepare_retained_frontend_cutover` 生成同镜像切换计划。候选先以停止状态创建，随后停止原容器、保留改名后的原实例、为候选更名并启动。切换和恢复都拒绝把受保护容器 ID 当作候选。恢复计划按已确认的切换步数和候选运行状态生成，需要把实际候选 ID、现场状态和操作绑定进独立审批。现有审批仍只绑定重建计划，实际 worker 还需接入这些检查并绑定新切换摘要。
+
+本地 Docker Desktop Engine 24.0.6 使用博客镜像内的诊断进程，在独立内部网络上完成三组演练。正常切换返回 200，故障候选返回 503，第三组在候选启动前停止切换。三组都保留并恢复原容器，探针均确认 `frontend` 只解析到预期实例，恢复后返回 200。每笔演练写入前均检查范围锁，事后核对本地资源清理。生产 Engine 29、实际 Nuxt/Caddy 路径和审批执行链仍需验收。
+
+Python 3.10、3.14 与隔离 Linux Python 3.13 各通过 31 项定向测试，包含真实子进程竞争和强杀、范围日志故障、保护投影漂移与切换计划。独立复审通过。可在具备本地博客镜像的 Docker Desktop 上用 `python3 tests/support/compose_retained_frontend_local_fixture.py` 重跑三组演练。[演练记录](../validation/BLOG-RETAINED-FRONTEND-CUTOVER-2026-11-11.json)

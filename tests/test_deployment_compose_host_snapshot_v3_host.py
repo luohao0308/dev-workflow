@@ -34,6 +34,7 @@ class HostTests(unittest.TestCase):
         self.row=dict(Id='a'*64,Name='/protected',Image='sha256:'+'b'*64,RestartCount=0,
             State=dict(StartedAt='2026-01-01T00:00:00Z',Status='running'),Config={'Env':['private-fixture']},
             HostConfig={'Memory':1024},Mounts=[],NetworkSettings={'Networks':{},'Ports':{}})
+        self.other_rows={}
         self.values={'/v1.45/info':{'ID':'production-one','DockerRootDir':'/var/lib/docker'},
             CONTAINERS:[{'Id':'a'*64}],IMAGES:[{'Id':'sha256:'+'b'*64}],NETWORKS:[{'Id':'c'*64}],
             VOLUMES:{'Volumes':[{'Name':'protected-data'}],'Warnings':None}}
@@ -42,7 +43,11 @@ class HostTests(unittest.TestCase):
             def log_message(self,*args):pass
             def do_GET(self):
                 test.http.append(self.path)
-                value=deepcopy(test.row) if self.path.endswith('/json') and '/containers/' in self.path else test.values[self.path]
+                if self.path.endswith('/json') and '/containers/' in self.path:
+                    cid=self.path.split('/')[-2]
+                    value=deepcopy(test.other_rows.get(cid,test.row))
+                else:
+                    value=test.values[self.path]
                 if value is not test.values.get(self.path) and type(value.get('State')) is dict:
                     value['State']['Health']={'Log':[{'End':str(len(test.http))}]}
                 raw=json.dumps(value).encode();self.send_response(200)
@@ -122,6 +127,47 @@ class HostTests(unittest.TestCase):
         value=self.observe();(self.run/'docker.sock').rename(self.run/'old.sock')
         other=socket.socket(socket.AF_UNIX);self.addCleanup(other.close);other.bind(str(self.run/'docker.sock'))
         with self.assertRaises(ValueError):value.verify_unchanged()
+
+    def test_frontend_protection_tracks_all_other_containers_and_resource_definitions(self):
+        original,candidate='e'*64,'f'*64
+        for cid in (original,candidate):
+            self.other_rows[cid]=dict(deepcopy(self.row),Id=cid,Name='/'+cid[0])
+        self.values[CONTAINERS].append({'Id':original})
+        network=self.values[NETWORKS][0]
+        network.update(Driver='bridge',Containers={original:{'Name':'old'},self.row['Id']:{'Name':'other'}})
+        volume=self.values[VOLUMES]['Volumes'][0]
+        volume.update(Driver='local',Options={'device':'protected'})
+        observer=self.observe()
+        protection=host.ProductionFrontendProtectionV1(
+            observer,daemon_id='production-one',original_id=original,protected_ids=(self.row['Id'],))
+        baseline=protection.verify()
+        self.values[CONTAINERS].append({'Id':candidate})
+        self.other_rows[original]['State']['Status']='exited'
+        network['Containers'][candidate]={'Name':'new'}
+        self.assertEqual(protection.verify(candidate_id=candidate),baseline)
+        with self.assertRaises(ValueError):
+            protection.verify()
+        for target,key,bad in ((self.row,'RestartCount',1),
+                (network,'Driver','host'),(volume,'Options',{'device':'different'}),
+                (network['Containers'][self.row['Id']],'Name','changed')):
+            before=target[key]
+            target[key]=bad
+            with self.assertRaises(ValueError):
+                protection.verify(candidate_id=candidate)
+            target[key]=before
+        self.values[CONTAINERS].remove({'Id':original})
+        with self.assertRaises(ValueError):
+            protection.verify(candidate_id=candidate)
+
+    def test_frontend_protection_rejects_incomplete_or_wrong_daemon_scope(self):
+        original='e'*64
+        self.other_rows[original]=dict(deepcopy(self.row),Id=original)
+        self.values[CONTAINERS].append({'Id':original})
+        observer=self.observe()
+        for daemon,protected in (('different',(self.row['Id'],)),('production-one',('d'*64,))):
+            with self.assertRaises(ValueError):
+                host.ProductionFrontendProtectionV1(
+                    observer,daemon_id=daemon,original_id=original,protected_ids=protected)
 
 
 class ContextTests(unittest.TestCase):
