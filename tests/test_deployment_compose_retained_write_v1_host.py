@@ -19,7 +19,7 @@ from deployment_compose_production_cutover_v1_host import ContainerOperation
 import deployment_compose_retained_write_v1_host as retained_write
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_write_gateway_v3_host import _UnixDocker
-from deployment_gateway import GatePolicy
+from deployment_gateway import GatePolicy, WriterSession
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
@@ -179,6 +179,35 @@ class RetainedWriteTests(GateFixture, unittest.TestCase):
                               before_dispatch=self._guard, expires_at=time.time() - 1)
         self.assertEqual(self.guards, [])
         self.assertEqual(self.calls_engine, [])
+
+    def test_dispatch_uses_fresh_signed_window_after_witness_preparation(self):
+        now = time.time()
+        expires_at = now + 120
+        clock = SimpleNamespace(monotonic=time.monotonic, time=lambda: now)
+        relay = self.writer._relay
+        prepare_attempt = WriterSession.prepare_attempt
+        deadlines = []
+
+        def delayed_prepare(session, *args):
+            nonlocal now
+            attempt = prepare_attempt(session, *args)
+            now += 31
+            return attempt
+
+        def guard():
+            self._guard()
+            deadlines.append(now + 30)
+            return deadlines[-1]
+
+        with (patch.object(retained_write, 'time', clock),
+              patch.object(WriterSession, 'prepare_attempt', delayed_prepare),
+              patch.object(self.writer, '_relay', wraps=relay) as dispatch):
+            status, _, _ = self.writer.write(self.create, **self.pins, index=0,
+                                            before_dispatch=guard, expires_at=expires_at)
+        self.assertEqual(status, 201)
+        self.assertEqual(dispatch.call_args.args[-1], deadlines[1])
+        self.assertLess(deadlines[0], now)
+        self.assertEqual(self.calls_engine, [(self.create.path, b'{}')])
 
     def test_authorization_expiring_during_final_guard_never_reaches_engine(self):
         now = time.time()

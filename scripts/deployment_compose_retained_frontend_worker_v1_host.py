@@ -225,18 +225,13 @@ class RetainedFrontendWorkerV1:
         expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         return transport, receipt_hash, execution_digest, expires_at
 
-    @staticmethod
-    def _step_expiry(approval, request, expires_at):
-        checked = approval.check_consumed_intent(request)
-        if type(approval) is RetainedIntentClientV1:
-            return min(expires_at, checked)
-        return expires_at
-
     def _write(self, transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at):
         def guard():
-            approval.check_consumed_intent(request)
             if self._observe() != self._observation:
                 raise RetainedWorkerBlocked('retained-production-write-drift')
+            checked = approval.check_consumed_intent(request)
+            if type(approval) is RetainedIntentClientV1:
+                return checked
 
         status, raw, witness = transport.write(
             operation, request_hash=request.digest(), receipt_hash=receipt_hash,
@@ -271,8 +266,7 @@ class RetainedFrontendWorkerV1:
         first = self._plan.create()
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, first)
         self._parent = request.digest()
-        first_expiry = self._step_expiry(approval, request, expires_at)
-        raw, witness = self._write(transport, approval, request, first, 0, receipt_hash, execution_digest, first_expiry)
+        raw, witness = self._write(transport, approval, request, first, 0, receipt_hash, execution_digest, expires_at)
         response = json.loads(raw, object_pairs_hook=pairs)
         candidate = response['Id']
         self._plan._candidate(candidate)
@@ -285,12 +279,12 @@ class RetainedFrontendWorkerV1:
             try:
                 # A denial here precedes any new witness reservation or Docker
                 # request. Only this known closed prefix can get a new approval.
-                step_expiry = self._step_expiry(approval, request, expires_at)
+                approval.check_consumed_intent(request)
             except (AuthorizationUnavailable, IntentRelayRejected):
                 if self._prefix and self._observe() == self._observation:
                     self._state = 'restoration-ready'
                 raise
-            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, step_expiry)
+            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
             witnesses.append(witness)
             self._prefix = index
             self._phase = switched_phase(self._plan, index)
@@ -314,8 +308,7 @@ class RetainedFrontendWorkerV1:
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, operations[0])
         witnesses = []
         for index, operation in enumerate(operations):
-            step_expiry = self._step_expiry(approval, request, expires_at)
-            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, step_expiry)
+            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
             witnesses.append(witness)
             self._phase = restored_phase(self._plan, self._phase, operation)
             self._observation = self._observe()
