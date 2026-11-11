@@ -1,5 +1,6 @@
 """Bind legacy journal reconciliation to the registered production frontend."""
 import hashlib
+import json
 import os
 import stat
 import subprocess
@@ -11,8 +12,9 @@ from deployment_compose_production_cutover_v1_host import prepare_retained_front
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import ScopeBlocked, _directory, _locked_pending_scope
 from deployment_compose_retained_phase_v1_host import original_projection
+from deployment_compose_retained_write_v1_host import _operation_tuple
 from deployment_compose_scope_reconciliation_v1_host import reconcile_pending_scope, recovery_payload
-from deployment_compose_witness_store import canonical, hex_value
+from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
 
 
 def _reject():
@@ -48,23 +50,42 @@ def _private_file(parent, name, maximum):
         os.close(fd)
 
 
-def _prepared_gate(registration, request_digest, generation, expected):
+def _same_entry(parent, name, fd):
+    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    opened = os.fstat(fd)
+    return (observed.st_dev, observed.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _prepared_gate(registration, request_digest, generation, expected, operation):
     root, identity = _directory(registration.root)
     try:
         if identity != registration.root_identity:
             _reject()
         gate = _directory_child(root, 'gate-' + request_digest)
         try:
-            if set(os.listdir(gate)) != {'mutex', 'policy.json', generation}:
+            gate_entries = {'mutex', 'policy.json', generation}
+            if set(os.listdir(gate)) != gate_entries:
                 _reject()
             events = _directory_child(gate, generation)
             try:
                 names = ('00000000.json', '00000001.json')
                 if set(os.listdir(events)) != set(names):
                     _reject()
-                digests = tuple(hashlib.sha256(_private_file(events, name, 16384)).hexdigest()
-                                for name in names)
-                if digests != expected or set(os.listdir(events)) != set(names):
+                raw = tuple(_private_file(events, name, 16384) for name in names)
+                digests = tuple(hashlib.sha256(value).hexdigest() for value in raw)
+                if (digests != expected or set(os.listdir(events)) != set(names)
+                        or set(os.listdir(gate)) != gate_entries
+                        or not _same_entry(gate, generation, events)
+                        or not _same_entry(root, 'gate-' + request_digest, gate)):
+                    _reject()
+                opened, prepared = (json.loads(value, object_pairs_hook=pairs)['payload'] for value in raw)
+                if (opened['kind'] != 'open' or opened['generation'] != generation
+                        or opened['previous'] != ZERO or opened['data']['request_hash'] != request_digest
+                        or opened['data']['operations'] != [operation]
+                        or prepared['kind'] != 'prepare' or prepared['generation'] != generation
+                        or prepared['directory'] != opened['directory']
+                        or prepared['previous'] != hashlib.sha256(canonical(opened)).hexdigest()
+                        or prepared['data']['operation'] != operation or not hex_value(prepared['data']['ref'])):
                     _reject()
                 return digests
             finally:
@@ -101,7 +122,8 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
         _reject()
 
     _require_quiescent()
-    events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests)
+    operation = list(_operation_tuple(cutover.create()))
+    events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation)
     observer = HostSnapshotV3()
     try:
         if observer.descriptor()['endpointDigest'] != endpoint_digest:
@@ -130,7 +152,7 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
         protection_digest = protection.verify()
         observer.verify_unchanged()
         _require_quiescent()
-        if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests) != events:
+        if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation) != events:
             _reject()
         return hashlib.sha256(canonical(dict(
             profile='production-frontend-legacy-reconciliation-v1', requestHash=request_digest,
