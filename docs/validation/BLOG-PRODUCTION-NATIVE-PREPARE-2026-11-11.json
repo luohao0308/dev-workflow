@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "kind": "blog-production-native-prepare",
+  "date": "2026-11-11",
+  "sourceSha": "fce02de19e0164130d6f08418c3661923a95b7ab",
+  "archiveDigest": "7e6e5d1acc4d51424bfeb07c6050f6602073c00056bf5cf925a11aab57e85026",
+  "caddyProbeReadOnlyPassed": true,
+  "caddyProbePackageDigest": "d90046718240b102e704235f37b7e97bf8c4d54c790e8f232bcbcb02267c55bf",
+  "sshNativeStartupVerified": true,
+  "nativePlanPrepared": true,
+  "bodyDigest": "dfcfee4ae2ebd76c9c3b418cf6146926ae1d37f79019eaef68a827a73664e6df",
+  "ownedUnitCleanupVerified": true,
+  "temporaryArtifactsCleaned": true,
+  "hostProjectionUnchanged": true,
+  "testJournalUnchanged": true,
+  "pythonVersions": [
+    "3.10",
+    "3.14"
+  ],
+  "targetedTestsPerVersion": 62,
+  "platformSkipsPerVersion": 3,
+  "sshRelayTestsPerVersion": 6,
+  "realGitHubApprovalDispatched": false,
+  "consentConsumed": false,
+  "productionWrites": 0,
+  "productionCutoverVerified": false
+}
