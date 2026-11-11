@@ -6,7 +6,7 @@ import sys,unittest,tempfile
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import deployment_compose_production_frontend_review_contract as contract
-from tests.test_deployment_compose_production_frontend_approval_v1_host import fixture
+from tests.test_deployment_compose_production_frontend_approval_v1_host import fixture,retained_review
 
 class ProductionReviewTests(unittest.TestCase):
     def setUp(self):
@@ -14,6 +14,24 @@ class ProductionReviewTests(unittest.TestCase):
         self.env=dict(GITHUB_REPOSITORY=contract.host.RUNTIME,GITHUB_REPOSITORY_ID='1327491026',GITHUB_REF='refs/heads/main',GITHUB_EVENT_NAME='workflow_dispatch',GITHUB_RUN_ATTEMPT='1',GITHUB_WORKFLOW_REF=contract.host.WORKFLOW,GITHUB_SHA=self.policy.workflow_sha,GITHUB_WORKFLOW_SHA=self.policy.workflow_sha,GITHUB_RUN_ID='123',DW_AUTH_REVIEWER_ID='42',DW_AUTH_LEDGER_REPOSITORY=contract.host.LEDGER,DW_AUTH_LEDGER_ID='1436718662',DW_AUTH_LEDGER_SHA=self.policy.ledger_sha,DW_PROD_FRONTEND_POLICY_HASH=self.req.policy_hash)
         self.payload=dict(request=asdict(self.req),review=self.review)
     def prepared(self):return contract.canonical(contract.prepare(contract.canonical(self.payload),self.env))
+    def test_retained_rollback_artifact_binds_and_displays_scope(self):
+        review=retained_review(self.review,'rollback')
+        req=contract.host.prepare_production_frontend_request(
+            review,operation='rollback',policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
+        self.payload=dict(request=asdict(req),review=review)
+        raw=self.prepared()
+        _,policy,_=contract.verify_prepared_review(raw,self.env,req,review)
+        self.assertIs(type(policy),contract.host.ProductionFrontendApprovalPolicyV2)
+        self.assertEqual(policy.observation_hash,req.observation_hash)
+        self.assertEqual(policy.snapshot_hash,req.before_hash)
+        summary=contract.summary(raw,self.env)
+        for value in ('Operation: `rollback`','Switch prefix: `4`','Candidate running: `true`',
+                      req.history_hash,req.observation_hash,review['retainedCutover']['candidateId'],
+                      'Runtime archive digest: `'+review['retainedCutover']['runtimeArchiveDigest']+'`'):
+            self.assertIn(value,summary)
+        review['retainedCutover']['switchPrefix']=3
+        review['retainedCutover']['candidateRunning']=False
+        with self.assertRaises(Exception):self.prepared()
     def test_roundtrip_private_binding_summary_and_separate_shas(self):
         raw=self.prepared();req,policy,digest=contract.verify_prepared_review(raw,self.env,self.req,self.review)
         self.assertEqual(req,self.req);self.assertEqual(policy.source_sha,self.req.source.source_sha)

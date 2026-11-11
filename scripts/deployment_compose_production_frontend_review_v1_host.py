@@ -13,7 +13,8 @@ import time
 
 from deployment_compose_live_review_v3_host import GitHubLiveReviewV3, LiveReviewBlocked, CONFIG, _private
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV1, prepare_production_frontend_request, PROFILE, RUNTIME)
+    GitHubProductionFrontendApprovalV1, GitHubProductionFrontendApprovalV2,
+    prepare_production_frontend_request, PROFILE, RUNTIME)
 from deployment_compose_full_body_review_contract import canonical, parse_stamp
 from deployment_contract_v2 import RequestV2
 
@@ -113,7 +114,9 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
             review=plan['publicReview']
             if hashlib.sha256(canonical(plan['privateBody']).encode('ascii')).hexdigest()!=review['bodyDigest']:
                 raise LiveReviewBlocked('Private body differs from review')
-            if prepare_production_frontend_request(review,policy_hash=self.registered_policy_hash,expires_at=request.expires_at)!=request:
+            if prepare_production_frontend_request(
+                    review,policy_hash=self.registered_policy_hash,expires_at=request.expires_at,
+                    operation=request.operation)!=request:
                 raise LiveReviewBlocked('Request differs from private preparation')
         check();self._environment()
         if self._get('/git/ref/heads/main').get('object',{}).get('sha')!=self.source_sha:
@@ -183,7 +186,7 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
                 if len(matches)>1:raise LiveReviewBlocked('Multiple matching production reviews')
                 if matches:
                     selected,raw,policy,bundle_hash=matches[0]
-                    on_review(dict(url=selected['html_url'],comment='dev-workflow approve '+bundle_hash,production=True,operation='deploy',requestHash=request.digest(),expiresAt=request.expires_at))
+                    on_review(dict(url=selected['html_url'],comment='dev-workflow approve '+bundle_hash,production=True,operation=request.operation,requestHash=request.digest(),expiresAt=request.expires_at))
                     check()
             if selected is not None:
                 run=self._get('/actions/runs/'+str(selected['id']))
@@ -200,7 +203,9 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
                     result=subprocess.run(['/usr/bin/openssl','cms','-decrypt','-inform','DER','-inkey',str(self.key)],input=cipher,capture_output=True,timeout=15)
                     token=result.stdout
                     if result.returncode or len(token)>32768 or not token.isascii() or token.count(b'.')!=2:raise LiveReviewBlocked('Invalid sealed consent')
-                    approval=GitHubProductionFrontendApprovalV1(self.client,token.decode('ascii'),[request],policy)
+                    approval_type=(GitHubProductionFrontendApprovalV2 if request.profile_version=='2'
+                                   else GitHubProductionFrontendApprovalV1)
+                    approval=approval_type(self.client,token.decode('ascii'),[request],policy)
                     grant=approval.validate(request);check()
                     return approval,grant,dict(runId=run['id'],url=run['html_url'],requestHash=request.digest(),runtimePermit=False,consumed=False)
             time.sleep(min(5,max(0,deadline-time.time())))

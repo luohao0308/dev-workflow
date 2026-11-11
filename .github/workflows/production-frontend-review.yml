@@ -10,7 +10,7 @@ on:
         default: launch
         required: true
       public_payload:
-        description: 'Closed production same-image frontend deploy intent'
+        description: 'Closed production frontend replacement or retained rollback intent'
         type: string
         required: true
 permissions:

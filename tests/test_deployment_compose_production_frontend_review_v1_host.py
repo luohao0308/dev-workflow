@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'scripts'))
 import deployment_compose_production_frontend_review_v1_host as bridge
 import deployment_compose_production_frontend_review_contract as contract
-from tests.test_deployment_compose_production_frontend_approval_v1_host import fixture,approved,host,release
+from tests.test_deployment_compose_production_frontend_approval_v1_host import fixture,approved,host,release,retained_review
 from tests.test_deployment_compose_production_frontend_v3_host import material,adapter
 from tests.test_release_host import claims
 
@@ -66,6 +66,7 @@ class BridgeTests(unittest.TestCase):
    stream=io.BytesIO()
    with zipfile.ZipFile(stream,'w') as z:z.writestr(filename,raw)
    return stream.getvalue()
+  self.zipped=zipped
   self.zips={1:zipped('bundle.json',self.raw),2:zipped('oidc.cms.der',self.cipher)}
   self.data['/repos/'+host.RUNTIME+'/actions/runs/123/artifacts?per_page=100']={'total_count':2,'artifacts':[{'id':1,'name':bridge.PUBLIC_ARTIFACT,'expired':False,'size_in_bytes':len(self.zips[1])},{'id':2,'name':bridge.SEALED_ARTIFACT,'expired':False,'size_in_bytes':len(self.zips[2])}]}
   self.b._command=lambda argv,**kwargs:SimpleNamespace(returncode=0,stdout=self.zips[int(argv[-1].split('/')[-2])])
@@ -90,6 +91,23 @@ class BridgeTests(unittest.TestCase):
   for file in self.root.rglob('*'):
    if file.is_file():self.assertNotIn(self.token,file.read_bytes())
   with self.assertRaises(FileExistsError):self.b.request_prepared_review(self.plan,self.req,lambda _:None)
+ def test_retained_rollback_returns_v2_consent_and_reports_operation(self):
+  review=retained_review(self.plan['publicReview'],'rollback')
+  self.plan['publicReview']=review
+  req=host.prepare_production_frontend_request(
+      review,operation='rollback',policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
+  raw=contract.prepare(contract.canonical(dict(request=asdict(req),review=review)),self.b._env(self.run))
+  self.zips[1]=self.zipped('bundle.json',contract.canonical(raw).encode())
+  self.data['/repos/'+host.RUNTIME+'/actions/runs/123/artifacts?per_page=100']['artifacts'][0]['size_in_bytes']=len(self.zips[1])
+  self.data['/repos/'+host.RUNTIME+'/actions/runs/123/approvals'][0]['comment']='dev-workflow approve '+raw['bundleHash']
+  events=[]
+  approval,grant,metadata=self.b.request_prepared_review(self.plan,req,events.append)
+  self.assertIs(type(approval),host.GitHubProductionFrontendApprovalV2)
+  self.assertEqual(grant.request_hash,req.digest())
+  self.assertEqual(events[0]['operation'],'rollback')
+  self.assertFalse(metadata['consumed'])
+  sent=json.loads(json.loads(self.dispatch_inputs[0])['inputs']['public_payload'])
+  self.assertEqual(sent['review']['retainedCutover'],review['retainedCutover'])
  def test_main_denied_before_post(self):
   self.data['/repos/'+host.RUNTIME+'/environments/compose-review/deployment-branch-policies?per_page=100']['branch_policies']=[]
   with self.assertRaises(bridge.LiveReviewBlocked):self.b.request_prepared_review(self.plan,self.req,lambda _:None)

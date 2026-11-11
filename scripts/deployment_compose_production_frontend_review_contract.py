@@ -35,11 +35,17 @@ def _values(payload,env,now):
     expected=host.prepare_production_frontend_request(payload['review'],policy_hash=env['DW_PROD_FRONTEND_POLICY_HASH'],expires_at=request.expires_at,operation=request.operation)
     if request!=expected:raise ValueError('Production request differs from review')
     request.ensure_fresh(now,maximum_seconds=1800)
-    policy=host.ProductionFrontendApprovalPolicyV1(**identity,expires_at=request.expires_at,
+    policy_type=host.ProductionFrontendApprovalPolicyV1
+    retained={}
+    if request.profile_version=='2':
+        policy_type=host.ProductionFrontendApprovalPolicyV2
+        retained=dict(operation=request.operation,observation_hash=request.observation_hash,history_hash=request.history_hash)
+    policy=policy_type(**identity,expires_at=request.expires_at,
         source_sha=request.source.source_sha,host_id=request.host_id,daemon_id=request.daemon_id,
-        current_image_id='sha256:'+request.artifact_digest,snapshot_hash=request.observation_hash,
+        current_image_id='sha256:'+request.artifact_digest,snapshot_hash=request.before_hash,
         body_hash=request.after_hash,plan_hash=request.plan_hash,
-        protected_inventory_hash=host._digest(list(request.protected_components)),request_hash=request.digest(),policy_hash=request.policy_hash)
+        protected_inventory_hash=host._digest(list(request.protected_components)),request_hash=request.digest(),
+        policy_hash=request.policy_hash,**retained)
     return request,policy
 
 
@@ -72,13 +78,28 @@ def verify_prepared_review(raw,env,expected_request,expected_review,now=None):
 
 def summary(raw,env):
     request,_,digest=verify(raw,env);review=common._parse(raw,65536)['review']
-    return ('PRODUCTION frontend intent consent; production=true; deploy only.\n\n'
+    details='PRODUCTION frontend intent consent; production=true; deploy only.\n\n'
+    retained=''
+    limits='Rollback/recovery denied. '
+    if request.profile_version=='2':
+        details=f'PRODUCTION frontend intent consent. production=true. Operation: `{request.operation}`.\n\n'
+        cutover=review['retainedCutover']
+        retained=(f"Retained cutover plan: `{cutover['planDigest']}`. Operation nonce: `{cutover['operationNonce']}`. "
+                  f"Protection digest: `{cutover['protectionDigest']}`. "
+                  f"Runtime archive digest: `{cutover['runtimeArchiveDigest']}`.\n\n")
+        if request.operation=='rollback':
+            retained+=(f"Candidate: `{cutover['candidateId']}`. Switch prefix: `{cutover['switchPrefix']}`. "
+                       f"Candidate running: `{str(cutover['candidateRunning']).lower()}`. "
+                       f"Parent request: `{request.history_hash}`. Observation: `{request.observation_hash}`.\n\n")
+        limits='Recovery denied. '
+    return (details
         +'Repository: `'+host.BLOG+'`; business SHA: `'+request.source.source_sha+'`; runtime SHA: `'+env['GITHUB_SHA']+'`.\n\n'
         +'Host: `'+request.host_id+'`; daemon: `'+request.daemon_id+'`; project: `luohao-blog-prod`; container: `blog-frontend` (`'+review['identity']['containerId']+'`).\n\n'
         +'Same immutable image: `'+review['identity']['imageId']+'`; protected IDs (inventory only): `'+', '.join(request.protected_components)+'`.\n\n'
-        +'Snapshot: `'+request.observation_hash+'`; body: `'+request.after_hash+'`; plan: `'+request.plan_hash+'`.\n\n'
+        +'Snapshot: `'+request.before_hash+'`; body: `'+request.after_hash+'`; plan: `'+request.plan_hash+'`.\n\n'
+        +retained
         +'Expiry: `'+request.expires_at+'`; maximum uses: 1.\n\n'
-        +'Limits: '+', '.join(review['executionBlockedReasons'])+'. No runtime permit, native enrollment, freshness, Engine reconstruction or production readiness is established. Rollback/recovery denied. Host must verify private prepared scope before consumption.\n\n'
+        +'Limits: '+', '.join(review['executionBlockedReasons'])+'. No runtime permit, native enrollment, freshness, Engine reconstruction or production readiness is established. '+limits+'Host must verify private prepared scope before consumption.\n\n'
         +'Exact approval comment: `dev-workflow approve '+digest+'`\n\nThis workflow performs no Docker, SSH, ledger consumption or deployment.\n')
 
 

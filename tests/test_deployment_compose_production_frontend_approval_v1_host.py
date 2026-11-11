@@ -29,6 +29,15 @@ def fixture():
     return req,host.ProductionFrontendApprovalPolicyV1(**fields),review
 
 
+def retained_review(review,operation):
+    review=deepcopy(review)
+    cutover=dict(planDigest='1'*64,operationNonce='2'*64,protectionDigest='3'*64,runtimeArchiveDigest='a'*64)
+    if operation=='rollback':
+        cutover.update(candidateId='4'*64,switchPrefix=4,candidateRunning=True,
+                       parentRequestHash='5'*64,observationDigest='6'*64)
+    return dict(review,retainedCutover=cutover)
+
+
 def approved(policy,req):
     client=Client(policy,[req]);data={}
     for key,value in client.data.items():
@@ -44,11 +53,73 @@ def approved(policy,req):
         data[key]=value
     client.data=data
     token=dict(claims(policy),aud=host.AUDIENCE)
-    approval=host.GitHubProductionFrontendApprovalV1(client,'signed',[req],policy,verifier=lambda _:deepcopy(token))
+    approval_type=host.GitHubProductionFrontendApprovalV2 if req.profile_version=='2' else host.GitHubProductionFrontendApprovalV1
+    approval=approval_type(client,'signed',[req],policy,verifier=lambda _:deepcopy(token))
     return approval,client,token
 
 
 class ProductionApprovalTests(unittest.TestCase):
+    def test_retained_deploy_and_rollback_bind_distinct_operations(self):
+        old,p,review=fixture()
+        for operation in ('deploy','rollback'):
+            with self.subTest(operation=operation):
+                scoped=retained_review(review,operation)
+                req=host.prepare_production_frontend_request(
+                    scoped,policy_hash=old.policy_hash,expires_at=old.expires_at,operation=operation)
+                self.assertEqual(req.profile_version,'2')
+                self.assertEqual(req.plan_hash,host._digest(scoped))
+                self.assertEqual(req.before_hash,review['snapshotDigest'])
+                self.assertEqual(req.observation_hash,'6'*64 if operation=='rollback' else review['snapshotDigest'])
+                self.assertEqual(req.history_hash,'5'*64 if operation=='rollback' else None)
+                policy=host.ProductionFrontendApprovalPolicyV2(**dict(vars(p),operation=operation,
+                    observation_hash=req.observation_hash,history_hash=req.history_hash,
+                    request_hash=req.digest(),plan_hash=req.plan_hash))
+                approval,client,_=approved(policy,req)
+                grant=approval.validate(req)
+                self.assertEqual(approval.consume(grant,req).request_hash,req.digest())
+                with self.assertRaises(AuthorizationUnavailable):approval.guard(req)
+                with self.assertRaises(AuthorizationUnavailable):approval.consume(grant,req)
+                with self.assertRaises(AuthorizationUnavailable):
+                    host.GitHubProductionFrontendApprovalV1(Mock(),'signed',[req],policy)
+                if operation=='rollback':
+                    for field in ('history_hash','observation_hash'):
+                        changed=replace(req,**{field:'9'*64})
+                        with self.assertRaises(AuthorizationUnavailable):
+                            approved(replace(policy,request_hash=changed.digest()),changed)
+
+    def test_retained_scope_rejects_unapproved_shapes_and_prefixes(self):
+        req,_,review=fixture()
+        for changes in (dict(switchPrefix=True),dict(switchPrefix=0),dict(switchPrefix=5),
+                        dict(switchPrefix=3),dict(candidateRunning=1),dict(planDigest='x'),
+                        dict(candidateId=review['identity']['containerId']),dict(unknown='0'*64)):
+            scoped=retained_review(review,'rollback')
+            scoped['retainedCutover'].update(changes)
+            with self.subTest(changes=changes),self.assertRaises(AuthorizationUnavailable):
+                host.prepare_production_frontend_request(
+                    scoped,policy_hash=req.policy_hash,expires_at=req.expires_at,operation='rollback')
+        for review_operation,request_operation in (('deploy','rollback'),('rollback','deploy'),('deploy','recovery')):
+            with self.subTest(operation=request_operation),self.assertRaises(AuthorizationUnavailable):
+                host.prepare_production_frontend_request(retained_review(review,review_operation),
+                    policy_hash=req.policy_hash,expires_at=req.expires_at,operation=request_operation)
+
+    def test_retained_deploy_and_rollback_require_and_bind_runtime_archive_digest(self):
+        req,_,review=fixture()
+        for operation in ('deploy','rollback'):
+            def prepare(scoped):
+                return host.prepare_production_frontend_request(
+                    scoped,policy_hash=req.policy_hash,expires_at=req.expires_at,operation=operation)
+            scoped=retained_review(review,operation)
+            first=prepare(scoped)
+            scoped['retainedCutover']['runtimeArchiveDigest']='b'*64
+            self.assertNotEqual(prepare(scoped).plan_hash,first.plan_hash)
+            for digest in ('A'*64,'a'*63,None):
+                scoped['retainedCutover']['runtimeArchiveDigest']=digest
+                with self.subTest(operation=operation,digest=digest),self.assertRaises(AuthorizationUnavailable):
+                    prepare(scoped)
+            del scoped['retainedCutover']['runtimeArchiveDigest']
+            with self.subTest(operation=operation,digest='missing'),self.assertRaises(AuthorizationUnavailable):
+                prepare(scoped)
+
     def test_production_consent_consumed_once_without_runtime_authority(self):
         req,p,review=fixture();approval,client,_=approved(p,req)
         grant=approval.validate(req);receipt=approval.consume(grant,req)

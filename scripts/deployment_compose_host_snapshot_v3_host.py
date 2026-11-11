@@ -138,7 +138,9 @@ class HostSnapshotV3:
         if self._socket_state is not None and self._show('docker.socket',_SOCKET,deadline)!=self._socket_state:reject()
 
     def _get(self,path,deadline,budget):
-        if path not in PATHS and path!='/v1.45/info' and not re.fullmatch(r'/v1\.45/containers/[0-9a-f]{64}/json',path):reject()
+        if (path not in PATHS and path not in ('/v1.45/info', '/v1.45/version')
+                and not re.fullmatch(r'/v1\.45/(?:containers/[0-9a-f]{64}|images/sha256:[0-9a-f]{64})/json',path)):
+            reject()
         self._local()
         connection=_UnixDocker('/proc/self/fd/'+str(self._fd)+'/docker.sock',min(3,units._left(deadline)))
         watchdog=None
@@ -208,6 +210,41 @@ class HostSnapshotV3:
         if first!=second:reject()
         units._left(deadline)
         return first
+
+    def _write_socket(self):
+        self._local()
+        return Path('/proc/self/fd') / str(self._fd) / 'docker.sock'
+
+    def _bound_write_connection(self, timeout, *, expires_at=None):
+        """Recheck the actual writer connection against the observed Unix peer."""
+        deadline = time.monotonic() + timeout
+        connection = _UnixDocker(str(self._write_socket()), timeout)
+        connect = connection.connect
+        request = connection.request
+
+        def check_peer():
+            self._local()
+            pid, uid, _ = _peer(connection.sock)
+            if (uid != _UID or pid != self._peer_pid or time.monotonic() >= deadline
+                    or expires_at is not None and time.time() >= expires_at):
+                reject()
+
+        def bound_connect():
+            self._fresh(deadline)
+            connect()
+            try:
+                check_peer()
+            except BaseException:
+                connection.close()
+                raise
+
+        def bound_request(*args, **kwargs):
+            check_peer()
+            return request(*args, **kwargs)
+
+        connection.connect = bound_connect
+        connection.request = bound_request
+        return connection
 
     def descriptor(self):
         self._check()

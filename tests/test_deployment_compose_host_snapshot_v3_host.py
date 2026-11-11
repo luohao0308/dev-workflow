@@ -35,6 +35,7 @@ class HostTests(unittest.TestCase):
             State=dict(StartedAt='2026-01-01T00:00:00Z',Status='running'),Config={'Env':['private-fixture']},
             HostConfig={'Memory':1024},Mounts=[],NetworkSettings={'Networks':{},'Ports':{}})
         self.other_rows={}
+        self.engine_post=None
         self.values={'/v1.45/info':{'ID':'production-one','DockerRootDir':'/var/lib/docker'},
             CONTAINERS:[{'Id':'a'*64}],IMAGES:[{'Id':'sha256:'+'b'*64}],NETWORKS:[{'Id':'c'*64}],
             VOLUMES:{'Volumes':[{'Name':'protected-data'}],'Warnings':None}}
@@ -49,9 +50,19 @@ class HostTests(unittest.TestCase):
                 else:
                     value=test.values[self.path]
                 if value is not test.values.get(self.path) and type(value.get('State')) is dict:
-                    value['State']['Health']={'Log':[{'End':str(len(test.http))}]}
+                    value['State'].setdefault('Health', {})['Log']=[{'End':str(len(test.http))}]
                 raw=json.dumps(value).encode();self.send_response(200)
                 self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+            def do_POST(self):
+                if test.engine_post is None:
+                    self.send_error(405)
+                    return
+                raw=self.rfile.read(int(self.headers['Content-Length']))
+                status,body=test.engine_post(self.path,raw)
+                self.send_response(status)
+                self.send_header('Content-Length',str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
         server=socketserver.UnixStreamServer(str(self.run/'docker.sock'),Handler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         self.addCleanup(lambda:(server.shutdown(),server.server_close(),thread.join(timeout=3)))
@@ -127,6 +138,17 @@ class HostTests(unittest.TestCase):
         value=self.observe();(self.run/'docker.sock').rename(self.run/'old.sock')
         other=socket.socket(socket.AF_UNIX);self.addCleanup(other.close);other.bind(str(self.run/'docker.sock'))
         with self.assertRaises(ValueError):value.verify_unchanged()
+
+    def test_native_write_connection_rejects_different_peer_before_request(self):
+        observer = self.observe()
+        connection = observer._bound_write_connection(3)
+        connection.connect()
+        self.addCleanup(connection.close)
+        before = list(self.http)
+        self.peer = 999
+        with self.assertRaises(ValueError):
+            connection.request('POST', '/v1.45/containers/' + 'a' * 64 + '/start')
+        self.assertEqual(self.http, before)
 
     def test_frontend_protection_tracks_all_other_containers_and_resource_definitions(self):
         original,candidate='e'*64,'f'*64

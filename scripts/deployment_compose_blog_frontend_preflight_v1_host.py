@@ -15,10 +15,10 @@ import time
 
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan, snapshot_digest
 
-_REMOTE_CAPTURE = r'''import subprocess,json
+_REMOTE_CAPTURE = r'''import subprocess,json,os
 
 def get(args):
- return subprocess.run(args,capture_output=True,text=True,check=True,timeout=15).stdout
+ return subprocess.run(args,env={**os.environ,'DOCKER_API_VERSION':'1.45'},capture_output=True,text=True,check=True,timeout=15).stdout
 allowed={'NUXT_PUBLIC_SITE_URL','NUXT_PUBLIC_CHAT_MASCOT_SRC','NUXT_BACKEND_BASE','NUXT_PUBLIC_ICP_NUMBER','PATH','NODE_VERSION','YARN_VERSION','NODE_ENV'}
 def inspect():
  return json.loads(get(['docker','inspect','--format','{"Id":{{json .Id}},"Name":{{json .Name}},"Image":{{json .Image}},"Config":{{json .Config}},"HostConfig":{{json .HostConfig}},"Mounts":{{json .Mounts}},"NetworkSettings":{{json .NetworkSettings}},"RestartCount":{{json .RestartCount}},"State":{"Pid":{{json .State.Pid}},"StartedAt":{{json .State.StartedAt}},"Running":{{json .State.Running}},"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}},"Dead":{{json .State.Dead}},"Status":{{json .State.Status}},"Health":{"Status":{{json .State.Health.Status}}}}}','blog-frontend']))

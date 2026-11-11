@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-11",
+  "kind": "production-retained-worker-wiring",
+  "testsPerPython": 89,
+  "pythonVersions": [
+    "3.10",
+    "3.14"
+  ],
+  "localResult": "passed",
+  "independentReview": "CLEAR",
+  "realTestMechanisms": [
+    "Unix HTTP",
+    "mTLS",
+    "signed witness",
+    "durable host scope"
+  ],
+  "testDoubles": [
+    "GitHub authorization service",
+    "Docker Engine",
+    "native systemd identity"
+  ],
+  "liveReadOnly": {
+    "engineVersion": "29.8.2",
+    "gitCommit": "8af9fe3",
+    "engineApi": "1.56",
+    "workerApi": "1.45",
+    "bodyDigest": "dfcfee4ae2ebd76c9c3b418cf6146926ae1d37f79019eaef68a827a73664e6df",
+    "homepageHttp": 200,
+    "healthHttp": 200,
+    "articlesHttp": 200
+  },
+  "productionApprovalDispatched": false,
+  "productionApprovalConsumed": false,
+  "productionWrites": 0,
+  "productionWorkerInstalled": false,
+  "productionReadinessProbeInstalled": false,
+  "productionReady": false
+}

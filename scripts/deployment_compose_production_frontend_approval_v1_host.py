@@ -1,8 +1,4 @@
-"""Production frontend consent only; no native enrollment or runtime permit.
-
-Rollback remains denied until an issued completed deployment-history contract
-exists. Caller JSON history cannot supply that missing authority.
-"""
+"""Production frontend consent for replacement and retained restoration plans."""
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -24,6 +20,8 @@ WORKFLOW=RUNTIME+'/.github/workflows/production-frontend-review.yml@refs/heads/m
 REVIEW_FIELDS={'identity','snapshotDigest','bodyDigest','protectedContainerIds','sameImage','selectedServices','representabilityChecked','engineReconstructionVerified','freshnessVerified','authorityGranted','runtimePermit','executionAvailable','productionReady','executionBlockedReasons'}
 IDENTITY_FIELDS={'hostId','daemonId','project','service','containerId','containerName','imageId','sourceSha'}
 HASH=re.compile('[0-9a-f]{64}\\Z')
+RETAINED_DEPLOY_FIELDS={'planDigest','operationNonce','protectionDigest','runtimeArchiveDigest'}
+RETAINED_ROLLBACK_FIELDS={'candidateId','switchPrefix','candidateRunning','parentRequestHash','observationDigest'}
 
 
 def _digest(value):
@@ -32,11 +30,37 @@ def _digest(value):
     return hashlib.sha256(raw).hexdigest()
 
 
+def _retained_pins(review, operation):
+    if 'retainedCutover' not in review:
+        if operation!='deploy':
+            _deny('V1 frontend intent supports deployment only')
+        return '1',review['snapshotDigest'],None
+    cutover=review['retainedCutover']
+    fields=RETAINED_DEPLOY_FIELDS | (RETAINED_ROLLBACK_FIELDS if operation=='rollback' else set())
+    if type(cutover) is not dict or set(cutover)!=fields:
+        _deny('Invalid retained frontend operation shape')
+    for key in fields-{'switchPrefix','candidateRunning'}:
+        if type(cutover[key]) is not str or not HASH.fullmatch(cutover[key]):
+            _deny('Invalid retained frontend digest')
+    if operation=='deploy':
+        return '2',review['snapshotDigest'],None
+    prefix,running=cutover['switchPrefix'],cutover['candidateRunning']
+    candidate=cutover['candidateId']
+    if (type(prefix) is not int or not 1<=prefix<=4 or type(running) is not bool
+            or running and prefix!=4 or candidate==review['identity']['containerId']
+            or candidate in review['protectedContainerIds']):
+        _deny('Invalid retained frontend restoration scope')
+    return '2',cutover['observationDigest'],cutover['parentRequestHash']
+
+
 def prepare_production_frontend_request(review,*,policy_hash,expires_at,operation='deploy'):
-    if operation!='deploy':_deny('Production rollback requires issued completed deployment history')
+    if type(operation) is not str or operation not in ('deploy','rollback'):
+        _deny('Unsupported production frontend operation')
     try:
         r=deepcopy(review)
-        if type(r) is not dict or set(r)!=REVIEW_FIELDS or type(r['identity']) is not dict or set(r['identity'])!=IDENTITY_FIELDS:_deny('Invalid closed production review')
+        if (type(r) is not dict or set(r) not in (REVIEW_FIELDS,REVIEW_FIELDS|{'retainedCutover'})
+                or type(r['identity']) is not dict or set(r['identity'])!=IDENTITY_FIELDS):
+            _deny('Invalid closed production review')
         i=r['identity'];protected=r['protectedContainerIds']
         reasons=r['executionBlockedReasons']
         if (any(type(i[k]) is not str for k in IDENTITY_FIELDS)
@@ -60,12 +84,13 @@ def prepare_production_frontend_request(review,*,policy_hash,expires_at,operatio
                 or any(type(x) is not str or not HASH.fullmatch(x) for x in protected)
                 or any(r.get(k) is not False for k in ('authorityGranted','runtimePermit','executionAvailable','productionReady','freshnessVerified','engineReconstructionVerified'))):
             _deny('Invalid read-only production frontend review')
-        req=RequestV2(schema_version=2,operation=operation,profile_id=PROFILE,profile_version='1',
+        version,observation,history=_retained_pins(r,operation)
+        req=RequestV2(schema_version=2,operation=operation,profile_id=PROFILE,profile_version=version,
             source=SourceIdentity('github.com','https://github.com/'+BLOG+'.git',1395689651,BLOG,i['sourceSha']),
             target=TargetIdentity('compose','luohao-blog-prod','frontend'),environment='production',production=True,
             daemon_id=i['daemonId'],host_id=i['hostId'],components=('frontend',),protected_components=tuple(protected),
             before_hash=r['snapshotDigest'],after_hash=r['bodyDigest'],artifact_digest=i['imageId'].removeprefix('sha256:'),
-            observation_hash=r['snapshotDigest'],history_hash=None,plan_hash=_digest(r),policy_hash=policy_hash,expires_at=expires_at,max_uses=1)
+            observation_hash=observation,history_hash=history,plan_hash=_digest(r),policy_hash=policy_hash,expires_at=expires_at,max_uses=1)
         if deepcopy(review)!=r:_deny('Production review changed during request construction')
         return req
     except (KeyError,ValueError,TypeError,AttributeError,OverflowError,RecursionError):
@@ -90,6 +115,7 @@ class ProductionFrontendReceiptV1:
 
 @dataclass(frozen=True,kw_only=True)
 class ProductionFrontendApprovalPolicyV1(HostPolicy):
+    supported_operations=frozenset(('deploy',))
     source_sha:str
     host_id:str
     daemon_id:str
@@ -108,13 +134,27 @@ class ProductionFrontendApprovalPolicyV1(HostPolicy):
         if (self.workflow_ref!=WORKFLOW or self.host_repository!=RUNTIME or self.host_repository_id!=1327491026
                 or self.target_repository!=BLOG or self.target_repository_id!=1395689651
                 or self.ledger_repository!=LEDGER or self.ledger_repository_id!=1436718662
-                or self.production is not True or self.operation!='deploy'
+                or self.production is not True or type(self.operation) is not str or self.operation not in self.supported_operations
                 or type(self.source_sha) is not str or not re.fullmatch('[0-9a-f]{40}',self.source_sha)
                 or type(self.current_image_id) is not str or not re.fullmatch('sha256:[0-9a-f]{64}',self.current_image_id)
                 or type(self.host_id) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9._-]{0,127}',self.host_id)
                 or type(self.daemon_id) is not str or not re.fullmatch('[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}',self.daemon_id)
                 or any(type(x) is not str or not HASH.fullmatch(x) for x in (self.snapshot_hash,self.body_hash,self.plan_hash,self.protected_inventory_hash,self.request_hash,self.policy_hash))):
             _deny('Invalid trusted production frontend policy')
+
+
+@dataclass(frozen=True,kw_only=True)
+class ProductionFrontendApprovalPolicyV2(ProductionFrontendApprovalPolicyV1):
+    supported_operations=frozenset(('deploy','rollback'))
+    observation_hash:str
+    history_hash:str|None=None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if (type(self.observation_hash) is not str or not HASH.fullmatch(self.observation_hash)
+                or self.operation=='deploy' and (self.history_hash is not None or self.observation_hash!=self.snapshot_hash)
+                or self.operation=='rollback' and (type(self.history_hash) is not str or not HASH.fullmatch(self.history_hash))):
+            _deny('Invalid retained production frontend policy')
 
 
 class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
@@ -126,9 +166,11 @@ class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
     receipt_type=ProductionFrontendReceiptV1
     ledger_namespace='workflow-production-frontend-intent-v1'
     grant_namespace='github-production-frontend-intent-v1'
+    policy_type=ProductionFrontendApprovalPolicyV1
+    profile_version='1'
 
     def __init__(self,client,oidc_token,requests,policy,*,verifier=None):
-        if type(policy) is not ProductionFrontendApprovalPolicyV1:_deny('Production frontend policy required')
+        if type(policy) is not self.policy_type:_deny('Exact production frontend policy required')
         super().__init__(client,oidc_token,requests,policy,verifier=verifier)
 
     def _ledger_marker(self,request):
@@ -137,12 +179,14 @@ class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
     def _match(self,request):
         p=self.policy
         if (type(request) is not RequestV2 or self._requests.get(request.digest())!=request
-                or request.digest()!=p.request_hash or request.operation!='deploy' or request.profile_id!=PROFILE or request.profile_version!='1'
+                or request.digest()!=p.request_hash or request.operation!=p.operation or request.profile_id!=PROFILE or request.profile_version!=self.profile_version
                 or request.source!=SourceIdentity('github.com','https://github.com/'+BLOG+'.git',1395689651,BLOG,p.source_sha)
                 or request.target!=TargetIdentity('compose','luohao-blog-prod','frontend') or request.environment!='production'
-                or request.production is not True or request.components!=('frontend',) or request.max_uses!=1 or request.history_hash is not None
+                or request.production is not True or request.components!=('frontend',) or request.max_uses!=1
+                or request.history_hash!=getattr(p,'history_hash',None)
                 or request.host_id!=p.host_id or request.daemon_id!=p.daemon_id
-                or request.before_hash!=p.snapshot_hash or request.observation_hash!=p.snapshot_hash or request.after_hash!=p.body_hash
+                or request.before_hash!=p.snapshot_hash or request.observation_hash!=getattr(p,'observation_hash',p.snapshot_hash)
+                or request.after_hash!=p.body_hash
                 or request.artifact_digest!=p.current_image_id[7:] or request.plan_hash!=p.plan_hash or request.policy_hash!=p.policy_hash
                 or _digest(list(request.protected_components))!=p.protected_inventory_hash):
             _deny('Production frontend request differs from trusted policy')
@@ -162,3 +206,9 @@ class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
 
     def check_consumed_intent(self,request):
         return GitHubActionsApproval.guard(self,request)
+
+
+class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
+    policy_type=ProductionFrontendApprovalPolicyV2
+    profile_version='2'
+    operations=ProductionFrontendApprovalPolicyV2.supported_operations
