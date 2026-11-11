@@ -31,11 +31,14 @@ class ProbeScopeTests(unittest.TestCase):
         self.probe = probe.ProductionCaddyProbeV1(observer, caddy_id=CADDY, network_id=NETWORK)
         self.observer = observer
         self.child = Mock(return_value=True)
+        probe_os = SimpleNamespace(
+            getpid=os.getpid, geteuid=Mock(return_value=0),
+            open=Mock(side_effect=[10, 11]), close=Mock(),
+            O_RDONLY=os.O_RDONLY, O_CLOEXEC=os.O_CLOEXEC,
+        )
         for change in (
                 patch.object(probe, 'sys', SimpleNamespace(platform='linux')),
-                patch.object(probe.os, 'geteuid', return_value=0),
-                patch.object(probe.os, 'open', side_effect=[10, 11]),
-                patch.object(probe.os, 'close'),
+                patch.object(probe, 'os', probe_os),
                 patch.object(probe, '_namespace_identity', side_effect=lambda pid, fd: (pid, (1, fd))),
                 patch.object(probe, '_probe', self.child)):
             change.start()
