@@ -140,7 +140,7 @@ class _Git:
         del buffer[:size+1]
         return raw
 
-    def files(self,source_sha):
+    def files(self,source_sha,profile=None):
         commit=self.object('commit',source_sha,1024*1024)
         first=commit.split(b'\n',1)[0]
         if re.fullmatch(rb'tree [0-9a-f]{40}',first) is None:reject()
@@ -159,7 +159,7 @@ class _Git:
                 self.entries+=1
                 if self.entries>MAX_ENTRIES:reject()
                 if mode==b'40000':tree(child,path+'/',depth+1)
-                elif _allowed(path):
+                elif _allowed(path) or (profile=='native-diagnostic-v1' and (path=='tests/__init__.py' or path.startswith('tests/test_') and len(path.split('/'))==2 and path.endswith('.py'))):
                     if mode not in (b'100644',b'100755') or path in files:reject()
                     payload=self.object('blob',child,MAX_SOURCE-self.total)
                     self.total+=len(payload)
@@ -169,13 +169,14 @@ class _Git:
         return files
 
 
-def _verify_archive(raw,*,repository,source_sha,archive_digest,timeout=15):
+def _verify_archive(raw,*,repository,source_sha,archive_digest,timeout=15,profile=None):
     if (type(raw) is not bytes or not 0<len(raw)<=MAX_ARCHIVE or digest(raw)!=archive_digest
             or type(source_sha) is not str or re.fullmatch('[0-9a-f]{40}',source_sha) is None
             or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=30):reject()
+    if profile not in (None,'native-diagnostic-v1'):reject()
     git=_Git(repository,time.monotonic()+timeout);git.origin()
     with git.batch():
-        files=git.files(source_sha)
+        files=git.files(source_sha,profile)
     manifest=[];total=0
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         members=archive.infolist();names=[info.filename for info in members]
@@ -183,7 +184,7 @@ def _verify_archive(raw,*,repository,source_sha,archive_digest,timeout=15):
         for info in sorted(members,key=lambda item:item.filename):
             git.left();path=PurePosixPath(info.filename)
             if (info.orig_filename!=info.filename or path.is_absolute() or any(p in ('.','..') for p in info.filename.split('/'))
-                    or str(path)!=info.filename or not _allowed(info.filename) or info.is_dir()
+                    or str(path)!=info.filename or not (_allowed(info.filename) or (profile=='native-diagnostic-v1' and (info.filename=='tests/__init__.py' or info.filename.startswith('tests/test_') and len(info.filename.split('/'))==2 and info.filename.endswith('.py')))) or info.is_dir()
                     or info.flag_bits&(1|64) or stat.S_IFMT(info.external_attr>>16) not in (0,stat.S_IFREG)
                     or info.compress_type not in (zipfile.ZIP_STORED,zipfile.ZIP_DEFLATED)
                     or not 0<=info.file_size<=MAX_SOURCE-total):reject()

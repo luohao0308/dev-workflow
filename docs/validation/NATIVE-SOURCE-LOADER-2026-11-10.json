@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "kind": "compose-native-source-loader-diagnostic",
+  "date": "2026-11-10",
+  "sourceSha": "5b41bc6f4118907c57838022fdedf20fe9469c0f",
+  "archiveDigest": "c47ebd218051b1261df308cab94d6a43e4d398d9f0631e1b7d9ceab9b21fc1ff",
+  "gitArchiveContentsVerified": true,
+  "currentPublicationVerified": false,
+  "localTests": {
+    "python3.10": {
+      "relatedTests": 67,
+      "skipped": 2,
+      "retentionRegression": 1,
+      "result": "passed"
+    },
+    "python3.14": {
+      "relatedTests": 67,
+      "skipped": 2,
+      "retentionRegression": 1,
+      "result": "passed"
+    },
+    "linuxPython3.12": {
+      "sourceAndRetentionTests": 7,
+      "skipped": 0,
+      "result": "passed"
+    }
+  },
+  "normalStop": {
+    "loaderArchiveVerified": true,
+    "producerUsedIsolatedArchive": true,
+    "siteDisabled": true,
+    "nativeCurrentMainPidBound": true,
+    "activeWriterRejected": true,
+    "originalOwnedUnitStopped": true,
+    "freshConsumerObservedStopped": true,
+    "retainedArchiveReverified": true,
+    "knownClosedWriteIndex": 9,
+    "producerSigkill": false,
+    "parentCleanupCompleted": true,
+    "realDockerWrites": 0,
+    "businessEngine": "double",
+    "gitHub": "double",
+    "currentPublicationVerified": false,
+    "sourceRevalidated": false,
+    "linuxQuiescenceVerified": false,
+    "runtimePermit": false,
+    "productionReady": false
+  },
+  "producerSigkill": {
+    "loaderArchiveVerified": true,
+    "producerUsedIsolatedArchive": true,
+    "siteDisabled": true,
+    "nativeCurrentMainPidBound": true,
+    "activeWriterRejected": true,
+    "originalOwnedUnitStopped": true,
+    "freshConsumerObservedStopped": true,
+    "retainedArchiveReverified": true,
+    "knownClosedWriteIndex": 9,
+    "producerSigkill": true,
+    "parentCleanupCompleted": true,
+    "realDockerWrites": 0,
+    "businessEngine": "double",
+    "gitHub": "double",
+    "currentPublicationVerified": false,
+    "sourceRevalidated": false,
+    "linuxQuiescenceVerified": false,
+    "runtimePermit": false,
+    "productionReady": false
+  },
+  "limitations": [
+    "Fixed diagnostic entrypoint executes the cold SDK against Engine/GitHub doubles",
+    "Consumer validates retained archive bytes; runtime source authorization remains false",
+    "General production worker protocol and scope-wide replacement writer exclusion remain pending",
+    "Scene-owner restart adoption remains pending"
+  ]
+}

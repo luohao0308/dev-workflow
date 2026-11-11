@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "kind": "compose-native-writer-lifecycle-diagnostic",
+  "date": "2026-11-09",
+  "sourceSha": "5aa09784debaec74328be82a2457a88f0adefed2",
+  "archiveDigest": "f04ec1e4d3be86562a885a5910dcb8c73478e654c4f7c3092f9d56b6b93a67ce",
+  "localTests": {
+    "python3.10": {
+      "nativeLifecycle": 10,
+      "coldRecovery": 18,
+      "result": "passed"
+    },
+    "python3.14": {
+      "nativeLifecycle": 10,
+      "coldRecovery": 18,
+      "result": "passed"
+    }
+  },
+  "linuxDiagnostic": {
+    "nativeCurrentMainPidBound": true,
+    "knownClosedWriteIndex": 9,
+    "activeWriterRejected": true,
+    "originalOwnedUnitStopped": true,
+    "originalProcessReaped": true,
+    "freshConsumerObservedStopped": true,
+    "realDockerWrites": 0,
+    "businessEngine": "double",
+    "sourceRevalidated": false,
+    "linuxQuiescenceVerified": false,
+    "runtimePermit": false,
+    "productionReady": false
+  },
+  "limitations": [
+    "Engine and GitHub are explicit test doubles",
+    "Runtime source-loader attestation is not established",
+    "Specific original writer stop does not prove global writer exclusion",
+    "Scene-owner restart adoption remains pending"
+  ]
+}

@@ -33,7 +33,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     setUpClass = classmethod(tls_fixture.WriteGatewayTests.setUpClass.__func__)
     tearDownClass = classmethod(tls_fixture.WriteGatewayTests.tearDownClass.__func__)
 
-    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None, continuation_runner=None, service_name='web', drop_first_create_response=False):
+    def run_recovery(self, count, *, two_services=False, fail_resumed_readiness=False, prefix_runner=None, initial_request_factory=None, fence_factory=None, continuation_runner=None, service_name='web', drop_first_create_response=False, ancestry_profile=None, expected_initial_write_count=None):
         kw, observation = prepare_fixture.fixture()
         kw['source'] = approval_fixture.request().source
         prepared = ComposePreparationHostV3(**kw).prepare_intent(observation, observation,
@@ -182,8 +182,9 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
                 body=apply(op)
                 h.finish(status=201 if op['phase']=='create' else 204,body=body)
                 if op['phase']=='create': h.receipts[op['service']]=receipts[op['service']]
-        parent=h.history()
-        prep=RecoveryPreparationHostV3(original_history=parent,store=store,phase_guard=guard,readiness=readiness)
+        parent=h.history(ancestry_profile=ancestry_profile)
+        prep=RecoveryPreparationHostV3(original_history=parent,store=store,phase_guard=guard,readiness=readiness,
+                                       ancestry_profile=ancestry_profile)
         recovery=prep.prepare_intent(operation_nonce='e'*64,expires_at=recovery_fixture.expiry())
         req=recovery['request']; reviewed=recovery['reviewed_history']
         approval=approval_fixture.ComposeApprovalTests();approval.setUp();approval.req=req
@@ -236,7 +237,7 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
                 return
             result=coordinator.run()
         self.assertEqual(writes,write_operations[count:])
-        self.assertEqual(result['initialWriteCount'],count)
+        self.assertEqual(result['initialWriteCount'],count if expected_initial_write_count is None else expected_initial_write_count)
         self.assertEqual(result['receipts'],receipts)
         for protected in bundle.to_dict()['protectedContainers']:
             cid = protected['containerId']
@@ -246,10 +247,10 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
             from deployment_compose_history_v3_host import AuthenticatedHistoryV3
             child=AuthenticatedHistoryV3(bundle,req,gate_policy=gate_policy,gate_key=b'g'*32,
                 consumption_receipt_hash=receipt,witness_client=child_client,witness_client_factory=h.factory,
-                parent_history=parent,reviewed_parent_snapshot=reviewed).capture().snapshot
+                parent_history=parent,reviewed_parent_snapshot=reviewed,ancestry_profile=ancestry_profile).capture().snapshot
         self.assertEqual(len(child['knownPrefix']),len(write_operations))
-        self.assertEqual(len(child['scopes']),len(write_operations)-count)
-        self.assertEqual(child['parent']['startWriteIndex'],count)
+        self.assertEqual(len(child['scopes']),len(write_operations) if ancestry_profile else len(write_operations)-count)
+        self.assertEqual(child['parent']['startWriteIndex'],count if expected_initial_write_count is None else expected_initial_write_count)
         if two_services:
             start=timeline.index(('write','start','api'))
             self.assertIn(('ready','web'),timeline[:start])
@@ -265,6 +266,30 @@ class RecoveryExecutionTests(history_fixture.GateFixture, unittest.TestCase):
     def test_recovery_after_delete(self): self.run_recovery(3)
     def test_recovery_after_rename(self): self.run_recovery(4)
     def test_recovery_after_first_start_rechecks_dependency_readiness(self): self.run_recovery(9,two_services=True)
+
+    def test_two_services_recover_after_first_create(self):
+        self.run_recovery(1, two_services=True)
+
+    def test_two_services_recover_after_all_creates(self):
+        self.run_recovery(2, two_services=True)
+
+    def test_two_services_recover_after_dependent_stop(self):
+        self.run_recovery(3, two_services=True)
+
+    def test_two_services_recover_after_all_stops(self):
+        self.run_recovery(4, two_services=True)
+
+    def test_two_services_recover_after_dependent_delete(self):
+        self.run_recovery(5, two_services=True)
+
+    def test_two_services_recover_after_all_deletes(self):
+        self.run_recovery(6, two_services=True)
+
+    def test_two_services_recover_after_dependency_rename(self):
+        self.run_recovery(7, two_services=True)
+
+    def test_two_services_recover_after_all_renames(self):
+        self.run_recovery(8, two_services=True)
 
     def test_unhealthy_prior_start_blocks_dependent_before_write(self):
         self.run_recovery(9,two_services=True,fail_resumed_readiness=True)

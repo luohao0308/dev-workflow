@@ -57,19 +57,54 @@ def _scope_upper_bound(binding, policy, descriptor, request_hash, receipt_hash, 
     return dict(binding=deepcopy(binding), events=records, parent=deepcopy(parent))
 
 
-def _prior_scopes(snapshot):
+def _prior_scopes(snapshot, ancestry_profile=None):
     from deployment_compose_history_v3_host import AuthenticatedHistorySnapshotV3
     if type(snapshot) is not AuthenticatedHistorySnapshotV3:
         _reject()
     value=json.loads(snapshot.canonical)
-    if value.get('schemaVersion') != 1:
+    from deployment_compose_history_v3_host import ANCESTRY_PROFILE
+    if not (ancestry_profile is None or type(ancestry_profile) is str and ancestry_profile == ANCESTRY_PROFILE):
         _reject()
+    if (type(value.get('schemaVersion')) is not int
+            or value.get('schemaVersion') != (3 if ancestry_profile else 1)
+            or (ancestry_profile and value.get('ancestryProfile') != ancestry_profile)):
+        _reject()
+    if ancestry_profile:
+        from deployment_compose_history_v3_host import MAX_ANCESTRY_DEPTH
+        segments = value.get('segments')
+        fields = {'requestHash', 'bundleDigest', 'receiptHash', 'parentHistoryDigest',
+                  'scopeStart', 'scopeCount', 'startWriteIndex'}
+        if type(segments) is not list or not 1 <= len(segments) <= MAX_ANCESTRY_DEPTH:
+            _reject()
+        offset = 0
+        requests = set()
+        for index, segment in enumerate(segments):
+            if (type(segment) is not dict or set(segment) != fields
+                    or any(type(segment[key]) is not int or segment[key] < 0
+                           for key in ('scopeStart', 'scopeCount', 'startWriteIndex'))
+                    or segment['scopeStart'] != offset or segment['scopeCount'] == 0
+                    or any(type(segment[key]) is not str or len(segment[key]) != 64
+                           or any(c not in '0123456789abcdef' for c in segment[key])
+                           for key in ('requestHash', 'bundleDigest', 'receiptHash'))
+                    or segment['requestHash'] in requests
+                    or (segment['parentHistoryDigest'] is None) != (index == 0)
+                    or (index == 0 and segment['startWriteIndex'] != 0)
+                    or (index > 0 and (type(segment['parentHistoryDigest']) is not str
+                        or len(segment['parentHistoryDigest']) != 64
+                        or any(c not in '0123456789abcdef' for c in segment['parentHistoryDigest'])))):
+                _reject()
+            requests.add(segment['requestHash'])
+            offset += segment['scopeCount']
+        if (offset != len(value['scopes']) or segments[-1]['requestHash'] != value['originalRequestHash']
+                or segments[-1]['bundleDigest'] != value['bundleDigest']
+                or segments[-1]['receiptHash'] != value['consumptionReceiptHash']):
+            _reject()
     scopes=[]
     parent=None
     for scope in value['scopes']:
         binding=binding_value(scope['binding'])
         records=deepcopy(scope['records'])
-        if scope['seq'] != len(records) or scope['head'] != (records[-1]['head'] if records else ZERO):
+        if type(scope['seq']) is not int or scope['seq'] != len(records) or scope['head'] != (records[-1]['head'] if records else ZERO):
             _reject()
         for record in records:
             envelope=json.loads(base64.b64decode(record['externalMaterialBase64'], validate=True))
@@ -80,25 +115,31 @@ def _prior_scopes(snapshot):
         scopes.append(dict(binding=binding, events=records, parent=deepcopy(parent)))
         parent=dict(binding=binding,seq=scope['seq'],head=scope['head'])
     status=value['chainStatus']
+    tails = [dict(binding=scope['binding'], seq=len(scope['events']),
+                  head=scope['events'][-1]['head'] if scope['events'] else ZERO) for scope in scopes]
     if (not scopes or len(status['lineage']) + 1 != len(scopes)
-            or status['activeBinding'] != scopes[-1]['binding']):
+            or status['activeBinding'] != scopes[-1]['binding']
+            or (ancestry_profile and status['lineage'] != tails[:-1])):
         _reject()
     return value,scopes
 
 
-def check_witness_byte_capacity(bundle, request, gate_policy, receipt_hash, binding, prior_snapshot=None):
+def check_witness_byte_capacity(bundle, request, gate_policy, receipt_hash, binding, prior_snapshot=None, *, ancestry_profile=None):
     """Bound sealed state after all remaining writes, before any writer opens.
 
     Prior schema-1 history may be the same request's complete/active prefix or a
-    reviewed original deployment before rollback. Prior bytes are retained in
-    full, including historical responses up to the old 64KiB verification limit.
-    Unsupported composed history is rejected instead of silently undercounted.
+    reviewed original deployment before rollback. Explicit bounded ancestry uses
+    cumulative schema-3 scopes and the current bundle's logical write index.
+    Prior bytes are retained in full, including historical responses up to the
+    old 64KiB verification limit.
     """
     from deployment_compose_bundle_v3 import ExecutionBundleV3
     from deployment_contract_v2 import RequestV2
     from deployment_compose_coordinator_v3_host import Profile3StepExecutor
     try:
-        if (type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
+        from deployment_compose_history_v3_host import ANCESTRY_PROFILE
+        if (not (ancestry_profile is None or type(ancestry_profile) is str and ancestry_profile == ANCESTRY_PROFILE)
+                or type(bundle) is not ExecutionBundleV3 or type(request) is not RequestV2
                 or type(gate_policy) is not GatePolicy or gate_policy.operation_profile != 'compose-v3'
                 or MAX_RESPONSE != 4096 or bundle.to_dict()['resolverRules']['maxResponseBytes'] != MAX_RESPONSE):
             _reject()
@@ -109,22 +150,24 @@ def check_witness_byte_capacity(bundle, request, gate_policy, receipt_hash, bind
             _reject()
         scopes=[]; start=0; active=False
         if prior_snapshot is not None:
-            prior,scopes=_prior_scopes(prior_snapshot)
+            prior,scopes=_prior_scopes(prior_snapshot, ancestry_profile)
             if any(s['binding']['epoch'] != binding['epoch'] or s['binding']['policyHash'] != binding['policyHash'] for s in scopes):
                 _reject()
             if (prior['bundleDigest'] == bundle.digest and request.operation == 'recovery'
                     and request.history_hash == prior_snapshot.digest):
                 start=len(prior['knownPrefix'])
                 total=sum(op['phase'] != 'readiness' for op in bundle.to_dict()['operations'])
-                if (not 0 < start < total or len(scopes) != start
+                if (not 0 < start < total or (ancestry_profile is None and len(scopes) != start)
                         or prior['blocker'] is not None or prior['pending'] is not None
                         or prior['chainStatus']['activePhase'] != 'closed'
                         or any(len(s['events']) != 6 for s in scopes)):
                     _reject()
             elif prior['bundleDigest'] == bundle.digest and prior['originalRequestHash'] == request.digest():
-                start=len(scopes)
+                start=len(prior['knownPrefix']) if ancestry_profile else len(scopes)
                 if len(scopes[-1]['events']) < 6:
-                    active=True;start-=1
+                    active=True
+                    if ancestry_profile is None:
+                        start-=1
             elif any(len(s['events']) != 6 for s in scopes):
                 _reject()
         # Full IDs all have the same encoded length. Pick disjoint hypothetical

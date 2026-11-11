@@ -98,6 +98,16 @@ Property、E2E、对抗性验证、回滚演练和人工确认按风险触发；
 | `deployment` | 离线计划、可信采集/授权 SDK 与固定 Docker API 单组件替换后端 | 按环境审核部署/回滚；真实执行仅限已配置的可信宿主，非生产就绪 |
 | `release` | 可选版本策略、发布准备、执行计划、GitHub Tag / Release provider 与受信 Actions 宿主 | 需要按 SHA 或 SemVer 发布的项目；本地 CLI 仅准备，真实执行需配置独立可信宿主 |
 
+开发分支的单服务 Compose V3 跨 Mac 进程恢复已在 `0c4b340` 完成真实隔离验收。原进程退出后，新进程通过独立恢复审批完成四笔恢复写入、健康检查、见证闭合和清理。支持范围与验收来源见[恢复计划](docs/plans/compose-mac-restart-2026-11-02.md)和[真实证据](docs/validation/SCENE-FULL-RECOVERY-REAL-2026-11-09.json)。普通项目 CLI 的执行可用性与生产就绪状态仍需按受信宿主和项目分别判断。
+
+通用批次 SDK 的受信宿主可提供按服务的 readiness 回调，并在完整回执表就绪后执行终态双采样。独立批次检查点材料支持任意已闭合未完成前缀的只读重认证，再由原认证 CAS 和恢复准备器生成新请求。双服务部署与新授权回滚、九个写入切点的本地组合验证，以及多代恢复范围见[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)。
+
+通用历史与恢复准备器可显式选择 `ancestry_profile='bounded-recovery-v1'`，在最多八代的祖先链上以新请求接续已闭合的恢复前缀，并在 successor CAS 前核验全链容量。该模式已通过单服务和双服务多代本地执行测试，受管 scene 和完整进程崩溃接管继续单独实现和验收。
+
+独立多代材料 reader 可在新进程重建并重新认证整条祖先链，随后使用原认证 CAS 准备新请求。本地测试覆盖三代双服务、回滚基线，以及检查点发布进程被 SIGKILL 后的新 consumer 冷读；完整 coordinator 和 scene-owner 的崩溃接管按[批次恢复计划](docs/plans/compose-batch-recovery-2026-11.md)继续推进。
+
+受信宿主可用 `ColdRecoveryHostV3` 接通冷材料、新审批消费、writer 停止检查、见证 CAS 和剩余写入。新进程完成双服务多代恢复的 SDK 组合用例已通过，原生 MainPID 登记与原 writer 停止冷读已通过 Linux 隔离诊断；固定诊断 loader 的归档加载与源码保管也已通过正常停止和 SIGKILL 验收（[记录](docs/plans/compose-native-source-2026-11.md)）；具体接口和现场验收边界见[冷恢复 SDK 执行](docs/plans/compose-batch-recovery-2026-11.md#冷恢复-sdk-执行)。
+
 多数流程包只包含普通 Markdown 文件。Core 自带零第三方依赖的 `scripts/delivery_guard.py`，`feature-catalog` 另带一个 Python 3 脚本；它们都不会安装解释器、依赖包、后台进程或常驻服务。不启用 `feature-catalog` 时，其余行为保持不变。
 
 Delivery 的本地 Agent 临时分支可以使用 `codex/*`，但这类分支禁止 push 到远端，也不能作为线上 PR 的 source branch。线上交付必须切换到项目约定的 `feat/*`、`fix/*`、`docs/*`、`chore/*` 等合规命名。

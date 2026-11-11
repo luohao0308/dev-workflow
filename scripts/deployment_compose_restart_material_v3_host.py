@@ -51,7 +51,7 @@ class ReadonlyRestartContextV3:
 
     def public_summary(self):
         return dict(digest=self.material_digest, historyDigest=self.snapshot.digest,
-                    completedWriteCount=1, historyAuthenticated=True,
+                    completedWriteCount=len(self.snapshot.snapshot['knownPrefix']), historyAuthenticated=True,
                     phaseFreshnessVerified=False, linuxQuiescenceVerified=False,
                     authorityGranted=False, executionAvailable=False, runtimePermit=False,
                     recoveryAuthorized=False, productionReady=False)

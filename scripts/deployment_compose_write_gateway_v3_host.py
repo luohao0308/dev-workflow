@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import re
@@ -45,7 +46,8 @@ def _complete_response(response):
 
 
 def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
-                      listen=('127.0.0.1', 0), timeout=10, control_timeout=180, control_deadline=None):
+                      listen=('127.0.0.1', 0), timeout=10, control_timeout=180,
+                      control_deadline=None, bound_observer=None, authorization_expires_at=None):
     """Return an unstarted server. Only the trusted coordinator opens generations.
 
     pre_dispatch(method, path, body, generation, attempt_ref) must raise on a
@@ -61,6 +63,8 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             or not 1 <= control_timeout <= 180
             or control_deadline is not None and (type(control_deadline) not in (int, float)
                 or not time.monotonic() < control_deadline <= time.monotonic()+180)
+            or authorization_expires_at is not None and (type(authorization_expires_at) not in (int, float)
+                or not math.isfinite(authorization_expires_at) or time.time() >= authorization_expires_at)
             or not hasattr(socket, 'AF_UNIX')):
         raise GatewayHostError('gateway-host-policy-rejected')
 
@@ -69,6 +73,18 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
     # Bind each listener to its construction-time connector. A fixed diagnostic
     # process restoring its module scope cannot change a surviving handler.
     connector = _UnixDocker
+    if bound_observer is not None:
+        from deployment_compose_host_snapshot_v3_host import HostSnapshotV3
+
+        if type(bound_observer) is not HostSnapshotV3 or docker_socket != bound_observer._write_socket():
+            raise GatewayHostError('gateway-host-endpoint-rejected')
+
+        def connector(path, timeout):
+            if path != bound_observer._write_socket():
+                raise GatewayHostError('gateway-host-endpoint-rejected')
+            if authorization_expires_at is None:
+                return bound_observer._bound_write_connection(timeout)
+            return bound_observer._bound_write_connection(timeout, expires_at=authorization_expires_at)
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
@@ -175,7 +191,8 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             super().__init__(*args)
 
         def check_live(self):
-            if self.closing or self.cancelled.is_set() or time.monotonic() >= deadline:
+            if (self.closing or self.cancelled.is_set() or time.monotonic() >= deadline
+                    or authorization_expires_at is not None and time.time() >= authorization_expires_at):
                 raise GatewayHostError('gateway-control-expired-or-cancelled')
 
         def cancel(self):

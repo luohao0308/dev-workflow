@@ -34,6 +34,8 @@ class HostTests(unittest.TestCase):
         self.row=dict(Id='a'*64,Name='/protected',Image='sha256:'+'b'*64,RestartCount=0,
             State=dict(StartedAt='2026-01-01T00:00:00Z',Status='running'),Config={'Env':['private-fixture']},
             HostConfig={'Memory':1024},Mounts=[],NetworkSettings={'Networks':{},'Ports':{}})
+        self.other_rows={}
+        self.engine_post=None
         self.values={'/v1.45/info':{'ID':'production-one','DockerRootDir':'/var/lib/docker'},
             CONTAINERS:[{'Id':'a'*64}],IMAGES:[{'Id':'sha256:'+'b'*64}],NETWORKS:[{'Id':'c'*64}],
             VOLUMES:{'Volumes':[{'Name':'protected-data'}],'Warnings':None}}
@@ -42,11 +44,25 @@ class HostTests(unittest.TestCase):
             def log_message(self,*args):pass
             def do_GET(self):
                 test.http.append(self.path)
-                value=deepcopy(test.row) if self.path.endswith('/json') and '/containers/' in self.path else test.values[self.path]
+                if self.path.endswith('/json') and '/containers/' in self.path:
+                    cid=self.path.split('/')[-2]
+                    value=deepcopy(test.other_rows.get(cid,test.row))
+                else:
+                    value=test.values[self.path]
                 if value is not test.values.get(self.path) and type(value.get('State')) is dict:
-                    value['State']['Health']={'Log':[{'End':str(len(test.http))}]}
+                    value['State'].setdefault('Health', {})['Log']=[{'End':str(len(test.http))}]
                 raw=json.dumps(value).encode();self.send_response(200)
                 self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
+            def do_POST(self):
+                if test.engine_post is None:
+                    self.send_error(405)
+                    return
+                raw=self.rfile.read(int(self.headers['Content-Length']))
+                status,body=test.engine_post(self.path,raw)
+                self.send_response(status)
+                self.send_header('Content-Length',str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
         server=socketserver.UnixStreamServer(str(self.run/'docker.sock'),Handler)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         self.addCleanup(lambda:(server.shutdown(),server.server_close(),thread.join(timeout=3)))
@@ -122,6 +138,58 @@ class HostTests(unittest.TestCase):
         value=self.observe();(self.run/'docker.sock').rename(self.run/'old.sock')
         other=socket.socket(socket.AF_UNIX);self.addCleanup(other.close);other.bind(str(self.run/'docker.sock'))
         with self.assertRaises(ValueError):value.verify_unchanged()
+
+    def test_native_write_connection_rejects_different_peer_before_request(self):
+        observer = self.observe()
+        connection = observer._bound_write_connection(3)
+        connection.connect()
+        self.addCleanup(connection.close)
+        before = list(self.http)
+        self.peer = 999
+        with self.assertRaises(ValueError):
+            connection.request('POST', '/v1.45/containers/' + 'a' * 64 + '/start')
+        self.assertEqual(self.http, before)
+
+    def test_frontend_protection_tracks_all_other_containers_and_resource_definitions(self):
+        original,candidate='e'*64,'f'*64
+        for cid in (original,candidate):
+            self.other_rows[cid]=dict(deepcopy(self.row),Id=cid,Name='/'+cid[0])
+        self.values[CONTAINERS].append({'Id':original})
+        network=self.values[NETWORKS][0]
+        network.update(Driver='bridge',Containers={original:{'Name':'old'},self.row['Id']:{'Name':'other'}})
+        volume=self.values[VOLUMES]['Volumes'][0]
+        volume.update(Driver='local',Options={'device':'protected'})
+        observer=self.observe()
+        protection=host.ProductionFrontendProtectionV1(
+            observer,daemon_id='production-one',original_id=original,protected_ids=(self.row['Id'],))
+        baseline=protection.verify()
+        self.values[CONTAINERS].append({'Id':candidate})
+        self.other_rows[original]['State']['Status']='exited'
+        network['Containers'][candidate]={'Name':'new'}
+        self.assertEqual(protection.verify(candidate_id=candidate),baseline)
+        with self.assertRaises(ValueError):
+            protection.verify()
+        for target,key,bad in ((self.row,'RestartCount',1),
+                (network,'Driver','host'),(volume,'Options',{'device':'different'}),
+                (network['Containers'][self.row['Id']],'Name','changed')):
+            before=target[key]
+            target[key]=bad
+            with self.assertRaises(ValueError):
+                protection.verify(candidate_id=candidate)
+            target[key]=before
+        self.values[CONTAINERS].remove({'Id':original})
+        with self.assertRaises(ValueError):
+            protection.verify(candidate_id=candidate)
+
+    def test_frontend_protection_rejects_incomplete_or_wrong_daemon_scope(self):
+        original='e'*64
+        self.other_rows[original]=dict(deepcopy(self.row),Id=original)
+        self.values[CONTAINERS].append({'Id':original})
+        observer=self.observe()
+        for daemon,protected in (('different',(self.row['Id'],)),('production-one',('d'*64,))):
+            with self.assertRaises(ValueError):
+                host.ProductionFrontendProtectionV1(
+                    observer,daemon_id=daemon,original_id=original,protected_ids=protected)
 
 
 class ContextTests(unittest.TestCase):

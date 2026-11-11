@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "kind": "blog-retained-frontend-cutover-rehearsal",
+  "date": "2026-11-11",
+  "dockerDesktop": {
+    "engineVersion": "24.0.6",
+    "engineApi": "1.43",
+    "imageId": "sha256:83186e359053e9600f99636f3d73ea606ee78645d07c8ee3e69643b1aabde6aa",
+    "usesRealFrontendImage": true,
+    "diagnosticProcess": true,
+    "scopeLeaseCheckedBeforeWrites": true,
+    "scenarios": [
+      {
+        "scenario": "healthy-switch",
+        "switchHTTP": 200,
+        "closedSwitchPrefix": 4,
+        "originalRetained": true,
+        "restoredHTTP": 200,
+        "singleAliasEndpointVerified": true,
+        "cleanupVerified": true
+      },
+      {
+        "scenario": "failed-http-probe",
+        "switchHTTP": 503,
+        "closedSwitchPrefix": 4,
+        "originalRetained": true,
+        "restoredHTTP": 200,
+        "singleAliasEndpointVerified": true,
+        "cleanupVerified": true
+      },
+      {
+        "scenario": "stopped-before-start",
+        "switchHTTP": null,
+        "closedSwitchPrefix": 3,
+        "originalRetained": true,
+        "restoredHTTP": 200,
+        "singleAliasEndpointVerified": true,
+        "cleanupVerified": true
+      }
+    ]
+  },
+  "testsPerPython": 31,
+  "pythonVersions": [
+    "3.10",
+    "3.14",
+    "3.13-linux-container"
+  ],
+  "independentReview": "CLEAR",
+  "productionWorkerIntegrated": false,
+  "productionApprovalConsumed": false,
+  "productionWrites": 0,
+  "productionReady": false
+}

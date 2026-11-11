@@ -258,7 +258,9 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('OIDC endpoint redirected')
 
 
-def fetch_token(env):
+def fetch_token(env, *, audience=AUDIENCE):
+    if audience not in (AUDIENCE, 'dev-workflow-production-frontend-intent-v1'):
+        raise ValueError('Unsupported OIDC audience')
     url = env['ACTIONS_ID_TOKEN_REQUEST_URL']
     parsed = urllib.parse.urlsplit(url)
     host = parsed.hostname or ''
@@ -268,7 +270,7 @@ def fetch_token(env):
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     if any(key == 'audience' for key, _ in query):
         raise ValueError('Unexpected OIDC audience parameter')
-    url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query + [('audience', AUDIENCE)])))
+    url = urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query + [('audience', audience)])))
     request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + env['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
@@ -287,6 +289,12 @@ def fetch_token(env):
 def seal(raw, env, recipient, output):
     verify(raw, env)
     token = fetch_token(env)
+    encrypt_token(token, recipient, output)
+
+
+def encrypt_token(token, recipient, output):
+    if type(token) is not bytes or not 0 < len(token) <= 32768 or not token.isascii() or token.count(b'.') != 2:
+        raise ValueError('Invalid bounded OIDC token')
     # Plaintext exists only in memory and the subprocess pipe, never a file or log.
     result = subprocess.run(['/usr/bin/openssl', 'cms', '-encrypt', '-binary', '-aes256',
                              '-outform', 'DER', str(recipient)], input=token, capture_output=True,

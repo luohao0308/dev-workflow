@@ -292,7 +292,10 @@ def readiness(session, cid):
 
 
 def execute_operation(channel, session, prepared, policy, gate_key, public, status_public,
-                      tls, tracker, *, parent=None, reviewed=None, fence=None):
+                      tls, tracker, *, parent=None, reviewed=None, fence=None, readiness_probe=None):
+    """Execute an approved batch with an optional trusted host readiness callback."""
+    if readiness_probe is not None and not callable(readiness_probe):
+        reject()
     bundle,request=prepared['bundle'],prepared['request']
     consumed=channel.receive('consume-intent')
     if (set(consumed)!={'requestHash','receiptHash','firstBinding'} or consumed['requestHash']!=request.digest()
@@ -325,16 +328,18 @@ def execute_operation(channel, session, prepared, policy, gate_key, public, stat
             op=bundle.resolve_operations(dict(receipts))[len(done)]
             return session.guard(dict(phase_index=len(done),operation=op,receipts=dict(receipts),completed_operations=done)) is True
         def verify_readiness(service,cid):
-            if service!='backend' or readiness(session,cid) is not True: return False
-            receipts={service:cid}
-            done=bundle.resolve_operations(receipts)
-            # There is no next write after readiness. Reuse the guard's final
-            # state capture, as current-baseline preparation does, to pin the
-            # full approved target body/image and unchanged protected peer.
-            first=session.guard._capture(done,receipts)
-            return canonical(first)==canonical(session.guard._capture(done,receipts))
+            if readiness_probe is not None:
+                return readiness_probe(service,cid) is True
+            return service=='backend' and readiness(session,cid) is True
         coordinator=ComposeCoordinatorV3(executor,verify_candidates=verify,readiness=verify_readiness)
         result=coordinator.run()
+        # Verify the complete receipt map only after every service is ready.
+        # Intermediate readiness must allow dependent services to start next.
+        receipts=result['receipts']
+        done=bundle.resolve_operations(receipts)
+        first=session.guard._capture(done,receipts)
+        if canonical(first)!=canonical(session.guard._capture(done,receipts)):
+            reject()
     finally:
         original=sys.exc_info()[1]
         try: tracker.apply_to_session(session,history)

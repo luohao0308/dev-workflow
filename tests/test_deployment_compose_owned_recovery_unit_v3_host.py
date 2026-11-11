@@ -42,6 +42,18 @@ class UnitTests(unittest.TestCase):
         self.assertIn('deployment_compose_owned_recovery_worker_v3_host.run',self.owner._code)
         self.assertFalse(diagnostic._attempted)
 
+    def test_site_is_disabled_only_when_explicitly_configured(self):
+        for value in (None,1,'true'):
+            with self.subTest(value=value),self.assertRaises(ValueError):
+                unit.OwnedRecoveryUnitV3('b'*64,'c'*40,disable_site=value)
+        owner=unit.OwnedRecoveryUnitV3('b'*64,'c'*40,disable_site=True)
+        self.addCleanup(owner._release_fds)
+        self.owner=owner
+        self.group=self.root/'system.slice'/owner.unit
+        owner.start()
+        self.assertEqual(self.argv[-6:-1],['/usr/bin/python3','-I','-S','-u','-c'])
+        owner.stop();owner.close()
+
     def reap(self):
         if self.process is not None:
             if self.process.poll() is None:self.process.kill();self.process.wait(timeout=5)
