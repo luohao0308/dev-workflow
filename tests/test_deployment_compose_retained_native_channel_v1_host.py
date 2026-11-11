@@ -39,7 +39,10 @@ class NativeChannelTests(unittest.TestCase):
     def test_initial_intent_failure_reports_stage_without_consumption_or_error_text(self):
         self._round_trip(deny_before_start=False, fail_validation=True)
 
-    def _round_trip(self, *, deny_before_start, fail_validation=False):
+    def test_restore_preparation_failure_keeps_verified_deploy_result(self):
+        self._round_trip(deny_before_start=False, fail_restore_preparation=True)
+
+    def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False):
         self.write_patch.stop()
         original = self.worker._plan
         prefix = 3 if deny_before_start else 4
@@ -58,6 +61,9 @@ class NativeChannelTests(unittest.TestCase):
             if fail_validation:
                 stack.enter_context(patch.object(native.RetainedIntentClientV1, 'validate',
                     side_effect=IntentRelayRejected('private failure detail')))
+            if fail_restore_preparation:
+                stack.enter_context(patch.object(native.RetainedFrontendWorkerV1, 'restore_review',
+                    side_effect=ValueError('private restore preparation detail')))
             if deny_before_start:
                 authorize = RetainedIntentIssuerV1.authorize_rpc
 
@@ -122,12 +128,19 @@ class NativeChannelTests(unittest.TestCase):
                                                   failureStage='validate-intent'))
                     self.assertEqual(self.writes, [])
                     self.assertEqual(len(first_ledger.markers), 0)
+                elif fail_restore_preparation:
+                    self.assertEqual(result['failureStage'], 'prepare-restore')
+                    self.assertTrue(result['blocked'])
+                    self.assertIsNone(result['restoreReview'])
+                    self.assertEqual(len(result['result']['witnessDigests']), 5)
+                    self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
+                    self.assertEqual(len(first_ledger.markers), 1)
                 elif deny_before_start:
                     self.assertIsNone(result['result'])
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
                 else:
                     self.assertEqual(len(result['result']['witnessDigests']), 5)
-                if not fail_validation:
+                if not (fail_validation or fail_restore_preparation):
                     approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
                     result = controller.execute(approval, grant, request)
                     self.assertEqual(len(result['result']['witnessDigests']), prefix)

@@ -159,6 +159,11 @@ class RelayTests(unittest.TestCase):
         for invalid in ('private failure detail', []):
             worker = [prepared, dict(blocked, failureStage=invalid)]
             self.assertEqual(self.exercise(controller, worker, error=True), ([prepared], controller))
+        executed = frame('executed', result={})
+        restore_blocked = dict(blocked, failureStage='prepare-restore')
+        worker = [prepared, executed, restore_blocked]
+        self.assertEqual(self.exercise(controller, worker), (worker, controller))
+        self.assertEqual(self.exercise(controller, [prepared, restore_blocked], error=True), ([prepared], controller))
 
     def test_wrong_direction_and_nonce_do_not_forward(self):
         configure = frame('configure', **{field: None for field in ssh.CONFIGURE})

@@ -218,7 +218,8 @@ class _Relay:
                 executed = True
             elif kind == 'blocked':
                 stage = frame['failureStage']
-                if executed or frame['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES:
+                if (frame['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
+                        or executed != (stage == 'prepare-restore')):
                     reject()
                 self._write(self.stdout, frame)
                 return False

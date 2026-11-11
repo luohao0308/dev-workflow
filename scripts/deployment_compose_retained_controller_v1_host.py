@@ -363,9 +363,10 @@ class RetainedControllerV1:
                 elif kind == 'blocked':
                     blocked = _closed(frame, {'kind'} | BLOCKED_FIELDS)
                     stage = blocked['failureStage']
-                    if result is not None or blocked['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES:
+                    if (blocked['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
+                            or (result is not None) != (stage == 'prepare-restore')):
                         reject()
-                    return {'result': None, 'restoreReview': None, 'blocked': True, 'failureStage': stage}
+                    return {'result': result, 'restoreReview': None, 'blocked': True, 'failureStage': stage}
                 elif kind == 'executed':
                     if result is not None:
                         reject()
