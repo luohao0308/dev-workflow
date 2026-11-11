@@ -10,7 +10,9 @@ import subprocess
 import sys
 import time
 
-from deployment_compose_retained_native_channel_v1_host import CONFIGURE
+from deployment_compose_retained_native_channel_v1_host import (
+    BLOCKED_FIELDS, CONFIGURE, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT,
+)
 from deployment_compose_retained_native_entry_v1_host import scope_registration
 from deployment_compose_retained_production_unit_v1_host import RetainedProductionUnitV1
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1
@@ -194,13 +196,13 @@ class _Relay:
         self._write(self.process.stdin, reply)
 
     def _execute(self, *, rollback):
-        command = self._controller({'execute': {'request'}, 'finish': set()})
+        command = self._controller({'execute': {'request'}, 'finish': set()}, limit=REVIEW_COMMAND_TIMEOUT)
         self._write(self.process.stdin, command)
         if command['kind'] == 'finish':
             return False
         executed = False
         for _ in range(4096):
-            shapes = {'blocked': {'knownPrefix'}}
+            shapes = {'blocked': BLOCKED_FIELDS}
             if not executed:
                 shapes.update(rpc={'service', 'method', 'request'}, executed={'result'})
             if not rollback:
@@ -215,7 +217,9 @@ class _Relay:
                     return False
                 executed = True
             elif kind == 'blocked':
-                if executed or frame['knownPrefix'] is not False:
+                stage = frame['failureStage']
+                if (frame['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
+                        or executed != (stage == 'prepare-restore')):
                     reject()
                 self._write(self.stdout, frame)
                 return False

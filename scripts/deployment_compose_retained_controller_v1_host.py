@@ -27,6 +27,7 @@ from deployment_compose_production_frontend_approval_v1_host import (
 from deployment_compose_retained_intent_relay_v1_host import (
     IntentRelayRejected, RetainedIntentBindingV1, RetainedIntentIssuerV1,
 )
+from deployment_compose_retained_native_channel_v1_host import BLOCKED_FIELDS, FAILURE_STAGES
 from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _signer_pin
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_v3_channel_worker import read_frame, write_frame
@@ -360,9 +361,12 @@ class RetainedControllerV1:
                         reject()
                     self._write('reply', response=response)
                 elif kind == 'blocked':
-                    if result is not None or _closed(frame, {'kind', 'knownPrefix'})['knownPrefix'] is not False:
+                    blocked = _closed(frame, {'kind'} | BLOCKED_FIELDS)
+                    stage = blocked['failureStage']
+                    if (blocked['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
+                            or (result is not None) != (stage == 'prepare-restore')):
                         reject()
-                    return {'result': None, 'restoreReview': None, 'blocked': True}
+                    return {'result': result, 'restoreReview': None, 'blocked': True, 'failureStage': stage}
                 elif kind == 'executed':
                     if result is not None:
                         reject()

@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from tests import test_deployment_compose_retained_frontend_worker_v1_host as fixture
 from deployment_compose_retained_controller_v1_host import RetainedControllerV1
-from deployment_compose_retained_intent_relay_v1_host import RetainedIntentIssuerV1
+from deployment_compose_retained_intent_relay_v1_host import IntentRelayRejected, RetainedIntentIssuerV1
 from release_execute import AuthorizationUnavailable
 import deployment_compose_retained_native_channel_v1_host as native
 import deployment_compose_retained_source_v1_host as loader
@@ -36,7 +36,13 @@ class NativeChannelTests(unittest.TestCase):
     def test_relay_denial_at_closed_prefix_leaves_separately_approvable_restore(self):
         self._round_trip(deny_before_start=True)
 
-    def _round_trip(self, *, deny_before_start):
+    def test_initial_intent_failure_reports_stage_without_consumption_or_error_text(self):
+        self._round_trip(deny_before_start=False, fail_validation=True)
+
+    def test_restore_preparation_failure_keeps_verified_deploy_result(self):
+        self._round_trip(deny_before_start=False, fail_restore_preparation=True)
+
+    def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False):
         self.write_patch.stop()
         original = self.worker._plan
         prefix = 3 if deny_before_start else 4
@@ -52,6 +58,12 @@ class NativeChannelTests(unittest.TestCase):
 
         self.engine_post = engine_post
         with ExitStack() as stack:
+            if fail_validation:
+                stack.enter_context(patch.object(native.RetainedIntentClientV1, 'validate',
+                    side_effect=IntentRelayRejected('private failure detail')))
+            if fail_restore_preparation:
+                stack.enter_context(patch.object(native.RetainedFrontendWorkerV1, 'restore_review',
+                    side_effect=ValueError('private restore preparation detail')))
             if deny_before_start:
                 authorize = RetainedIntentIssuerV1.authorize_rpc
 
@@ -111,16 +123,29 @@ class NativeChannelTests(unittest.TestCase):
                 stack.callback(controller.close)
                 approval, grant, request, first_ledger = self._approval(controller.review, 'deploy')
                 result = controller.execute(approval, grant, request)
-                if deny_before_start:
+                if fail_validation:
+                    self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
+                                                  failureStage='validate-intent'))
+                    self.assertEqual(self.writes, [])
+                    self.assertEqual(len(first_ledger.markers), 0)
+                elif fail_restore_preparation:
+                    self.assertEqual(result['failureStage'], 'prepare-restore')
+                    self.assertTrue(result['blocked'])
+                    self.assertIsNone(result['restoreReview'])
+                    self.assertEqual(len(result['result']['witnessDigests']), 5)
+                    self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
+                    self.assertEqual(len(first_ledger.markers), 1)
+                elif deny_before_start:
                     self.assertIsNone(result['result'])
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
                 else:
                     self.assertEqual(len(result['result']['witnessDigests']), 5)
-                approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
-                result = controller.execute(approval, grant, request)
-                self.assertEqual(len(result['result']['witnessDigests']), prefix)
-                self.assertEqual(self.writes, [operation.phase for operation in expected])
-                self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
+                if not (fail_validation or fail_restore_preparation):
+                    approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
+                    result = controller.execute(approval, grant, request)
+                    self.assertEqual(len(result['result']['witnessDigests']), prefix)
+                    self.assertEqual(self.writes, [operation.phase for operation in expected])
+                    self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
             finally:
                 parent_out.close()
                 thread.join(8)

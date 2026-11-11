@@ -149,6 +149,22 @@ class RelayTests(unittest.TestCase):
         finish = frame('finish')
         self.assertEqual(self.exercise([configure, finish], [prepared]), ([prepared], [configure, finish]))
 
+    def test_blocked_stage_is_forwarded_only_for_known_values(self):
+        configure = frame('configure', **{field: None for field in ssh.CONFIGURE})
+        prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
+        execute = frame('execute', request={})
+        blocked = frame('blocked', knownPrefix=False, failureStage='validate-intent')
+        controller = [configure, execute]
+        self.assertEqual(self.exercise(controller, [prepared, blocked]), ([prepared, blocked], controller))
+        for invalid in ('private failure detail', []):
+            worker = [prepared, dict(blocked, failureStage=invalid)]
+            self.assertEqual(self.exercise(controller, worker, error=True), ([prepared], controller))
+        executed = frame('executed', result={})
+        restore_blocked = dict(blocked, failureStage='prepare-restore')
+        worker = [prepared, executed, restore_blocked]
+        self.assertEqual(self.exercise(controller, worker), (worker, controller))
+        self.assertEqual(self.exercise(controller, [prepared, restore_blocked], error=True), ([prepared], controller))
+
     def test_wrong_direction_and_nonce_do_not_forward(self):
         configure = frame('configure', **{field: None for field in ssh.CONFIGURE})
         prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
