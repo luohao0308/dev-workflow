@@ -35,13 +35,13 @@ class ScopeReconciliationTests(unittest.TestCase):
                        capture_output=True, timeout=10, check=True)
         self.public = self.key.with_suffix('.pub').read_bytes()
         self.signer_digest = hashlib.sha256(key_material(self.public)).hexdigest()
-        self.request, self.evidence = 'a' * 64, 'b' * 64
+        self.request, self.evidence, self.observation = 'a' * 64, 'b' * 64, '9' * 64
         with scope.acquire_scope(self.registration, self.request):
             pass
         self.original = self.journal.read_bytes()
         self.pending = scope.inspect_pending_scope(self.registration, self.request)
         self.approval = recovery.recovery_payload(
-            self.registration, self.pending, self.evidence, expires_at=int(time.time()) + 60,
+            self.registration, self.pending, self.evidence, self.observation, expires_at=int(time.time()) + 60,
         )
         self.signature = self.sign(self.approval)
 
@@ -53,7 +53,7 @@ class ScopeReconciliationTests(unittest.TestCase):
 
     def reconcile(self, **overrides):
         args = dict(approval=self.approval, signature=self.signature, public_key=self.public,
-                    trusted_signer_digest=self.signer_digest, observe_evidence=lambda: self.evidence)
+                    trusted_signer_digest=self.signer_digest, observe_live_digest=lambda: self.observation)
         args.update(overrides)
         return recovery.reconcile_pending_scope(self.registration, self.request, **args)
 
@@ -62,6 +62,7 @@ class ScopeReconciliationTests(unittest.TestCase):
         self.assertEqual(self.journal.read_bytes(), self.original + canonical(record) + b'\n')
         self.assertEqual(record['state'], 'operator-reconciled')
         self.assertEqual(record['evidence'], self.evidence)
+        self.assertEqual(record['observation'], self.observation)
         self.assertEqual(record['signer'], self.signer_digest)
         with self.assertRaises(scope.ScopeBlocked):
             self.reconcile()
@@ -80,7 +81,7 @@ class ScopeReconciliationTests(unittest.TestCase):
             dict(approval=stale, signature=self.sign(stale)),
             dict(approval=expired, signature=self.sign(expired)),
             dict(approval=other_inode, signature=self.sign(other_inode)),
-            dict(observe_evidence=lambda: 'c' * 64),
+            dict(observe_live_digest=lambda: 'c' * 64),
         ):
             with self.subTest(keys=tuple(overrides)), self.assertRaises(scope.ScopeBlocked):
                 self.reconcile(**overrides)
@@ -94,10 +95,10 @@ class ScopeReconciliationTests(unittest.TestCase):
             with self.assertRaisesRegex(scope.ScopeBlocked, 'live writer'):
                 scope.inspect_pending_scope(self.registration, self.request)
             now = self.approval['expiresAt']
-            return self.evidence
+            return self.observation
 
         with patch.object(recovery.time, 'time', lambda: now), self.assertRaises(scope.ScopeBlocked):
-            self.reconcile(observe_evidence=observation)
+            self.reconcile(observe_live_digest=observation)
         self.assertEqual(self.journal.read_bytes(), self.original)
 
     def test_change_during_evidence_observation_blocks_reconciliation(self):
@@ -105,10 +106,10 @@ class ScopeReconciliationTests(unittest.TestCase):
 
         def observation():
             self.journal.write_bytes(changed)
-            return self.evidence
+            return self.observation
 
         with self.assertRaises(scope.ScopeBlocked):
-            self.reconcile(observe_evidence=observation)
+            self.reconcile(observe_live_digest=observation)
         self.assertEqual(self.journal.read_bytes(), changed)
 
     def test_torn_append_still_blocks_future_writes(self):
@@ -121,3 +122,15 @@ class ScopeReconciliationTests(unittest.TestCase):
         self.assertTrue(self.journal.read_bytes().startswith(self.original))
         with self.assertRaises(scope.ScopeBlocked):
             scope.acquire_scope(self.registration, 'c' * 64)
+
+    def test_complete_visible_record_is_synced_before_a_new_lease_is_issued(self):
+        with patch.object(scope.os, 'fsync', side_effect=OSError('fixture fsync failure')):
+            with self.assertRaises(OSError):
+                self.reconcile()
+        self.assertEqual(json.loads(self.journal.read_bytes().splitlines()[-1])['state'],
+                         'operator-reconciled')
+        with patch.object(scope.os, 'fsync', wraps=os.fsync) as sync:
+            with scope.acquire_scope(self.registration, 'c' * 64) as lease:
+                sync.assert_called_once()
+                self.assertEqual(lease.generation, 2)
+                lease.complete('d' * 64)

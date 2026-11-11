@@ -209,9 +209,9 @@ def _history(raw, registration):
             proof = end['proof']
             terminal = dict(state=end['state'], generation=generation, request=request, proof=proof)
             if end['state'] == 'operator-reconciled':
-                if not hex_value(end['evidence']) or not hex_value(end['signer']):
+                if not all(hex_value(end[field]) for field in ('evidence', 'observation', 'signer')):
                     _block('Invalid production reconciliation evidence')
-                terminal.update(evidence=end['evidence'], signer=end['signer'])
+                terminal.update(evidence=end['evidence'], observation=end['observation'], signer=end['signer'])
             elif end['state'] != 'verified':
                 _block('Invalid production scope disposition')
             if (not hex_value(request) or request in requests or not hex_value(proof)

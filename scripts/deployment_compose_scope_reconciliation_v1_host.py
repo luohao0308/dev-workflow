@@ -25,13 +25,13 @@ def _reject():
     raise ScopeBlocked('Production scope reconciliation rejected') from None
 
 
-def recovery_payload(registration, pending, evidence_digest, *, expires_at):
+def recovery_payload(registration, pending, evidence_digest, observation_digest, *, expires_at):
     """Build the exact message for an operator reviewing a legacy incident."""
     if (type(registration) is not ScopeRegistrationV1 or type(pending) is not dict
             or set(pending) != {'generation', 'requestHash', 'journalDigest'}
             or type(pending['generation']) is not int or pending['generation'] < 1
             or not all(hex_value(value) for value in (
-                pending['requestHash'], pending['journalDigest'], evidence_digest))
+                pending['requestHash'], pending['journalDigest'], evidence_digest, observation_digest))
             or type(expires_at) is not int):
         _reject()
     return dict(
@@ -39,7 +39,8 @@ def recovery_payload(registration, pending, evidence_digest, *, expires_at):
         hostId=registration.host_id, project=registration.project, daemonId=registration.daemon_id,
         scopeDirectory=str(registration.root), scopeIdentity=list(registration.root_identity),
         journalIdentity=list(registration.journal_identity), pending=dict(pending),
-        evidenceDigest=evidence_digest, legacyMacAuthentication='unavailable',
+        evidenceDigest=evidence_digest, observationDigest=observation_digest,
+        legacyMacAuthentication='unavailable',
         expiresAt=expires_at,
     )
 
@@ -60,39 +61,44 @@ def _verify_signature(material, signature, public_key):
 
 
 def reconcile_pending_scope(registration, request_digest, *, approval, signature,
-                            public_key, trusted_signer_digest, observe_evidence):
+                            public_key, trusted_signer_digest, observe_live_digest):
     """Append one signed operator disposition after a locked evidence recheck.
 
     The embedding retains the signed approval and independently supplies the
-    trusted signer digest and the callback returning fresh evidence's digest.
-    A successful return certifies journal closure only.
+    trusted signer digest and the callback returning a fresh, stable live
+    observation digest. The incident evidence digest binds the historical
+    report separately. A successful return certifies journal closure only.
+    A torn line remains blocked. If sync fails after a complete append, a
+    later acquisition must sync the journal before issuing another lease.
     """
     if (type(approval) is not dict or type(signature) is not bytes
             or not 0 < len(signature) <= 4096 or not hex_value(trusted_signer_digest)
-            or not callable(observe_evidence)):
+            or not callable(observe_live_digest)):
         _reject()
     key = key_material(public_key)
     if hashlib.sha256(key).hexdigest() != trusted_signer_digest:
         _reject()
     expiry = approval.get('expiresAt')
     evidence = approval.get('evidenceDigest')
+    observation = approval.get('observationDigest')
     if type(expiry) is not int or not 0 < expiry - time.time() <= MAX_APPROVAL_SECONDS:
         _reject()
 
     with _locked_pending_scope(registration, request_digest, writable=True) as (fd, raw, pending):
-        expected = recovery_payload(registration, pending, evidence, expires_at=expiry)
+        expected = recovery_payload(registration, pending, evidence, observation, expires_at=expiry)
         material = canonical(expected)
         if canonical(approval) != material:
             _reject()
         _verify_signature(material, signature, key)
-        if (observe_evidence() != evidence or _read(registration, fd) != raw
+        if (observe_live_digest() != observation or _read(registration, fd) != raw
                 or time.time() >= expiry):
             _reject()
         proof = hashlib.sha256(
             b'dev-workflow:production-scope-reconciliation:v1\0' + material + b'\0' + signature,
         ).hexdigest()
         record = dict(state='operator-reconciled', generation=pending['generation'],
-                      request=request_digest, proof=proof, evidence=evidence, signer=trusted_signer_digest)
+                      request=request_digest, proof=proof, evidence=evidence,
+                      observation=observation, signer=trusted_signer_digest)
         line = _line(record)
         if len(raw) + len(line) > MAX_BYTES:
             _reject()
