@@ -1,0 +1,128 @@
+{
+  "date": "2026-11-03",
+  "status": "local scene-specific writer/source checkpoint binding verified; real retained-scene acceptance pending",
+  "publication": "local workspace only; not committed or published",
+  "scope": "original first-create closed history, historical writer/stop facts and exact source archive custody",
+  "filesSha256": {
+    "scripts/deployment_compose_scene_checkpoint_v3_host.py": "f77efdc2b64dca93e0829c4762059313a15e9567c832645740a751014fec4932",
+    "scripts/deployment_compose_scene_create_broker_v3_host.py": "9b622a1b696dda387fc1622c71b319a64ff674782b6c991c4d63ad2d2330bded",
+    "scripts/deployment_compose_scene_create_controller_v3_host.py": "c85fdd10bf35069dabd11b81681f3bcbb5591aef4e6e12ca989c060f34d75f3c",
+    "scripts/deployment_compose_scene_control_ssh_v3_host.py": "64b3fe0bfa8bb62f8908a0f090d5c36bf6444be195cdb8fb6e956003aabfcc17",
+    "tests/support/compose_scene_create_integration_fixture.py": "e7d71f859288d225c5ac5aad18a3e76e822bcb1426dda6aba1cf7702dd6e6534",
+    "tests/support/compose_scene_controller_integration_fixture.py": "9f43f51e3755bf075627cb4bfa6b11cc610b6a72f0d7c38beed85a045b60acf8",
+    "tests/support/compose_scene_binding_exit_fixture.py": "25e39ad0ecdd7fef5de36621f3b3576d5ffd1f3716c53b2a2f6b54c4c2d4a0bf",
+    "tests/test_deployment_compose_scene_checkpoint_binding_v3_host.py": "90ed5364646f25e901539fef3296bd009557573645327a6fe2c5d362d8c25b7e",
+    "tests/test_deployment_compose_scene_checkpoint_security_v3_host.py": "f04d846413d3d4106505ed09bb1d728fc8548bb3fbaa58fe0c35fdaaf3a0aabe",
+    "tests/test_deployment_compose_scene_checkpoint_ssh_v3_host.py": "ecf730db56673332c56cc89503de9f4a4c28e286c48a4e45a7125db264764b55"
+  },
+  "validation": {
+    "python314": {
+      "native_binding_integration": {
+        "tests": 3,
+        "seconds": 45.157,
+        "result": "pass"
+      },
+      "producer_exit_and_security": {
+        "tests": 7,
+        "seconds": 43.79,
+        "result": "pass"
+      },
+      "native_relay_and_issuer": {
+        "tests": 6,
+        "seconds": 7.35,
+        "result": "pass"
+      },
+      "broker_and_closure": {
+        "tests": 6,
+        "seconds": 6.372,
+        "result": "pass"
+      },
+      "scene_service_slot_preparation": {
+        "tests": 23,
+        "seconds": 24.146,
+        "result": "pass"
+      },
+      "legacy_checkpoint_controller": {
+        "tests": 10,
+        "seconds": 161.128,
+        "result": "pass"
+      }
+    },
+    "python310": {
+      "native_binding_integration": {
+        "tests": 3,
+        "seconds": 54.146,
+        "result": "pass"
+      },
+      "producer_exit_security_relay": {
+        "tests": 13,
+        "seconds": 37.719,
+        "result": "pass"
+      },
+      "legacy_checkpoint_controller": {
+        "tests": 11,
+        "seconds": 168.783,
+        "result": "pass"
+      }
+    },
+    "pythonAST": "430 Python files passed",
+    "bashSyntax": "pass",
+    "diffWhitespace": "pass",
+    "fullRemoteCI": "not run for this local unpublished increment"
+  },
+  "evidence": {
+    "producerExitedBeforeColdConsumer": true,
+    "nativeGitCommitTreeBlobZIP": true,
+    "nativeTLSGateSSHSIGCAS": true,
+    "originalWitnessUnchanged": true,
+    "legacyReaderOriginRemainsNone": true,
+    "opaqueControllerCaptureRequired": true,
+    "copiedControllerOrOverriddenMethodsRejected": true,
+    "nativeSSHConstructorProvenanceRequired": true,
+    "fullUnixAndRelayFramesWithin8192Bytes": true,
+    "wrongExternalKeyOrArtifactPinsRejected": true,
+    "rehashedForgedOriginRejected": true,
+    "crossContextAndWrongNamespaceRejected": true,
+    "sourcePermissionsContentAndExtraMembersRejected": true,
+    "readerCopyThreadForkAndClosedUseRejected": true,
+    "failedEnterClosesOriginalFDs": true,
+    "partialPublicationNoNotifyAndNoRedispatch": true
+  },
+  "doubles": [
+    "GitHub provider and approval environment",
+    "Unix Engine",
+    "Linux kernel/issuer and macOS Linux filesystem namespace mapping",
+    "scene/SSH startup and authentication transport in business integration; native relay/Unix protocol separately tested"
+  ],
+  "review": {
+    "status": "CLEAR for bounded local slice after fixes",
+    "fixed": [
+      "controller and SSH client constructor provenance seals; fixed class capture methods",
+      "original request provider/origin/SHA source cross-check",
+      "failed reader __enter__ closes owned resources"
+    ]
+  },
+  "initialFailures": {
+    "preservedAsFailures": true,
+    "causes": [
+      "local preparation fixture used fixed synthetic SHA instead of the native Git fixture SHA",
+      "fixture imported the same preparation helper under two module names",
+      "macOS /var/tmp symlink spelling differs from Linux namespace identity and strict filesystem paths"
+    ],
+    "resolution": "fixture-only source input correction and explicit Darwin namespace Path mapping; original Git, Gate, CAS and signing checks retained"
+  },
+  "remaining": [
+    "publish and validate exact updated source before real SSH acceptance",
+    "real same-retained-scene checkpoint and cold process acceptance",
+    "fresh writer stop and live Engine phase revalidation",
+    "new recovery profile approval/consumption/session/admission/tail CAS"
+  ],
+  "phaseFreshnessVerified": false,
+  "linuxQuiescenceVerified": false,
+  "sourceRevalidated": false,
+  "currentPublicationVerified": false,
+  "authorityGranted": false,
+  "executionAvailable": false,
+  "recoveryAuthorized": false,
+  "productionReady": false
+}

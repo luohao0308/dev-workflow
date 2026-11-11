@@ -124,6 +124,28 @@ class ReleaseHostTests(unittest.TestCase):
         self.assertIs(type(receipt), host.Receipt)
         self.assertTrue(next(iter(self.client.markers)).startswith('tags/workflow-grants/123/'))
 
+    def test_default_authority_read_order_and_early_identity_rejection(self):
+        expected = ['/repos/sample/host', '/repos/sample/target', '/repos/sample/ledger',
+                    '/repos/sample/host/actions/oidc/customization/sub',
+                    '/repos/sample/host/actions/runs/123',
+                    '/repos/sample/host/environments/release',
+                    '/repos/sample/host/actions/runs/123/approvals']
+        with mock.patch.object(self.client, 'request', wraps=self.client.request) as reads:
+            self.make_host()
+            self.assertEqual([call.args[1] for call in reads.call_args_list], expected)
+            reads.reset_mock()
+            self.client.data[expected[0]]['id'] = 999
+            with self.assertRaises(AuthorizationUnavailable):
+                self.make_host()
+            self.assertEqual([call.args[1] for call in reads.call_args_list], expected[:1])
+
+    def test_prefetched_null_subject_never_falls_back_to_network(self):
+        approval = self.make_host()
+        with mock.patch.object(self.client, 'request') as reads:
+            with self.assertRaises(AuthorizationUnavailable):
+                approval._verify_subject(self.claims, self.client.data['/repos/sample/host'], None)
+            reads.assert_not_called()
+
     def test_before_consume_runs_after_last_authority_reads_at_before_send(self):
         approval = self.make_host()
         grant = approval.validate(self.req)

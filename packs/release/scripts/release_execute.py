@@ -467,7 +467,22 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.action == 'status':
-            result = dict(executionAvailable=False, mode='preparation-only', reason='trusted-host-adapter-unavailable', operations=list(OPERATIONS))
+            result = dict(executionAvailable=False, mode='preparation-only', reason='trusted-host-adapter-unavailable',
+                          operations=list(OPERATIONS), adapters=[
+                              dict(platform='github.com', host='github-actions',
+                                   tagRelease='implemented', implementation='implemented',
+                                   validation='scope-specific', availability='trusted-host-required',
+                                   localExecutionAvailable=False),
+                              dict(platform='gitlab', host='gitlab-ci',
+                                   tagRelease='unsupported', implementation='unsupported',
+                                   preparation='native-tag-host-foundations',
+                                   blockers=['registered-native-review-and-ledger-required',
+                                             'independent-gitlab-project-validation-required',
+                                             'release-atomic-tag-constraint-unproven'],
+                                   validation='none', availability='unsupported', localExecutionAvailable=False),
+                              dict(platform='local', host='local',
+                                   tagRelease='unsupported', implementation='unsupported',
+                                   validation='none', availability='unsupported', localExecutionAvailable=False)])
         elif args.action == 'execute':
             raise AuthorizationUnavailable('Trusted host authorization is unavailable; preparation only')
         else:

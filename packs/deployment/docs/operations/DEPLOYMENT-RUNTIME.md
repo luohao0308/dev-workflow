@@ -58,3 +58,10 @@ mock/单元测试只能证明相应 SDK 分支。真实 Docker + 服务端 GET-o
 P1-5 的 `HostStore.capture_history()` 只接受 collector 签发且现场复核通过的完整 observation。重启后 `load_history(..., collector=new_collector, before=fresh_current)` 校验宿主签名、固定目标和全部历史组件的镜像／来源／规格仍存在，签发独立 `HistoricalSnapshot`。它仅能用于 `validate_history(..., before=...)` 和新回滚请求；`validate()`／`recheck()` 仍只认可本 collector 的新鲜现场对象。
 
 历史记录保留原始 producer policy；当前 catalog 增加版本、传输证书轮换不必抹去旧历史。删除或改变历史配方、变更目标／组件集合、错误签名密钥均拒绝。请求额外绑定签名记录、store、producer/current policy 摘要和真实仓库数值 ID。已有进程内历史路径及未配置扩展时的执行策略哈希保持兼容。详见 [持久化与恢复](DEPLOYMENT-RECOVERY.md)。
+
+
+## Compose 当前能力与接入顺序
+
+`deployment_execute.py status` 对 Compose 保持 `execution/implementation/availability=unsupported`、`validation=none`；`preparation=local-foundations` 只说明本地准备模块存在。`blockers` 列出仍需完成的受信报告生产者、Engine 重建验收、产品 writer 部署→回滚组合验收、阶段崩溃恢复验收及生产信任登记。开启 deployment:compose 能力、安装 pack 或离线测试通过均不会消除这些缺口。
+
+发行仓库已取得真实 Linux 隔离样本，实验性 V3 锚点、网关及恢复模块已有局部实现；`0f053f3` 的 push/PR 完整 CI（含 Windows/PowerShell）已通过。这些证据不等于已安装项目的完整执行画像通过验收，也不授予生产执行能力，因此不把已有样本或某次 CI 成功提升为 Compose 可用。

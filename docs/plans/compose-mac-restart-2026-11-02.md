@@ -1,0 +1,280 @@
+# Mac进程重启恢复
+
+## 当前事实与目标
+
+`d9e9969`真实首create闭合→独立审批四步续作→终态证书已验收，但原Mac进程一直保留。新进程验签只验证历史证明，不提供执行恢复。
+
+原controller的gate/store及准备材料密钥只在内存；原admission保留真实approval/consumption对象、PID/issuer与epoch。远端daemon还绑定原writer父进程，失联会停止。因此不能反序列化旧admission，也不能让新SSH连接继承旧现场权限。
+
+## 首切片：重新认证私有闭合前缀
+
+交付可由后续恢复准备器消费的只读history与独立基线，不注册admission或连接Engine。先限单服务deploy的首create闭合切点，拒绝pending、unknown-response、多步或恢复后history。
+
+- 保留原bundle/request/policy、消费摘要、first binding、原认证snapshot、独立baseline字节及执行源码归档身份；不保存grant、OIDC、旧approval/consumption对象或签名私钥。
+- 完整保留经原生产端认证的image defaults，使用原bundle构造器重建并逐字节核对包括派生字段的完整bundle；defaults摘要不能替代原值。
+- 验证密钥、见证transport及材料摘要/context pin由可信embedding独立提供；材料中的公钥或摘要不能自行建立信任。
+- 新进程重建原只读AuthenticatedHistoryV3并通过原OperationWitnessClientV3重验真实SSHSIG和gate HMAC；从见证重新capture，不能仅相信保存的snapshot。
+- 再次捕获须与独立固定的历史摘要及完整snapshot相等，基线须与bundle摘要相符。认证失败不修复、覆盖或推进见证。
+- 输出不得宣称当前Engine/phase新鲜、旧writer已停止、反回滚根已登记或任何执行权限。可信独占本地见证存储仍是前提。
+
+优先复用原类型、规范化、签名校验和只读操作；不新增依赖，不改既有PID/issuer检查、wire协议或普通CLI支持矩阵。
+
+首版API为`capture_material(original_history, *, baseline_bytes, authenticated_image_defaults, archive_digest)`及`reopen_material(raw, *, expected_digest, expected_context, gate_key, witness_public_key, witness_transport)`。首版只提供bytes接口，不实现文件写入或自动密钥保管；可信embedding负责私有文件权限、独立pin和外部密钥/transport来源。`expected_context`严格包含sourceSha、hostId、daemonId、archiveDigest、historyDigest、baselineStateDigest。
+
+返回冻结的只读history/snapshot/baseline上下文，私有字段不进入repr；材料不含gate/store密钥。显式核对原request的policy_hash等于GatePolicy.identity_hash。历史过期请求可以审计，但不续期或创建旧权限。新nonce读取不证明存储不可整体回滚，输出所有权限、phase freshness、Linux quiescence及production标志均为false。
+
+## 方案取舍
+
+选择重新读取认证见证：能给后续RecoveryPreparationHostV3/恢复capsule校验提供原history类型与独立基线，直接补原controller进程内数据缺口。
+
+仅新增部分历史签名证书虽容易跨进程验签，但会重复现有历史证明，并不能重验原见证或恢复准备器输入，暂不采用。
+
+## 验证
+
+1. 生产者子进程生成真实Gate/HMAC/SSHSIG闭合历史和私有材料后退出；另一全新进程在外部可信密钥/transport下重读见证并认证相同前缀。Engine/provider只用明确替身。
+2. 篡改、重复键、非规范输入、超限、错误源码/host/archive/history/baseline/key或材料pin拒绝；pending/unknown和见证推进/旧前缀不匹配拒绝。
+3. 只允许read/check/events_after/chain_status；register/append/transition、Engine及审批调用不得发生。验证前后见证字节不变。
+4. 私有材料不可通过repr/公开摘要泄漏body；文件接口若纳入本切片，必须拒绝符号链接、非0600文件、替换和不安全目录。
+5. 保留原history/capsule/admission/session相关回归。证据必须区分新进程历史认证与新进程执行恢复。
+
+## 后续执行恢复的未闭合边界
+
+可信密钥保管/登记、外部单调见证、旧writer独立终止证明、已停Engine的重新绑定与实时phase、全新session及新精确消费、尾部CAS须分别实现和验收。首切片不解除这些条件，不启动生产。
+
+## 第二切片：原controller捕获与本地私有保管
+
+将首切片接到原managed普通controller的仅本地可选`on_restart_checkpoint`回调：提供回调即启用捕获和私有保管；默认None保持原路径。原恢复phase验证通过后、第二次精确审批消费前保存材料，并通过回调交付一次独立descriptor/pins；回调只接收深复制的描述性摘要，不含body、key、grant。raw-Popen和固定诊断画像拒绝此扩展，不新增wire字段。defaults须从已经认证的原deploy capsule用原image HMAC派生逻辑重新得到，不能从声称的摘要猜测。
+
+材料与读取所需的gate/store密钥分开保存在本次Mac私有case中；见证签名私钥继续使用原来的独立文件，不复制进材料或公开摘要。只接受POSIX当前用户0700目录和0600普通单链接文件，全路径拒绝符号链接；完整临时写入、fsync、独占发布，不覆盖旧结果或修复残片。两文件不是事务，任意写入或目录fsync失败都不得交付descriptor，冷读拒绝不完整pair。保存或回调失败必须在第二审批前拒绝，并沿原controller异常/清理路径退出。
+
+冷读入口必须显式接收来自可信embedding的材料摘要、密钥保管文件摘要、六项context pin及见证公钥摘要；邻接manifest不自证。这是可信独占主机上的私有文件保管，不声称Keychain/KMS、抵抗主机管理员或全局单调存储登记。新增custody只保存历史重验所需gate/store密钥，不复制旧grant、OIDC、approval/consumption对象或intent签名私钥；原controller已有签名文件的生命周期不在本切片内改写。
+
+冷读重开原OperationWitnessStoreV3，仅允许原只读dispatch及新nonce签名响应，交给原reopen_material继续完整认证。reader的PID/thread/对象身份和关闭状态须防复制、fork或外线程关闭原句柄；所有文件身份及权限前后重验。原writer已退出不构成独立终止证明，冷读成功也不能恢复执行。
+
+验收采用原managed controller及真实本地管道/HMAC/SSHSIG，在首create闭合并落盘后从原生回调保留独立pins，再故意拒绝第二审批，旧producer正常完成异常清理并退出，再由新进程读取；不得patch保存函数获取pins或从邻接manifest补造信任。并覆盖文件权限/链接/替换、错误外部pin、部分发布/重复发布、读后关闭或复制/fork，以及见证已推进时旧checkpoint拒绝；不产生第二次消费或Engine派发。读取保留原store阻塞flock边界，不声明全局硬期限。
+
+## 第三切片：Linux原writer身份与冷进程停止核验
+
+当前manager交付给Mac的六字段binding不含PID/startTicks及cgroup inode，不能从daemon身份或JSON猜出旧writer身份。先补Linux本地完整origin及独立冷读核验；Mac端的外层origin frame、nonce/旧六字段绑定和checkpoint接线后续单列。
+
+原OwnedRecoveryUnitV3在确定启动后，重新验证同boot、原InvocationID/PID/startTicks、原cgroup与parent inode，才能导出canonical只读origin。origin同时固定producer的`/proc/self/ns/pid` device/inode，并验证`/proc/self/stat`中的PID等于`os.getpid()`；consumer必须匹配同一PID namespace与一致的/proc视图，避免把不同命名空间中看不到PID误判为原进程死亡。源码/归档身份取原固定loader构造参数。未启动、启动不确定、PID/Invocation/cgroup/namespace替换均拒绝。
+
+相同数字PID不能证明相同namespace；[Linux pid_namespaces(7)](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html)说明procfs按挂载者namespace呈现进程。实现据此再比较`/proc/1/ns/pid`与`/proc/self/ns/pid`，并在捕获前后核对原MainPID的namespace与producer一致；即使数字PID偶合也不能混合不同视图的身份。
+
+冷核验器显式接收原origin字节及外部固定digest/source/archive，不复活旧owner对象。只接受固定`dw-writer-host-<16hex>.service`命名范围，cgroup路径由名称派生；只读systemctl show、/proc和cgroup。当前boot须匹配，原PID须已消失（包括zombie或PID复用均拒绝），unit须为严格not-found或原Invocation明确停止态，原cgroup须已消失或同inode递归空。两次完整观测须稳定一致，任何权限、解析、状态推进或身份变化均拒绝；所有读共享原有界deadline。
+
+停止观测只说明原wrapper/cgroup在本次观测中已停止，不说明daemon、业务、现场新鲜或后续永不重启；所有执行/恢复权限保持false。描述性结果不能作为新admission或stop能力。
+
+测试覆盖原owner活着时捕获、旧producer停止退出后全新consumer只读核验、残留后代、PID/unit/cgroup复用、错pin与错误boot、PID namespace及/proc视图不匹配、观测期间变化、权限失败与deadline。真实专用Linux/root测试仅启动等待归档的原固定loader，不发送归档/config、不启动worker或Engine；原owner负责停止，新consumer不得执行任何启停命令。
+
+## 第四切片：认证外层origin交付与checkpoint绑定
+
+checkpoint启用时，原controller在`session.begin`前通过issued普通会话捕获一次origin。固定manager请求仅在未启动业务、normal且未尝试时受理，先burn尝试，再执行固定短预算的原owner.capture_origin；独立外层回执经原有有界client队列交付，不嵌套在worker-frame中，不改变原六/七字段binding或增加caller可选unit/PID/program。
+
+Mac验证会话nonce、完整binding及origin的source/archive/unit/boot/invocation；原session/PID/thread/process和规范化origin须由module级WeakKey seal保留。发送/接收/验证失败永久禁止重试与begin。提前terminal保留给close；close可验证排空一条已请求的pending origin，但不能为失败capture签发成功seal，半帧超时不能猜测恢复。manager处理同批client帧时有效stop先于昂贵origin捕获，origin回执未交付时拒绝start；同步捕获本身不声明可中途抢占。
+
+首create闭合phase验证后，checkpoint从原session seal取origin，与material/custody/witness摘要、六项context、完整manager binding及nonce绑定为独立私有artifact，不改原history material schema。独占发布并回读核验后才调用原native checkpoint回调交付增强描述；任何失败在第二review前沿原清理路径终止。
+
+冷reader仅在调用者提供独立外部origin artifact pin时读取并验证它，交叉核全部checkpoint/context/binding/source数据，输出raw Linux origin供后续只读停止核验；不从相邻文件自行推导信任，不恢复session或执行权限。未提供origin pin的旧reader保持原语义。
+
+测试覆盖默认无新帧、diag/raw拒绝、原对象/线程/复制/属性替换、partial send不重试、同批stop、pending回执排空、重复/嵌套伪帧、错pin/串场、producer退出后冷读。真实发布源码SSH stop-before-start只验证origin认证交付与关闭：不发送业务worker归档/config，不启动Engine，不消费审批，不能标成跨主机执行恢复。
+
+## 第五切片：Mac冷reader的固定SSH停止观测
+
+reader仅在原owner/PID/thread、origin双外部pin及全部私有文件Guard仍有效时发起纯读SSH核验。host别名和旧producer source/archive必须从已pin origin artifact重读，不能从可改写的history缓存或caller的unit/PID参数推导；网络调用前后重新核对Guard和原artifact绑定。
+
+成功构造reader时以module WeakKey seal固定原guard/store/context身份、case和全部外部pins，观测入口拒绝缓存/guard/store替换。前后以这些原pins重新读取真实材料与history及origin artifact，而不是把可改写对象当唯一来源。
+
+SSH使用原strict host-key/禁转发参数、精确已发布源码归档及固定cold worker.run；不接受caller提供Popen、program、module或command。单canonical请求绑定新nonce、host、origin摘要、producer source/archive、verifier source/archive及checkpoint摘要。两套source/archive独立，旧writer与新verifier版本或重新打包ZIP不必相同。
+
+Linux worker严格校验输入与EOF，仅调用原cold.observe_stopped_writer，只读systemctl show、/proc和cgroup。Mac仅在结果形状/context/request摘要/观察摘要匹配、干净EOF、SSH0、stderr无字节以及本地进程/线程/流回收通过后交付只读远端观测；任何错误、额外帧、警告stderr、半帧或非零退出均拒绝，不自动重试。共享绝对deadline和有界stderr/帧保留原阻塞filesystem/crypto边界，不宣称不可中断内核IO的硬期限。
+
+`timeout`限定自建SSH进程从spawn到输入/输出、EOF、SSH退出及stderr收尾的共享阶段；发布归档的逐文件Git预检及本地历史前后重验保留原有单步超时/阻塞flock，不能宣称整个API的30秒硬期限。新固定bootstrap须独立补重复键拒绝及原始输入字节canonical相等校验，不扩大改写其他原入口。响应中的两份观察须封闭、完全相等、boot/namespace对应原origin，观察摘要可重算，权限字段严格false。
+
+返回结果绑定原checkpoint和origin，仍无admission/RuntimePermit、daemon停止、Engine新鲜性或执行恢复权限。checkpoint未加载可信origin则不得发送SSH；只读失败不会重放任何产品请求。
+
+`checkpointBinding`仅为本次请求/回复的相关性绑定，不是Linux独立认证Mac历史。reader路径必须含material/origin artifact/history三摘要且精确匹配；私有低层真实origin-only smoke可传None，但结果须明确`checkpointBound=false`，不能冒称真实checkpoint验收。
+
+验收分两部分：合成checkpoint通过原native callback交付、旧producer退出、新Mac reader调用固定SSH协议（Linux/sysfs为明确替身）的完整接缝与负例；真实发布源码先捕获startup origin并关闭，再由新Mac进程通过严格SSH取得实际Linux停止观测。真实路径无业务checkpoint写入，不发送业务worker归档/config、不启动Engine或消费审批，不将其升级为真实已准入恢复验收。
+
+## 第六切片：独立存活Engine的实时phase适用性
+
+当前managed contract为停止独立daemon、保留磁盘证据，并在PreparationSession.cleanup删除已确认自建容器/网络/卷；unknown写入时拒绝猜测删除。这些默认行为不变。保留root/data/CAS目录不证明资源连续性或可重新启动，已清理scene必须拒绝实时phase捕获。
+
+先为由独立可信fixture owner保持存活的同一Engine/资源现场实现`LiveRecoveryPhaseCaptureV3`。输入原AuthenticatedHistoryV3和已认证checkpoint.baseline_bytes；历史只读transport可由独立Mac见证提供，不把见证store密钥或签名私钥搬入subject Linux。仅接受单服务root deploy的首create闭合前缀，固定原request/bundle/receiptMap/baseline摘要，拒pending/unknown/推进后的history。
+
+GET producer复用原ObservedRecoveryDaemonV3实际Unix连接和SO_PEERCRED/pidfile/socket/root/cgroup身份。新增phase读取从可信bundle/receiptMap推导固定version/info、项目过滤清单、固定container/network/volume GET白名单，预算与deadline共享；不接受任意read_json callback后宣称机器真实性。peer PID/start及PID/net/mount namespace在新capture前后核验，peer namespace需与可信/proc PID视图一致，net/mount不要求等于observer但不可漂移。预期Version/GitCommit来自可信embedding的原解释版本，不能用当前GET自证。
+
+使用原inflate(baseline_bytes)和PhaseGuardV3.capture_phase对下一操作进行两次一致读取，再重验原history、当前endpoint和私有结果。交付可供后续准备器消费的phase bytes及绑定摘要，只声明本次项目phase与认证闭合前缀一致。daemonContinuityVerified、旧writer排他性、恢复/执行权限仍false，不宣称全Engine库存、卷内容或观测后的永久新鲜性。
+
+原RecoveryPreparationHostV3要求重开Linux ComposeRecoveryStore；该CAS使用keys.archive，当前Mac custody只保管gate/store。因此本切片不冒称已接通其新请求签发，不跳过旧CAS校验。后续必须明确checkpoint基线来源的新准备器契约或补CAS密钥保管，并在新请求/精确审批/新消费/尾部CAS之后才开放writer。
+
+正例由独立fixture owner持有Unix Engine与见证服务，在producer退出后让新consumer捕获，再由owner统一清理。负例包括原scene清理/候选丢失、保护资源/网络/卷变化、错peer/socket/daemon/version/root、namespace或history漂移、超限/超时；断言新producer只有GET、零产品写入、零审批消费。Linux/sysfs/systemd/Engine若为替身必须逐项注明，不以模拟连续性冒充真实保留daemon验收。
+
+## 第七切片：从认证checkpoint准备独立的新恢复意图
+
+新增独立的checkpoint准备入口，不修改原RecoveryPreparationHostV3的原archive CAS要求。输入完整私有restart material、独立外部material/context pins、外部Gate key/见证公钥及只读签名transport、精确ObservedRecoveryDaemonV3、可信预期Version/GitCommit与新宿主ComposeRecoveryStore。入口内部调用原reopen_material并自建LiveRecoveryPhaseCaptureV3，不接受caller自造的readonly dataclass、静态phase结果或任意capture callback作为认证来源。外部material pin绑定原request的完整source/host/target/policy；本切片不据此宣称当前源码已经重验。
+
+新私有context使用独立kind `compose-checkpoint-recovery-context-v3`。基线来自重新认证的checkpoint，写入新CAS后以`checkpointBaselineReference`和原baseline摘要绑定；不得读取、伪造或覆盖原bundle中的旧baselineStateReference。context绑定原material/bundle/request/history、首create receipt与下一操作、两次实时phase扫描结果、endpoint与解释版本、新nonce及有效期。默认nonce由安全随机源生成；显式可信embedding nonce仍需有效且不得复用原bundle nonce。新RequestV2使用独立profile_id `compose-checkpoint-recovery-intent-v3`（仍为version3），保留原完整业务规格，operation改为recovery，history/observation摘要绑定本次新context，有效期在准备与核验前后重新验证。
+
+prepare只在新CAS独占发布/读回、私有基线校验、重新实时capture/history及全部context精确比较后交付。verify每次从新CAS读回且重新捕获现场，拒绝自改后重hash的receipt/phase/endpoint/请求字段、history推进、已清理scene、过期/超远期与CAS破坏。读取共享调用deadline，不宣称可中断filesystem/crypto/flock的全局硬期限。preparer绑定原PID/thread/输入与store身份，拒复制、pickle、fork或资源替换；失败不交付成功结果，不删除证据或修复残片。
+
+新context不是旧schema的替代品；旧capsule/preparer必须拒绝，新profile令只检查RequestV2的旧审批入口也明确拒绝，不能自动送入原审批/admission/coordinator。公开review仅给摘要、下一写入序号、有效期和明确blockers，不泄露完整body/phase/endpoint。sourceRevalidated、writerQuiescenceVerified、daemonContinuityVerified、approvalReady、执行/恢复权限与production均false；无审批登记/消费、尾部CAS、writer派发或Engine写入。
+
+验收使用原签名历史与真实Unix HTTP、独立新CAS；原archive store关闭/不可读仍可准备。独立owner保留现场及见证，旧材料producer退出后由新consumer实际准备并验证新request与context，最后由owner清理；不传见证store HMAC或签名私钥给subject。Engine/systemd/proc/peer仍为明确替身，真实保留daemon与真实业务checkpoint冷验收继续单列。后续仍需当前source与旧writer排他证明、实际独立生命周期、新session/admission、精确审批/新消费及历史尾部CAS。
+
+## 第八切片：真实隔离Engine的独立owner跨进程草案诊断
+
+复用原isolated_daemon_probe的`bind_to_owned_writer=False`及3600秒上限的workload callback，由同一可信诊断owner持有专用systemd daemon/资源，直到旧材料producer退出且新consumer完成草案准备/验证，最后沿原session.cleanup及probe finally统一清理。不关闭pidfd、不改managed默认销毁、不重启旧scene；此有界owner是诊断夹具，不是已部署的持久保留服务。
+
+通过原prepare_profile3建立真实隔离baseline/protected容器、网络/卷及认证bundle/defaults，再仅在夹具seed阶段创建固定候选。parent见证为此真实候选Id生成明确synthetic域的首create闭合Gate历史；这些签名事件不是实际产品writer捕获的响应，也没有真实审批或消费。parent独占签名私钥/store key，子进程仅获Gate key、公钥、材料和独立pins，经只读Unix RPC重新认证。
+
+producer与consumer必须是真实新进程且前者已wait/reap；consumer使用原生ObservedRecoveryDaemonV3，不patch systemd、proc/cgroup、peer、namespace、Engine响应或平台。必须绑定同一实际PID/start/invocation/socket/root，重验现有phase并调用原checkpoint草案准备器；旧archive CAS关闭后使用新CAS。检查旧producer退出时daemon仍活，fixture清理后候选缺失则后续只读核验拒绝，owner最终停止daemon并复核unit/cgroup及命名宿主投影。
+
+本轮产品writer、真实审批消费、session/admission、尾部CAS和恢复权限仍为零/false；真实保留daemon的产品生命周期、真实已准入checkpoint冷验收及跨Mac执行恢复继续待办。私有日志/完整inspect/密钥留在私有case，不入分支；报告分别记录真实Engine/native身份与synthetic历史，不能提升为daemon永久连续性或完整生产可用性证明。
+
+## 第九切片：原发布源码归档保管及冷读Git内容重验
+
+原session仅计算原ZIP摘要并发送，checkpoint只有摘要；重新ZIP不保证恢复原字节。本切片在module WeakKey中绑定原normal issued session/PID/thread/Popen/source/archive bytes，仅checkpoint已启用时，从该原记录独占发布`source-archive/archive.private.zip`，在原origin绑定之后、回调及第二review之前完成fsync/readback。默认/raw/diagnostic路径不新增归档落盘；失败不交付增强descriptor、不修复残片。
+
+冷读入口使用原reader seal及独立material/custody/context/witness/origin pins，按原context.archiveDigest读取私有原ZIP；前后重开原材料/历史及Guard身份，不能信reader可改缓存或相邻manifest，旧checkpoint缺原ZIP明确拒绝。归档保管不保存旧grant或执行能力。
+
+新增只读Git verifier：可信embedding提供本地repository，来源身份及原SHA取自重新认证的checkpoint；限定原dev-workflow发布来源与原代码发布白名单。固定原commit及其递归tree/blob，每个Git对象按原始类型/长度/内容重算SHA1 OID，不遍历parent历史、不依赖当前HEAD等于原SHA、不fetch、不执行源码或过滤器；禁替换对象、外部配置、hook/fsmonitor；任何partialClone/promisor配置（含本地include）在对象读取前拒绝，兼容不能识别no-lazy-fetch开关的旧Git，并禁传输协议。ZIP逐成员唯一且路径安全，完整匹配白名单regular blobs，拒缺项/额外项/symlink/加密/错误CRC/超限；兼容原writestr权限元数据。数量、深度、对象/总字节及读取deadline有界；timeout限定Git/ZIP阶段，前后私有材料认证保留原crypto/flock及filesystem阻塞边界，不宣称整个API硬期限。
+
+输出仅声明`publishedSourceArchiveVerified`与Git对象内容一致性，绑定原material/source/archive及manifest摘要；不宣称当前分支仍指向旧SHA、现时发布引用或业务source已重验。`sourceRevalidated`、writer排他、approvalReady、恢复/执行权限及production继续false。产品retained owner的启动、接管及清理authority不因本切片而成立。
+
+## 第十切片：独立owner下producer SIGKILL故障矩阵
+
+原真实Engine诊断仅覆盖producer正常退出。本轮新增独立严格入口，producer经原签名只读RPC完成材料重验和私有持久化后原子发布ready并同步后从原Popen管道发固定ACK，再停留等待；parent仅对自己原Popen执行SIGKILL并wait/reap，之后才可启动原native consumer。不能从JSON PID派生kill权限，ready或子进程身份/退出码/回收失败不得进入consumer。
+
+独立owner继续持有同一daemon、资源和见证，检查SIGKILL前后binding一致；新consumer完成live phase及新CAS草案重验，后续候选清理后拒绝、库存恢复及probe停止/宿主投影仍须全部通过。子阶段有共享deadline，失败清理仅自己的子进程，证据与正常退出场景分开。
+
+保持首create history为synthetic、实际fixture Engine写入有发生、产品writer派发及真实审批消费为零，所有恢复/执行权限false。不将该producer材料诊断冒充整个coordinator崩溃、真实已准入checkpoint或产品持久owner完成。
+
+## 第十一切片：本地固定daemon owner的实际启动/退出接口
+
+新增Linux/root本地creator，自建固定隔离Python owner进程，不接受caller Popen、命令、unit、root或workload。owner复用原probe独立模式的真实namespace/containerd/dockerd启动与3600秒systemd上限；固定callback只交付hello并等待原控制管道STOP/EOF，不执行应用容器写入。原managed worker/pidfd及默认清理不变。
+
+start只在原Popen、nonce与封闭hello匹配后自建原生ObservedRecoveryDaemonV3，核验真实root/socket/PID-start/cgroup/boot/invocation；observer只读，停止权限仍由原creator保有。stop经原Popen发送STOP，等待probe finally结束、原daemon停止、命名宿主投影结果、干净EOF/退出码及stderr收尾，再独立verify_stopped。任一清理/协议/身份失败不得成功；只回收原owner进程，不据JSON PID/unit导入停止权限。原对象/PID/thread身份、复制/pickle及替换边界必须拒绝。
+
+这是独立于业务writer、由可信宿主issuer存活期间管理的实际daemon creator。控制管道EOF沿原finally清理；issuer或owner遭SIGKILL的最坏收尾仍依赖原systemd RuntimeMaxSec，不宣称持久接管、owner重启恢复、业务资源清理或产品准入已接通。随机unit由可信独占宿主管理保留，systemd没有原子compare-invocation-and-stop，此切片不承诺抵抗恶意root替换unit。
+
+验证采用真实本地pipe/Unix HTTP及明确kernel替身的边界用例，再在已发布源码上通过严格SSH完成空Engine实际start/stop及二次unit/PID/cgroup核查；不启动应用workload或消费审批，保留全部production/恢复权限false。
+
+## 第十二切片：独立场景服务跨控制客户端重连
+
+独立固定systemd场景服务持有原daemon creator，不再把其issuer放在Mac控制会话中。服务启动随机私有scene目录及Unix socket；固定程序、Restart=no及有界服务/daemon RuntimeMax，客户端无任意程序/unit/root/workload入口。scene ID以独占started marker烧录，旧socket/marker不删除修复、不重新采用；跨服务重启接管仍拒绝。
+
+控制凭据是独立32字节场景控制key，由可信embedding私有保管，不能从邻接JSON自证。双方校验root Unix peer/私有目录socket权限，并用新server/client nonce及双向HMAC认证；每次请求/响应绑定scene、lease nonce、generation和递增序号。服务只允许单控制连接；断线撤销连接lease但保留同一daemon，后续认证连接取得更高generation。旧/并发lease、重放、坏帧和慢连接不获得控制权；租期固定30秒，只有完整认证status可续租，零碎字节不续期且不超过service绝对deadline；服务过期仍按绝对deadline退出。
+
+启动仅在listen与权限身份验证完成、ready原子发布后认证；closeScene响应预算独立于5秒半帧/认证预算。本轮仅status/detach/closeScene实际服务接口，closeScene始终由服务持有的原creator执行guarded stop，不把key或generation当业务准入。服务需在同线程调用原PID/thread绑定creator。SIGTERM/过期沿原guard清理；服务SIGKILL最坏依赖daemon RuntimeMax，不提前报告清理。控制通道排他不是writer fence，所有业务恢复权限仍false。
+
+验证包括真实Unix/HMAC服务与明确daemon/peer替身的跨进程断开及重连、错误key/并发连接拒绝、同ID禁止重启；再用已发布源码在真实Linux systemd启动服务，让旧客户端退出，新客户端重连同一daemon并主动关闭，独立核验无残留。业务worker、精确审批/新消费、尾部CAS、真实已准入checkpoint与整闭环继续接线，不将此切片标成最终业务恢复。
+
+## 第十三切片：服务持有的预派发writer槽位
+
+先修复上一CI中全进程FD数量受其他对象关闭影响的脆弱测试，改为验证本次native CAS实际FD及inode被关闭，并以故意漏关对照证明检查未弱化，生产finally不变。
+
+随后场景服务可在创建时冻结单组loader source/archive预期身份，私有HMAC文件绑定scene；旧无源场景保持槽位disabled。新reserve/drain命令只接expected slot generation，不接unit/PID、任意代码、归档/config/GO或业务请求。控制lease generation与slot generation独立。
+
+reserve先烧录槽位代次与unknown状态，再由服务持有原OwnedRecoveryUnitV3启动固定等待loader并捕获origin；不延长原30秒输入期限。控制客户端退出后原slot仍归服务持有，新客户端必须查询并drain原slot；旧代次、active或unknown slot拒绝替换。drain须由原issuer stop、独立cold stopped observation及close全部成功后才允许下一代；自然退出不能自动视为drained。create/ACK不确定不自动重试创建。
+
+closeScene先进入closing拒新attach，按原slot与daemon顺序尽力收尾；任何slot不确定/停止失败阻止成功，不能用新的observer或JSON origin导入stop权限。各命令独立预算并共享场景关闭上限，连接丢失不抹掉已确认slot结果。所有业务授权、sourceRevalidated、writerQuiescenceVerified及恢复执行仍false；本切片不派发产品writer，也不替代新审批/消费/尾部CAS。
+
+## 第十四切片：固定只读worker实际加载归档并附着原scene
+
+原normal worker会新建daemon及清理自己的session，不能把向其转发archive当成业务附着。新增固定AttachReadUnit与唯一只读入口，加载本服务自身可信分发的原ZIP，独立构造native observer、逐字段核原daemon binding，再执行固定GET库存双读；无GO、任意方法/路径、业务写入或普通worker入口选择。
+
+服务创建时可选私有保管原ZIP bytes。除hash匹配外，启动时成员集合和每个regular py字节须精确等于本服务固定可信ROOT的发布白名单分发，调用者不能选择trustedRoot；真实SSH的ROOT由原published/hashpinned loader建立。仅control key签hash不足以授权代码。验证后缓存原bytes并重验私有file身份/hash，ready后源码目录移除不重新信任外部输入。
+
+inspect_attached_worker只接expected slot generation；attachment由原daemon owner取得而非客户端root/PID/unit。启动/捕获origin/配置EOF/固定回执、退出0/干净EOF/零stderr、原issuer停止+独立cold观察+close均通过后才返回drained闭合结果。失败持有原issuer并阻止replacement，需显式drain；原30秒loader输入期不变。内部55秒共享预算，客户端60秒响应上限。
+
+此处已实际发送只读worker的受约束归档与附着配置，不发送业务archive/config/GO。结果证明固定reader附着和库存读取，不是完整业务phase、源码审批或RuntimePermit；新审批/消费、signed intent-status/witness、业务worker生命周期及尾部CAS仍需接线。全部business权限false。
+
+## 第十五切片：场景服务持有实际staging准备会话与清理责任
+
+新增服务内PreparationSession owner：先一次性生成原writer TLS与原hello身份，可信控制端据此确定GatePolicy；再一次性冻结policy hash及五份HMAC完整性keys，调用原固定prepare_profile3建立隔离staging baseline/保护容器、网络/卷与原bundle/request。keys不是业务授权，Mac独立见证签名私钥不入服务。准备和identity均先烧尝试，失败不能重跑创建或原地换policy/nonce/expiry。
+
+原prepare_profile3新增本地固定on_session_created回调，在原Session构造后、首笔fixture写入前交服务持有；默认旧调用不变。服务必须跨SystemExit/SIGTERM保有原对象，不能仅靠函数返回或except Exception取回所有权。开始准备前重新构造native observer核完整原daemon binding，客户端不能给root/project/命令等来源。
+
+原live.private_capsule完整私有结果独占fsync/readback保管；原observerFacts独立从live observer取，不能从capsule拷bootId充当外部pin。状态只公开preparationId/hash/total/requestDigest/expiry及未授权标志。认证chunk接口固定id/fullhash/total/offset/最多4096字节，不接任意path；Mac重组先验完整hash，再用自己保管的keys/policy/hello及独立facts调用原verifier。重连只读同一份结果，不重复准备。
+
+closeScene与finally按原writer drain、原session.cleanup、原daemon.stop顺序尽力收尾；unknown写入拒猜删，任何失败阻止成功且保留原异常。fixture写入明确发生；本切片仍preparation-only/approvalReady=false、零产品writer派发与真实审批消费，服务内业务候选的后续所有权对账、signed intent/witness、准入及尾部CAS另接。
+
+长准备回执有独立5秒flush，在旧lease过期时仅交付已接受操作结果再断连，既不续lease也不接后续命令。closeScene/服务TimeoutStop为420秒；服务接收期限2850秒，Runtime3300为收尾预留450秒，准备前需至少剩余1200秒。已知session清理前复核原native endpoint，漂移拒资源DELETE并仍尽力停止原daemon。
+
+## 第十六切片：场景首次业务create的完整准入、传输及清理对账
+
+可信本地启动时独立冻结witness与intent两份不同公钥到原scene，控制RPC不能替换；Mac签名私钥不传Linux。Mac controller重新完整核capsule，复用原GitHubLiveReview/原精确approval与consumption对象、MacLiveAdmission.register_intent和fresh live consent；不接受JSON consumed声明。review与网络登记期间先detach，真正准备派发时重新认证原scene。broker先验证组合archive/config/capsule能装入原4MiB帧，再一次性烧attempt及原准备session的unknown写入状态，最后启动同daemon上的固定SceneCreateUnit。普通CLI无直接业务执行入口。
+
+固定worker从原native daemon binding、原完整capsule/CAS重建initial capture与phase guard，复用原create_cut、Profile3StepExecutor、OwnedCreateTransportV3、nonce绑定的签名intent-status与独立witness/Gate，且只执行首create。consume refs不是审批，错pub/status/nonce、未消费、撤销账本都必须在POST前拒绝。scene控制帧仍8KiB；较大业务RPC通过固定4096字节分块、完整消息hash、顺序offset及begin/chunk/commit桥接，原业务帧上限仍4MiB。仅允许原intent check及witness read/check/events_after/chain_status/append_event，不开放后继登记或任意服务方法。
+
+active attempt只属于原控制连接代次，120秒业务lease只有完整status续期；断线、原调用异常或超时停止原worker并冻结attempt，不自动重派create，也不把active RPC迁移新lease。Mac拒绝路径立即close控制连接。原worker发送闭合terminal后必须继续验证实际双EOF、exit0与零stderr，再经原issuer stop、独立cold observation及close才能进入closed；terminal或自然退出本身不解除unknown。
+
+Mac仅在原fresh consent、AuthenticatedHistory及精确首create六事件闭合前缀重新认证后，使用原intent私钥和独立SSHSIG namespace签闭合证书。证书精确绑定scene/attempt/nonce/preparation/capsule/slot/request/bundle/history/receipts。原worker已closed后可detach完成网络签证，再认证同scene并精确重验同closed result后提交；这不是active恢复或重派。broker核启动时pinned pub与完整challenge，再由原准备owner对实际native endpoint与phase1现场重验，候选CID必须为新且非baseline/protected，才登记到原created_ids并解除unknown。证书不是执行许可，任一步失败仍保留unknown且原session拒猜测DELETE。
+
+本切片的组合验证使用真实TLS、SSHSIG、CAS、Gate、原审批消费/status/witness与phase guard；GitHub provider、Unix Engine、Linux kernel/原issuer隔离及组合测试的scene控制transport/startup明确为替身，原Unix/HMAC服务协议另由跨进程测试验证。不得将本地组合通过描述成真实Engine产品派发或真实GitHub审批验收。后续仍需已发布源码上的真实精确审批、首次业务create与原session清理验收、业务checkpoint持久化、跨Mac恢复、旧writer排他及新profile消费/尾部CAS；production与恢复执行权限继续false。
+
+Mac端额外使用固定SceneSSHClient适配器：原Linux SceneClient只支持本地Unix，不能把组合测试的transport替身当Mac接线。SSH转发端仅从原发布白名单ZIP加载固定remote_main，先用原Git对象/member verifier核保管ZIP，再核本地checkout及当前发布ref；ZIP时间戳不影响成员内容证明。严格host key/BatchMode、禁forwarding，控制key经stdio输入，ready/每条command/result/terminal均绑定nonce、序号及scene/source。远端只构造原生SceneClient，命令限原固定白名单，8KiB消息头先拒超限；不代签业务status/witness、不接任意代码或命令。detach/close需远端完整terminal、EOF、exit0、零stderr；Mac EOF只结束自己SSH及原控制连接，不据JSON PID/单位导入stop权限。原Unix/HMAC与实际SSH适配器分别验证，真实业务验收仍须新鲜精确审批。
+
+
+## 第十七切片：scene 闭合业务的只读 checkpoint 接线
+
+用户已确认按业务 checkpoint、同 scene 跨 Mac 恢复、完整故障矩阵、V4/GitLab 的顺序推进。首个实现增量限定为 scene 首 create 已闭合并由原准备 owner 完成 reconcile 后的认证材料保存；它不增加恢复执行接口。
+
+Mac controller 通过可选本地通知启用保存，回调必须在审批或任何产品写入之前验证；默认路径不保存材料。原 admission 提供 case、见证 store 与 signer，基线及镜像默认值只从已验证的原 capsule 派生，不接受调用者额外提供的路径、history、keys 或 defaults。固定目录/签名文件布局不兼容、已有发布材料等可预测错误应在写入前拒绝。
+
+复用原 save_checkpoint 的私有材料/密钥分离、独占 fsync 发布及 reader 验证；保存前后需重验原 controller/admission 身份、root/current/pending、request/bundle 与本次 closure 的 historyDigest/receiptMap。独立 pins 只由原生回调交付深拷贝；保存或回调失败不返回成功、不重新 create，不能抹除已完成事实或原 scene 的清理责任。
+
+验收覆盖默认路径、非法回调/不兼容布局零产品派发、真实 TLS/Gate/SSHSIG/CAS 的一次 create、保存/回调失败、原 producer 退出后的独立 reader 冷读，以及错误 pins、替换材料或见证推进拒绝。测试中的 provider/Engine/kernel/scene transport 替身必须明确列出，不冒充真实宿主验收。
+
+此增量的 writer_origin 仍为空，源码归档尚未通过 scene 专属身份绑定保管，phaseFreshnessVerified、linuxQuiescenceVerified 及恢复/执行权限仍为 false。后续需另做原 scene writer origin/停止观察与 closure 的认证绑定及源码保管，不能放宽旧 normal session 的 issued 检查来模拟接线。scene 租期有界，保存耗时本身不证明同场景持续存活。
+
+
+## 第十八切片：scene 专属 writer 身份与源码归档绑定
+
+沿用原 material checkpoint，新增独立 schema/SSHSIG namespace 的 scene 绑定，不放宽旧 normal session 的 writer-origin 认证。原 broker 仅在 closed/reconciled 后输出原 native writer origin、已完成的停止观测摘要和原 daemon binding；Mac 从认证连接读取并前后比较同一不可变闭合结果。
+
+原 controller 的显式 opt-in 在首笔产品派发前核对 source ZIP 与原 hello archiveDigest，并用已有 Git commit/tree/blob verifier 检查原 sourceSha 的准确成员内容。Git repository 只提供内容对象，不提供来源或执行授权；SSH 路径可从原 handle 复用归档。本地测试以明确 provider/Engine/kernel/control 替身和真实 Git/ZIP、TLS、签名、CAS 组合验证。
+
+原 intent signer 以新 namespace 签名 scene、attempt/preparation/capsule/slot、原 closure、material/custody/context、hello、origin、stop digest、daemon binding 和源码成员摘要。原材料与密钥仍复用原保存器，scene artifact 与 ZIP 独占私有落盘；独立 pins 经原回调交付，失败不重派 create、不修复或覆盖部分发布。
+
+独立 scene reader 包装原只读 reader，校验外部 artifact/key pins、专属签名、原 closure、原历史/基线与 source/context/origin/daemon 绑定。文件权限、链接/替换、错误 key/pin、旧历史/串场、部分发布、copy/thread/fork 等继续拒绝；新进程读取使用原生回调 pins，不能从相邻文件补造信任。源码成员再验证复用原纯 Git/ZIP verifier，旧 archive reader 仍拒绝 scene 包装对象。
+
+此切片只绑定历史 writer/停止记录与发布源码内容；不宣称新鲜 Linux 停止观测、实时 Engine phase、当前发布 ref、全局 writer 排他或恢复执行。真实保留 scene 冷验收、新 profile 审批/消费及 session/admission/尾部 CAS 继续后续推进。
+
+本地实现与验收已完成：独立进程冷读、真实 Git/ZIP、原生签名/材料、错误 pins/签名域/跨上下文、复制/线程/fork、失败 enter 回收、部分发布及完整帧大小均通过；3.10/3.14 定向回归见[本地证据](../validation/SCENE-CHECKPOINT-BINDING-LOCAL-2026-11-03.json)。本增量尚未发布，不将本地替身组合提升为真实 retained scene 或恢复执行验收。
+
+
+## 第十九切片：scene checkpoint 的原 writer 停止重验
+
+从原 scene 签名绑定及外部 pins 重新认证 writer origin，复用固定只读 SSH verifier；originMaterialDigest 在此显式表示 scene binding artifact 摘要，不导入 legacy normal session 权限。原材料/历史/文件在 SSH 前后均重验，检查原 reader 身份与全部响应 binding/source/host/origin 字段。原 SSH deadline 保留，文件/crypto/flock不宣称全局硬期限。观测结果只证明该原 writer 的读取时刻停止，不能授予未来排他、实时phase、admission或恢复执行。
+
+本地验证覆盖原subject/binding派生、原生pipe/SSHSIG材料与明确SSH/kernel/source分发替身、错误回显拒绝以及传输期间artifact变化拒绝；真实SSH证据另外记录。
+
+
+## 第二十切片：原 scene issuer 的只读 live phase 摘要
+
+新命令仅接受随机nonce，原broker在reconciled后冻结已验证closure，并从其receipts派生phase1；原准备owner以guard._base和原版本调用ObservedDaemon的endpoint前后核验与双PhaseGuard扫描。15秒操作预算共享到_fresh构造/GET；原lease不续，沿用5秒flush。调用失败只拒本次观测，原闭合事实与清理责任保留。
+
+回复是小型phaseObservation envelope，包含closure、baseline/phase/endpoint摘要、完整endpoint及版本和全false权限；保持完整Unix/SSH帧8192上限。Mac先认证原材料/历史，再新建原source/ref gate通过的SSH连接，比较原scene/slot/daemon/closure，读取后立即detach并核原EOF/退出/stderr，再认证本地材料和历史。原deploy到期不妨碍历史只读观测，新的写授权另走新profile。
+
+该摘要是可信scene issuer已按原逻辑验证现场适用性的观测，不含完整phase_bytes，不能生成现有recovery context，也不授予fence、连续性、实时写准入或恢复执行。新RPC只支持包含本版本的分发scene，旧scene不热升级。真实存活scene验收仍需后续新场景/精确审批；本切片先完成本地Unix/PhaseGuard、协议、字段及生命周期边界验证。
+
+
+## 第二十一切片准备：有界完整 phase 快照（尚未实现）
+
+当前64d945d冻结等待真实摘要验收，不修改该检出。下一片仅增加原broker私有单快照（canonical rows/resources，总字节不超过4MiB）、capture nonce与snapshotId/digest/total描述符、4096字节chunk小envelope。成功新capture才替换缓存并拒旧ID，失败不把旧缓存当新观测。chunk只读缓存不再读Engine；完整Unix/HMAC与SSH帧仍限8192。下载仅通过原status合法续租，独立120秒总预算，不无限续租。
+
+Mac完整接收后核长度/canonical/digest/endpoint及原scene/closure/material/history前后绑定，先验证SSH EOF/exit0/零stderr再本地复验。输出独立已签发、PID/thread/字节seal绑定的ScenePhaseSnapshot类型；缓存只证明历史快照完整，freshness/fence/admission/执行权限均false。不得用任意frozen dataclass冒充证明。
+
+后续另建snapshot-draft入口消费已认证全量观察；旧CheckpointRecoveryPreparationHostV3会现场重采样且其store依赖Linux，不能塞假native observer或把缓存改称旧verify_context成功。新草案仍需新观察、排他、精确审批和admission/尾部CAS。覆盖乱序/混快照/超限/替换/超时/文件与历史变更/SSH收尾/伪造或复制签发对象拒绝，并验证chunk无Engine调用及业务写。此处仅准备方案，不声明实现或验收。
+
+
+## 第二十一切片：有界完整phase快照传输
+
+在原broker中保管单个canonical rows/resources快照（最多4MiB），新capture仅原nonce输入并复用原live phase扫描与closure/slot绑定；成功后才原子替换缓存、旧ID拒绝。chunk接口只接受snapshotId、phaseDigest、offset、length，严格排bool、每块至多4096字节，小envelope完整Unix/HMAC与SSH帧仍限8192；chunk不采样Engine、不写业务、不续租。
+
+Mac在原reader/pins/history认证后建立原source/ref绑定的SSH，先status、capture，再顺序读完整chunks并核精确长度/base64/canonical/完整SHA、原闭合receipts对应rows及原network/volume范围。通过原完整status每10秒合法续租，时间从status发起前计；所有RPC前后和返回对象前核120秒结果接受预算。原单次I/O、源码/签名/锁及cleanup保持各自边界，不声称API硬120秒返回。原SSH detach/EOF/退出0/零stderr和材料/history后验全部成功后才签发对象。
+
+ScenePhaseSnapshotV3采用eq=False、原PID/thread/weak-reader及所有字段（含类型与false flags）的私有签发seal；直接构造/replace/copy/fork/线程/关闭reader/改flags均不成为有效证明。快照只证明历史字节与原issuer关联，不能作为freshness/fence/admission/恢复执行；新snapshot-draft入口后续独立接，不造假native observer喂旧准备器。

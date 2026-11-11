@@ -80,3 +80,9 @@ python3 scripts/release_execute.py plan --repo . --preparation .dev-workflow/rel
 执行基础把本地 tag 创建、远端 tag 推送、远端 Release 创建分成独立操作。分发 CLI 的 `execute` 在任何仓库读取、网络访问或变更前拒绝；真实执行使用固定可信版本的宿主，不从待发布项目加载授权实现。宿主核验签名 OIDC、受保护环境中准确 bundle hash 的真实人工审批，并在独立账本仓库创建不可覆盖的一次性消耗标记。不要通过自制授权 JSON、伪造 OIDC、环境变量、TTY 确认、加载任意 provider 文件或直接调用 Git/托管平台命令绕过该边界。
 
 首次接入须配置可信工作流、固定仓库 ID / workflow SHA、人工 reviewer ID、目标和独立账本仓库身份，以及宿主管理的凭据。宿主首先支持 GitHub-hosted Linux，使用 `/usr/bin/openssl` 验证 RS256；SDK 与本地准备仍按跨平台测试支持。远端 tag 只创建 lightweight ref，目标 commit 必须已在远端；不上传 Git 对象、不执行分支 push。Release 检查使用具有 push 可见性的凭据分页覆盖草稿与已发布记录，准确匹配内容，创建时 `make_latest=false`。没有配置可信宿主或尚未取得真实审批时，只交付计划和具体阻塞。分发端 `scripts/release_host_runner.py` 和 [工作流模板](host-workflow.example.yml) 用于独立宿主，不是目标项目的本地授权入口。完整设置、失败处理与当前验收边界见 [执行集成契约](EXECUTION.md)。
+
+## GitLab 原生审批画像（实验宿主）
+
+GitLab 发行宿主已有实验性的 `gitlab-lightweight-tag-v2` 准备、原生部署审批核验、独立 POSIX 一次性账本及轻量 Tag SDK。它重新验证本地意图与远端身份，核对固定 GitLab OIDC、受保护环境和准确摘要批准评论，再消费账本；写前再次核验，冷连接完成后仍受绝对发送期限约束。未知结果不退款或自动重试，成功只表示准确 Tag 读回，不证明独占创建。
+
+这些模块只位于固定发行宿主，没有候选项目 CLI 授权入口。当前原生审批画像按 GitLab 19.5.1 的明确用户规则保守校验；真实 GitLab 项目、审批配置、凭据与独立账本登记尚未验收。`status` 的 GitLab 组合仍为 unsupported/validation=none，仅新增 preparation 说明。Release 创建仍因缺少现存 Tag 不可变 CAS 保证而拒绝，不能由 Tag 测试推导支持。

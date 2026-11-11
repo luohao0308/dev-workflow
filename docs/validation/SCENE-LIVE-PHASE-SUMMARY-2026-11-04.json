@@ -1,0 +1,67 @@
+{
+  "date": "2026-11-04",
+  "parentSourceSha": "5872490d770b00adcdfc4a668dddc4122750391e",
+  "scope": "original scene issuer live phase summary; no raw recovery context",
+  "validation": {
+    "python310Combined": {
+      "tests": 40,
+      "seconds": 98.253,
+      "result": "pass"
+    },
+    "python314PhaseIntegration": {
+      "tests": 4,
+      "seconds": 37.218,
+      "result": "pass"
+    },
+    "python314FinalMacNegativeCases": {
+      "tests": 3,
+      "seconds": 23.776,
+      "result": "pass"
+    },
+    "python310FinalMacNegativeCases": {
+      "tests": 3,
+      "seconds": 24.191,
+      "result": "pass"
+    },
+    "review": "CLEAR",
+    "AST": "pass",
+    "diffWhitespace": "pass"
+  },
+  "filesSha256": {
+    "docs/plans/compose-mac-restart-2026-11-02.md": "56daee627895a1e77066ee9d6a3dcf7b960a970cb87e4d6c672610ea86f52636",
+    "scripts/deployment_compose_scene_checkpoint_v3_host.py": "d72591e6fe4ec8f4bec44aee91a40c553d45336c19b71373defe4488a6c5a205",
+    "scripts/deployment_compose_scene_control_ssh_v3_host.py": "8daf6ba404451a684926996e50cabe33da74e2c796208bb6d233453141203881",
+    "scripts/deployment_compose_scene_create_broker_v3_host.py": "43ed07969c3a98a74fd137d63abcfd2379c34240420f3939b5602e49337e4428",
+    "scripts/deployment_compose_scene_preparation_v3_host.py": "8d7116492d5b7eed987e323c8b740138549c0974009b1ec6c0ec0ccfb653193b",
+    "scripts/deployment_compose_scene_service_v3_host.py": "f52ac27276eede7d18b2bc54f98e8cdd8c6dd78fdd312540c8634440256f7e78",
+    "scripts/deployment_compose_scene_live_phase_v3_host.py": "13b883ca36b17c1f978ecd7208395f7567d8789143429dd2dfd0370aaeef98a4",
+    "tests/support/compose_scene_controller_integration_fixture.py": "51e65e99e378a6914f857babc49d405ab422edf908a166e58d9a087280cb88a0",
+    "tests/support/compose_scene_create_integration_fixture.py": "f4c9f69dc9ea6b36936d55e0a2a719e25a0520ba2c4fa549ef1157d0ebf56fda",
+    "tests/test_deployment_compose_scene_live_phase_v3_host.py": "6fe64e45767d54d27a2debee58cf64432f1aeeb51993de72bd79075d698c45bd",
+    "tests/test_deployment_compose_scene_phase_v3_host.py": "341bc140b34ac72b32f09608ffb34b472cb2a5bb2e2894d0536677985c628691"
+  },
+  "doubles": [
+    "GitHub provider",
+    "scene/SSH startup/authentication transport in business integration",
+    "kernel/native endpoint capture; original PhaseGuard and Unix GET remain actual"
+  ],
+  "evidence": {
+    "nonceOnlyRemoteInput": true,
+    "originalVerifiedClosureAndBaseline": true,
+    "originalNativePhaseGuardDoubleRead": true,
+    "sharedOperationDeadline15Seconds": true,
+    "originalLeaseNotExtended": true,
+    "fullUnixAndRelayFramesWithin8192": true,
+    "expiredDeployFreshnessNotReusedForReads": true,
+    "wrongNonceClosureDaemonVersionAuthorityFloatNamespaceReject": true,
+    "midflightMaterialMutationAndUncleanDetachReject": true
+  },
+  "realLiveSceneAcceptance": "pending exact published source complete CI and fresh scene/approval",
+  "rawPhaseAvailable": false,
+  "phaseFreshnessVerified": false,
+  "daemonContinuityVerified": false,
+  "writerQuiescenceVerified": false,
+  "authorityGranted": false,
+  "recoveryAuthorized": false,
+  "productionReady": false
+}
