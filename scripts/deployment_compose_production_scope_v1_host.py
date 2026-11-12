@@ -207,16 +207,63 @@ def _history(raw, registration):
             request = start['request']
             generation = offset // 2 + 1
             proof = end['proof']
+            terminal = dict(state=end['state'], generation=generation, request=request, proof=proof)
+            if end['state'] == 'operator-reconciled':
+                if not all(hex_value(end[field]) for field in ('evidence', 'observation', 'signer')):
+                    _block('Invalid production reconciliation evidence')
+                terminal.update(evidence=end['evidence'], observation=end['observation'], signer=end['signer'])
+            elif end['state'] != 'verified':
+                _block('Invalid production scope disposition')
             if (not hex_value(request) or request in requests or not hex_value(proof)
                     or records[offset] != canonical(dict(state='started', generation=generation,
                                                          request=request))
-                    or records[offset + 1] != canonical(dict(state='verified', generation=generation,
-                                                             request=request, proof=proof))):
+                    or records[offset + 1] != canonical(terminal)):
                 _block('Invalid production scope transaction history')
             requests.add(request)
     except (ValueError, TypeError, KeyError, RecursionError):
         _block('Invalid production scope transaction history')
     return len(records) // 2 + 1, requests
+
+
+@contextmanager
+def _locked_pending_scope(registration, request_digest, *, writable=False):
+    if (type(registration) is not ScopeRegistrationV1 or not hex_value(request_digest)
+            or not _pin_pair(registration.root_identity) or not _pin_pair(registration.journal_identity)):
+        _block('Independent production scope and request pins required')
+    _header(registration.host_id, registration.project, registration.daemon_id)
+    root_fd, identity = _directory(registration.root)
+    try:
+        if identity != registration.root_identity:
+            _block('Production scope directory changed')
+        fd = _open_journal(root_fd, _name(registration.project), os.O_RDWR if writable else os.O_RDONLY)
+    finally:
+        os.close(root_fd)
+    try:
+        with _bound_root(registration, fd):
+            try:
+                fcntl.flock(fd, (fcntl.LOCK_EX if writable else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+            except BlockingIOError:
+                _block('Production scope already has a live writer')
+        raw = _read(registration, fd)
+        if not raw.endswith(b'\n'):
+            _block('Invalid production scope journal tail')
+        prefix, _, tail = raw[:-1].rpartition(b'\n')
+        generation, requests = _history(prefix + b'\n', registration)
+        if request_digest in requests or tail != canonical(dict(
+                state='started', generation=generation, request=request_digest)):
+            _block('Production scope tail differs from requested attempt')
+        if _read(registration, fd) != raw:
+            _block('Production scope journal changed during review')
+        yield fd, raw, dict(generation=generation, requestHash=request_digest,
+                            journalDigest=hashlib.sha256(raw).hexdigest())
+    finally:
+        _close_journal(fd)
+
+
+def inspect_pending_scope(registration, request_digest):
+    """Read an exact, abandoned journal tail under the registered inode lock."""
+    with _locked_pending_scope(registration, request_digest) as (_, _, pending):
+        return pending
 
 
 @dataclass
