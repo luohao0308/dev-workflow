@@ -1,4 +1,5 @@
 import copy
+import hashlib
 from dataclasses import replace
 import gc
 import os
@@ -109,6 +110,22 @@ sys.stdin.buffer.read(1)
             os.fstat(fd)
         with self.assertRaisesRegex(scope.ScopeBlocked, 'Unresolved'):
             scope.acquire_scope(self.registration, self.second)
+
+    def test_review_pending_scope_requires_quiescent_exact_tail_and_preserves_bytes(self):
+        with scope.acquire_scope(self.registration, self.first) as lease:
+            lease.complete(self.proof)
+        with scope.acquire_scope(self.registration, self.second):
+            with self.assertRaisesRegex(scope.ScopeBlocked, 'live writer'):
+                scope.inspect_pending_scope(self.registration, self.second)
+        raw = self.path.read_bytes()
+        with self.assertRaises(scope.ScopeBlocked):
+            scope.inspect_pending_scope(self.registration, self.first)
+        self.assertEqual(scope.inspect_pending_scope(self.registration, self.second),
+                         dict(generation=2, requestHash=self.second,
+                              journalDigest=hashlib.sha256(raw).hexdigest()))
+        self.assertEqual(self.path.read_bytes(), raw)
+        with self.assertRaisesRegex(scope.ScopeBlocked, 'Unresolved'):
+            scope.acquire_scope(self.registration, 'd' * 64)
 
     def test_copy_thread_and_fork_ownership_and_child_does_not_keep_flock(self):
         lease = scope.acquire_scope(self.registration, self.first)
