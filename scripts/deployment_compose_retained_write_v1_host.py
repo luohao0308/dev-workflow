@@ -135,6 +135,8 @@ class RetainedWriteV1:
               expires_at=None):
         """Return a closed definitive response and its witness evidence digest.
 
+        The dispatch guard may return a fresh authorization deadline, which
+        can shorten the request's absolute expiry.
         A definitive non-success is returned for diagnosis and freezes further
         writes. An ambiguous response raises and also freezes the transport.
         """
@@ -156,8 +158,13 @@ class RetainedWriteV1:
 
         def guard():
             self._check(deadline, expires_at)
-            before_dispatch()
+            fresh_until = before_dispatch()
             self._check(deadline, expires_at)
+            if fresh_until is None:
+                return expires_at
+            if type(fresh_until) not in (int, float) or not math.isfinite(fresh_until) or time.time() >= fresh_until:
+                _reject()
+            return fresh_until if expires_at is None else min(expires_at, fresh_until)
 
         guard()
         binding = dict(self._initial, generation=descriptor['generation'], scopeHash=descriptor['scopeHash'])
@@ -183,7 +190,7 @@ class RetainedWriteV1:
 
         adapter = GateOperationWitnessAdapterV3(client)
         gate = FileWriterGate(policy, self._root, key=self._key, witness=adapter)
-        guard()
+        self._check(deadline, expires_at)
         session = gate.open_generation(generation=descriptor['generation'], request_hash=request_hash,
             receipt_hash=receipt_hash, operations=descriptor['operations'], source_context_digest=descriptor['source'])
         attempt = session.prepare_attempt('POST', operation.path, operation.body)
@@ -197,7 +204,10 @@ class RetainedWriteV1:
                 _reject()
             guard()
 
-        status, raw = self._relay(gate, pre_dispatch, operation, headers, deadline, expires_at)
+        # Witness preparation can outlast a signed intent reply. Bind the
+        # listener and Docker connection to a fresh reply after preparation.
+        dispatch_expires_at = guard()
+        status, raw = self._relay(gate, pre_dispatch, operation, headers, deadline, dispatch_expires_at)
         # A response to an already dispatched write must still be closed even
         # when authorization has expired since the POST was sent.
         self._check(deadline)

@@ -205,6 +205,18 @@ class GitHubActionsApproval:
         # Default hosts retain sequential reads and their original early rejects.
         return None
 
+    def _authority_queries(self):
+        p = self.policy
+        repository = '/repos/' + p.host_repository
+        run = repository + '/actions/runs/' + str(p.run_id)
+        return (('host-repository', repository),
+                ('target-repository', '/repos/' + p.target_repository),
+                ('ledger-repository', '/repos/' + p.ledger_repository),
+                ('oidc-subject', repository + '/actions/oidc/customization/sub'),
+                ('workflow-run', run),
+                ('protected-environment', repository + '/environments/' + self._approval_environment()),
+                ('approvals', run + '/approvals'))
+
     def __init__(self, client, oidc_token, requests, policy: HostPolicy, *, verifier=None):
         self.client, self.token, self.policy = client, oidc_token, policy
         self.requests = tuple(requests)

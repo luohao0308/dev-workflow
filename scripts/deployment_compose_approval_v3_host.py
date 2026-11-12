@@ -130,16 +130,7 @@ class GitHubFullBodyApprovalV3(GitHubActionsApproval):
             _deny('Live approval client must come from trusted distribution')
         if type(self.client) is not module._ReadRetryGitHubClient:
             return None
-        p = self.policy
-        run = '/repos/' + p.host_repository + '/actions/runs/' + str(p.run_id)
-        queries = (('host-repository', '/repos/' + p.host_repository),
-                   ('target-repository', '/repos/' + p.target_repository),
-                   ('ledger-repository', '/repos/' + p.ledger_repository),
-                   ('oidc-subject', '/repos/' + p.host_repository + '/actions/oidc/customization/sub'),
-                   ('workflow-run', run),
-                   ('protected-environment', '/repos/' + p.host_repository + '/environments/' + p.approval_environment),
-                   ('approvals', run + '/approvals'))
-        result = self.client.fetch_authority_reads(queries)
+        result = self.client.fetch_authority_reads(self._authority_queries())
         if result is None:
             _deny('Invalid GitHub authority batch')
         return result

@@ -59,6 +59,44 @@ def approved(policy,req):
 
 
 class ProductionApprovalTests(unittest.TestCase):
+    def test_live_retained_approval_rechecks_fresh_batches_and_consumed_ledger(self):
+        import deployment_compose_live_review_v3_host as live
+
+        old, base, review = fixture()
+        request = host.prepare_production_frontend_request(
+            retained_review(review, 'deploy'), policy_hash=old.policy_hash, expires_at=old.expires_at,
+        )
+        policy = host.ProductionFrontendApprovalPolicyV2(**dict(
+            vars(base), observation_hash=request.observation_hash,
+            request_hash=request.digest(), plan_hash=request.plan_hash,
+        ))
+        _, fixture_client, token = approved(policy, request)
+        calls = []
+
+        def transport(method, path, payload):
+            calls.append((method, path))
+            value, headers = fixture_client.request(method, path, payload)
+            return (201 if method == 'POST' else 200), headers, value
+
+        client = live._ReadRetryGitHubClient('fixture-token', transport=transport)
+        self.addCleanup(client.close)
+        with mock.patch.object(client, 'fetch_authority_reads', wraps=client.fetch_authority_reads) as batch:
+            approval = host.GitHubProductionFrontendApprovalV2(
+                client, 'signed', [request], policy, verifier=lambda _: deepcopy(token),
+            )
+            approval.consume(approval.validate(request), request)
+            approval.check_consumed_intent(request)
+            self.assertEqual(batch.call_count, 5)
+            self.assertTrue(all(len(call.args[0]) == 7 for call in batch.call_args_list))
+            self.assertEqual(sum(method == 'POST' for method, _ in calls), 1)
+            self.assertEqual(sum('/git/ref/' in path for _, path in calls), 1)
+            approval_path = '/repos/' + host.RUNTIME + '/actions/runs/' + str(policy.run_id) + '/approvals'
+            fixture_client.data[approval_path][0]['comment'] = 'approval changed'
+            with self.assertRaises(AuthorizationUnavailable):
+                approval.check_consumed_intent(request)
+            self.assertEqual(batch.call_count, 6)
+            self.assertEqual(sum('/git/ref/' in path for _, path in calls), 1)
+
     def test_retained_deploy_and_rollback_bind_distinct_operations(self):
         old,p,review=fixture()
         for operation in ('deploy','rollback'):
