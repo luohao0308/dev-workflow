@@ -93,6 +93,25 @@ class ScopeReconciliationTests(unittest.TestCase):
                 self.reconcile(**overrides)
             self.assertEqual(self.journal.read_bytes(), self.original)
 
+    def test_ledger_unconsumed_reconciliation_requires_separately_signed_basis(self):
+        basis = recovery.LEDGER_UNCONSUMED
+        approval = recovery.recovery_payload(
+            self.registration, self.pending, self.evidence, self.observation,
+            expires_at=self.approval['expiresAt'], recovery_basis=basis,
+        )
+        self.assertNotIn('recoveryBasis', self.approval)
+        self.assertEqual(self.approval['legacyMacAuthentication'], 'unavailable')
+        self.assertEqual(approval['legacyMacAuthentication'], 'not-applicable')
+        signature = self.sign(approval)
+        for overrides in (dict(recovery_basis=basis), dict(approval=approval, signature=signature),
+                          dict(approval=approval, recovery_basis=basis)):
+            with self.assertRaises(scope.ScopeBlocked):
+                self.reconcile(**overrides)
+        self.assertEqual(self.journal.read_bytes(), self.original)
+        record = self.reconcile(approval=approval, signature=signature, recovery_basis=basis)
+        self.assertEqual(record['state'], 'operator-reconciled')
+        self.assertEqual(record['request'], self.request)
+
     def test_observation_runs_with_exclusive_lock_and_expiry_is_rechecked(self):
         now = time.time()
 

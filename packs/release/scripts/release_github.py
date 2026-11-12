@@ -29,6 +29,21 @@ class GitHubUnavailable(ExecutionError):
     """An authoritative response is unavailable; a mutation may have happened."""
 
 
+class GitHubMutationUnavailable(GitHubUnavailable):
+    """Bounded transport phase for a single attempted GitHub mutation."""
+
+    def __init__(self, stage, *, status=None):
+        super().__init__('GitHub mutation response unavailable')
+        self.stage = stage
+        self.status = status
+
+
+class GitHubMutationRejected(ProviderRejected):
+    def __init__(self, status):
+        super().__init__('GitHub rejected the mutation (HTTP ' + str(status) + ')')
+        self.status = status
+
+
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -90,8 +105,10 @@ class GitHubClient:
             return None, {}
         expected = 200 if method == 'GET' else 201
         if status != expected:
-            if method == 'POST' and isinstance(status, int) and 400 <= status < 500 and status != 408:
-                raise ProviderRejected('GitHub rejected the mutation (HTTP ' + str(status) + ')')
+            if method == 'POST' and type(status) is int and 100 <= status <= 599:
+                if 400 <= status < 500 and status != 408:
+                    raise GitHubMutationRejected(status)
+                raise GitHubMutationUnavailable('http-response', status=status)
             raise GitHubUnavailable('GitHub authoritative response unavailable')
         if not isinstance(headers, dict):
             raise GitHubUnavailable('GitHub response headers unavailable')
