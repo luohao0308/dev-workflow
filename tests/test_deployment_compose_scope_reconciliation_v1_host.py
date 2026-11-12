@@ -150,6 +150,27 @@ class ScopeReconciliationTests(unittest.TestCase):
             self.reconcile(observe_live_digest=observation)
         self.assertEqual(self.journal.read_bytes(), self.original)
 
+    def test_unknown_first_create_requires_its_own_signed_disposition(self):
+        basis = recovery.FIRST_CREATE_OUTCOME_UNKNOWN
+        target = 'a' * 40
+        approval = recovery.recovery_payload(
+            self.registration, self.pending, self.evidence, self.observation,
+            expires_at=self.approval['expiresAt'], recovery_basis=basis, ledger_target_sha=target,
+        )
+        self.assertEqual(approval['recoveryBasis'], basis)
+        self.assertEqual(approval['legacyMacAuthentication'], 'unavailable')
+        self.assertEqual(approval['ledgerTargetSha'], target)
+        signature = self.sign(approval)
+        with self.assertRaises(scope.ScopeBlocked):
+            self.reconcile(approval=approval, signature=signature,
+                           recovery_basis=recovery.LEDGER_CONSUMED_BEFORE_GATE,
+                           ledger_target_sha=target)
+        self.assertEqual(self.journal.read_bytes(), self.original)
+        record = self.reconcile(approval=approval, signature=signature,
+                                recovery_basis=basis, ledger_target_sha=target)
+        self.assertEqual(record['state'], 'operator-reconciled')
+        self.assertEqual(record['request'], self.request)
+
     def test_change_during_evidence_observation_blocks_reconciliation(self):
         changed = self.original + b'torn-tail'
 

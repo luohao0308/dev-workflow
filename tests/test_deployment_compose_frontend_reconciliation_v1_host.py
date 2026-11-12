@@ -115,6 +115,58 @@ class FrontendRecoveryTests(unittest.TestCase):
     def test_consumed_before_gate_observation_requires_exact_live_marker_and_absent_gate(self):
         self._check_observation(frontend.LEDGER_CONSUMED_BEFORE_GATE)
 
+    def test_unknown_first_create_requires_exact_gate_chain_and_admission_marker(self):
+        attempt = 'd' * 64
+        info = self.events.stat()
+        identity = [info.st_dev, info.st_ino]
+        policy = dict(operation_profile='compose-v3', witness_required=True)
+        marker = self.events / ('admitted-' + attempt)
+
+        def envelope(domain, payload):
+            return canonical(dict(version=1, domain='dev-workflow.writer-gate.' + domain,
+                                  policy=policy, payload=payload, mac='1' * 64))
+
+        def setup_gate(**response_overrides):
+            response = dict(ref=attempt, definitive=False, response_hash=None,
+                            response_binding_schema=1, status=0, bodyBase64='')
+            response.update(response_overrides)
+            previous = ZERO
+            digests = []
+            for index, (kind, data) in enumerate((
+                ('open', dict(request_hash=self.request, operations=[self.operation])),
+                ('prepare', dict(operation=self.operation, ref=attempt)),
+                ('admit', attempt),
+                ('finish', response),
+            )):
+                event = dict(kind=kind, generation=self.generation, directory=identity,
+                             previous=previous, data=data)
+                path = self.events / f'{index:08}.json'
+                path.touch(mode=0o600)
+                raw = envelope('event', event)
+                path.write_bytes(raw)
+                previous = hashlib.sha256(canonical(event)).hexdigest()
+                digests.append(hashlib.sha256(raw).hexdigest())
+            marker.touch(mode=0o600)
+            marker.write_bytes(envelope('admission', dict(generation=self.generation, ref=attempt)))
+            return tuple(digests)
+
+        def observe(digests):
+            return frontend._prepared_gate(self.registration, self.request, self.generation,
+                                           digests, self.operation, outcome_unknown=True)
+
+        digests = setup_gate()
+        self.assertEqual(observe(digests), (*digests, hashlib.sha256(marker.read_bytes()).hexdigest()))
+        extra = self.events / '00000004.json'
+        extra.touch(mode=0o600)
+        with self.assertRaises(scope.ScopeBlocked):
+            observe(digests)
+        extra.unlink()
+        marker.write_bytes(envelope('admission', dict(generation=self.generation, ref='2' * 64)))
+        with self.assertRaises(scope.ScopeBlocked):
+            observe(digests)
+        with self.assertRaises(scope.ScopeBlocked):
+            observe(setup_gate(definitive=True, status=201))
+
     def _check_observation(self, basis):
         self.gate.rename(self.gate.with_name('old-gate'))
         caddy, network, endpoint = 'e' * 64, 'f' * 64, '1' * 64

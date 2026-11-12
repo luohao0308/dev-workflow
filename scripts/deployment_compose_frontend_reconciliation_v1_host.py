@@ -20,7 +20,7 @@ from deployment_compose_production_scope_v1_host import ScopeBlocked, _directory
 from deployment_compose_retained_phase_v1_host import original_projection
 from deployment_compose_retained_write_v1_host import _operation_tuple
 from deployment_compose_scope_reconciliation_v1_host import (
-    LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED, reconcile_pending_scope,
+    FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED, reconcile_pending_scope,
     recovery_payload, valid_ledger_sha,
 )
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
@@ -65,7 +65,39 @@ def _same_entry(parent, name, fd):
     return (observed.st_dev, observed.st_ino) == (opened.st_dev, opened.st_ino)
 
 
-def _prepared_gate(registration, request_digest, generation, expected, operation):
+def _unknown_create_marker(events, envelopes, generation, attempt, operation):
+    """Validate the pinned unknown-response tail structurally, without the lost MAC key."""
+    admitted, finished = (envelope['payload'] for envelope in envelopes[2:])
+    prepared = envelopes[1]['payload']
+    info = os.fstat(events)
+    directory = [info.st_dev, info.st_ino]
+    policy = envelopes[0]['policy']
+    expected_response = dict(ref=attempt, definitive=False, response_hash=None,
+                             response_binding_schema=1, status=0, bodyBase64='')
+    marker_raw = _private_file(events, 'admitted-' + attempt, 16384)
+    marker = json.loads(marker_raw, object_pairs_hook=pairs)
+    for envelope, domain in (*((item, 'event') for item in envelopes), (marker, 'admission')):
+        if (type(envelope) is not dict or set(envelope) != {'version', 'domain', 'policy', 'payload', 'mac'}
+                or type(envelope['version']) is not int or envelope['version'] != 1
+                or envelope['domain'] != 'dev-workflow.writer-gate.' + domain
+                or envelope['policy'] != policy or not hex_value(envelope['mac'])):
+            _reject()
+    if (type(policy) is not dict or policy.get('operation_profile') != 'compose-v3'
+            or policy.get('witness_required') is not True
+            or operation[0] != 'POST' or not operation[1].startswith('/v1.45/containers/create?name=')
+            or marker['payload'] != dict(generation=generation, ref=attempt)
+            or any(set(item['payload']) != {'generation', 'directory', 'previous', 'kind', 'data'}
+                   or item['payload']['directory'] != directory for item in envelopes)
+            or admitted != dict(kind='admit', generation=generation, directory=directory,
+                               previous=hashlib.sha256(canonical(prepared)).hexdigest(), data=attempt)
+            or finished['kind'] != 'finish' or finished['generation'] != generation
+            or finished['previous'] != hashlib.sha256(canonical(admitted)).hexdigest()
+            or canonical(finished['data']) != canonical(expected_response)):
+        _reject()
+    return hashlib.sha256(marker_raw).hexdigest()
+
+
+def _prepared_gate(registration, request_digest, generation, expected, operation, *, outcome_unknown=False):
     root, identity = _directory(registration.root)
     try:
         if identity != registration.root_identity:
@@ -77,17 +109,19 @@ def _prepared_gate(registration, request_digest, generation, expected, operation
                 _reject()
             events = _directory_child(gate, generation)
             try:
-                names = ('00000000.json', '00000001.json')
-                if set(os.listdir(events)) != set(names):
+                names = tuple(f'{index:08}.json' for index in range(4 if outcome_unknown else 2))
+                entries = set(os.listdir(events))
+                if not set(names) <= entries or len(entries) != len(names) + int(outcome_unknown):
                     _reject()
                 raw = tuple(_private_file(events, name, 16384) for name in names)
                 digests = tuple(hashlib.sha256(value).hexdigest() for value in raw)
-                if (digests != expected or set(os.listdir(events)) != set(names)
+                if (digests != expected
                         or set(os.listdir(gate)) != gate_entries
                         or not _same_entry(gate, generation, events)
                         or not _same_entry(root, 'gate-' + request_digest, gate)):
                     _reject()
-                opened, prepared = (json.loads(value, object_pairs_hook=pairs)['payload'] for value in raw)
+                envelopes = tuple(json.loads(value, object_pairs_hook=pairs) for value in raw)
+                opened, prepared = (envelope['payload'] for envelope in envelopes[:2])
                 if (opened['kind'] != 'open' or opened['generation'] != generation
                         or opened['previous'] != ZERO or opened['data']['request_hash'] != request_digest
                         or opened['data']['operations'] != [operation]
@@ -95,6 +129,15 @@ def _prepared_gate(registration, request_digest, generation, expected, operation
                         or prepared['directory'] != opened['directory']
                         or prepared['previous'] != hashlib.sha256(canonical(opened)).hexdigest()
                         or prepared['data']['operation'] != operation or not hex_value(prepared['data']['ref'])):
+                    _reject()
+                if outcome_unknown:
+                    attempt = prepared['data']['ref']
+                    if entries != {*names, 'admitted-' + attempt}:
+                        _reject()
+                    digests += (_unknown_create_marker(events, envelopes, generation, attempt, operation),)
+                if (set(os.listdir(events)) != entries or set(os.listdir(gate)) != gate_entries
+                        or not _same_entry(gate, generation, events)
+                        or not _same_entry(root, 'gate-' + request_digest, gate)):
                     _reject()
                 return digests
             finally:
@@ -137,9 +180,11 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
             or not all(hex_value(value) for value in (request_digest, caddy_id, network_id, endpoint_digest))):
         _reject()
     before_gate = recovery_basis in (LEDGER_UNCONSUMED, LEDGER_CONSUMED_BEFORE_GATE)
+    outcome_unknown = recovery_basis == FIRST_CREATE_OUTCOME_UNKNOWN
+    consumed = recovery_basis == LEDGER_CONSUMED_BEFORE_GATE or outcome_unknown
     if before_gate and (gate_generation is not None or gate_event_digests is not None):
         _reject()
-    if recovery_basis == LEDGER_CONSUMED_BEFORE_GATE:
+    if consumed:
         if (not callable(verify_ledger_consumed) or not valid_ledger_sha(ledger_target_sha)
                 or verify_ledger_absent is not None):
             _reject()
@@ -148,8 +193,8 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
     if recovery_basis == LEDGER_UNCONSUMED:
         if not callable(verify_ledger_absent):
             _reject()
-    elif not before_gate and (recovery_basis is not None or verify_ledger_absent is not None
-          or type(gate_event_digests) is not tuple or len(gate_event_digests) != 2
+    elif not before_gate and (recovery_basis not in (None, FIRST_CREATE_OUTCOME_UNKNOWN) or verify_ledger_absent is not None
+          or type(gate_event_digests) is not tuple or len(gate_event_digests) != (4 if outcome_unknown else 2)
           or not all(hex_value(value) for value in (gate_generation, *gate_event_digests))):
         _reject()
     cutover = prepare_retained_frontend_cutover(private_plan, operation_nonce=operation_nonce)
@@ -166,7 +211,8 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
         events = ()
     else:
         operation = list(_operation_tuple(cutover.create()))
-        events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation)
+        events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation,
+                                outcome_unknown=outcome_unknown)
     observer = HostSnapshotV3()
     try:
         if observer.descriptor()['endpointDigest'] != endpoint_digest:
@@ -200,7 +246,7 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
             gateGeneration=gate_generation, gateEventDigests=list(events), planDigest=cutover.digest,
             frontendId=cutover.original_id, caddyId=caddy_id, networkId=network_id,
         )
-        if recovery_basis == LEDGER_CONSUMED_BEFORE_GATE:
+        if consumed:
             # The trusted controller reads the exact ref afresh from its pinned
             # ledger. Bind both the ref and the reviewed target to this digest.
             marker = verify_ledger_consumed(request_digest)
@@ -210,8 +256,12 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
             )
             if type(marker) is not dict or marker != expected:
                 _reject()
-            facts.update(profile='production-frontend-consumed-before-gate-reconciliation-v1',
-                         recoveryBasis=LEDGER_CONSUMED_BEFORE_GATE, ledgerMarker=expected)
+            profile = ('production-frontend-first-create-outcome-unknown-reconciliation-v1' if outcome_unknown
+                       else 'production-frontend-consumed-before-gate-reconciliation-v1')
+            facts.update(profile=profile,
+                         recoveryBasis=recovery_basis, ledgerMarker=expected)
+            if outcome_unknown:
+                facts.update(gateEventDigests=list(events[:4]), admissionMarkerDigest=events[4])
         elif recovery_basis == LEDGER_UNCONSUMED:
             # Supplied by the trusted private-ledger controller adapter. It must
             # perform a fresh exact-ref read and treat all other outcomes as denial.
@@ -223,7 +273,8 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
         if before_gate:
             _require_absent_gate(registration, request_digest)
         else:
-            if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation) != events:
+            if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation,
+                              outcome_unknown=outcome_unknown) != events:
                 _reject()
         return hashlib.sha256(canonical(facts)).hexdigest()
     finally:
