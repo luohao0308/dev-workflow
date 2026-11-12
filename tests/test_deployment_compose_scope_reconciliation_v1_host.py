@@ -112,6 +112,30 @@ class ScopeReconciliationTests(unittest.TestCase):
         self.assertEqual(record['state'], 'operator-reconciled')
         self.assertEqual(record['request'], self.request)
 
+    def test_ledger_consumed_reconciliation_signs_exact_target_and_basis(self):
+        basis = recovery.LEDGER_CONSUMED_BEFORE_GATE
+        target = 'a' * 40
+        approval = recovery.recovery_payload(
+            self.registration, self.pending, self.evidence, self.observation,
+            expires_at=self.approval['expiresAt'], recovery_basis=basis, ledger_target_sha=target,
+        )
+        self.assertEqual(approval['recoveryBasis'], basis)
+        self.assertEqual(approval['ledgerTargetSha'], target)
+        signature = self.sign(approval)
+        for arguments in (
+            dict(recovery_basis=basis),
+            dict(recovery_basis=basis, ledger_target_sha='b' * 40),
+            dict(recovery_basis=recovery.LEDGER_UNCONSUMED),
+            {},
+        ):
+            with self.subTest(arguments=arguments), self.assertRaises(scope.ScopeBlocked):
+                self.reconcile(approval=approval, signature=signature, **arguments)
+        self.assertEqual(self.journal.read_bytes(), self.original)
+        record = self.reconcile(approval=approval, signature=signature, recovery_basis=basis,
+                                ledger_target_sha=target)
+        self.assertEqual(record['state'], 'operator-reconciled')
+        self.assertEqual(record['request'], self.request)
+
     def test_observation_runs_with_exclusive_lock_and_expiry_is_rechecked(self):
         now = time.time()
 

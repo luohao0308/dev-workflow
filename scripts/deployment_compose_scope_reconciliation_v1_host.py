@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -23,6 +24,11 @@ NAMESPACE = 'dev-workflow-production-scope-reconciliation-v1'
 PRINCIPAL = 'production-scope-recovery-operator'
 MAX_APPROVAL_SECONDS = 900
 LEDGER_UNCONSUMED = 'ledger-unconsumed'
+LEDGER_CONSUMED_BEFORE_GATE = 'ledger-consumed-before-gate'
+
+
+def valid_ledger_sha(value):
+    return type(value) is str and re.fullmatch('[a-f0-9]{40}', value) is not None
 
 
 def _reject():
@@ -30,7 +36,7 @@ def _reject():
 
 
 def recovery_payload(registration, pending, evidence_digest, observation_digest, *, expires_at,
-                     recovery_basis=None):
+                     recovery_basis=None, ledger_target_sha=None):
     """Build the exact message for an operator reviewing a legacy incident."""
     if (type(registration) is not ScopeRegistrationV1 or type(pending) is not dict
             or set(pending) != {'generation', 'requestHash', 'journalDigest'}
@@ -38,7 +44,9 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
             or not all(hex_value(value) for value in (
                 pending['requestHash'], pending['journalDigest'], evidence_digest, observation_digest))
             or type(expires_at) is not int
-            or recovery_basis not in (None, LEDGER_UNCONSUMED)):
+            or recovery_basis not in (None, LEDGER_UNCONSUMED, LEDGER_CONSUMED_BEFORE_GATE)
+            or (recovery_basis == LEDGER_CONSUMED_BEFORE_GATE and not valid_ledger_sha(ledger_target_sha))
+            or (recovery_basis != LEDGER_CONSUMED_BEFORE_GATE and ledger_target_sha is not None)):
         _reject()
     payload = dict(
         schemaVersion=1, operation='operator-reconcile-production-scope',
@@ -51,6 +59,9 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
     )
     if recovery_basis == LEDGER_UNCONSUMED:
         payload.update(recoveryBasis=LEDGER_UNCONSUMED, legacyMacAuthentication='not-applicable')
+    elif recovery_basis == LEDGER_CONSUMED_BEFORE_GATE:
+        payload.update(recoveryBasis=LEDGER_CONSUMED_BEFORE_GATE,
+                       legacyMacAuthentication='not-applicable', ledgerTargetSha=ledger_target_sha)
     return payload
 
 
@@ -104,7 +115,8 @@ def _retain_approval(registration, proof, expected, signature, public_key):
 
 
 def reconcile_pending_scope(registration, request_digest, *, approval, signature,
-                            public_key, trusted_signer_digest, observe_live_digest, recovery_basis=None):
+                            public_key, trusted_signer_digest, observe_live_digest,
+                            recovery_basis=None, ledger_target_sha=None):
     """Append one signed operator disposition after a locked evidence recheck.
 
     The embedding independently supplies the trusted signer digest and a
@@ -129,7 +141,7 @@ def reconcile_pending_scope(registration, request_digest, *, approval, signature
 
     with _locked_pending_scope(registration, request_digest, writable=True) as (fd, raw, pending):
         expected = recovery_payload(registration, pending, evidence, observation, expires_at=expiry,
-                                    recovery_basis=recovery_basis)
+                                    recovery_basis=recovery_basis, ledger_target_sha=ledger_target_sha)
         material = canonical(expected)
         if canonical(approval) != material:
             _reject()
