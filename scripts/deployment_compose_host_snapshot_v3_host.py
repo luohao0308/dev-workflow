@@ -230,7 +230,8 @@ class HostSnapshotV3:
                 reject()
 
         def bound_connect():
-            self._fresh(deadline)
+            # systemd metadata reads have a shorter bound than Docker writes.
+            self._fresh(min(deadline, time.monotonic() + 20))
             connect()
             try:
                 check_peer()
