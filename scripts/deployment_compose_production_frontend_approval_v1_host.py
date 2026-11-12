@@ -212,3 +212,18 @@ class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
     policy_type=ProductionFrontendApprovalPolicyV2
     profile_version='2'
     operations=ProductionFrontendApprovalPolicyV2.supported_operations
+
+    def _prefetch_authority(self):
+        if type(self) is not GitHubProductionFrontendApprovalV2:
+            return None
+        import deployment_compose_live_review_v3_host as live
+
+        if Path(getattr(live, '__file__', '')).resolve() != Path(__file__).resolve().with_name(
+                'deployment_compose_live_review_v3_host.py'):
+            _deny('Live approval client must come from trusted distribution')
+        if type(self.client) is not live._ReadRetryGitHubClient:
+            return None
+        result = self.client.fetch_authority_reads(self._authority_queries())
+        if result is None:
+            _deny('Invalid GitHub authority batch')
+        return result
