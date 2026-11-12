@@ -144,17 +144,26 @@ sys.stdin.buffer.read(1)
             self.assertEqual(errors, [True])
 
             read_end, write_end = os.pipe()
+            ready_read, ready_write = os.pipe()
             pid = os.fork()
             if pid == 0:
                 os.close(write_end)
+                os.close(ready_read)
                 try:
                     lease.close()
                 except scope.ScopeBlocked:
+                    os.write(ready_write, b'1')
+                    os.close(ready_write)
                     os.read(read_end, 1)
                     os._exit(0)
                 os._exit(1)
             os.close(read_end)
+            os.close(ready_write)
             try:
+                with selectors.DefaultSelector() as selector:
+                    selector.register(ready_read, selectors.EVENT_READ)
+                    self.assertTrue(selector.select(10), 'child did not finish its fork cleanup')
+                    self.assertEqual(os.read(ready_read, 1), b'1')
                 with self.assertRaisesRegex(scope.ScopeBlocked, 'live writer'):
                     scope.acquire_scope(self.registration, self.second)
                 lease.complete(self.proof)
@@ -162,6 +171,7 @@ sys.stdin.buffer.read(1)
                 with scope.acquire_scope(self.registration, self.second) as next_lease:
                     next_lease.complete(self.proof)
             finally:
+                os.close(ready_read)
                 os.close(write_end)
                 _, result = os.waitpid(pid, 0)
                 self.assertEqual(result, 0)

@@ -2,7 +2,7 @@ import os
 import pickle
 from pathlib import Path
 import tempfile
-import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import sys
@@ -98,9 +98,13 @@ class BindHostTests(unittest.TestCase):
             snapshot(bad, allowed_paths=(bad,), key=KEY)
 
     def test_expiry_and_in_read_mutation_fail_closed(self):
-        evidence = snapshot(str(self.file), allowed_paths=self.allowed, key=KEY, timeout_seconds=0.001)
-        time.sleep(0.003)
-        self.assertFalse(recheck(evidence, allowed_paths=self.allowed, key=KEY))
+        now = 100
+        clock = SimpleNamespace(monotonic=lambda: now)
+        with mock.patch('deployment_compose_bind_host.time', clock):
+            evidence = snapshot(str(self.file), allowed_paths=self.allowed, key=KEY, timeout_seconds=1)
+            self.assertTrue(recheck(evidence, allowed_paths=self.allowed, key=KEY, timeout_seconds=1))
+            now = 101
+            self.assertFalse(recheck(evidence, allowed_paths=self.allowed, key=KEY, timeout_seconds=1))
         real_read = os.read
         def changing_read(fd, amount):
             data = real_read(fd, amount)

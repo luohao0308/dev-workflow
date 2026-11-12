@@ -32,14 +32,27 @@ PRINCIPAL = 'retained-production-intent-v1'
 RPC_FIELDS = {'method', 'requestHash', 'binding', 'nonce', 'generation', 'grantHash', 'receiptHash'}
 RESPONSE_FIELDS = {'request', 'issuedAt', 'expiresAt', 'result', 'runtimePermit'}
 METHODS = frozenset(('validate', 'consume', 'check'))
+_MAX_CLOCK_SKEW = 2
 
 
 class IntentRelayRejected(ValueError):
     pass
 
 
+class ConsumedReceiptRejected(IntentRelayRejected):
+    pass
+
+
 def reject():
     raise IntentRelayRejected('retained-production-intent-relay-rejected') from None
+
+
+def _wait_for_clock(issued_at):
+    now = time.time()
+    if 0 < issued_at - now <= _MAX_CLOCK_SKEW:
+        time.sleep(issued_at - now)
+        now = time.time()
+    return now
 
 
 @dataclass(frozen=True)
@@ -253,23 +266,21 @@ class RetainedIntentClientV1(_OriginalOwner):
             if verified.returncode:
                 reject()
         issued, expires = payload['issuedAt'], payload['expiresAt']
-        now = time.time()
-        if type(issued) is int and 0 < issued - now <= 2:
-            time.sleep(issued-now)
-            now = time.time()
+        if type(issued) is not int or type(expires) is not int:
+            reject()
+        now = _wait_for_clock(issued)
         expiry = timestamp(self._request.expires_at).timestamp()
         if self._grant is not None:
             expiry = min(expiry, timestamp(self._grant.expires_at).timestamp())
-        if (type(issued) is not int or type(expires) is not int
-                or not issued <= now < expires <= min(issued + 30, expiry)):
+        if not issued <= now < expires <= min(issued + 30, expiry):
             reject()
-        return deepcopy(payload['result']), expires
+        return deepcopy(payload['result']), issued, expires
 
     def validate(self, request):
         self._match(request)
         if self._attempted:
             reject()
-        result, _ = self._call('validate')
+        result, _, _ = self._call('validate')
         grant = ProductionFrontendGrantV1(**result)
         expiry = timestamp(grant.expires_at).timestamp()
         if (grant.request_hash != self._pin[0] or type(grant.max_uses) is not int or grant.max_uses != 1
@@ -288,13 +299,19 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._attempted = True
         self._scope = generation
         before_consume()
-        result, _ = self._call('consume', grant_hash=_digest(asdict(grant)), before_consume=before_consume)
+        result, issued, expires = self._call(
+            'consume', grant_hash=_digest(asdict(grant)), before_consume=before_consume,
+        )
         receipt = ProductionFrontendReceiptV1(**result)
         consumed = timestamp(receipt.consumed_at).timestamp()
         if (receipt.grant_id != grant.grant_id or receipt.request_hash != self._pin[0]
                 or type(receipt.use_number) is not int or receipt.use_number != 1
-                or consumed > time.time() or consumed >= timestamp(grant.expires_at).timestamp()):
-            reject()
+                or consumed >= min(issued + 1, expires, timestamp(grant.expires_at).timestamp())):
+            raise ConsumedReceiptRejected('retained-production-consumed-receipt-rejected') from None
+        # The signed envelope floors its issue time to whole seconds. Wait for
+        # the fractional receipt time without extending the verified expiry.
+        if not consumed <= _wait_for_clock(consumed) < expires:
+            raise ConsumedReceiptRejected('retained-production-consumed-receipt-rejected') from None
         self._receipt = receipt
         return receipt
 
@@ -302,7 +319,7 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._match(request)
         if self._receipt is None or time.time() >= timestamp(self._grant.expires_at).timestamp():
             reject()
-        result, expires_at = self._call('check', receipt_hash=_digest(asdict(self._receipt)))
+        result, _, expires_at = self._call('check', receipt_hash=_digest(asdict(self._receipt)))
         if result != {'consumed': True}:
             reject()
         return expires_at

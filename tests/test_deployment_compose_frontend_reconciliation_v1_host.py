@@ -110,6 +110,12 @@ class FrontendRecoveryTests(unittest.TestCase):
                                                approval={}, signature=b'', public_key=b'')
 
     def test_unconsumed_observation_checks_ledger_under_lock_and_rechecks_gate(self):
+        self._check_observation(frontend.LEDGER_UNCONSUMED)
+
+    def test_consumed_before_gate_observation_requires_exact_live_marker_and_absent_gate(self):
+        self._check_observation(frontend.LEDGER_CONSUMED_BEFORE_GATE)
+
+    def _check_observation(self, basis):
         self.gate.rename(self.gate.with_name('old-gate'))
         caddy, network, endpoint = 'e' * 64, 'f' * 64, '1' * 64
         plan = {'publicReview': dict(identity=dict(hostId='host-a', project='luohao-blog-prod',
@@ -124,24 +130,30 @@ class FrontendRecoveryTests(unittest.TestCase):
             original if '/containers/' in path else dict(Id='image', Os='linux', Architecture='arm64', Config={})
         )
 
+        consumed = basis == frontend.LEDGER_CONSUMED_BEFORE_GATE
+        marker = dict(ref='refs/tags/workflow-production-frontend-intent-v1/' + self.request,
+                      objectSha='3' * 40)
+
         def verify_ledger(request):
             self.assertEqual(request, self.request)
             with self.assertRaisesRegex(scope.ScopeBlocked, 'live writer'):
                 scope.acquire_scope(self.registration, 'c' * 64)
-            return True
+            return marker if consumed else True
 
         def prepare(callback):
+            ledger = (dict(verify_ledger_consumed=callback, ledger_target_sha=marker['objectSha'])
+                      if consumed else dict(verify_ledger_absent=callback))
             return frontend.prepare_frontend_reconciliation(
                 self.registration, self.request, evidence_digest='2' * 64, expires_at=1000,
-                recovery_basis=frontend.LEDGER_UNCONSUMED, verify_ledger_absent=callback,
+                recovery_basis=basis, **ledger,
                 private_plan=plan, operation_nonce='nonce', caddy_id=caddy, network_id=network,
                 endpoint_digest=endpoint,
             )
 
         def gate_appears(request):
-            verify_ledger(request)
+            result = verify_ledger(request)
             self.gate.symlink_to('does-not-exist')
-            return True
+            return result
 
         with (patch.object(frontend, '_require_quiescent'),
               patch.object(frontend, 'prepare_retained_frontend_cutover', return_value=cutover),
@@ -154,8 +166,13 @@ class FrontendRecoveryTests(unittest.TestCase):
                            return_value=SimpleNamespace(verify=lambda: 'protection'))):
             first = prepare(verify_ledger)
             self.assertEqual(first, prepare(verify_ledger))
-            self.assertEqual(first['recoveryBasis'], 'ledger-unconsumed')
+            self.assertEqual(first['recoveryBasis'], basis)
             self.assertEqual(first['legacyMacAuthentication'], 'not-applicable')
-            for callback in (None, lambda _: False, lambda _: 1, gate_appears):
+            failures = [None, lambda _: False, lambda _: 1]
+            if consumed:
+                self.assertEqual(first['ledgerTargetSha'], marker['objectSha'])
+                failures.extend((lambda _: dict(marker, ref=marker['ref'] + 'other'),
+                                 lambda _: dict(marker, objectSha='4' * 40)))
+            for callback in (*failures, gate_appears):
                 with self.subTest(callback=callback), self.assertRaises(scope.ScopeBlocked):
                     prepare(callback)

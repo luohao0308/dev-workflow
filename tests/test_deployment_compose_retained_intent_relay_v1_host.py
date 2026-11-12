@@ -1,15 +1,21 @@
 """Real OpenSSH signing and one-shot GitHub ledger fixture through the V2 relay."""
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 import os
 import subprocess
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from tests.test_deployment_compose_production_frontend_approval_v1_host import approved, fixture, host, retained_review
+import deployment_compose_retained_intent_relay_v1_host as relay
 from deployment_compose_retained_intent_relay_v1_host import (
-    IntentRelayRejected, RetainedIntentBindingV1, RetainedIntentClientV1, RetainedIntentIssuerV1,
+    ConsumedReceiptRejected, IntentRelayRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
+    RetainedIntentIssuerV1,
 )
 
 
@@ -77,4 +83,54 @@ class RetainedRelayTests(unittest.TestCase):
         for _ in range(2):
             with self.assertRaises(IntentRelayRejected):
                 client.consume(grant, self.request, before_consume=lambda: None, generation=7)
+        self.assertEqual(len(self.ledger.markers), 1)
+
+    def test_signed_receipt_waits_for_fractional_clock_skew_without_extending_expiry(self):
+        now = time.time()
+        receipt_at = None
+        sleeps = []
+
+        def sleep(seconds):
+            nonlocal now
+            sleeps.append(seconds)
+            now += seconds
+
+        def transport(rpc):
+            nonlocal now, receipt_at
+            with patch.object(relay, 'time', time):
+                response = self.issuer.authorize_rpc(rpc)
+                if rpc['method'] == 'consume':
+                    payload = deepcopy(response['payload'])
+                    receipt_at = payload['issuedAt'] + .6
+                    payload['result']['consumed_at'] = datetime.fromtimestamp(
+                        receipt_at, timezone.utc,
+                    ).isoformat()
+                    response = self.issuer._seal(payload)
+                    now = receipt_at - .4
+            return response
+
+        client = self.client(transport)
+        grant = client.validate(self.request)
+        with patch.object(relay, 'time', SimpleNamespace(time=lambda: now, sleep=sleep)):
+            receipt = client.consume(grant, self.request, before_consume=lambda: None, generation=7)
+        self.assertEqual(receipt.request_hash, self.request.digest())
+        self.assertEqual(now, receipt_at)
+        self.assertAlmostEqual(sum(sleeps), .4, places=5)
+        self.assertEqual(len(self.ledger.markers), 1)
+
+    def test_signed_receipt_timestamp_outside_issue_second_is_rejected(self):
+        def transport(rpc):
+            response = self.issuer.authorize_rpc(rpc)
+            if rpc['method'] == 'consume':
+                payload = deepcopy(response['payload'])
+                payload['result']['consumed_at'] = datetime.fromtimestamp(
+                    payload['issuedAt'] + 1, timezone.utc,
+                ).isoformat()
+                return self.issuer._seal(payload)
+            return response
+
+        client = self.client(transport)
+        grant = client.validate(self.request)
+        with self.assertRaises(ConsumedReceiptRejected):
+            client.consume(grant, self.request, before_consume=lambda: None, generation=7)
         self.assertEqual(len(self.ledger.markers), 1)

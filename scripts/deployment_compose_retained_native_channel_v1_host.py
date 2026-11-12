@@ -11,7 +11,9 @@ from deployment_compose_operation_witness_client_v3 import OperationWitnessClien
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1
 from deployment_compose_retained_frontend_worker_v1_host import RetainedFrontendWorkerV1
-from deployment_compose_retained_intent_relay_v1_host import RetainedIntentBindingV1, RetainedIntentClientV1
+from deployment_compose_retained_intent_relay_v1_host import (
+    ConsumedReceiptRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
+)
 from deployment_compose_retained_source_v1_host import check_loaded_source
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_v3_channel_worker import read_frame, write_frame
@@ -22,7 +24,9 @@ from deployment_gateway import GatePolicy
 CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
              'witnessPublicKey', 'gateKey', 'caddyId', 'networkId'}
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
-FAILURE_STAGES = frozenset(('parse-request', 'validate-intent', 'execute-worker', 'prepare-restore'))
+FAILURE_STAGES = frozenset((
+    'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
+))
 # Leave time for the controller to close the session after its 15-minute review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
 
@@ -136,6 +140,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                     grant = client.validate(request)
                     stage = 'execute-worker'
                     result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
+                except ConsumedReceiptRejected:
+                    return 'verify-consumed-receipt'
                 except Exception:
                     return stage
                 channel.emit('executed', result=result)
