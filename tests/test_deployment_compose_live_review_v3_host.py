@@ -1,4 +1,5 @@
 """No network: live adapter transport boundaries are replaced privately."""
+from http.client import RemoteDisconnected
 import io
 import json
 import os
@@ -561,11 +562,21 @@ class PersistentLiveClientTests(unittest.TestCase):
         self.client.close(); self.client.close()
         with self.assertRaises(live.GitHubUnavailable): self.client.request('GET', '/repos/sample/target')
 
-    def test_recursive_mutation_guard_uses_idle_connection_after_nested_get(self):
+    def test_recursive_mutation_guard_uses_fresh_connection_after_nested_get(self):
         def guard(): self.client.request('GET', '/repos/sample/target')
         self.client.request('POST', '/repos/sample/target/git/refs', {'ref':'test'}, before_send=guard)
         self.assertEqual([x[0] for x in self.calls], ['GET', 'POST'])
-        self.assertEqual(self.accepts, 1)
+        self.assertEqual(self.accepts, 2)
+
+    def test_mutation_discards_stale_connection_after_parallel_guard(self):
+        self.client.request('GET', '/repos/sample/target')
+        idle = self.client._connection
+        guard = Mock(side_effect=lambda: self.client.fetch_authority_reads(self.queries()))
+        with patch.object(idle, 'request', side_effect=RemoteDisconnected()) as stale:
+            self.client.request('POST', '/repos/sample/target/git/refs', {}, before_send=guard)
+        stale.assert_not_called()
+        guard.assert_called_once()
+        self.assertEqual([method for method, _ in self.calls].count('POST'), 1)
 
     def test_complete_chunked_response_preserves_idle_connection(self):
         self.assertEqual(self.client.request('GET', '/repos/sample/chunked')[0], {'n':1})
@@ -588,7 +599,9 @@ class PersistentLiveClientTests(unittest.TestCase):
         with patch.object(live.time, 'sleep'):
             with self.assertRaises(live.GitHubUnavailable): self.client.request('GET', '/repos/sample/lost')
             self.assertEqual(len(self.calls), 3)
-            with self.assertRaises(live.GitHubUnavailable): self.client.request('POST', '/repos/sample/lost', {})
+            with self.assertRaises(live.GitHubMutationUnavailable) as error:
+                self.client.request('POST', '/repos/sample/lost', {})
+        self.assertEqual(error.exception.stage, 'send-or-response')
         self.assertEqual(len(self.calls), 4)
         self.assertIsNone(self.client._connection)
 

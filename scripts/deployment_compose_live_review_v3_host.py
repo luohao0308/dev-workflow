@@ -24,7 +24,7 @@ from deployment_compose_bundle_v3 import ExecutionBundleV3
 from deployment_contract_v2 import RequestV2
 from deployment_compose_approval_v3_host import (
     PROFILE, GitHubFullBodyApprovalV3, GitHubSceneRecoveryApprovalV3, SceneRecoveryApprovalPolicyV3)
-from release_github import GitHubClient, GitHubUnavailable, MAX_RESPONSE
+from release_github import GitHubClient, GitHubMutationUnavailable, GitHubUnavailable, MAX_RESPONSE
 from release_host import timestamp
 
 CONFIG = dict(DW_AUTH_LEDGER_REPOSITORY='luohao0308/dev-workflow-authority-ledger',
@@ -141,10 +141,13 @@ class _ReadRetryGitHubClient(GitHubClient):
         with self._network_lock:
             if self._closed:
                 raise GitHubUnavailable('Live GitHub client is closed')
-            # A mutation guard can make nested GETs. It must finish before we
-            # select the idle connection, and its denial must propagate intact.
+            # A mutation guard can make nested GETs. Its denial must propagate
+            # intact. After it succeeds, use a fresh socket for the single POST.
             before_send()
+            if method == 'POST':
+                self._drop_connection()
             response = None
+            stage = 'connect'
             try:
                 if self._connection is None:
                     context = ssl.create_default_context()
@@ -153,8 +156,11 @@ class _ReadRetryGitHubClient(GitHubClient):
                     self._connection = HTTPSConnection('api.github.com', 443,
                         timeout=self.timeout, context=context)
                 connection = self._connection
+                if method == 'POST':
+                    connection.connect()
                 if connection.sock is not None:
                     connection.sock.settimeout(self.timeout)
+                stage = 'send-or-response'
                 connection.request(method, path, body=data, headers=headers)
                 response = connection.getresponse()
                 status, reply_headers = response.status, dict(response.headers.items())
@@ -179,6 +185,8 @@ class _ReadRetryGitHubClient(GitHubClient):
                 return status, reply_headers, result
             except (OSError, http.client.HTTPException, ValueError, UnicodeError):
                 self._drop_connection()
+                if method == 'POST':
+                    raise GitHubMutationUnavailable(stage) from None
                 raise GitHubUnavailable('GitHub response unavailable or invalid') from None
             except BaseException:
                 self._drop_connection()

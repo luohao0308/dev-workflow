@@ -1,4 +1,9 @@
-"""Bind legacy journal reconciliation to the registered production frontend."""
+"""Bind journal reconciliation to the registered production frontend.
+
+Unconsumed reconciliation requires a trusted controller adapter that reads
+the exact request marker in the private authorization ledger. Preview and
+apply both need that adapter.
+"""
 import hashlib
 import json
 import os
@@ -13,7 +18,9 @@ from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import ScopeBlocked, _directory, _locked_pending_scope
 from deployment_compose_retained_phase_v1_host import original_projection
 from deployment_compose_retained_write_v1_host import _operation_tuple
-from deployment_compose_scope_reconciliation_v1_host import reconcile_pending_scope, recovery_payload
+from deployment_compose_scope_reconciliation_v1_host import (
+    LEDGER_UNCONSUMED, reconcile_pending_scope, recovery_payload,
+)
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
 
 
@@ -106,12 +113,32 @@ def _require_quiescent():
         _reject()
 
 
+def _require_absent_gate(registration, request_digest):
+    root, identity = _directory(registration.root)
+    try:
+        if identity != registration.root_identity:
+            _reject()
+        try:
+            os.stat('gate-' + request_digest, dir_fd=root, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        _reject()
+    finally:
+        os.close(root)
+
+
 def _observe(registration, request_digest, *, private_plan, operation_nonce,
-             gate_generation, gate_event_digests, caddy_id, network_id, endpoint_digest):
+             caddy_id, network_id, endpoint_digest, gate_generation=None, gate_event_digests=None,
+             recovery_basis=None, verify_ledger_absent=None):
     if (registration.project != 'luohao-blog-prod'
-            or type(gate_event_digests) is not tuple or len(gate_event_digests) != 2
-            or not all(hex_value(value) for value in (
-                request_digest, gate_generation, caddy_id, network_id, endpoint_digest, *gate_event_digests))):
+            or not all(hex_value(value) for value in (request_digest, caddy_id, network_id, endpoint_digest))):
+        _reject()
+    if recovery_basis == LEDGER_UNCONSUMED:
+        if gate_generation is not None or gate_event_digests is not None or not callable(verify_ledger_absent):
+            _reject()
+    elif (recovery_basis is not None or verify_ledger_absent is not None
+          or type(gate_event_digests) is not tuple or len(gate_event_digests) != 2
+          or not all(hex_value(value) for value in (gate_generation, *gate_event_digests))):
         _reject()
     cutover = prepare_retained_frontend_cutover(private_plan, operation_nonce=operation_nonce)
     review = private_plan['publicReview']
@@ -123,7 +150,11 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
 
     _require_quiescent()
     operation = list(_operation_tuple(cutover.create()))
-    events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation)
+    if recovery_basis == LEDGER_UNCONSUMED:
+        _require_absent_gate(registration, request_digest)
+        events = ()
+    else:
+        events = _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation)
     observer = HostSnapshotV3()
     try:
         if observer.descriptor()['endpointDigest'] != endpoint_digest:
@@ -151,27 +182,41 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
             _reject()
         protection_digest = protection.verify()
         observer.verify_unchanged()
-        _require_quiescent()
-        if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation) != events:
-            _reject()
-        return hashlib.sha256(canonical(dict(
+        facts = dict(
             profile='production-frontend-legacy-reconciliation-v1', requestHash=request_digest,
             endpointDigest=endpoint_digest, protectionDigest=protection_digest,
             gateGeneration=gate_generation, gateEventDigests=list(events), planDigest=cutover.digest,
             frontendId=cutover.original_id, caddyId=caddy_id, networkId=network_id,
-        ))).hexdigest()
+        )
+        if recovery_basis == LEDGER_UNCONSUMED:
+            # Supplied by the trusted private-ledger controller adapter. It must
+            # perform a fresh exact-ref read and treat all other outcomes as denial.
+            if verify_ledger_absent(request_digest) is not True:
+                _reject()
+            _require_quiescent()
+            _require_absent_gate(registration, request_digest)
+            facts.update(profile='production-frontend-unconsumed-reconciliation-v1',
+                         recoveryBasis=LEDGER_UNCONSUMED, ledgerMarkerAbsent=True)
+        else:
+            _require_quiescent()
+            if _prepared_gate(registration, request_digest, gate_generation, gate_event_digests, operation) != events:
+                _reject()
+        return hashlib.sha256(canonical(facts)).hexdigest()
     finally:
         observer.close()
 
 
-def prepare_frontend_reconciliation(registration, request_digest, *, evidence_digest, expires_at, **observation):
+def prepare_frontend_reconciliation(registration, request_digest, *, evidence_digest, expires_at,
+                                    recovery_basis=None, **observation):
     """Return an unsigned message after an exact read-only production check."""
     with _locked_pending_scope(registration, request_digest) as (_, _, pending):
-        digest = _observe(registration, request_digest, **observation)
-        return recovery_payload(registration, pending, evidence_digest, digest, expires_at=expires_at)
+        digest = _observe(registration, request_digest, recovery_basis=recovery_basis, **observation)
+        return recovery_payload(registration, pending, evidence_digest, digest, expires_at=expires_at,
+                                recovery_basis=recovery_basis)
 
 
-def reconcile_frontend_scope(registration, request_digest, *, approval, signature, public_key, **observation):
+def reconcile_frontend_scope(registration, request_digest, *, approval, signature, public_key,
+                             recovery_basis=None, **observation):
     """Use the independently installed signer pin and a fresh locked observation."""
     def signer_digest():
         parent, _ = _directory(registration.root.parent)
@@ -186,12 +231,12 @@ def reconcile_frontend_scope(registration, request_digest, *, approval, signatur
     trusted = signer_digest()
 
     def observe_live():
-        digest = _observe(registration, request_digest, **observation)
+        digest = _observe(registration, request_digest, recovery_basis=recovery_basis, **observation)
         if signer_digest() != trusted:
             _reject()
         return digest
 
     return reconcile_pending_scope(
         registration, request_digest, approval=approval, signature=signature, public_key=public_key,
-        trusted_signer_digest=trusted, observe_live_digest=observe_live,
+        trusted_signer_digest=trusted, observe_live_digest=observe_live, recovery_basis=recovery_basis,
     )

@@ -22,22 +22,25 @@ from deployment_gate_witness import key_material
 NAMESPACE = 'dev-workflow-production-scope-reconciliation-v1'
 PRINCIPAL = 'production-scope-recovery-operator'
 MAX_APPROVAL_SECONDS = 900
+LEDGER_UNCONSUMED = 'ledger-unconsumed'
 
 
 def _reject():
     raise ScopeBlocked('Production scope reconciliation rejected') from None
 
 
-def recovery_payload(registration, pending, evidence_digest, observation_digest, *, expires_at):
+def recovery_payload(registration, pending, evidence_digest, observation_digest, *, expires_at,
+                     recovery_basis=None):
     """Build the exact message for an operator reviewing a legacy incident."""
     if (type(registration) is not ScopeRegistrationV1 or type(pending) is not dict
             or set(pending) != {'generation', 'requestHash', 'journalDigest'}
             or type(pending['generation']) is not int or pending['generation'] < 1
             or not all(hex_value(value) for value in (
                 pending['requestHash'], pending['journalDigest'], evidence_digest, observation_digest))
-            or type(expires_at) is not int):
+            or type(expires_at) is not int
+            or recovery_basis not in (None, LEDGER_UNCONSUMED)):
         _reject()
-    return dict(
+    payload = dict(
         schemaVersion=1, operation='operator-reconcile-production-scope',
         hostId=registration.host_id, project=registration.project, daemonId=registration.daemon_id,
         scopeDirectory=str(registration.root), scopeIdentity=list(registration.root_identity),
@@ -46,6 +49,9 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
         legacyMacAuthentication='unavailable',
         expiresAt=expires_at,
     )
+    if recovery_basis == LEDGER_UNCONSUMED:
+        payload.update(recoveryBasis=LEDGER_UNCONSUMED, legacyMacAuthentication='not-applicable')
+    return payload
 
 
 def _verify_signature(material, signature, public_key):
@@ -98,7 +104,7 @@ def _retain_approval(registration, proof, expected, signature, public_key):
 
 
 def reconcile_pending_scope(registration, request_digest, *, approval, signature,
-                            public_key, trusted_signer_digest, observe_live_digest):
+                            public_key, trusted_signer_digest, observe_live_digest, recovery_basis=None):
     """Append one signed operator disposition after a locked evidence recheck.
 
     The embedding independently supplies the trusted signer digest and a
@@ -122,7 +128,8 @@ def reconcile_pending_scope(registration, request_digest, *, approval, signature
         _reject()
 
     with _locked_pending_scope(registration, request_digest, writable=True) as (fd, raw, pending):
-        expected = recovery_payload(registration, pending, evidence, observation, expires_at=expiry)
+        expected = recovery_payload(registration, pending, evidence, observation, expires_at=expiry,
+                                    recovery_basis=recovery_basis)
         material = canonical(expected)
         if canonical(approval) != material:
             _reject()

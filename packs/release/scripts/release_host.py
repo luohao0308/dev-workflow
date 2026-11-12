@@ -20,6 +20,7 @@ import time
 import urllib.request
 
 from release_execute import AuthorizationUnavailable, Grant, Receipt, Request, OPERATIONS, canonical, timestamp
+from release_github import GitHubMutationRejected, GitHubMutationUnavailable
 
 ISSUER = 'https://token.actions.githubusercontent.com'
 AUDIENCE = 'dev-workflow-release-host'
@@ -401,9 +402,18 @@ class GitHubActionsApproval:
             try:
                 value, _headers = self.client.request('POST', '/repos/' + self.policy.ledger_repository + '/git/refs',
                                             {'ref': marker, 'sha': self.policy.ledger_sha}, before_send=before_send)
-            except Exception:
+            except Exception as error:
                 if preflight_stage is not None:
                     _deny('Durable grant preflight rejected at ' + preflight_stage)
+                if type(error) is GitHubMutationRejected and type(error.status) is int and 400 <= error.status < 500:
+                    _deny('Durable grant consumption rejected (HTTP ' + str(error.status) + ')')
+                if type(error) is GitHubMutationUnavailable:
+                    if error.stage == 'connect':
+                        _deny('Durable grant connection failed before sending')
+                    if error.stage == 'send-or-response':
+                        _deny('Durable grant outcome unknown after send started')
+                    if error.stage == 'http-response' and type(error.status) is int and 100 <= error.status <= 599:
+                        _deny('Durable grant outcome unknown (HTTP ' + str(error.status) + ')')
                 _deny('Durable grant consumption rejected or outcome unknown')
             if not isinstance(value, dict) or value.get('ref') != marker or value.get('object', {}).get('sha') != self.policy.ledger_sha:
                 _deny('Durable grant consumption not verified')

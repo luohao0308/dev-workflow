@@ -3,8 +3,9 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / path) for path in (
@@ -107,3 +108,54 @@ class FrontendRecoveryTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             frontend.reconcile_frontend_scope(self.registration, self.request,
                                                approval={}, signature=b'', public_key=b'')
+
+    def test_unconsumed_observation_checks_ledger_under_lock_and_rechecks_gate(self):
+        self.gate.rename(self.gate.with_name('old-gate'))
+        caddy, network, endpoint = 'e' * 64, 'f' * 64, '1' * 64
+        plan = {'publicReview': dict(identity=dict(hostId='host-a', project='luohao-blog-prod',
+                                                  daemonId='docker-1', imageId='image'),
+                                     snapshotDigest='snapshot', protectedContainerIds=[caddy])}
+        cutover = SimpleNamespace(protected_ids=(caddy,), original_id='original', digest='digest',
+                                  create=lambda: None)
+        original = dict(NetworkSettings=dict(Networks={'luohao-blog-prod_default': dict(NetworkID=network)}))
+        observer = Mock()
+        observer.descriptor.return_value = {'endpointDigest': endpoint}
+        observer._get.side_effect = lambda path, *_: (
+            original if '/containers/' in path else dict(Id='image', Os='linux', Architecture='arm64', Config={})
+        )
+
+        def verify_ledger(request):
+            self.assertEqual(request, self.request)
+            with self.assertRaisesRegex(scope.ScopeBlocked, 'live writer'):
+                scope.acquire_scope(self.registration, 'c' * 64)
+            return True
+
+        def prepare(callback):
+            return frontend.prepare_frontend_reconciliation(
+                self.registration, self.request, evidence_digest='2' * 64, expires_at=1000,
+                recovery_basis=frontend.LEDGER_UNCONSUMED, verify_ledger_absent=callback,
+                private_plan=plan, operation_nonce='nonce', caddy_id=caddy, network_id=network,
+                endpoint_digest=endpoint,
+            )
+
+        def gate_appears(request):
+            verify_ledger(request)
+            self.gate.symlink_to('does-not-exist')
+            return True
+
+        with (patch.object(frontend, '_require_quiescent'),
+              patch.object(frontend, 'prepare_retained_frontend_cutover', return_value=cutover),
+              patch.object(frontend, '_operation_tuple', return_value=self.operation),
+              patch.object(frontend, 'HostSnapshotV3', return_value=observer),
+              patch.object(frontend, 'original_projection', side_effect=lambda row: row),
+              patch.object(frontend, 'prepare_frontend_plan', return_value=plan),
+              patch.object(frontend, 'ProductionCaddyProbeV1', return_value=lambda _: True),
+              patch.object(frontend, 'ProductionFrontendProtectionV1',
+                           return_value=SimpleNamespace(verify=lambda: 'protection'))):
+            first = prepare(verify_ledger)
+            self.assertEqual(first, prepare(verify_ledger))
+            self.assertEqual(first['recoveryBasis'], 'ledger-unconsumed')
+            self.assertEqual(first['legacyMacAuthentication'], 'not-applicable')
+            for callback in (None, lambda _: False, lambda _: 1, gate_appears):
+                with self.subTest(callback=callback), self.assertRaises(scope.ScopeBlocked):
+                    prepare(callback)

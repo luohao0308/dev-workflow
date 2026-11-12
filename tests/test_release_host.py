@@ -87,6 +87,38 @@ class Client:
 
 
 class ReleaseHostTests(unittest.TestCase):
+    def test_consumption_reports_bounded_transport_and_provider_failures(self):
+        from release_github import GitHubMutationRejected, GitHubMutationUnavailable
+
+        cases = (
+            (GitHubMutationUnavailable('connect'), 'connection failed before sending'),
+            (GitHubMutationUnavailable('send-or-response'), 'outcome unknown after send started'),
+            (GitHubMutationUnavailable('http-response', status=503), r'outcome unknown \(HTTP 503\)'),
+            (GitHubMutationRejected(422), r'consumption rejected \(HTTP 422\)'),
+        )
+        for failure, message in cases:
+            with self.subTest(message=message):
+                client = Client(self.policy, [self.req])
+                approval = host.GitHubActionsApproval(client, 'signed', [self.req], self.policy,
+                                                     verifier=lambda _: claims(self.policy))
+                request = client.request
+                posts = []
+
+                def transport(method, path, payload=None, *, before_send=lambda: None):
+                    if method == 'POST':
+                        before_send()
+                        posts.append(path)
+                        raise failure
+                    return request(method, path, payload, before_send=before_send)
+
+                client.request = transport
+                grant = approval.validate(self.req)
+                with self.assertRaisesRegex(AuthorizationUnavailable, message):
+                    approval.consume(grant, self.req)
+                with self.assertRaises(AuthorizationUnavailable):
+                    approval.consume(grant, self.req)
+                self.assertEqual(len(posts), 1)
+
     def setUp(self):
         self.req = request()
         self.policy = policy()
