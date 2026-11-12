@@ -15,7 +15,8 @@ from deployment_compose_retained_intent_relay_v1_host import (
     ConsumedReceiptRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
 )
 from deployment_compose_retained_source_v1_host import check_loaded_source
-from deployment_compose_retained_write_v1_host import RetainedWriteV1
+from deployment_compose_retained_write_v1_host import RetainedDockerWriteUncertain, RetainedWriteV1
+from deployment_compose_write_gateway_v3_host import ADMITTED_FAILURE_STAGES
 from deployment_compose_v3_channel_worker import read_frame, write_frame
 from deployment_contract_v2 import RequestV2
 from deployment_gate_witness import key_material
@@ -26,7 +27,7 @@ CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
-))
+)) | ADMITTED_FAILURE_STAGES
 # Leave time for the controller to close the session after its 15-minute review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
 
@@ -142,6 +143,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                     result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
                 except ConsumedReceiptRejected:
                     return 'verify-consumed-receipt'
+                except RetainedDockerWriteUncertain as error:
+                    return error.stage
                 except Exception:
                     return stage
                 channel.emit('executed', result=result)

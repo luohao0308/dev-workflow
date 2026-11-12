@@ -17,7 +17,7 @@ from tests import test_deployment_runtime as tls_fixture
 from deployment_compose_host_snapshot_v3_host import HostSnapshotV3
 from deployment_compose_production_cutover_v1_host import ContainerOperation
 import deployment_compose_retained_write_v1_host as retained_write
-from deployment_compose_retained_write_v1_host import RetainedWriteV1
+from deployment_compose_retained_write_v1_host import RetainedDockerWriteUncertain, RetainedWriteV1
 from deployment_compose_write_gateway_v3_host import _UnixDocker
 from deployment_gateway import GatePolicy, WriterSession
 
@@ -138,12 +138,23 @@ class RetainedWriteTests(GateFixture, unittest.TestCase):
 
     def test_unknown_upstream_result_blocks_retry_and_successor(self):
         self.disconnect = True
-        with self.assertRaises(ValueError):
+        with self.assertRaises(RetainedDockerWriteUncertain) as error:
             self.writer.write(self.create, **self.pins, index=0, before_dispatch=self._guard)
+        self.assertEqual(error.exception.stage, 'docker-response')
         for index, operation in enumerate((self.create, self.stop)):
             with self.assertRaises(ValueError):
                 self.writer.write(operation, **self.pins, index=index, before_dispatch=self._guard)
         self.assertEqual(self.calls_engine, [(self.create.path, b'{}')])
+
+    def test_connect_failure_after_admission_keeps_scope_blocked_and_reports_stage(self):
+        with patch.object(HostSnapshotV3, '_bound_write_connection', side_effect=OSError('private detail')):
+            with self.assertRaises(RetainedDockerWriteUncertain) as error:
+                self.writer.write(self.create, **self.pins, index=0, before_dispatch=self._guard)
+        self.assertEqual(error.exception.stage, 'docker-connect')
+        self.assertNotIn('private detail', str(error.exception))
+        self.assertFalse(self.calls_engine)
+        with self.assertRaises(ValueError):
+            self.writer.write(self.create, **self.pins, index=0, before_dispatch=self._guard)
 
     def test_definitive_failure_is_returned_but_no_more_steps(self):
         self.create_status = 409

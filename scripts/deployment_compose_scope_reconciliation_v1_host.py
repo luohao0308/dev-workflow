@@ -25,6 +25,8 @@ PRINCIPAL = 'production-scope-recovery-operator'
 MAX_APPROVAL_SECONDS = 900
 LEDGER_UNCONSUMED = 'ledger-unconsumed'
 LEDGER_CONSUMED_BEFORE_GATE = 'ledger-consumed-before-gate'
+FIRST_CREATE_OUTCOME_UNKNOWN = 'first-create-outcome-unknown'
+_CONSUMED_BASES = (LEDGER_CONSUMED_BEFORE_GATE, FIRST_CREATE_OUTCOME_UNKNOWN)
 
 
 def valid_ledger_sha(value):
@@ -44,9 +46,9 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
             or not all(hex_value(value) for value in (
                 pending['requestHash'], pending['journalDigest'], evidence_digest, observation_digest))
             or type(expires_at) is not int
-            or recovery_basis not in (None, LEDGER_UNCONSUMED, LEDGER_CONSUMED_BEFORE_GATE)
-            or (recovery_basis == LEDGER_CONSUMED_BEFORE_GATE and not valid_ledger_sha(ledger_target_sha))
-            or (recovery_basis != LEDGER_CONSUMED_BEFORE_GATE and ledger_target_sha is not None)):
+            or recovery_basis not in (None, LEDGER_UNCONSUMED, *_CONSUMED_BASES)
+            or (recovery_basis in _CONSUMED_BASES and not valid_ledger_sha(ledger_target_sha))
+            or (recovery_basis not in _CONSUMED_BASES and ledger_target_sha is not None)):
         _reject()
     payload = dict(
         schemaVersion=1, operation='operator-reconcile-production-scope',
@@ -62,6 +64,8 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
     elif recovery_basis == LEDGER_CONSUMED_BEFORE_GATE:
         payload.update(recoveryBasis=LEDGER_CONSUMED_BEFORE_GATE,
                        legacyMacAuthentication='not-applicable', ledgerTargetSha=ledger_target_sha)
+    elif recovery_basis == FIRST_CREATE_OUTCOME_UNKNOWN:
+        payload.update(recoveryBasis=FIRST_CREATE_OUTCOME_UNKNOWN, ledgerTargetSha=ledger_target_sha)
     return payload
 
 

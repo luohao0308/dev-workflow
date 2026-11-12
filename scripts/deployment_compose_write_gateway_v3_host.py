@@ -19,6 +19,10 @@ MAX_BODY = 1024 * 1024
 MAX_RESPONSE = 4096
 _HEX = re.compile(r'[0-9a-f]{64}')
 _HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+ADMITTED_FAILURE_STAGES = frozenset((
+    'docker-after-admission', 'docker-connect', 'docker-before-send',
+    'docker-send', 'docker-response', 'docker-witness',
+))
 
 
 def _complete_response(response):
@@ -47,11 +51,13 @@ def _complete_response(response):
 
 def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
                       listen=('127.0.0.1', 0), timeout=10, control_timeout=180,
-                      control_deadline=None, bound_observer=None, authorization_expires_at=None):
+                      control_deadline=None, bound_observer=None, authorization_expires_at=None,
+                      on_unknown=None):
     """Return an unstarted server. Only the trusted coordinator opens generations.
 
     pre_dispatch(method, path, body, generation, attempt_ref) must raise on a
     failed freshness, approval or protected-source guard. It grants no permit.
+    on_unknown can observe a fixed stage after admission. It grants no authority.
     """
     if (type(gate) is not FileWriterGate or gate.policy.operation_profile != 'compose-v3'
             or gate.policy.witness_required is not True
@@ -59,6 +65,7 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
             or tls_context.verify_mode != ssl.CERT_REQUIRED
             or not isinstance(docker_socket, Path) or not docker_socket.is_absolute()
             or not callable(pre_dispatch) or type(timeout) not in (int, float)
+            or on_unknown is not None and not callable(on_unknown)
             or not 1 <= timeout <= 180 or type(control_timeout) not in (int, float)
             or not 1 <= control_timeout <= 180
             or control_deadline is not None and (type(control_deadline) not in (int, float)
@@ -137,19 +144,25 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
                 self.server.check_live()
                 ticket = FileWriterGate.admit(gate, generations[0], attempts[0],
                     method=self.command, path=self.path, body=body, writer_certificate_sha256=peer)
+                stage = 'docker-after-admission'
                 # Cancellation and the final forwarding decision share one lock.
                 # The serving thread remains owned until it is drained, even if
                 # forwarding wins the race and its result becomes unknown.
                 with self.server.dispatch_lock:
                     self.server.check_live()
+                    stage = 'docker-connect'
                     connection = connector(docker_socket, min(timeout, deadline-time.monotonic()))
                     connection.connect()
+                    stage = 'docker-before-send'
                     self.server.check_live()
                     watchdog = runtime.deadline_watchdog(connection.sock, min(deadline,time.monotonic()+timeout))
+                    stage = 'docker-send'
                     connection.request(self.command, self.path, body=body,
                         headers={'Content-Type': 'application/json', 'Connection': 'close'})
+                stage = 'docker-response'
                 response = connection.getresponse()
                 raw = _complete_response(response)
+                stage = 'docker-witness'
                 FileWriterGate.finish_response(gate, ticket, definitive=True, status=response.status, body=raw)
                 # Clear only after durable witness and local acknowledgement. No retry.
                 ticket = None
@@ -160,6 +173,11 @@ def create_gateway_v3(gate, *, tls_context, docker_socket: Path, pre_dispatch,
                         FileWriterGate.finish_response(gate, ticket, definitive=False, status=0, body=b'')
                     except Exception:
                         pass  # Remote-ahead or unresolved admission remains blocked.
+                    if on_unknown is not None:
+                        try:
+                            on_unknown(stage)
+                        except Exception:
+                            pass
                 try:
                     if connection is None:
                         self._deny()

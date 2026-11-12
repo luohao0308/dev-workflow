@@ -21,7 +21,9 @@ from deployment_compose_operation_witness_client_v3 import (
     OperationWitnessClientV3, binding_value, encode, hex_value,
 )
 from deployment_compose_production_cutover_v1_host import ContainerOperation
-from deployment_compose_write_gateway_v3_host import MAX_BODY, _complete_response, create_gateway_v3
+from deployment_compose_write_gateway_v3_host import (
+    ADMITTED_FAILURE_STAGES, MAX_BODY, _complete_response, create_gateway_v3,
+)
 from deployment_gate_witness import opening_scope
 from deployment_gateway import FileWriterGate, GatePolicy, _profile_operation
 
@@ -41,6 +43,14 @@ _PHASE_SUFFIX = {
 
 def _reject():
     raise ValueError('retained-frontend-write-blocked') from None
+
+
+class RetainedDockerWriteUncertain(ValueError):
+    def __init__(self, stage):
+        if type(stage) is not str or stage not in ADMITTED_FAILURE_STAGES:
+            _reject()
+        super().__init__('retained-frontend-write-outcome-unknown')
+        self.stage = stage
 
 
 def _digest(value):
@@ -237,9 +247,11 @@ class RetainedWriteV1:
 
     def _relay(self, gate, pre_dispatch, operation, headers, deadline, expires_at):
         self._check(deadline, expires_at)
+        failure = []
         server = create_gateway_v3(gate, tls_context=self._server_tls, docker_socket=self._socket,
             pre_dispatch=pre_dispatch, timeout=self._timeout, control_deadline=deadline,
-            bound_observer=self._observer, authorization_expires_at=expires_at)
+            bound_observer=self._observer, authorization_expires_at=expires_at,
+            on_unknown=failure.append)
         outcome = []
 
         def client_exchange():
@@ -275,6 +287,8 @@ class RetainedWriteV1:
             server.server_close()
             if thread.ident is not None:
                 thread.join(max(0, deadline - time.monotonic()))
+        if len(failure) == 1:
+            raise RetainedDockerWriteUncertain(failure[0])
         if thread.is_alive() or len(outcome) != 1:
             _reject()
         return outcome[0]
