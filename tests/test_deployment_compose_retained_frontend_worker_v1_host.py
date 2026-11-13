@@ -177,7 +177,7 @@ class RetainedWorkerTests(unittest.TestCase):
     def test_other_container_drift_prevents_consent_consumption(self):
         approval, grant, request, ledger = self._approval(self.worker.deploy_review(), 'deploy')
         self.row['RestartCount'] += 1
-        with self.assertRaisesRegex(worker_module.RetainedObservationFailed, 'pre-write-protection-check'):
+        with self.assertRaisesRegex(worker_module.RetainedObservationFailed, 'pre-write-protection-container-lifecycle'):
             self.worker.deploy(approval, grant, request)
         self.assertFalse(ledger.markers)
         self.assertFalse(self.writes)
@@ -196,7 +196,7 @@ class RetainedWorkerTests(unittest.TestCase):
         with patch.object(RetainedWriteV1, 'write', side_effect=write):
             with self.assertRaises(worker_module.RetainedPostWriteObservationFailed) as failure:
                 self.worker.deploy(approval, grant, request)
-        self.assertEqual(failure.exception.stage, 'post-write-protection-check')
+        self.assertEqual(failure.exception.stage, 'post-write-protection-network')
         self.assertEqual(self.writes, ['create', 'stop-original'])
         with self.assertRaises(RetainedWorkerBlocked):
             self.worker.restore_review()
