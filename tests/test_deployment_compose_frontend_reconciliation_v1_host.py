@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import os
 from pathlib import Path
@@ -54,6 +55,50 @@ class FrontendRecoveryTests(unittest.TestCase):
         return frontend._prepared_gate(
             self.registration, self.request, self.generation, self.digests, self.operation,
         )
+
+    def test_restored_original_requires_exact_closed_create_and_stop(self):
+        candidate = 'f' * 64
+        from deployment_compose_production_cutover_v1_host import RetainedFrontendCutoverV1
+
+        plan = RetainedFrontendCutoverV1('c' * 64, (), 'dwc-' + '1' * 24 + '-frontend',
+                                         'dwb-' + '1' * 24 + '-frontend', b'{}', 'd' * 64)
+        evidence = {}
+        for generation, operation, status, body in (
+            (self.generation, plan.create(), 201, canonical({'Id': candidate})),
+            ('e' * 64, plan.switch(candidate)[0], 204, b''),
+        ):
+            path = self.gate / generation
+            path.mkdir(mode=0o700, exist_ok=True)
+            info = path.stat()
+            directory = [info.st_dev, info.st_ino]
+            ref = '9' * 64
+            exact = list(frontend._operation_tuple(operation))
+            response = dict(ref=ref, definitive=True, status=status, response_binding_schema=1,
+                            bodyBase64=base64.b64encode(body).decode('ascii'),
+                            response_hash=hashlib.sha256(str(status).encode() + b'\0' + body).hexdigest())
+            previous = ZERO
+            hashes = []
+            data = (dict(request_hash=self.request, operations=[exact]), dict(operation=exact, ref=ref),
+                    ref, response, None, None)
+            for i, (kind, value) in enumerate(zip(('open', 'prepare', 'admit', 'finish', 'close', 'proof'), data)):
+                if kind == 'proof':
+                    value = dict(payload=dict(generation=generation, head=previous))
+                event = dict(kind=kind, generation=generation, directory=directory, previous=previous, data=value)
+                raw = canonical(dict(payload=event))
+                item = path / f'{i:08}.json'
+                item.write_bytes(raw)
+                item.chmod(0o600)
+                hashes.append(hashlib.sha256(raw).hexdigest())
+                previous = hashlib.sha256(canonical(event)).hexdigest()
+            marker = path / ('admitted-' + ref)
+            marker.write_bytes(canonical(dict(payload=dict(generation=generation, ref=ref))))
+            marker.chmod(0o600)
+            evidence[generation] = tuple(hashes)
+        self.assertEqual(frontend._closed_create_and_stop(self.registration, self.request, plan, evidence)[0],
+                         candidate)
+        (path / '00000006.json').touch(mode=0o600)
+        with self.assertRaises(scope.ScopeBlocked):
+            frontend._closed_create_and_stop(self.registration, self.request, plan, evidence)
 
     def test_exact_prepared_gate_and_reject_admission_or_drift(self):
         self.assertEqual(self.prepared(), self.digests)
