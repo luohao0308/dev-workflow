@@ -189,7 +189,7 @@ class RetainedWorkerTests(unittest.TestCase):
         def write(operation, **kwargs):
             result = original_write(operation, **kwargs)
             if operation.phase == 'stop-original':
-                self.network['firewall4'] = '9' * 64
+                self.network['firewall6'] = '9' * 64
             return result
 
         self.write_patch.stop()
@@ -204,6 +204,15 @@ class RetainedWorkerTests(unittest.TestCase):
         self.worker._lease = None
         with self.assertRaisesRegex(ScopeBlocked, 'Unresolved'):
             acquire_scope(self.registration, '2' * 64)
+
+    def test_firewall_drift_after_review_blocks_before_lease_or_consumption(self):
+        approval, grant, request, ledger = self._approval(self.worker.deploy_review(), 'deploy')
+        self.network['firewall4'] = '9' * 64
+        with self.assertRaisesRegex(worker_module.RetainedObservationFailed, 'pre-write-protection-network'):
+            self.worker.deploy(approval, grant, request)
+        self.assertIsNone(self.worker._lease)
+        self.assertFalse(ledger.markers)
+        self.assertFalse(self.writes)
 
     def test_closed_start_then_exit_can_restore_without_stopping_candidate(self):
         self.candidate_exits = True

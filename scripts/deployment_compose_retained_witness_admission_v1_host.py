@@ -257,7 +257,9 @@ class RetainedWitnessAdmissionV1:
                 or self._entry['approval'].policy.workflow_sha != child._entry['approval'].policy.workflow_sha
                 or request.policy_hash != child._entry['request'].policy_hash
                 or any(self._cutover[key] != cutover[key] for key in
-                       ('planDigest', 'operationNonce', 'protectionDigest', 'runtimeArchiveDigest'))
+                       ('planDigest', 'operationNonce', 'runtimeArchiveDigest'))
+                or (self._cutover['protectionDigest'] != cutover['protectionDigest']
+                    and (cutover['switchPrefix'] != 1 or cutover['candidateRunning'] is not False))
                 or len(self._scopes) != cutover['switchPrefix'] + 1):
             reject()
         for index, scope in enumerate(self._scopes):

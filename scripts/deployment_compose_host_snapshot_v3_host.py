@@ -419,6 +419,13 @@ class ProductionFrontendProtectionV1:
                                             frontend_ids=frontend_ids))
 
     def verify(self, *, candidate_id=None, timeout=20):
+        return self._compare(candidate_id, timeout, refresh_ipv4=False)
+
+    def prepare_original_restart(self, *, candidate_id, timeout=20):
+        """Pin a fresh IPv4 firewall observation for separately approved recovery."""
+        return self._compare(candidate_id, timeout, refresh_ipv4=True)
+
+    def _compare(self, candidate_id, timeout, *, refresh_ipv4):
         state = _FRONTEND_PROTECTIONS.get(self)
         if state is None or state[0]!=(os.getpid(),threading.get_ident()):
             reject()
@@ -430,5 +437,13 @@ class ProductionFrontendProtectionV1:
         except (ValueError, OSError, KeyError, TypeError):
             raise FrontendProtectionMismatch('protection-capture') from None
         if current!=baseline:
-            raise FrontendProtectionMismatch(_protection_difference(baseline, current))
+            if not refresh_ipv4:
+                raise FrontendProtectionMismatch(_protection_difference(baseline, current))
+            before, after = json.loads(baseline), json.loads(current)
+            if 'firewall4WithoutTransientBans' not in before['network']:
+                raise FrontendProtectionMismatch('protection-network')
+            before['network']['firewall4'] = after['network']['firewall4']
+            if encode(before) != current:
+                raise FrontendProtectionMismatch(_protection_difference(baseline, current))
+            _FRONTEND_PROTECTIONS[self] = (*state[:4], current, bind_endpoint_rules)
         return hashlib.sha256(current).hexdigest()
