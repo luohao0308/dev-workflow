@@ -11,7 +11,7 @@ from deployment_compose_operation_witness_client_v3 import OperationWitnessClien
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1
 from deployment_compose_retained_frontend_worker_v1_host import (
-    POST_WRITE_OBSERVATION_STAGES, RetainedFrontendWorkerV1, RetainedPostWriteObservationFailed,
+    POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedFrontendWorkerV1, RetainedObservationFailed,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
     ConsumedReceiptRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
@@ -29,7 +29,7 @@ CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
-)) | ADMITTED_FAILURE_STAGES | POST_WRITE_OBSERVATION_STAGES
+)) | ADMITTED_FAILURE_STAGES | POST_WRITE_OBSERVATION_STAGES | PRE_WRITE_OBSERVATION_STAGES
 # Leave time for the controller to close the session after its 15-minute review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
 
@@ -147,7 +147,7 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                     return 'verify-consumed-receipt'
                 except RetainedDockerWriteUncertain as error:
                     return error.stage
-                except RetainedPostWriteObservationFailed as error:
+                except RetainedObservationFailed as error:
                     return error.stage
                 except Exception:
                     return stage

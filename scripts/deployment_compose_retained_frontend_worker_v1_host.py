@@ -45,14 +45,21 @@ class RetainedReadinessFailed(RetainedWorkerBlocked):
 POST_WRITE_OBSERVATION_STAGES = frozenset((
     'post-write-owner-check', 'post-write-protection-check', 'post-write-container-check',
 ))
+PRE_WRITE_OBSERVATION_STAGES = frozenset((
+    'pre-write-owner-check', 'pre-write-protection-check', 'pre-write-container-check',
+))
 
 
-class RetainedPostWriteObservationFailed(RetainedWorkerBlocked):
+class RetainedObservationFailed(RetainedWorkerBlocked):
     def __init__(self, stage):
-        if stage not in POST_WRITE_OBSERVATION_STAGES:
-            raise ValueError('invalid post-write observation stage')
+        if stage not in POST_WRITE_OBSERVATION_STAGES | PRE_WRITE_OBSERVATION_STAGES:
+            raise ValueError('invalid observation stage')
         super().__init__(stage)
         self.stage = stage
+
+
+class RetainedPostWriteObservationFailed(RetainedObservationFailed):
+    pass
 
 
 class RetainedFrontendWorkerV1:
@@ -139,20 +146,22 @@ class RetainedFrontendWorkerV1:
     def _container(self, container_id):
         return self._get('/v1.45/containers/' + container_id + '/json')
 
-    def _observe(self, *, require_ready=False, refresh_candidate=False, after_write=False):
-        stage = 'post-write-owner-check'
+    def _observe(self, *, require_ready=False, refresh_candidate=False, after_write=False, recheck_review=False):
+        stage = 'owner-check'
         try:
             self._verify_observer_owner()
-            stage = 'post-write-protection-check'
+            stage = 'protection-check'
             if self._protection.verify(candidate_id=self._candidate_id) != self._protection_digest:
                 raise RetainedWorkerBlocked('production-protection-drift')
-            stage = 'post-write-container-check'
+            stage = 'container-check'
             return self._observe_containers(require_ready=require_ready, refresh_candidate=refresh_candidate)
         except FrontendNotReady:
             raise
         except Exception:
             if after_write:
-                raise RetainedPostWriteObservationFailed(stage) from None
+                raise RetainedPostWriteObservationFailed('post-write-' + stage) from None
+            if recheck_review:
+                raise RetainedObservationFailed('pre-write-' + stage) from None
             raise
 
     def _verify_observer_owner(self):
@@ -202,9 +211,13 @@ class RetainedFrontendWorkerV1:
                             observationDigest=self._observation)
         return dict(deepcopy(self._review), retainedCutover=retained)
 
-    def deploy_review(self):
+    def deploy_review(self, *, recheck_review=False):
         self._check_owner()
-        if self._state != 'prepared' or self._observe() != self._observation:
+        if self._state != 'prepared':
+            raise RetainedWorkerBlocked('production-deploy-review-stale')
+        if self._observe(recheck_review=recheck_review) != self._observation:
+            if recheck_review:
+                raise RetainedObservationFailed('pre-write-container-check')
             raise RetainedWorkerBlocked('production-deploy-review-stale')
         return self._review_for()
 
@@ -289,7 +302,7 @@ class RetainedFrontendWorkerV1:
         raise RetainedReadinessFailed('retained-production-readiness-failed')
 
     def deploy(self, approval, grant, request):
-        review = self.deploy_review()
+        review = self.deploy_review(recheck_review=True)
         self._state = 'blocked'
         first = self._plan.create()
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, first)
