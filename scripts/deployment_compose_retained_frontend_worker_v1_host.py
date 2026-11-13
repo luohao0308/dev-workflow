@@ -42,6 +42,19 @@ class RetainedReadinessFailed(RetainedWorkerBlocked):
     pass
 
 
+POST_WRITE_OBSERVATION_STAGES = frozenset((
+    'post-write-owner-check', 'post-write-protection-check', 'post-write-container-check',
+))
+
+
+class RetainedPostWriteObservationFailed(RetainedWorkerBlocked):
+    def __init__(self, stage):
+        if stage not in POST_WRITE_OBSERVATION_STAGES:
+            raise ValueError('invalid post-write observation stage')
+        super().__init__(stage)
+        self.stage = stage
+
+
 class RetainedFrontendWorkerV1:
     def __init__(self, private_plan, *, operation_nonce, observer, registration,
                  writer_source_sha, writer_archive_digest, policy_hash, witness_transport_factory,
@@ -126,16 +139,31 @@ class RetainedFrontendWorkerV1:
     def _container(self, container_id):
         return self._get('/v1.45/containers/' + container_id + '/json')
 
-    def _observe(self, *, require_ready=False, refresh_candidate=False):
+    def _observe(self, *, require_ready=False, refresh_candidate=False, after_write=False):
+        stage = 'post-write-owner-check'
+        try:
+            self._verify_observer_owner()
+            stage = 'post-write-protection-check'
+            if self._protection.verify(candidate_id=self._candidate_id) != self._protection_digest:
+                raise RetainedWorkerBlocked('production-protection-drift')
+            stage = 'post-write-container-check'
+            return self._observe_containers(require_ready=require_ready, refresh_candidate=refresh_candidate)
+        except FrontendNotReady:
+            raise
+        except Exception:
+            if after_write:
+                raise RetainedPostWriteObservationFailed(stage) from None
+            raise
+
+    def _verify_observer_owner(self):
         self._check_owner()
         self._verify_source()
         if _capture_current_origin(*self._runtime) != self._origin:
             raise RetainedWorkerBlocked('production-writer-identity-changed')
         if self._lease is not None:
             self._lease.check()
-        if self._protection.verify(candidate_id=self._candidate_id) != self._protection_digest:
-            raise RetainedWorkerBlocked('production-protection-drift')
 
+    def _observe_containers(self, *, require_ready, refresh_candidate):
         def sample():
             original = self._container(self._plan.original_id)
             candidate = self._container(self._candidate_id) if self._candidate_id is not None else None
@@ -272,7 +300,7 @@ class RetainedFrontendWorkerV1:
         self._plan._candidate(candidate)
         self._candidate_id = candidate
         self._phase = switched_phase(self._plan, 0)
-        self._observation = self._observe()
+        self._observation = self._observe(after_write=True)
         witnesses = [witness]
         self._deploy_witnesses = tuple(witnesses)
         for index, operation in enumerate(self._plan.switch(candidate), start=1):
@@ -288,7 +316,7 @@ class RetainedFrontendWorkerV1:
             witnesses.append(witness)
             self._prefix = index
             self._phase = switched_phase(self._plan, index)
-            self._observation = self._observe(refresh_candidate=index == 4)
+            self._observation = self._observe(refresh_candidate=index == 4, after_write=True)
             self._deploy_witnesses = tuple(witnesses)
         try:
             self._observation = self._verify_readiness(candidate)
@@ -311,7 +339,7 @@ class RetainedFrontendWorkerV1:
             _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
             witnesses.append(witness)
             self._phase = restored_phase(self._plan, self._phase, operation)
-            self._observation = self._observe()
+            self._observation = self._observe(after_write=True)
         self._observation = self._verify_readiness(self._plan.original_id)
         result = self._finish(request, witnesses)
         self._state = 'restored'
