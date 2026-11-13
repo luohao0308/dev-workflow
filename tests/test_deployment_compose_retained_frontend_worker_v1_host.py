@@ -182,6 +182,29 @@ class RetainedWorkerTests(unittest.TestCase):
         self.assertFalse(ledger.markers)
         self.assertFalse(self.writes)
 
+    def test_post_stop_protection_drift_reports_stage_and_keeps_scope_pending(self):
+        approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
+        original_write = self._write
+
+        def write(operation, **kwargs):
+            result = original_write(operation, **kwargs)
+            if operation.phase == 'stop-original':
+                self.network['firewall4'] = '9' * 64
+            return result
+
+        self.write_patch.stop()
+        with patch.object(RetainedWriteV1, 'write', side_effect=write):
+            with self.assertRaises(worker_module.RetainedPostWriteObservationFailed) as failure:
+                self.worker.deploy(approval, grant, request)
+        self.assertEqual(failure.exception.stage, 'post-write-protection-check')
+        self.assertEqual(self.writes, ['create', 'stop-original'])
+        with self.assertRaises(RetainedWorkerBlocked):
+            self.worker.restore_review()
+        self.worker._lease.close()
+        self.worker._lease = None
+        with self.assertRaisesRegex(ScopeBlocked, 'Unresolved'):
+            acquire_scope(self.registration, '2' * 64)
+
     def test_closed_start_then_exit_can_restore_without_stopping_candidate(self):
         self.candidate_exits = True
         approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
