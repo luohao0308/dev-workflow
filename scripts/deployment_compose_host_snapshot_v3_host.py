@@ -31,6 +31,43 @@ _RUN=Path('/run')
 _UID=0
 _SERVICE=('Id','LoadState','ActiveState','SubState','MainPID','ControlGroup','InvocationID')
 _SOCKET=('Id','LoadState','ActiveState','SubState','InvocationID','Listen')
+FRONTEND_PROTECTION_FAILURES = frozenset((
+    'protection-capture', 'protection-endpoint', 'protection-resources',
+    'protection-container-lifecycle', 'protection-container-configuration',
+    'protection-container-mixed', 'protection-network', 'protection-mixed',
+))
+
+
+class FrontendProtectionMismatch(ValueError):
+    def __init__(self, category):
+        if category not in FRONTEND_PROTECTION_FAILURES:
+            raise ValueError('invalid frontend protection category')
+        super().__init__(category)
+        self.category = category
+
+
+def _protection_difference(baseline, current):
+    before, after = json.loads(baseline), json.loads(current)
+    changed = {key for key in before if before[key] != after[key]}
+    if changed == {'containers'}:
+        old_rows, new_rows = ({row['id']: row for row in value['containers']} for value in (before, after))
+        if old_rows.keys() == new_rows.keys():
+            configuration = any(old_rows[cid]['staticDigest'] != new_rows[cid]['staticDigest'] for cid in old_rows)
+            lifecycle = any(old_rows[cid][key] != new_rows[cid][key]
+                            for cid in old_rows for key in ('startedAt', 'status', 'restartCount'))
+            if configuration and lifecycle:
+                return 'protection-container-mixed'
+            if configuration:
+                return 'protection-container-configuration'
+            if lifecycle:
+                return 'protection-container-lifecycle'
+    if len(changed) != 1:
+        return 'protection-mixed'
+    return {
+        'endpointDigest': 'protection-endpoint',
+        'resources': 'protection-resources',
+        'network': 'protection-network',
+    }.get(changed.pop(), 'protection-mixed')
 
 
 def reject():raise ValueError('compose-host-snapshot-v3-rejected') from None
@@ -387,8 +424,11 @@ class ProductionFrontendProtectionV1:
             reject()
         _,observer,original,protected,baseline,bind_endpoint_rules=state
         ids = (original,) if candidate_id is None else (original, candidate_id)
-        current=_frontend_projection(self._observe(observer,timeout,ids if bind_endpoint_rules else ()),
-                                     original,protected,candidate_id)
+        try:
+            current=_frontend_projection(self._observe(observer,timeout,ids if bind_endpoint_rules else ()),
+                                         original,protected,candidate_id)
+        except (ValueError, OSError, KeyError, TypeError):
+            raise FrontendProtectionMismatch('protection-capture') from None
         if current!=baseline:
-            reject()
+            raise FrontendProtectionMismatch(_protection_difference(baseline, current))
         return hashlib.sha256(current).hexdigest()

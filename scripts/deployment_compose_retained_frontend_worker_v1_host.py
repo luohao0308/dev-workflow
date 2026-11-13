@@ -12,7 +12,9 @@ import os
 import threading
 import time
 
-from deployment_compose_host_snapshot_v3_host import HostSnapshotV3, ProductionFrontendProtectionV1
+from deployment_compose_host_snapshot_v3_host import (
+    FRONTEND_PROTECTION_FAILURES, FrontendProtectionMismatch, HostSnapshotV3, ProductionFrontendProtectionV1,
+)
 from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_origin
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
@@ -44,10 +46,10 @@ class RetainedReadinessFailed(RetainedWorkerBlocked):
 
 POST_WRITE_OBSERVATION_STAGES = frozenset((
     'post-write-owner-check', 'post-write-protection-check', 'post-write-container-check',
-))
+)) | {'post-write-' + category for category in FRONTEND_PROTECTION_FAILURES}
 PRE_WRITE_OBSERVATION_STAGES = frozenset((
     'pre-write-owner-check', 'pre-write-protection-check', 'pre-write-container-check',
-))
+)) | {'pre-write-' + category for category in FRONTEND_PROTECTION_FAILURES}
 
 
 class RetainedObservationFailed(RetainedWorkerBlocked):
@@ -157,7 +159,9 @@ class RetainedFrontendWorkerV1:
             return self._observe_containers(require_ready=require_ready, refresh_candidate=refresh_candidate)
         except FrontendNotReady:
             raise
-        except Exception:
+        except Exception as error:
+            if stage == 'protection-check' and type(error) is FrontendProtectionMismatch:
+                stage = error.category
             if after_write:
                 raise RetainedPostWriteObservationFailed('post-write-' + stage) from None
             if recheck_review:
