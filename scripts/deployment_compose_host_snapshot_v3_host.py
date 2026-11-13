@@ -5,6 +5,7 @@ administration and service lifecycle are trusted/exclusive during observation;
 state checks are not an atomic fence against a hostile root actor.
 """
 import hashlib
+from ipaddress import IPv4Address, IPv4Interface
 import json
 import math
 import os
@@ -139,7 +140,7 @@ class HostSnapshotV3:
 
     def _get(self,path,deadline,budget):
         if (path not in PATHS and path not in ('/v1.45/info', '/v1.45/version')
-                and not re.fullmatch(r'/v1\.45/(?:containers/[0-9a-f]{64}|images/sha256:[0-9a-f]{64})/json',path)):
+                and not re.fullmatch(r'/v1\.45/(?:(?:containers/[0-9a-f]{64}|images/sha256:[0-9a-f]{64})/json|networks/[0-9a-f]{64})',path)):
             reject()
         self._local()
         connection=_UnixDocker('/proc/self/fd/'+str(self._fd)+'/docker.sock',min(3,units._left(deadline)))
@@ -171,13 +172,14 @@ class HostSnapshotV3:
         self._local()
         return value
 
-    def _scan(self,deadline,budget,*,include_definitions=False):
+    def _scan(self,deadline,budget,*,include_definitions=False,frontend_ids=()):
         self._fresh(deadline)
         info=self._get('/v1.45/info',deadline,budget)
         if (type(info) is not dict or info.get('ID')!=self._info_id or info.get('DockerRootDir')!=self._data_root):reject()
         resources=inventory(lambda path:self._get(path,deadline,budget),include_definitions=include_definitions)
         if len(resources['containers'])>64:reject()
         containers=[]
+        frontend_rows = []
         for cid in resources['containers']:
             row=self._get('/v1.45/containers/'+cid+'/json',deadline,budget)
             if (type(row) is not dict or row.get('Id')!=cid or type(row.get('State')) is not dict
@@ -189,6 +191,8 @@ class HostSnapshotV3:
             if (type(state.get('StartedAt')) is not str or len(state['StartedAt'])>128
                     or state.get('Status') not in ('created','running','paused','restarting','removing','exited','dead')):reject()
             settings=row['NetworkSettings']
+            if cid in frontend_ids:
+                frontend_rows.append(row)
             if type(settings.get('Networks')) is not dict or type(settings.get('Ports')) not in (dict,type(None)):reject()
             mounts=row['Mounts']
             if (len(mounts)>128 or any(type(m) is not dict or type(m.get('Destination')) is not str
@@ -198,15 +202,31 @@ class HostSnapshotV3:
                 mounts=sorted(mounts,key=lambda m:m['Destination']),networks=settings['Networks'],ports=settings['Ports'])
             containers.append(dict(id=cid,startedAt=state['StartedAt'],status=state['Status'],
                 restartCount=row['RestartCount'],staticDigest=hashlib.sha256(encode(static)).hexdigest()))
-        network=capture_network(deadline)
+        if frontend_ids:
+            if {row['Id'] for row in frontend_rows} != set(frontend_ids):
+                reject()
+            ids = {endpoint['NetworkID'] for row in frontend_rows
+                   for endpoint in row['NetworkSettings']['Networks'].values()}
+            if len(ids) != 1:
+                reject()
+            network_id, = ids
+            if network_id not in resources['networkDefinitions']:
+                reject()
+            definition = self._get('/v1.45/networks/' + network_id, deadline, budget)
+            if definition.get('Id') != network_id:
+                reject()
+            rules = _frontend_endpoint_rules({network_id: definition}, frontend_rows)
+            network = capture_network(deadline, expected_endpoint_rules=rules)
+        else:
+            network=capture_network(deadline)
         if network['netns']!=self._context['net'] or network['mountns']!=self._context['mnt']:reject()
         self._fresh(deadline)
         return encode(dict(profile=PROFILE,endpointDigest=hashlib.sha256(self._endpoint).hexdigest(),
             resources=resources,containers=containers,network=network))
 
-    def _capture(self,deadline,budget,*,include_definitions=False):
-        first=self._scan(deadline,budget,include_definitions=include_definitions)
-        second=self._scan(deadline,budget,include_definitions=include_definitions)
+    def _capture(self,deadline,budget,*,include_definitions=False,frontend_ids=()):
+        first=self._scan(deadline,budget,include_definitions=include_definitions,frontend_ids=frontend_ids)
+        second=self._scan(deadline,budget,include_definitions=include_definitions,frontend_ids=frontend_ids)
         if first!=second:reject()
         units._left(deadline)
         return first
@@ -265,6 +285,38 @@ class HostSnapshotV3:
         if self._fd is not None:os.close(self._fd);self._fd=None
 
 
+def _frontend_endpoint_rules(definitions, rows):
+    """Derive the exact Docker raw IPv4 rule from each active target endpoint."""
+    rules = []
+    for row in rows:
+        settings = row['NetworkSettings']
+        networks = settings['Networks']
+        if set(networks) != {'luohao-blog-prod_default'} or row['HostConfig'].get('PortBindings') not in (None, {}):
+            reject()
+        endpoint = networks['luohao-blog-prod_default']
+        network_id = endpoint['NetworkID']
+        definition = definitions[network_id]
+        if (not re.fullmatch('[0-9a-f]{64}', network_id)
+                or definition.get('Name') != 'luohao-blog-prod_default'
+                or definition.get('Driver') != 'bridge' or definition.get('Options') != {}):
+            reject()
+        members = definition['Containers'] or {}
+        if row['State']['Status'] != 'running':
+            if row['Id'] in members or endpoint.get('IPAddress') or endpoint.get('EndpointID'):
+                reject()
+            continue
+        member = members[row['Id']]
+        address = IPv4Address(endpoint['IPAddress'])
+        if (address.is_loopback or address.is_unspecified or address.is_multicast
+                or not endpoint['EndpointID'] or member['EndpointID'] != endpoint['EndpointID']
+                or IPv4Interface(member['IPv4Address']).ip != address
+                or any(cid != row['Id'] and other.get('IPv4Address')
+                       and IPv4Interface(other['IPv4Address']).ip == address for cid, other in members.items())):
+            reject()
+        rules.append(f'-A PREROUTING -d {address}/32 ! -i br-{network_id[:12]} -j DROP'.encode('ascii'))
+    return tuple(rules)
+
+
 def _frontend_projection(snapshot, original_id, protected_ids, candidate_id):
     expected = set(protected_ids) | {original_id}
     if candidate_id is not None:
@@ -307,7 +359,7 @@ class ProductionFrontendProtectionV1:
     """
     __slots__ = ('__weakref__',)
 
-    def __init__(self, observer, *, daemon_id, original_id, protected_ids, timeout=20):
+    def __init__(self, observer, *, daemon_id, original_id, protected_ids, timeout=20, bind_endpoint_rules=False):
         if (type(self) is not ProductionFrontendProtectionV1 or type(observer) is not HostSnapshotV3
                 or self in _FRONTEND_PROTECTIONS
                 or type(daemon_id) is not str or daemon_id!=observer._info_id
@@ -316,22 +368,27 @@ class ProductionFrontendProtectionV1:
                 or any(type(item) is not str or not re.fullmatch('[0-9a-f]{64}',item) for item in protected_ids)
                 or tuple(sorted(set(protected_ids)))!=protected_ids or original_id in protected_ids):
             reject()
-        baseline = _frontend_projection(self._observe(observer,timeout),original_id,protected_ids,None)
-        _FRONTEND_PROTECTIONS[self] = ((os.getpid(),threading.get_ident()),observer,original_id,protected_ids,baseline)
+        baseline = _frontend_projection(self._observe(observer, timeout, (original_id,) if bind_endpoint_rules else ()),
+                                        original_id, protected_ids, None)
+        _FRONTEND_PROTECTIONS[self] = ((os.getpid(),threading.get_ident()),observer,original_id,protected_ids,
+                                       baseline,bind_endpoint_rules)
 
     @staticmethod
-    def _observe(observer,timeout):
+    def _observe(observer,timeout,frontend_ids=()):
         observer._check()
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=20:
             reject()
-        return json.loads(observer._capture(time.monotonic()+timeout,[32*1024*1024],include_definitions=True))
+        return json.loads(observer._capture(time.monotonic()+timeout,[32*1024*1024],include_definitions=True,
+                                            frontend_ids=frontend_ids))
 
     def verify(self, *, candidate_id=None, timeout=20):
         state = _FRONTEND_PROTECTIONS.get(self)
         if state is None or state[0]!=(os.getpid(),threading.get_ident()):
             reject()
-        _,observer,original,protected,baseline=state
-        current=_frontend_projection(self._observe(observer,timeout),original,protected,candidate_id)
+        _,observer,original,protected,baseline,bind_endpoint_rules=state
+        ids = (original,) if candidate_id is None else (original, candidate_id)
+        current=_frontend_projection(self._observe(observer,timeout,ids if bind_endpoint_rules else ()),
+                                     original,protected,candidate_id)
         if current!=baseline:
             reject()
         return hashlib.sha256(current).hexdigest()

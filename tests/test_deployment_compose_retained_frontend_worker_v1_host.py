@@ -242,6 +242,26 @@ class RetainedWorkerTests(unittest.TestCase):
         self.worker.restore(approval, grant, rollback)
         self.assertEqual(self.writes[-3:], ['unname-candidate', 'rename-original', 'start-original'])
 
+    def test_denial_after_verified_original_stop_allows_separately_approved_restart(self):
+        approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
+        check = approval.check_consumed_intent
+
+        def deny_after_stop(req):
+            if self.writes == ['create', 'stop-original']:
+                raise AuthorizationUnavailable('fixture denied before rename')
+            check(req)
+
+        with patch.object(approval, 'check_consumed_intent', side_effect=deny_after_stop):
+            with self.assertRaises(AuthorizationUnavailable):
+                self.worker.deploy(approval, grant, request)
+        review = self.worker.restore_review()
+        self.assertEqual(review['retainedCutover']['switchPrefix'], 1)
+        approval, grant, rollback, _ = self._approval(review, 'rollback')
+        self.worker.restore(approval, grant, rollback)
+        self.assertEqual(self.writes, ['create', 'stop-original', 'start-original'])
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+        self.assertEqual(self.other_rows[self.candidate]['State']['Status'], 'created')
+
     @unittest.skipUnless(shutil.which('openssl') and shutil.which('ssh-keygen'), 'OpenSSL and OpenSSH required')
     def test_worker_uses_mtls_native_connection_and_signed_witnesses_for_both_requests(self):
         self.write_patch.stop()

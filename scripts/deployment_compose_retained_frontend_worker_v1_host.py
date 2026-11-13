@@ -96,7 +96,7 @@ class RetainedFrontendWorkerV1:
             raise RetainedWorkerBlocked('production-create-body-drift')
         self._protection = ProductionFrontendProtectionV1(
             observer, daemon_id=registration.daemon_id, original_id=self._plan.original_id,
-            protected_ids=self._plan.protected_ids,
+            protected_ids=self._plan.protected_ids, bind_endpoint_rules=loaded_source is not None,
         )
         self._candidate_id = None
         self._candidate_created_at = None
