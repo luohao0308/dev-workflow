@@ -4,6 +4,8 @@ Unconsumed reconciliation requires a trusted controller adapter that reads
 the exact request marker in the private authorization ledger. Preview and
 apply both need that adapter.
 """
+import base64
+from contextlib import ExitStack
 import hashlib
 import json
 import os
@@ -11,19 +13,23 @@ import stat
 import subprocess
 import time
 
-from deployment_compose_host_snapshot_v3_host import HostSnapshotV3, ProductionFrontendProtectionV1
+from deployment_compose_host_snapshot_v3_host import (
+    HostSnapshotV3, ProductionFrontendProtectionV1, _frontend_projection,
+)
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import GitHubProductionFrontendApprovalV2
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import ScopeBlocked, _directory, _locked_pending_scope
-from deployment_compose_retained_phase_v1_host import original_projection
+from deployment_compose_retained_phase_v1_host import original_projection, restored_phase, switched_phase, verify_phase
 from deployment_compose_retained_write_v1_host import _operation_tuple
 from deployment_compose_scope_reconciliation_v1_host import (
-    FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED, reconcile_pending_scope,
+    FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED,
+    ORIGINAL_RESTORED_AFTER_STOP, reconcile_pending_scope,
     recovery_payload, valid_ledger_sha,
 )
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
+from deployment_gateway import FileWriterGate
 
 
 def _reject():
@@ -172,12 +178,153 @@ def _require_absent_gate(registration, request_digest):
         os.close(root)
 
 
+def _closed_create_and_stop(registration, request_digest, cutover, gate_evidence):
+    """Match two closed operations to independently captured event hashes."""
+    if type(gate_evidence) is not dict or len(gate_evidence) != 2:
+        _reject()
+    if any(not hex_value(generation) or type(digests) is not tuple or len(digests) != 6
+           or not all(hex_value(digest) for digest in digests)
+           for generation, digests in gate_evidence.items()):
+        _reject()
+    gate_name = 'gate-' + request_digest
+    evidence = {}
+    with ExitStack() as stack:
+        root, identity = _directory(registration.root)
+        stack.callback(os.close, root)
+        if identity != registration.root_identity:
+            _reject()
+        gate = _directory_child(root, gate_name)
+        stack.callback(os.close, gate)
+        entries = {'mutex', 'policy.json', *gate_evidence}
+        if set(os.listdir(gate)) != entries:
+            _reject()
+        for generation, digests in gate_evidence.items():
+            fd = _directory_child(gate, generation)
+            stack.callback(os.close, fd)
+            info = os.fstat(fd)
+            names = tuple(f'{i:08}.json' for i in range(6))
+            previous = ZERO
+            events = []
+            for name, digest, kind in zip(names, digests, ('open', 'prepare', 'admit', 'finish', 'close', 'proof')):
+                raw = _private_file(fd, name, 16384)
+                if hashlib.sha256(raw).hexdigest() != digest:
+                    _reject()
+                event = json.loads(raw, object_pairs_hook=pairs)['payload']
+                if (event['kind'] != kind or event['generation'] != generation or event['previous'] != previous
+                        or event['directory'] != [info.st_dev, info.st_ino]):
+                    _reject()
+                if kind == 'proof' and event['data']['payload'] != dict(generation=generation, head=previous):
+                    _reject()
+                previous = hashlib.sha256(canonical(event)).hexdigest()
+                events.append(event['data'])
+            opened, prepared, admitted, response, closed, _ = events
+            attempt = prepared['ref']
+            if (not hex_value(attempt) or admitted != attempt or response['ref'] != attempt
+                    or opened['request_hash'] != request_digest or opened['operations'] != [prepared['operation']]
+                    or closed is not None):
+                _reject()
+            marker_name = 'admitted-' + attempt
+            marker_raw = _private_file(fd, marker_name, 16384)
+            if (json.loads(marker_raw, object_pairs_hook=pairs)['payload'] != dict(generation=generation, ref=attempt)
+                    or set(os.listdir(fd)) != {*names, marker_name} or not _same_entry(gate, generation, fd)):
+                _reject()
+            FileWriterGate._response_data(response)
+            status = response['status']
+            if not response['definitive'] or status not in (201, 204) or status in evidence:
+                _reject()
+            evidence[status] = (prepared['operation'], base64.b64decode(response['bodyBase64'], validate=True),
+                                hashlib.sha256(marker_raw).hexdigest())
+        if set(os.listdir(gate)) != entries or not _same_entry(root, gate_name, gate):
+            _reject()
+    if set(evidence) != {201, 204}:
+        _reject()
+    create, body, create_marker = evidence[201]
+    stop, stop_body, stop_marker = evidence[204]
+    candidate = json.loads(body, object_pairs_hook=pairs)['Id']
+    if (create != list(_operation_tuple(cutover.create())) or stop_body
+            or stop != list(_operation_tuple(cutover.switch(candidate)[0]))):
+        _reject()
+    return candidate, (create_marker, stop_marker)
+
+
+def _observe_restored(registration, request_digest, cutover, review, *, original_baseline, closed_gate_evidence,
+                      caddy_id, network_id, endpoint_digest, verify_ledger_consumed, ledger_target_sha):
+    if not callable(verify_ledger_consumed) or not valid_ledger_sha(ledger_target_sha):
+        _reject()
+    _require_quiescent()
+    candidate, markers = _closed_create_and_stop(registration, request_digest, cutover, closed_gate_evidence)
+    phase = restored_phase(cutover, switched_phase(cutover, 1),
+                           cutover.restore(candidate, switch_prefix=1, candidate_running=False)[0])
+    observer = HostSnapshotV3()
+    try:
+        if observer.descriptor()['endpointDigest'] != endpoint_digest:
+            _reject()
+        identity = review['identity']
+        image_row = observer._get('/v1.45/images/' + identity['imageId'] + '/json',
+                                  time.monotonic() + 5, [2 * 1024 * 1024])
+        image = {key: image_row[key] for key in ('Id', 'Os', 'Architecture', 'Config')}
+        rebuilt = prepare_frontend_plan(
+            original_baseline, image, expected_identity=identity, expected_snapshot_digest=review['snapshotDigest'],
+            network_ids={'luohao-blog-prod_default': network_id}, protected_container_ids=review['protectedContainerIds'],
+        )
+        if canonical(rebuilt['publicReview']) != canonical(review):
+            _reject()
+
+        def sample():
+            rows = [observer._get('/v1.45/containers/' + cid + '/json', time.monotonic() + 5, [2 * 1024 * 1024])
+                    for cid in (cutover.original_id, candidate)]
+            state = verify_phase(cutover, original_baseline, *rows, candidate_id=candidate, phase=phase, require_ready=True)
+            snapshot = ProductionFrontendProtectionV1._observe(observer, 20)
+            protection = _frontend_projection(snapshot, cutover.original_id, cutover.protected_ids, candidate)
+            return hashlib.sha256(state).hexdigest(), hashlib.sha256(protection).hexdigest()
+
+        before = sample()
+        if ProductionCaddyProbeV1(observer, caddy_id=caddy_id, network_id=network_id)(cutover.original_id) is not True:
+            _reject()
+        expected = dict(ref='refs/tags/' + GitHubProductionFrontendApprovalV2.ledger_namespace + '/' + request_digest,
+                        objectSha=ledger_target_sha)
+        if verify_ledger_consumed(request_digest) != expected or sample() != before:
+            _reject()
+        _require_quiescent()
+        if _closed_create_and_stop(registration, request_digest, cutover, closed_gate_evidence) != (candidate, markers):
+            _reject()
+        return hashlib.sha256(canonical(dict(
+            recoveryBasis=ORIGINAL_RESTORED_AFTER_STOP, requestHash=request_digest, endpointDigest=endpoint_digest,
+            planDigest=cutover.digest, candidateId=candidate, closedGateEvidence={
+                key: list(value) for key, value in closed_gate_evidence.items()},
+            admissionMarkers=list(markers), observationDigest=before[0], protectionDigest=before[1],
+            ledgerMarker=expected, caddyId=caddy_id, networkId=network_id,
+        ))).hexdigest()
+    finally:
+        observer.close()
+
+
 def _observe(registration, request_digest, *, private_plan, operation_nonce,
              caddy_id, network_id, endpoint_digest, gate_generation=None, gate_event_digests=None,
              recovery_basis=None, verify_ledger_absent=None,
-             verify_ledger_consumed=None, ledger_target_sha=None):
+             verify_ledger_consumed=None, ledger_target_sha=None,
+             original_baseline=None, closed_gate_evidence=None):
     if (registration.project != 'luohao-blog-prod'
             or not all(hex_value(value) for value in (request_digest, caddy_id, network_id, endpoint_digest))):
+        _reject()
+    if recovery_basis == ORIGINAL_RESTORED_AFTER_STOP:
+        if (gate_generation is not None or gate_event_digests is not None or verify_ledger_absent is not None
+                or type(original_baseline) is not dict):
+            _reject()
+        cutover = prepare_retained_frontend_cutover(private_plan, operation_nonce=operation_nonce)
+        review = private_plan['publicReview']
+        identity = review['identity']
+        if ((identity['hostId'], identity['project'], identity['daemonId']) != (
+                registration.host_id, registration.project, registration.daemon_id)
+                or caddy_id not in cutover.protected_ids):
+            _reject()
+        return _observe_restored(
+            registration, request_digest, cutover, review, original_baseline=original_baseline,
+            closed_gate_evidence=closed_gate_evidence, caddy_id=caddy_id, network_id=network_id,
+            endpoint_digest=endpoint_digest, verify_ledger_consumed=verify_ledger_consumed,
+            ledger_target_sha=ledger_target_sha,
+        )
+    if original_baseline is not None or closed_gate_evidence is not None:
         _reject()
     before_gate = recovery_basis in (LEDGER_UNCONSUMED, LEDGER_CONSUMED_BEFORE_GATE)
     outcome_unknown = recovery_basis == FIRST_CREATE_OUTCOME_UNKNOWN

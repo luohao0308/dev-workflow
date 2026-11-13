@@ -26,7 +26,8 @@ MAX_APPROVAL_SECONDS = 900
 LEDGER_UNCONSUMED = 'ledger-unconsumed'
 LEDGER_CONSUMED_BEFORE_GATE = 'ledger-consumed-before-gate'
 FIRST_CREATE_OUTCOME_UNKNOWN = 'first-create-outcome-unknown'
-_CONSUMED_BASES = (LEDGER_CONSUMED_BEFORE_GATE, FIRST_CREATE_OUTCOME_UNKNOWN)
+ORIGINAL_RESTORED_AFTER_STOP = 'original-restored-after-confirmed-stop'
+_CONSUMED_BASES = (LEDGER_CONSUMED_BEFORE_GATE, FIRST_CREATE_OUTCOME_UNKNOWN, ORIGINAL_RESTORED_AFTER_STOP)
 
 
 def valid_ledger_sha(value):
@@ -64,8 +65,8 @@ def recovery_payload(registration, pending, evidence_digest, observation_digest,
     elif recovery_basis == LEDGER_CONSUMED_BEFORE_GATE:
         payload.update(recoveryBasis=LEDGER_CONSUMED_BEFORE_GATE,
                        legacyMacAuthentication='not-applicable', ledgerTargetSha=ledger_target_sha)
-    elif recovery_basis == FIRST_CREATE_OUTCOME_UNKNOWN:
-        payload.update(recoveryBasis=FIRST_CREATE_OUTCOME_UNKNOWN, ledgerTargetSha=ledger_target_sha)
+    elif recovery_basis in _CONSUMED_BASES:
+        payload.update(recoveryBasis=recovery_basis, ledgerTargetSha=ledger_target_sha)
     return payload
 
 
