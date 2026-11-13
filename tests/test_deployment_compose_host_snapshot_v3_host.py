@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/p) for p in ('scripts','packs/deployment/scripts','packs/release/scripts')]
 import deployment_compose_host_snapshot_v3_host as host
+from deployment_compose_host_commands_v3_host import _left as systemd_time_left
 from deployment_compose_resource_inventory_v3_host import CONTAINERS,IMAGES,NETWORKS,VOLUMES
 
 
@@ -149,6 +150,22 @@ class HostTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             connection.request('POST', '/v1.45/containers/' + 'a' * 64 + '/start')
         self.assertEqual(self.http, before)
+
+    def test_native_write_connection_uses_bounded_systemd_deadline_with_long_write_budget(self):
+        observer = self.observe()
+
+        def command_with_production_deadline(name, deadline):
+            systemd_time_left(deadline)
+            return self.command(name, deadline)
+
+        connection = observer._bound_write_connection(120)
+        self.addCleanup(connection.close)
+        with patch.object(host, 'read_systemd', side_effect=command_with_production_deadline):
+            connection.connect()
+        connection.request('GET', '/v1.45/info')
+        with connection.getresponse() as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.load(response)['ID'], 'production-one')
 
     def test_frontend_protection_tracks_all_other_containers_and_resource_definitions(self):
         original,candidate='e'*64,'f'*64
