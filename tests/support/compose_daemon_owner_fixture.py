@@ -8,8 +8,8 @@ root,nonce,attack=sys.argv[1:]
 if attack=='no-hello':time.sleep(5);raise SystemExit(0)
 hello=dict(kind='daemon-owner-hello-v3',nonce=nonce,root=root,daemonId='daemon-one')
 if attack=='bad-nonce':hello['nonce']='0'*64
-write_frame(sys.stdout.buffer,hello)
 if attack=='stderr':sys.stderr.write('unexpected warning\n');sys.stderr.flush()
+write_frame(sys.stdout.buffer,hello)
 command=read_frame(sys.stdin.buffer,timeout=5)
 if command!={'kind':'daemon-owner-stop-v3','nonce':nonce}:raise ValueError('fixture-stop')
 terminal=dict(kind='daemon-owner-terminal-v3',nonce=nonce,root=root,daemonId='daemon-one',
