@@ -76,7 +76,7 @@ class HostTests(unittest.TestCase):
             patch.object(host,'_root_process'),patch.object(host.units,'_pid_identity',return_value=(self.main,555)),
             patch.object(host,'_peer',side_effect=lambda _:(self.peer,os.getuid(),42)),
             patch.object(host,'_UnixDocker',side_effect=connection),
-            patch.object(host,'capture_network',side_effect=lambda _:deepcopy(self.network)),
+            patch.object(host,'capture_network',side_effect=lambda _, **kwargs:deepcopy(self.network)),
             patch.object(host,'read_systemd',side_effect=self.command)]
         for p in self.patches:p.start();self.addCleanup(p.stop)
     def command(self,name,deadline):
@@ -207,6 +207,25 @@ class HostTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 host.ProductionFrontendProtectionV1(
                     observer,daemon_id=daemon,original_id=original,protected_ids=protected)
+
+    def test_frontend_firewall_rule_is_bound_to_bridge_membership(self):
+        network_id = 'a' * 64
+        name = 'luohao-blog-prod_default'
+        cid = 'b' * 64
+        endpoint = dict(NetworkID=network_id, IPAddress='172.19.0.2', EndpointID='endpoint')
+        row = dict(Id=cid, State={'Status': 'running'}, HostConfig={'PortBindings': {}},
+                   NetworkSettings={'Networks': {name: endpoint}})
+        members = {cid: dict(IPv4Address='172.19.0.2/16', EndpointID='endpoint')}
+        definitions = {network_id: dict(Name=name, Driver='bridge', Options={}, Containers=members)}
+        self.assertEqual(host._frontend_endpoint_rules(definitions, [row]),
+                         (b'-A PREROUTING -d 172.19.0.2/32 ! -i br-aaaaaaaaaaaa -j DROP',))
+        members['c' * 64] = dict(members[cid])
+        with self.assertRaises(ValueError):
+            host._frontend_endpoint_rules(definitions, [row])
+        members.clear()
+        row['State']['Status'] = 'exited'
+        endpoint.update(IPAddress='', EndpointID='')
+        self.assertEqual(host._frontend_endpoint_rules(definitions, [row]), ())
 
 
 class ContextTests(unittest.TestCase):

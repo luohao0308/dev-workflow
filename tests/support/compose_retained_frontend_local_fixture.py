@@ -20,8 +20,10 @@ def run_diagnostic():
     repo = Path(__file__).resolve().parents[2]
     sys.path[:0] = [str(repo / 'scripts'), str(repo / 'packs/deployment/scripts'), str(repo / 'packs/release/scripts')]
     from deployment_compose_reader_host import _UnixDocker
+    from deployment_compose_host_snapshot_v3_host import _frontend_projection
     from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
     from deployment_compose_production_scope_v1_host import acquire_scope, provision_scope
+    from deployment_compose_retained_phase_v1_host import _endpoint_config
 
     def docker(*args):
         return subprocess.run(
@@ -124,24 +126,56 @@ def run_diagnostic():
                     candidate = create(plan.candidate_name, json.loads(plan.create().body))
                     assert not row(candidate)['State']['Running']
                     verify(old, 200)
+                    old_before_stop = row(old)
+
+                    def network_projection():
+                        definition = json.loads(docker('network', 'inspect', network))[0]
+                        return _frontend_projection({
+                            'resources': {'containers': [old, candidate, probe_id],
+                                          'networkDefinitions': {network: definition}},
+                            'containers': [{'id': cid} for cid in (old, candidate, probe_id)],
+                            'endpointDigest': daemon_id,
+                            'network': {},
+                        }, old, (probe_id,), candidate)
 
                     def perform(op):
                         path = op.path.replace('name=blog-frontend', 'name=' + final)
                         assert re.search('/containers/(?:' + old + '|' + candidate + ')/', path)
                         lease.check()
                         api('POST', path, op.body, expected=(204,))
-                    switch_prefix = 3 if scenario == 'stopped-before-start' else 4
+                    switch_prefix = {'stopped-after-original-stop': 1, 'stopped-before-start': 3}.get(scenario, 4)
+                    before_stop_projection = network_projection() if switch_prefix == 1 else None
                     for op in plan.switch(candidate)[:switch_prefix]:
                         perform(op)
-                    assert row(old)['Name'] == '/' + plan.retained_name and (not row(old)['State']['Running'])
+                    stopped = row(old)
+                    expected_original_name = final if switch_prefix == 1 else plan.retained_name
+                    assert stopped['Name'] == '/' + expected_original_name and not stopped['State']['Running']
+                    if switch_prefix == 1:
+                        assert stopped['State']['Status'] == 'exited' and stopped['State']['Pid'] == 0
+                        assert stopped['State']['StartedAt'] == old_before_stop['State']['StartedAt']
+                        assert all(stopped[key] == old_before_stop[key]
+                                   for key in ('Image', 'Config', 'HostConfig', 'Mounts', 'RestartCount'))
+                        assert _endpoint_config(stopped) == _endpoint_config(old_before_stop)
+                        assert network_projection() == before_stop_projection
+                        assert row(candidate)['State']['Status'] == 'created'
                     running = row(candidate)['State']['Running']
                     assert running == (switch_prefix == 4)
                     after = verify(candidate, 503 if fail else 200) if running else None
-                    for op in plan.restore(candidate, switch_prefix=switch_prefix, candidate_running=running):
+                    restoration = plan.restore(candidate, switch_prefix=switch_prefix, candidate_running=running)
+                    if switch_prefix == 1:
+                        assert tuple(op.phase for op in restoration) == ('start-original',)
+                    for op in restoration:
                         perform(op)
                     verify(old, 200)
                     assert row(old)['Name'] == '/' + final and (not row(candidate)['State']['Running'])
                     result = {'scenario': scenario, 'switchHTTP': after['status'] if after else None, 'closedSwitchPrefix': switch_prefix, 'originalRetained': True, 'restoredHTTP': 200, 'singleAliasEndpointVerified': True}
+                    if switch_prefix == 1:
+                        result['changedOriginalNetworkFields'] = sorted(
+                            key for key in stopped['NetworkSettings']
+                            if stopped['NetworkSettings'][key] != old_before_stop['NetworkSettings'].get(key)
+                        )
+                        result['restorationOperations'] = [op.phase for op in restoration]
+                        result['protectedNetworkMembershipUnchanged'] = True
                     lease.complete(hashlib.sha256(encode(result)).hexdigest())
         finally:
             for cid in reversed(owned):
@@ -151,6 +185,7 @@ def run_diagnostic():
             assert inventory() == before, 'local inventory differs after scoped cleanup'
         result['cleanupVerified'] = True
         return result
-    return {'engineVersion': version[0], 'engineApi': version[1], 'imageId': image, 'usesRealFrontendImage': True, 'diagnosticProcess': True, 'scopeLeaseCheckedBeforeWrites': True, 'scenarios': [run(scenario) for scenario in ('healthy-switch', 'failed-http-probe', 'stopped-before-start')]}
+    scenarios = ('healthy-switch', 'failed-http-probe', 'stopped-after-original-stop', 'stopped-before-start')
+    return {'engineVersion': version[0], 'engineApi': version[1], 'imageId': image, 'usesRealFrontendImage': True, 'diagnosticProcess': True, 'scopeLeaseCheckedBeforeWrites': True, 'scenarios': [run(scenario) for scenario in scenarios]}
 if __name__ == '__main__':
     print(json.dumps(run_diagnostic()), flush=True)
