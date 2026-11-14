@@ -11,7 +11,8 @@ from deployment_compose_operation_witness_client_v3 import OperationWitnessClien
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1
 from deployment_compose_retained_frontend_worker_v1_host import (
-    POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedFrontendWorkerV1, RetainedObservationFailed,
+    POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedCutoverWindowTooShort,
+    RetainedFrontendWorkerV1, RetainedObservationFailed,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
     ConsumedReceiptRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
@@ -29,9 +30,11 @@ CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
+    'cutover-window-too-short',
 )) | ADMITTED_FAILURE_STAGES | POST_WRITE_OBSERVATION_STAGES | PRE_WRITE_OBSERVATION_STAGES
-# Leave time for the controller to close the session after its 15-minute review wait.
+# Leave time for the controller to close the session after the longest review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
+ROLLBACK_COMMAND_TIMEOUT = 1620
 
 
 def reject():
@@ -145,6 +148,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                     result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
                 except ConsumedReceiptRejected:
                     return 'verify-consumed-receipt'
+                except RetainedCutoverWindowTooShort:
+                    return 'cutover-window-too-short'
                 except RetainedDockerWriteUncertain as error:
                     return error.stage
                 except RetainedObservationFailed as error:
@@ -168,7 +173,7 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                 return
             channel.emit('restore-prepared', review=restore_review)
             kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
-                                          timeout=REVIEW_COMMAND_TIMEOUT)
+                                          timeout=ROLLBACK_COMMAND_TIMEOUT)
             if kind == 'execute':
                 failure = execute(frame, restore_review, 'rollback')
                 if failure is not None:

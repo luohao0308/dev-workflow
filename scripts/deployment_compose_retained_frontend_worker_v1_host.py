@@ -44,6 +44,15 @@ class RetainedReadinessFailed(RetainedWorkerBlocked):
     pass
 
 
+class RetainedCutoverWindowTooShort(RetainedWorkerBlocked):
+    pass
+
+
+# Four sequential switch operations are still pending when the original is
+# running. Reserve one minute per operation before taking it out of service.
+MIN_CUTOVER_SECONDS = 240
+
+
 POST_WRITE_OBSERVATION_STAGES = frozenset((
     'post-write-owner-check', 'post-write-protection-check', 'post-write-container-check',
 )) | {'post-write-' + category for category in FRONTEND_PROTECTION_FAILURES}
@@ -248,6 +257,9 @@ class RetainedFrontendWorkerV1:
         )
         if request != expected or approval.validate(request) != grant:
             raise RetainedWorkerBlocked('retained-production-request-mismatch')
+        expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
+        if request.operation == 'deploy':
+            self._require_cutover_window(expires_at)
         if self._lease is None:
             self._lease = acquire_scope(self._registration, request.digest())
 
@@ -267,8 +279,12 @@ class RetainedFrontendWorkerV1:
         transport = self._factory(self._observer, first, request.digest(), receipt_hash, execution_digest)
         if type(transport) is not RetainedWriteV1 or transport.observer is not self._observer:
             raise RetainedWorkerBlocked('retained-production-witness-transport-mismatch')
-        expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         return transport, receipt_hash, execution_digest, expires_at
+
+    @staticmethod
+    def _require_cutover_window(expires_at):
+        if expires_at - time.time() < MIN_CUTOVER_SECONDS:
+            raise RetainedCutoverWindowTooShort('production-cutover-window-too-short')
 
     def _write(self, transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at):
         def guard():
@@ -329,6 +345,8 @@ class RetainedFrontendWorkerV1:
                 if self._prefix and self._observe() == self._observation:
                     self._state = 'restoration-ready'
                 raise
+            if index == 1:
+                self._require_cutover_window(expires_at)
             _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
             witnesses.append(witness)
             self._prefix = index

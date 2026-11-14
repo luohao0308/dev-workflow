@@ -182,6 +182,35 @@ class RetainedWorkerTests(unittest.TestCase):
         self.assertFalse(ledger.markers)
         self.assertFalse(self.writes)
 
+    def test_short_authorization_window_keeps_original_serving(self):
+        approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
+        original_authorize = self.worker._authorize
+
+        def limited(*args):
+            transport, receipt, execution, _ = original_authorize(*args)
+            return transport, receipt, execution, worker_module.time.time() + 239
+
+        with patch.object(self.worker, '_authorize', side_effect=limited):
+            with self.assertRaises(worker_module.RetainedCutoverWindowTooShort):
+                self.worker.deploy(approval, grant, request)
+        self.assertEqual(self.writes, ['create'])
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+        self.assertEqual(self.other_rows[self.candidate]['State']['Status'], 'created')
+
+    def test_short_initial_authorization_does_not_open_generation(self):
+        approval, _, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
+        claims = approval.verifier('signed')
+        claims['exp'] = int(worker_module.time.time()) + 239
+        approval.verifier = lambda _: claims
+        grant = approval.validate(request)
+
+        with patch.object(approval, 'consume') as consume:
+            with self.assertRaises(worker_module.RetainedCutoverWindowTooShort):
+                self.worker.deploy(approval, grant, request)
+        consume.assert_not_called()
+        self.assertIsNone(self.worker._lease)
+        self.assertEqual(self.writes, [])
+
     def test_post_stop_protection_drift_reports_stage_and_keeps_scope_pending(self):
         approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
         original_write = self._write

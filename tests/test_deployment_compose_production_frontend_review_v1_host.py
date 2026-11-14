@@ -2,7 +2,7 @@
 import base64
 from copy import copy,deepcopy
 from dataclasses import asdict,replace
-from datetime import datetime,timezone
+from datetime import datetime,timedelta,timezone
 import io,json,os,subprocess,sys,tempfile,threading,unittest,zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -112,6 +112,18 @@ class BridgeTests(unittest.TestCase):
   self.data['/repos/'+host.RUNTIME+'/environments/compose-review/deployment-branch-policies?per_page=100']['branch_policies']=[]
   with self.assertRaises(bridge.LiveReviewBlocked):self.b.request_prepared_review(self.plan,self.req,lambda _:None)
   self.assertFalse(self.posts)
+ def test_retained_rollback_wait_is_bounded_by_request_expiry_and_local_cap(self):
+  review=retained_review(self.plan['publicReview'],'rollback')
+  self.plan['publicReview']=review
+  now=datetime.now(timezone.utc).replace(microsecond=0)
+  with patch.object(bridge.time,'time',return_value=now.timestamp()):
+   for lifetime,wait in ((1200,1200),(1680,1500)):
+    req=host.prepare_production_frontend_request(
+        review,operation='rollback',policy_hash=self.req.policy_hash,
+        expires_at=(now+timedelta(seconds=lifetime)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+    with patch.object(self.b,'_await_review') as await_review:
+     self.b.request_prepared_review(self.plan,req,lambda _:None)
+    self.assertEqual(await_review.call_args.args[-1],now.timestamp()+wait)
  def test_unknown_dispatch_not_retried(self):
   self.dispatch_exit=1
   for _ in range(2):
