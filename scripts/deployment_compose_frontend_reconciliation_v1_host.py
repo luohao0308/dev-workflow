@@ -25,7 +25,7 @@ from deployment_compose_retained_phase_v1_host import original_projection, resto
 from deployment_compose_retained_write_v1_host import _operation_tuple
 from deployment_compose_scope_reconciliation_v1_host import (
     FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED,
-    ORIGINAL_RESTORED_AFTER_STOP, reconcile_pending_scope,
+    ORIGINAL_RESTORED_AFTER_RENAMES, ORIGINAL_RESTORED_AFTER_STOP, reconcile_pending_scope,
     recovery_payload, valid_ledger_sha,
 )
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
@@ -179,8 +179,12 @@ def _require_absent_gate(registration, request_digest):
 
 
 def _closed_create_and_stop(registration, request_digest, cutover, gate_evidence):
-    """Match two closed operations to independently captured event hashes."""
-    if type(gate_evidence) is not dict or len(gate_evidence) != 2:
+    return _closed_switch_prefix(registration, request_digest, cutover, gate_evidence, prefix=1)
+
+
+def _closed_switch_prefix(registration, request_digest, cutover, gate_evidence, *, prefix):
+    """Match each operation in the required prefix to its exact closed receipt."""
+    if prefix not in (1, 3) or type(gate_evidence) is not dict or len(gate_evidence) != prefix + 1:
         _reject()
     if any(not hex_value(generation) or type(digests) is not tuple or len(digests) != 6
            or not all(hex_value(digest) for digest in digests)
@@ -230,31 +234,34 @@ def _closed_create_and_stop(registration, request_digest, cutover, gate_evidence
                 _reject()
             FileWriterGate._response_data(response)
             status = response['status']
-            if not response['definitive'] or status not in (201, 204) or status in evidence:
+            operation = tuple(prepared['operation'])
+            if not response['definitive'] or operation in evidence:
                 _reject()
-            evidence[status] = (prepared['operation'], base64.b64decode(response['bodyBase64'], validate=True),
-                                hashlib.sha256(marker_raw).hexdigest())
+            evidence[operation] = (status, base64.b64decode(response['bodyBase64'], validate=True),
+                                   hashlib.sha256(marker_raw).hexdigest())
         if set(os.listdir(gate)) != entries or not _same_entry(root, gate_name, gate):
             _reject()
-    if set(evidence) != {201, 204}:
+    create = _operation_tuple(cutover.create())
+    if create not in evidence or evidence[create][0] != 201:
         _reject()
-    create, body, create_marker = evidence[201]
-    stop, stop_body, stop_marker = evidence[204]
+    _, body, create_marker = evidence.pop(create)
     candidate = json.loads(body, object_pairs_hook=pairs)['Id']
-    if (create != list(_operation_tuple(cutover.create())) or stop_body
-            or stop != list(_operation_tuple(cutover.switch(candidate)[0]))):
+    expected = tuple(_operation_tuple(op) for op in cutover.switch(candidate)[:prefix])
+    if set(evidence) != set(expected) or any(evidence[op][:2] != (204, b'') for op in expected):
         _reject()
-    return candidate, (create_marker, stop_marker)
+    return candidate, (create_marker, *(evidence[op][2] for op in expected))
 
 
 def _observe_restored(registration, request_digest, cutover, review, *, original_baseline, closed_gate_evidence,
-                      caddy_id, network_id, endpoint_digest, verify_ledger_consumed, ledger_target_sha):
+                      caddy_id, network_id, endpoint_digest, verify_ledger_consumed, ledger_target_sha, recovery_basis):
     if not callable(verify_ledger_consumed) or not valid_ledger_sha(ledger_target_sha):
         _reject()
     _require_quiescent()
-    candidate, markers = _closed_create_and_stop(registration, request_digest, cutover, closed_gate_evidence)
-    phase = restored_phase(cutover, switched_phase(cutover, 1),
-                           cutover.restore(candidate, switch_prefix=1, candidate_running=False)[0])
+    prefix = 3 if recovery_basis == ORIGINAL_RESTORED_AFTER_RENAMES else 1
+    candidate, markers = _closed_switch_prefix(registration, request_digest, cutover, closed_gate_evidence, prefix=prefix)
+    phase = switched_phase(cutover, prefix)
+    for operation in cutover.restore(candidate, switch_prefix=prefix, candidate_running=False):
+        phase = restored_phase(cutover, phase, operation)
     observer = HostSnapshotV3()
     try:
         if observer.descriptor()['endpointDigest'] != endpoint_digest:
@@ -286,10 +293,10 @@ def _observe_restored(registration, request_digest, cutover, review, *, original
         if verify_ledger_consumed(request_digest) != expected or sample() != before:
             _reject()
         _require_quiescent()
-        if _closed_create_and_stop(registration, request_digest, cutover, closed_gate_evidence) != (candidate, markers):
+        if _closed_switch_prefix(registration, request_digest, cutover, closed_gate_evidence, prefix=prefix) != (candidate, markers):
             _reject()
         return hashlib.sha256(canonical(dict(
-            recoveryBasis=ORIGINAL_RESTORED_AFTER_STOP, requestHash=request_digest, endpointDigest=endpoint_digest,
+            recoveryBasis=recovery_basis, requestHash=request_digest, endpointDigest=endpoint_digest,
             planDigest=cutover.digest, candidateId=candidate, closedGateEvidence={
                 key: list(value) for key, value in closed_gate_evidence.items()},
             admissionMarkers=list(markers), observationDigest=before[0], protectionDigest=before[1],
@@ -307,7 +314,7 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
     if (registration.project != 'luohao-blog-prod'
             or not all(hex_value(value) for value in (request_digest, caddy_id, network_id, endpoint_digest))):
         _reject()
-    if recovery_basis == ORIGINAL_RESTORED_AFTER_STOP:
+    if recovery_basis in (ORIGINAL_RESTORED_AFTER_STOP, ORIGINAL_RESTORED_AFTER_RENAMES):
         if (gate_generation is not None or gate_event_digests is not None or verify_ledger_absent is not None
                 or type(original_baseline) is not dict):
             _reject()
@@ -322,7 +329,7 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
             registration, request_digest, cutover, review, original_baseline=original_baseline,
             closed_gate_evidence=closed_gate_evidence, caddy_id=caddy_id, network_id=network_id,
             endpoint_digest=endpoint_digest, verify_ledger_consumed=verify_ledger_consumed,
-            ledger_target_sha=ledger_target_sha,
+            ledger_target_sha=ledger_target_sha, recovery_basis=recovery_basis,
         )
     if original_baseline is not None or closed_gate_evidence is not None:
         _reject()
