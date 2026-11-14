@@ -57,16 +57,22 @@ class FrontendRecoveryTests(unittest.TestCase):
         )
 
     def test_restored_original_requires_exact_closed_create_and_stop(self):
+        self._check_closed_restored_prefix(1)
+
+    def test_restored_original_requires_both_closed_renames_at_prefix_three(self):
+        self._check_closed_restored_prefix(3)
+
+    def _check_closed_restored_prefix(self, prefix):
         candidate = 'f' * 64
         from deployment_compose_production_cutover_v1_host import RetainedFrontendCutoverV1
 
         plan = RetainedFrontendCutoverV1('c' * 64, (), 'dwc-' + '1' * 24 + '-frontend',
                                          'dwb-' + '1' * 24 + '-frontend', b'{}', 'd' * 64)
         evidence = {}
-        for generation, operation, status, body in (
-            (self.generation, plan.create(), 201, canonical({'Id': candidate})),
-            ('e' * 64, plan.switch(candidate)[0], 204, b''),
-        ):
+        writes = [(plan.create(), 201, canonical({'Id': candidate}))]
+        writes.extend((op, 204, b'') for op in plan.switch(candidate)[:prefix])
+        for generation, (operation, status, body) in zip(
+                (self.generation, 'e' * 64, '1' * 64, '2' * 64), writes):
             path = self.gate / generation
             path.mkdir(mode=0o700, exist_ok=True)
             info = path.stat()
@@ -94,11 +100,15 @@ class FrontendRecoveryTests(unittest.TestCase):
             marker.write_bytes(canonical(dict(payload=dict(generation=generation, ref=ref))))
             marker.chmod(0o600)
             evidence[generation] = tuple(hashes)
-        self.assertEqual(frontend._closed_create_and_stop(self.registration, self.request, plan, evidence)[0],
-                         candidate)
+        def verify(records):
+            return frontend._closed_switch_prefix(self.registration, self.request, plan, records, prefix=prefix)
+
+        self.assertEqual(verify(evidence)[0], candidate)
+        with self.assertRaises(scope.ScopeBlocked):
+            verify(dict(list(evidence.items())[:-1]))
         (path / '00000006.json').touch(mode=0o600)
         with self.assertRaises(scope.ScopeBlocked):
-            frontend._closed_create_and_stop(self.registration, self.request, plan, evidence)
+            verify(evidence)
 
     def test_exact_prepared_gate_and_reject_admission_or_drift(self):
         self.assertEqual(self.prepared(), self.digests)
