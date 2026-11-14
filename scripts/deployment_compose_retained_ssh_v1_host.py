@@ -11,7 +11,7 @@ import sys
 import time
 
 from deployment_compose_retained_native_channel_v1_host import (
-    BLOCKED_FIELDS, CONFIGURE, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT,
+    BLOCKED_FIELDS, CONFIGURE, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT, ROLLBACK_COMMAND_TIMEOUT,
 )
 from deployment_compose_retained_native_entry_v1_host import scope_registration
 from deployment_compose_retained_production_unit_v1_host import RetainedProductionUnitV1
@@ -196,7 +196,8 @@ class _Relay:
         self._write(self.process.stdin, reply)
 
     def _execute(self, *, rollback):
-        command = self._controller({'execute': {'request'}, 'finish': set()}, limit=REVIEW_COMMAND_TIMEOUT)
+        command = self._controller({'execute': {'request'}, 'finish': set()},
+                                   limit=ROLLBACK_COMMAND_TIMEOUT if rollback else REVIEW_COMMAND_TIMEOUT)
         self._write(self.process.stdin, command)
         if command['kind'] == 'finish':
             return False

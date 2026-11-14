@@ -124,7 +124,8 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
         workflow=self._get('/actions/workflows/production-frontend-review.yml')
         if workflow.get('path')!=WORKFLOW or workflow.get('state')!='active':
             raise LiveReviewBlocked('Production review workflow unavailable')
-        deadline=min(time.time()+900,parse_stamp(request.expires_at).timestamp())
+        wait_seconds = 1500 if request.operation == 'rollback' else 900
+        deadline=min(time.time()+wait_seconds,parse_stamp(request.expires_at).timestamp())
         session_name='production-review-'+request.digest()
         os.mkdir(session_name,mode=0o700,dir_fd=self._root_fd)
         session_fd=os.open(session_name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=self._root_fd)
