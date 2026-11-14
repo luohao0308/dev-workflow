@@ -42,18 +42,29 @@ class NativeChannelTests(unittest.TestCase):
     def test_restore_preparation_failure_keeps_verified_deploy_result(self):
         self._round_trip(deny_before_start=False, fail_restore_preparation=True)
 
-    def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False):
+    def test_ipv4_drift_after_stop_allows_only_a_fresh_approved_original_restart(self):
+        self._round_trip(deny_before_start=False, ipv4_drift_after_stop=True)
+
+    def test_ipv4_drift_after_restart_review_cannot_consume_recovery_approval(self):
+        self._round_trip(deny_before_start=False, ipv4_drift_after_stop=True, late_ipv4_drift=True)
+
+    def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False,
+                    ipv4_drift_after_stop=False, late_ipv4_drift=False):
         self.write_patch.stop()
+        if ipv4_drift_after_stop:
+            self.network['firewall4WithoutTransientBans'] = 'a' * 64
         original = self.worker._plan
-        prefix = 3 if deny_before_start else 4
+        prefix = 1 if ipv4_drift_after_stop else 3 if deny_before_start else 4
         expected = (original.create(), *original.switch(self.candidate)[:prefix],
-                    *original.restore(self.candidate, switch_prefix=prefix, candidate_running=not deny_before_start))
+                    *original.restore(self.candidate, switch_prefix=prefix, candidate_running=prefix == 4))
         by_path = {operation.path: operation for operation in expected}
 
         def engine_post(path, raw):
             operation = by_path[path]
             self.assertEqual(raw, operation.body)
             status, body, _ = self._write(operation, before_dispatch=lambda: None)
+            if ipv4_drift_after_stop and operation.phase == 'stop-original':
+                self.network['firewall4'] = '9' * 64
             return status, body
 
         self.engine_post = engine_post
@@ -125,7 +136,8 @@ class NativeChannelTests(unittest.TestCase):
                     witness_root=directory, witness_key=b'w'*32, gate_key=b'g'*32,
                     caddy_id=self.row['Id'], network_id=network['NetworkID'], timeout=120)
                 stack.callback(controller.close)
-                approval, grant, request, first_ledger = self._approval(controller.review, 'deploy')
+                deploy_review = controller.review
+                approval, grant, request, first_ledger = self._approval(deploy_review, 'deploy')
                 result = controller.execute(approval, grant, request)
                 if fail_validation:
                     self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
@@ -139,6 +151,12 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(len(result['result']['witnessDigests']), 5)
                     self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
                     self.assertEqual(len(first_ledger.markers), 1)
+                elif ipv4_drift_after_stop:
+                    self.assertIsNone(result['result'])
+                    restored = result['restoreReview']['retainedCutover']
+                    self.assertEqual(restored['switchPrefix'], 1)
+                    self.assertNotEqual(restored['protectionDigest'], deploy_review['retainedCutover']['protectionDigest'])
+                    self.assertEqual(self.writes, ['create', 'stop-original'])
                 elif deny_before_start:
                     self.assertIsNone(result['result'])
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
@@ -146,10 +164,17 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(len(result['result']['witnessDigests']), 5)
                 if not (fail_validation or fail_restore_preparation):
                     approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
+                    if late_ipv4_drift:
+                        self.network['firewall4'] = '8' * 64
                     result = controller.execute(approval, grant, request)
-                    self.assertEqual(len(result['result']['witnessDigests']), prefix)
-                    self.assertEqual(self.writes, [operation.phase for operation in expected])
-                    self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
+                    if late_ipv4_drift:
+                        self.assertTrue(result['blocked'])
+                        self.assertEqual(self.writes, ['create', 'stop-original'])
+                        self.assertFalse(second_ledger.markers)
+                    else:
+                        self.assertEqual(len(result['result']['witnessDigests']), prefix)
+                        self.assertEqual(self.writes, [operation.phase for operation in expected])
+                        self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
             finally:
                 parent_out.close()
                 thread.join(8)

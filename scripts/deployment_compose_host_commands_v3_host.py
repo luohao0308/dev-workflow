@@ -110,9 +110,10 @@ def _routes(raw):
 
 _BRIDGE_DROP = re.compile(rb'-A PREROUTING -d ([0-9.]+)/32 ! -i br-[0-9a-f]{12} -j DROP')
 _LOOPBACK_DROP = re.compile(rb'-A PREROUTING -d 127\.0\.0\.1/32 ! -i lo -p tcp -m tcp --dport [0-9]{1,5} -j DROP')
+_YJ_BAN = re.compile(rb'-A YJ-FIREWALL-INPUT -s [0-9.]+/32 -p (tcp|udp) -m \1 --dport 22 -j REJECT --reject-with icmp-port-unreachable')
 
 
-def firewall_hash(raw, *, expected_endpoint_rules=None):
+def firewall_hash(raw, *, expected_endpoint_rules=None, _project_transient_bans=False):
     """Ignore generated timestamps/chain counters; preserve every rule byte/order."""
     material=[];table=None;seen=set()
     remaining=set(expected_endpoint_rules or ())
@@ -127,6 +128,8 @@ def firewall_hash(raw, *, expected_endpoint_rules=None):
             if table is None:reject()
             table=None
         elif not line.startswith(b'#') and table is None:reject()
+        if _project_transient_bans and table == b'*filter' and _YJ_BAN.fullmatch(line):
+            continue
         if expected_endpoint_rules is not None and table == b'*raw' and line.startswith(b'-A PREROUTING '):
             # Only disjoint destination rules or other terminal DROP rules may
             # share this chain with the Docker-managed endpoint rules.
@@ -159,12 +162,18 @@ def capture_network(deadline, *, expected_endpoint_rules=None):
     # Preflight all binaries before any command: missing IPv6 coverage never passes.
     identities={command[0]:_executable(command[0]) for command in _COMMANDS}
     routes4=_routes(_run(_COMMANDS[0],deadline));routes6=_routes(_run(_COMMANDS[1],deadline))
-    firewall4=firewall_hash(_run(_COMMANDS[2],deadline),expected_endpoint_rules=expected_endpoint_rules)
+    raw4 = _run(_COMMANDS[2],deadline)
+    firewall4=firewall_hash(raw4,expected_endpoint_rules=expected_endpoint_rules)
     firewall6=firewall_hash(_run(_COMMANDS[3],deadline))
     forwards=[_forward(path) for path in _FORWARD]
     if (os.readlink('/proc/self/ns/net')!=netns or os.readlink('/proc/self/ns/mnt')!=mountns
             or any(_executable(path)!=identity for path,identity in identities.items())):reject()
     _left(deadline)
     tools={path:dict(target=value[0],device=value[1],inode=value[2]) for path,value in identities.items()}
-    return dict(profile=PROFILE,netns=netns,mountns=mountns,tools=tools,routes4=routes4,routes6=routes6,
+    result = dict(profile=PROFILE,netns=netns,mountns=mountns,tools=tools,routes4=routes4,routes6=routes6,
         ipForward4=forwards[0],ipForward6=forwards[1],firewall4=firewall4,firewall6=firewall6)
+    if expected_endpoint_rules is not None:
+        result['firewall4WithoutTransientBans'] = firewall_hash(
+            raw4, expected_endpoint_rules=expected_endpoint_rules, _project_transient_bans=True,
+        )
+    return result

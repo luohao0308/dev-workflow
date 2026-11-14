@@ -333,8 +333,22 @@ class RetainedFrontendWorkerV1:
             witnesses.append(witness)
             self._prefix = index
             self._phase = switched_phase(self._plan, index)
-            self._observation = self._observe(refresh_candidate=index == 4, after_write=True)
             self._deploy_witnesses = tuple(witnesses)
+            try:
+                self._observation = self._observe(refresh_candidate=index == 4, after_write=True)
+            except RetainedPostWriteObservationFailed as error:
+                if index == 1 and error.stage == 'post-write-protection-network':
+                    try:
+                        self._verify_observer_owner()
+                        observation = self._observe_containers(require_ready=False, refresh_candidate=False)
+                        self._protection_digest = self._protection.prepare_original_restart(candidate_id=candidate)
+                        if self._observe() != observation:
+                            raise RetainedWorkerBlocked('production-restart-review-drift')
+                    except (ValueError, OSError, KeyError, TypeError):
+                        raise error from None
+                    self._observation = observation
+                    self._state = 'restoration-ready'
+                raise
         try:
             self._observation = self._verify_readiness(candidate)
         except RetainedReadinessFailed:

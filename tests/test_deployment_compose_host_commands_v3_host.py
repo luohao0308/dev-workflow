@@ -13,6 +13,29 @@ import deployment_compose_host_commands_v3_host as host
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_security_agent_rule_changes_remain_visible_across_frontend_stop(self):
+        endpoint = b'-A PREROUTING -d 172.18.0.2/32 ! -i br-aaaaaaaaaaaa -j DROP'
+        jump = b'-A INPUT -j YJ-FIREWALL-INPUT'
+        ban = b'-A YJ-FIREWALL-INPUT -s 192.0.2.41/32 -p tcp -m tcp --dport 22 -j REJECT --reject-with icmp-port-unreachable'
+        unrelated = b'-A FORWARD -j DROP'
+
+        def snapshot(*rules, running, project_bans=False):
+            raw = b'\n'.join((b'*raw', *((endpoint,) if running else ()), b'COMMIT',
+                              b'*filter', b':YJ-FIREWALL-INPUT - [0:0]', *rules, b'COMMIT'))
+            return host.firewall_hash(raw, expected_endpoint_rules=(endpoint,) if running else (),
+                                      _project_transient_bans=project_bans)
+
+        approved = snapshot(jump, ban, running=True)
+        self.assertEqual(approved, snapshot(jump, ban, running=False))
+        for changed in ((jump,), (ban,), (jump, ban, unrelated)):
+            with self.subTest(rules=changed):
+                self.assertNotEqual(approved, snapshot(*changed, running=True))
+                self.assertNotEqual(approved, snapshot(*changed, running=False))
+        projected = snapshot(jump, ban, running=True, project_bans=True)
+        self.assertEqual(projected, snapshot(jump, running=False, project_bans=True))
+        for changed in ((ban,), (jump, ban, unrelated), (jump, ban.replace(b'22', b'443'))):
+            self.assertNotEqual(projected, snapshot(*changed, running=False, project_bans=True))
+
     def test_endpoint_rule_must_exist_once_and_preserves_other_rule_order(self):
         rule = b'-A PREROUTING -d 172.18.0.2/32 ! -i br-aaaaaaaaaaaa -j DROP'
         other = rule.replace(b'.2/32', b'.3/32')

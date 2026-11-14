@@ -191,7 +191,7 @@ class RetainedControllerV1:
             reject()
         return reply
 
-    def _validate_review(self, review, *, rollback=False):
+    def _validate_review(self, review, *, rollback=False, allow_restart_refresh=False):
         review = deepcopy(_closed(review, set(self._base_review) | {'retainedCutover'}))
         cutover = review.pop('retainedCutover')
         fields = {'planDigest', 'operationNonce', 'protectionDigest', 'runtimeArchiveDigest'}
@@ -202,7 +202,9 @@ class RetainedControllerV1:
                 or cutover['operationNonce'] != self._operation_nonce
                 or cutover['runtimeArchiveDigest'] != self._source['archiveDigest']
                 or not hex_value(cutover['protectionDigest'])
-                or self._protection_digest is not None and cutover['protectionDigest'] != self._protection_digest):
+                or self._protection_digest is not None and cutover['protectionDigest'] != self._protection_digest
+                and not (rollback and allow_restart_refresh and cutover['switchPrefix'] == 1
+                         and cutover['candidateRunning'] is False)):
             reject()
         if rollback:
             if (not hex_value(cutover['observationDigest']) or cutover['parentRequestHash'] != self._deploy_request.digest()):
@@ -376,10 +378,12 @@ class RetainedControllerV1:
                         return {'result': result, 'restoreReview': None, 'blocked': False}
                 elif kind == 'restore-prepared' and request.operation == 'deploy' and broker is not None:
                     self._deploy_request, self._parent = request, broker
-                    review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], rollback=True)
+                    review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], rollback=True,
+                                                   allow_restart_refresh=result is None)
                     if result is not None and review['retainedCutover']['switchPrefix'] != 4:
                         reject()
                     self._review = review
+                    self._protection_digest = review['retainedCutover']['protectionDigest']
                     self._state = 'rollback'
                     return {'result': result, 'restoreReview': self.review, 'blocked': False}
                 else:
