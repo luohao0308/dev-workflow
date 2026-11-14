@@ -105,6 +105,8 @@ class NativeChannelTests(unittest.TestCase):
             stack.enter_context(patch.object(loader, 'check_loaded_source', return_value=source))
             stack.enter_context(patch('deployment_compose_host_snapshot_v3_host._frontend_endpoint_rules',
                                       return_value=()))
+            stack.enter_context(patch('deployment_compose_host_snapshot_v3_host._frontend_host_veths',
+                                      return_value=frozenset()))
             network_id = next(iter(self.private['privateBody']['NetworkingConfig']['EndpointsConfig'].values()))['NetworkID']
             self.values['/v1.45/networks/' + network_id] = {'Id': network_id}
             stack.enter_context(patch.object(native, 'ProductionCaddyProbeV1', return_value=lambda _: True))
