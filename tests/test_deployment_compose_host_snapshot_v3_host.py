@@ -229,6 +229,19 @@ class HostTests(unittest.TestCase):
 
 
 class ContextTests(unittest.TestCase):
+    def test_only_exact_kernel_routes_on_verified_frontend_peers_are_projected(self):
+        peer = 'vethabc'
+        common = dict(dev=peer, protocol='kernel', flags=[], pref='medium')
+        link = dict(common, dst='fe80::/64', metric=256)
+        local = dict(common, type='local', dst='fe80::2', table='local', metric=0)
+        multicast = dict(common, type='multicast', dst='ff00::/8', table='local', metric=256)
+        other = [dict(link, dev='vethdef'), dict(link, dst='::/0'), dict(local, dst='2001:db8::1'),
+                 dict(multicast, protocol='static'), dict(link, metric=300)]
+        self.assertEqual(host._without_frontend_link_routes([link, local, multicast, *other], {peer}), other)
+        self.assertEqual(host._without_frontend_link_routes(other, set()), other)
+        with self.assertRaises(ValueError):
+            host._without_frontend_link_routes([local, dict(local, dst='fe80::3')], {peer})
+
     def test_private_namespace_is_not_host_coverage(self):
         links={f'/proc/{pid}/ns/{name}':f'{name}:[1]' for pid in ('self','1') for name in ('net','mnt','pid')}
         links['/proc/self/ns/mnt']='mnt:[2]'

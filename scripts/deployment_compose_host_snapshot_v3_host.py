@@ -5,7 +5,7 @@ administration and service lifecycle are trusted/exclusive during observation;
 state checks are not an atomic fence against a hostile root actor.
 """
 import hashlib
-from ipaddress import IPv4Address, IPv4Interface
+from ipaddress import IPv4Address, IPv4Interface, IPv6Address
 import json
 import math
 import os
@@ -14,6 +14,7 @@ import re
 import socket
 import stat
 import struct
+import subprocess
 import threading
 import time
 import weakref
@@ -253,7 +254,11 @@ class HostSnapshotV3:
             if definition.get('Id') != network_id:
                 reject()
             rules = _frontend_endpoint_rules({network_id: definition}, frontend_rows)
+            veths = _frontend_host_veths(frontend_rows, network_id, deadline)
             network = capture_network(deadline, expected_endpoint_rules=rules)
+            if _frontend_host_veths(frontend_rows, network_id, deadline) != veths:
+                reject()
+            network['routes6'] = _without_frontend_link_routes(network['routes6'], veths)
         else:
             network=capture_network(deadline)
         if network['netns']!=self._context['net'] or network['mountns']!=self._context['mnt']:reject()
@@ -320,6 +325,84 @@ class HostSnapshotV3:
         if os.getpid()!=self._owner:reject()
         self._closed=True
         if self._fd is not None:os.close(self._fd);self._fd=None
+
+
+def _frontend_host_veths(rows, network_id, deadline):
+    """Bind active target interfaces to their reciprocal host bridge peers."""
+    from deployment_compose_recovery_daemon_v3_host import _ticks
+
+    peers = set()
+    for row in rows:
+        if row['State']['Status'] != 'running':
+            continue
+        pid = row['State']['Pid']
+        if type(pid) is not int or pid <= 1:
+            reject()
+        ns = Path('/proc') / str(pid) / 'ns/net'
+        ticks = _ticks(pid)
+        fd = os.open(ns, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            before = os.fstat(fd)
+            host_ns = Path('/proc/self/ns/net').stat()
+            if (type(ticks) is not int or ticks <= 0
+                    or (before.st_dev, before.st_ino) == (host_ns.st_dev, host_ns.st_ino)):
+                reject()
+            result = subprocess.run(
+                ['/usr/bin/nsenter', '--net=/proc/self/fd/' + str(fd), '--',
+                 '/usr/sbin/ip', '-json', 'address', 'show', 'dev', 'eth0'],
+                capture_output=True, check=True, timeout=min(3, units._left(deadline)),
+                env={}, pass_fds=(fd,),
+            )
+        finally:
+            os.close(fd)
+        if len(result.stdout) > 8192 or result.stderr:
+            reject()
+        link, = json.loads(result.stdout)
+        endpoint = row['NetworkSettings']['Networks']['luohao-blog-prod_default']
+        if (link.get('ifname') != 'eth0' or not any(
+                a.get('family') == 'inet' and a.get('local') == endpoint['IPAddress'] for a in link['addr_info'])):
+            reject()
+        matches = [p for p in Path('/sys/class/net').glob('veth*')
+                   if re.fullmatch('veth[0-9a-f]+', p.name)
+                   and (p / 'ifindex').read_text().strip() == str(link['link_index'])]
+        after = ns.stat()
+        if (len(matches) != 1 or _ticks(pid) != ticks
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)):
+            reject()
+        peer, = matches
+        if ((peer / 'master').resolve().name != 'br-' + network_id[:12]
+                or (peer / 'iflink').read_text().strip() != str(link['ifindex'])
+                or peer.name in peers):
+            reject()
+        peers.add(peer.name)
+    return frozenset(peers)
+
+
+def _without_frontend_link_routes(routes, peers):
+    retained = []
+    seen = set()
+    for route in routes:
+        dev = route.get('dev')
+        dst = route.get('dst')
+        if dev not in peers:
+            retained.append(route)
+            continue
+        common = dict(dev=dev, protocol='kernel', flags=[], pref='medium')
+        if route == dict(common, dst='fe80::/64', metric=256):
+            kind = 'link'
+        elif route == dict(common, type='multicast', dst='ff00::/8', table='local', metric=256):
+            kind = 'multicast'
+        elif (type(dst) is str and dst.startswith('fe80:')
+                and route == dict(common, type='local', dst=dst, table='local', metric=0)
+                and IPv6Address(dst).is_link_local):
+            kind = 'local'
+        else:
+            retained.append(route)
+            continue
+        if (dev, kind) in seen:
+            reject()
+        seen.add((dev, kind))
+    return retained
 
 
 def _frontend_endpoint_rules(definitions, rows):
