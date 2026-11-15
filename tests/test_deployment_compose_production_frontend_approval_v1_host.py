@@ -53,7 +53,8 @@ def approved(policy,req):
         data[key]=value
     client.data=data
     token=dict(claims(policy),aud=host.AUDIENCE)
-    approval_type=host.GitHubProductionFrontendApprovalV2 if req.profile_version=='2' else host.GitHubProductionFrontendApprovalV1
+    approval_type={'1':host.GitHubProductionFrontendApprovalV1,'2':host.GitHubProductionFrontendApprovalV2,
+                   '3':host.GitHubProductionFrontendApprovalV3}[req.profile_version]
     approval=approval_type(client,'signed',[req],policy,verifier=lambda _:deepcopy(token))
     return approval,client,token
 
