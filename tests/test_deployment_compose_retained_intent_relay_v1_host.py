@@ -91,6 +91,24 @@ class RetainedRelayTests(unittest.TestCase):
             client.validated_grant(self.request)
         self.assertEqual(methods, ['validate', 'validate', 'consume'])
 
+    def test_challenge_performs_one_mandatory_preflight_at_consumption_edge(self):
+        guards = []
+
+        def consume_transport(rpc, before_consume):
+            def challenge(expected):
+                before_consume()
+                return expected
+
+            self.issuer._preflight_challenge = challenge
+            return self.issuer.authorize_rpc(rpc)
+
+        client = RetainedIntentClientV1(self.request, binding=self.binding, public_key=self.public,
+            transport=self.issuer.authorize_rpc, consume_transport=consume_transport)
+        grant = client.validate(self.request)
+        client.consume(grant, self.request, before_consume=lambda: guards.append('live'), generation=7)
+        self.assertEqual(guards, ['live'])
+        self.assertEqual(len(self.ledger.markers), 1)
+
     def test_tampered_receipt_is_rejected_without_second_consumption(self):
         def corrupt(rpc):
             result = self.issuer.authorize_rpc(rpc)

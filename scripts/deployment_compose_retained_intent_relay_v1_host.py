@@ -116,8 +116,12 @@ class RetainedIntentIssuerV1(_OriginalOwner):
         self._pin = _request_pin(request, binding)
         if (type(approval) is not _APPROVAL_TYPES[request.profile_version]
                 or type(grant) is not ProductionFrontendGrantV1
-                or approval.policy.workflow_sha != binding.runtime_sha or approval.validate(request) != grant
+                or approval.policy.workflow_sha != binding.runtime_sha
                 or preflight_challenge is not None and not callable(preflight_challenge)):
+            reject()
+        checked = (approval.provisional_grant(request) if request.profile_version == '3'
+                   else approval.validate(request))
+        if checked != grant:
             reject()
         self._owner = (os.getpid(), threading.current_thread())
         self._approval, self._request, self._grant = approval, request, grant
@@ -310,10 +314,22 @@ class RetainedIntentClientV1(_OriginalOwner):
             reject()
         self._attempted = True
         self._scope = generation
-        before_consume()
+        challenge_confirmed = False
+
+        def confirm():
+            nonlocal challenge_confirmed
+            if challenge_confirmed:
+                reject()
+            before_consume()
+            challenge_confirmed = True
+
+        if self._consume_transport is None:
+            confirm()
         result, issued, expires = self._call(
-            'consume', grant_hash=_digest(asdict(grant)), before_consume=before_consume,
+            'consume', grant_hash=_digest(asdict(grant)), before_consume=confirm,
         )
+        if not challenge_confirmed:
+            raise ConsumedReceiptRejected('retained-production-consumed-receipt-rejected') from None
         receipt = ProductionFrontendReceiptV1(**result)
         consumed = timestamp(receipt.consumed_at).timestamp()
         if (receipt.grant_id != grant.grant_id or receipt.request_hash != self._pin[0]
