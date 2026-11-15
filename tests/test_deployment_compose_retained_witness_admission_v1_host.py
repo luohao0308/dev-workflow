@@ -45,7 +45,8 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         self.origin = '7'*64
         self.candidate = 'e'*64
         self.protection = '8'*64
-        self.registration = self._registration()
+        if not getattr(self, 'staged_only', False):
+            self.registration = self._registration()
 
     def _registration(self, *, parent=None, prefix=1, candidate=None, stage=None, creation=None,
                       creation_witness=None, switch_witness=None, generation=1, reviewed_generation=1):
@@ -97,7 +98,8 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
                     witness_public_key=self.public, private_plan=self.private, review=review, request=request,
                     approval=approval, consumption=consumption, scope_generation=generation, writer_origin_digest=self.origin)
 
-    def _complete(self, broker, binding, operation, index, *, body=b'', status=204, definitive=True):
+    def _complete(self, broker, binding, operation, index, *, body=b'', status=204, definitive=True,
+                  admit_only=False):
         desc = self._descriptor(broker, operation, index)
         policy = replace(broker._policy, witness_scope_hash=desc['scopeHash'])
         client = broker.client(binding)
@@ -108,6 +110,8 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         attempt = session.prepare_attempt('POST', operation.path, operation.body)
         ticket = gate.admit(session.generation, attempt.ref, method='POST', path=operation.path,
                             body=operation.body, writer_certificate_sha256=self.cert)
+        if admit_only:
+            return client
         gate.finish_response(ticket, definitive=definitive, status=status, body=body)
         if definitive:
             gate.close_generation(session.generation)
