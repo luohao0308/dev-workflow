@@ -13,7 +13,7 @@ import time
 
 from deployment_compose_live_review_v3_host import GitHubLiveReviewV3, LiveReviewBlocked, CONFIG, _private
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV1, GitHubProductionFrontendApprovalV2,
+    GitHubProductionFrontendApprovalV1, GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3,
     prepare_production_frontend_request, PROFILE, RUNTIME)
 from deployment_compose_full_body_review_contract import canonical, parse_stamp
 from deployment_contract_v2 import RequestV2
@@ -22,6 +22,11 @@ WORKFLOW='.github/workflows/production-frontend-review.yml'
 PUBLIC_ARTIFACT='production-frontend-public-review'
 SEALED_ARTIFACT='production-frontend-sealed-oidc'
 _ISSUED=weakref.WeakKeyDictionary()
+_APPROVAL_TYPES = {
+    '1': GitHubProductionFrontendApprovalV1,
+    '2': GitHubProductionFrontendApprovalV2,
+    '3': GitHubProductionFrontendApprovalV3,
+}
 
 
 class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
@@ -166,6 +171,7 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
 
     def _await_review(self,plan,request,on_review,verify,check,payload,deadline):
         dispatched=datetime.now(timezone.utc).replace(microsecond=0)
+        stage = {'stage': plan['publicReview']['retainedCutover']['stage']} if request.profile_version == '3' else {}
         check()
         self._dispatch(payload,check)
         selected=None;raw=None
@@ -187,7 +193,7 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
                 if len(matches)>1:raise LiveReviewBlocked('Multiple matching production reviews')
                 if matches:
                     selected,raw,policy,bundle_hash=matches[0]
-                    on_review(dict(url=selected['html_url'],comment='dev-workflow approve '+bundle_hash,production=True,operation=request.operation,requestHash=request.digest(),expiresAt=request.expires_at))
+                    on_review(dict(url=selected['html_url'],comment='dev-workflow approve '+bundle_hash,production=True,operation=request.operation,requestHash=request.digest(),expiresAt=request.expires_at,**stage))
                     check()
             if selected is not None:
                 run=self._get('/actions/runs/'+str(selected['id']))
@@ -204,10 +210,9 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
                     result=subprocess.run(['/usr/bin/openssl','cms','-decrypt','-inform','DER','-inkey',str(self.key)],input=cipher,capture_output=True,timeout=15)
                     token=result.stdout
                     if result.returncode or len(token)>32768 or not token.isascii() or token.count(b'.')!=2:raise LiveReviewBlocked('Invalid sealed consent')
-                    approval_type=(GitHubProductionFrontendApprovalV2 if request.profile_version=='2'
-                                   else GitHubProductionFrontendApprovalV1)
+                    approval_type=_APPROVAL_TYPES[request.profile_version]
                     approval=approval_type(self.client,token.decode('ascii'),[request],policy)
                     grant=approval.validate(request);check()
-                    return approval,grant,dict(runId=run['id'],url=run['html_url'],requestHash=request.digest(),runtimePermit=False,consumed=False)
+                    return approval,grant,dict(runId=run['id'],url=run['html_url'],requestHash=request.digest(),runtimePermit=False,consumed=False,**stage)
             time.sleep(min(5,max(0,deadline-time.time())))
         raise LiveReviewBlocked('Production review expired; do not retry dispatch')
