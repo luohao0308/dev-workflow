@@ -1,5 +1,6 @@
 """Process loss with real OpenSSH signatures and production-scope flock."""
 from copy import deepcopy
+from contextlib import ExitStack
 from dataclasses import asdict
 import hashlib
 import json
@@ -10,6 +11,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +25,9 @@ from deployment_compose_production_scope_v1_host import (
     ScopeBlocked, ScopeRegistrationV1, acquire_scope, inspect_pending_scope, provision_scope,
 )
 from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
+import deployment_compose_retained_native_channel_v1_host as native
+from deployment_compose_retained_controller_v1_host import RetainedControllerV1
+from deployment_compose_retained_ssh_v1_host import _Relay
 from deployment_compose_retained_recovery_handoff_v1_host import (
     claim_crash_rollback, execute_crash_rollback, observe_confirmed_stop, prepare_crash_rollback_review,
 )
@@ -205,6 +212,129 @@ class RetainedCrashEvidenceTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL required')
     def test_restart_without_http_readiness_keeps_generation_pending(self):
         self._witnessed_restart(ready=False)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL required')
+    def test_crash_restart_round_trip_through_controller_native_and_ssh_relay(self):
+        self._crash_channel(evidence_drift=False)
+
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL required')
+    def test_crash_channel_denies_consumption_if_signed_history_changes_after_review(self):
+        self._crash_channel(evidence_drift=True)
+
+    def _crash_channel(self, *, evidence_drift):
+        case = worker_fixture.RetainedWorkerTests()
+        case.fixed_production_network = True
+        self.addCleanup(case.doCleanups)
+        case.setUp()
+        worker = case.worker
+        prepared = dict(plan=case.private, protection=worker._protection_digest, candidate=case.candidate)
+        scope, root, pending, old_public, key_hash, _, _ = self._interrupt(admit_only=False, prepared=prepared)
+        case._write(worker._plan.create(), before_dispatch=lambda: None)
+        case._write(worker._plan.switch(case.candidate)[0], before_dispatch=lambda: None)
+        case.writes.clear()
+        operation, = worker._plan.restore(case.candidate, switch_prefix=1, candidate_running=False)
+        case.write_patch.stop()
+
+        def engine_post(path, raw):
+            self.assertEqual((path, raw), (operation.path, operation.body))
+            status, body, _ = case._write(operation, before_dispatch=lambda: None)
+            return status, body
+
+        case.engine_post = engine_post
+        observer = case.observe()
+        nonce = '9'*64
+        source = dict(profile='production-retained-v2', channelNonce=nonce, sourceSha='b'*40,
+                      archiveDigest='9'*64, originDigest=hashlib.sha256(b'new-native-owner').hexdigest())
+        pins = dict(root=str(scope.root), rootIdentity=list(scope.root_identity), journalIdentity=list(scope.journal_identity),
+                    hostId=scope.host_id, project=scope.project, daemonId=scope.daemon_id)
+        hello = dict(kind='production-startup', channelNonce=nonce, source=source, scope=pins,
+                     endpointDigest=observer.descriptor()['endpointDigest'])
+        protection = worker_fixture.worker_module.ProductionFrontendProtectionV1
+        capture = protection._observe
+        with ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory())).resolve()
+            keys = [directory/'intent', directory/'witness']
+            for key in keys:
+                subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
+                               check=True, capture_output=True, timeout=10)
+            stack.enter_context(patch.object(native, 'check_loaded_source', return_value=source))
+            stack.enter_context(patch.object(native, 'ProductionCaddyProbeV1', return_value=lambda _: True))
+            stack.enter_context(patch.object(protection, '_observe', side_effect=lambda obs, limit, _: capture(obs, limit)))
+            stack.enter_context(patch('deployment_compose_retained_recovery_handoff_v1_host._capture_current_origin',
+                                      return_value=b'new-native-owner'))
+            stack.enter_context(patch('deployment_compose_retained_recovery_handoff_v1_host.ProductionCaddyProbeV1',
+                                      return_value=lambda _: True))
+            stack.enter_context(patch.object(sys, 'platform', 'linux'))
+
+            def pipe():
+                r, w = os.pipe()
+                return (stack.enter_context(os.fdopen(r, 'rb', buffering=0)),
+                        stack.enter_context(os.fdopen(w, 'wb', buffering=0)))
+
+            relay_in, controller_out = pipe()
+            controller_in, relay_out = pipe()
+            worker_in, relay_to_worker = pipe()
+            relay_from_worker, worker_out = pipe()
+            errors = []
+
+            def background(run, *outputs):
+                try:
+                    run()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    for output in outputs:
+                        output.close()
+
+            manager = _Relay(relay_in, relay_out, SimpleNamespace(stdin=relay_to_worker, stdout=relay_from_worker),
+                             nonce, time.monotonic()+100)
+            threads = [
+                threading.Thread(target=background, args=(manager.run, relay_out, relay_to_worker), daemon=True),
+                threading.Thread(target=background, args=(lambda: native.run_channel(
+                    dict(channelNonce=nonce, workDirectory=str(directory)), object(), observer, scope,
+                    stdin=worker_in, stdout=worker_out), worker_out), daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            try:
+                network, = case.private['privateBody']['NetworkingConfig']['EndpointsConfig'].values()
+                controller = RetainedControllerV1(
+                    controller_out, controller_in, startup=hello, expected_startup=hello, private_plan=case.private,
+                    operation_nonce='1'*64, policy_hash='f'*64, intent_signer=keys[0],
+                    intent_public_key=keys[0].with_suffix('.pub').read_bytes(), witness_signer=keys[1],
+                    witness_public_key=keys[1].with_suffix('.pub').read_bytes(), witness_root=directory,
+                    witness_key=b'w'*32, gate_key=b'g'*32, caddy_id=case.row['Id'], network_id=network['NetworkID'],
+                    recovery=dict(root=root, pending=pending, public_key=old_public, expected_key_hash=key_hash,
+                                  original_baseline=worker._baseline),
+                )
+                stack.callback(controller.close)
+                self.assertEqual(case.writes, [])
+                approval, grant, request, ledger = case._approval(controller.review, 'rollback')
+                if evidence_drift:
+                    first = root/(pending['requestHash'] + '.retained-lineage.json')
+                    first.write_bytes(b'changed after review')
+                    with self.assertRaises(ValueError):
+                        controller.execute(approval, grant, request)
+                    self.assertFalse(ledger.markers)
+                else:
+                    result = controller.execute(approval, grant, request)
+                    self.assertFalse(result['blocked'])
+                    self.assertEqual(result['result']['scopeGeneration'], pending['generation'])
+                    self.assertEqual(len(ledger.markers), 1)
+            finally:
+                controller_out.close()
+                for thread in threads:
+                    thread.join(8)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+        if evidence_drift:
+            self.assertEqual(case.writes, [])
+            self.assertEqual(inspect_pending_scope(scope, pending['requestHash']), pending)
+            return
+        self.assertEqual(errors, [])
+        self.assertEqual(case.writes, ['start-original'])
+        self.assertTrue(case.other_rows[case.original]['State']['Running'])
+        with acquire_scope(scope, 'f'*64) as following:
+            self.assertEqual(following.generation, pending['generation'] + 1)
 
     def _witnessed_restart(self, *, ready):
         case = worker_fixture.RetainedWorkerTests()

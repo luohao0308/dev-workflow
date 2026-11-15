@@ -11,7 +11,7 @@ import sys
 import time
 
 from deployment_compose_retained_native_channel_v1_host import (
-    BLOCKED_FIELDS, CONFIGURE, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT, ROLLBACK_COMMAND_TIMEOUT,
+    BLOCKED_FIELDS, CONFIGURE, CONFIGURE_RECOVERY, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT, ROLLBACK_COMMAND_TIMEOUT,
 )
 from deployment_compose_retained_native_entry_v1_host import scope_registration
 from deployment_compose_retained_production_unit_v1_host import RetainedProductionUnitV1
@@ -239,11 +239,13 @@ class _Relay:
         reject()
 
     def run(self):
-        configuration = self._controller({'configure': CONFIGURE, 'configure-staged': CONFIGURE})
+        configuration = self._controller({'configure': CONFIGURE, 'configure-staged': CONFIGURE,
+                                          'configure-crash-recovery': CONFIGURE_RECOVERY})
         self._write(self.process.stdin, configuration)
         prepared = self._worker({'prepared': {'review', 'writerCertificateSha256'}})
         self._write(self.stdout, prepared)
-        phase = 'create' if configuration['kind'] == 'configure-staged' else 'deploy'
+        phase = {'configure': 'deploy', 'configure-staged': 'create',
+                 'configure-crash-recovery': 'rollback'}[configuration['kind']]
         while phase is not None:
             phase = self._execute(phase)
 
