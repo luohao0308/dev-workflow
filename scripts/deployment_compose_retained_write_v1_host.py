@@ -142,11 +142,13 @@ class RetainedWriteV1:
             _reject()
 
     def write(self, operation, *, request_hash, receipt_hash, plan_digest, index, before_dispatch,
-              expires_at=None):
+              expires_at=None, refresh_intent=None):
         """Return a closed definitive response and its witness evidence digest.
 
         The dispatch guard may return a fresh authorization deadline, which
         can shorten the request's absolute expiry.
+        An optional intent refresh sets the listener deadline after preparation.
+        The full guard still runs before preparation and at admission.
         A definitive non-success is returned for diagnosis and freezes further
         writes. An ambiguous response raises and also freezes the transport.
         """
@@ -158,6 +160,7 @@ class RetainedWriteV1:
         self._check(deadline, expires_at)
         pins = request_hash, receipt_hash, plan_digest
         if (self._blocked or index != self._index or not callable(before_dispatch)
+                or (refresh_intent is not None and not callable(refresh_intent))
                 or self._request is not None and pins != self._request):
             _reject()
         descriptor = self.scope_descriptor(operation, request_hash=request_hash,
@@ -166,9 +169,9 @@ class RetainedWriteV1:
         self._blocked = True
         self._request = pins
 
-        def guard():
+        def guard(check=before_dispatch):
             self._check(deadline, expires_at)
-            fresh_until = before_dispatch()
+            fresh_until = check()
             self._check(deadline, expires_at)
             if fresh_until is None:
                 return expires_at
@@ -216,7 +219,7 @@ class RetainedWriteV1:
 
         # Witness preparation can outlast a signed intent reply. Bind the
         # listener and Docker connection to a fresh reply after preparation.
-        dispatch_expires_at = guard()
+        dispatch_expires_at = guard(refresh_intent if refresh_intent is not None else before_dispatch)
         status, raw = self._relay(gate, pre_dispatch, operation, headers, deadline, dispatch_expires_at)
         # A response to an already dispatched write must still be closed even
         # when authorization has expired since the POST was sent.
