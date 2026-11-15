@@ -19,7 +19,6 @@ import threading
 import time
 
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
-from deployment_compose_operation_witness_client_v3 import decode_material, encode
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
     GitHubProductionFrontendApprovalV2, prepare_production_frontend_request,
@@ -31,7 +30,7 @@ from deployment_compose_retained_native_channel_v1_host import BLOCKED_FIELDS, F
 from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _signer_pin
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_v3_channel_worker import read_frame, write_frame
-from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
+from deployment_compose_witness_store import canonical, hex_value
 from deployment_contract_v2 import RequestV2
 from deployment_gate_witness import key_material
 from deployment_gateway import GatePolicy
@@ -273,27 +272,7 @@ class RetainedControllerV1:
     def _closed_chain(broker):
         if type(broker) is not RetainedWitnessAdmissionV1:
             reject()
-        with broker._lock:
-            if broker._state_pin() != broker._state:
-                reject()
-            evidence = []
-            candidate = None
-            for scope in broker._scopes:
-                candidate = broker._closed_response(scope) or candidate
-                binding = scope['binding']
-                records = broker._store.events_after(binding, seq=0, head=ZERO)
-                events = [json.loads(decode_material(record['externalMaterialBase64']),
-                                     object_pairs_hook=pairs)['payload'] for record in records]
-                gate = dict(generation=binding['generation'], head=_hash(canonical(events[-1])),
-                            binding=events[0]['data'], events=[
-                                dict(kind=event['kind'], data=event['data']) for event in events[1:]
-                            ], closed=True, authorityGranted=False)
-                material = dict(records=records, authorityGranted=False, productionReady=False)
-                evidence.append(_hash(encode(dict(closure=canonical(events[-1]['data']).decode('ascii'),
-                                                   gate=gate, witness=material, binding=binding))))
-            if broker._state_pin() != broker._state:
-                reject()
-            return candidate, evidence
+        return broker.closed_chain()
 
     def _reconcile(self, result, broker, request):
         fields = {'requestHash', 'observationDigest', 'protectionDigest', 'witnessDigests', 'originalId', 'candidateId'}

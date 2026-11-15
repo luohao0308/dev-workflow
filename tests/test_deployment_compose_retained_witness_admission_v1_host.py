@@ -1,4 +1,5 @@
 """Real Gate envelopes and SSH signatures with an explicit GitHub service double."""
+import base64
 from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
@@ -16,7 +17,7 @@ from tests.test_deployment_compose_production_frontend_v3_host import adapter, m
 from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
-from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _digest
+from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _digest, _LINEAGE_NAMESPACE
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_witness_store import ZERO, canonical
 from deployment_gate_witness import key_material
@@ -46,13 +47,25 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         self.protection = '8'*64
         self.registration = self._registration()
 
-    def _registration(self, *, parent=None, prefix=1, candidate=None):
+    def _registration(self, *, parent=None, prefix=1, candidate=None, stage=None, creation=None,
+                      creation_witness=None, switch_witness=None, generation=1, reviewed_generation=1):
         old, policy, _ = fixture()
         cutover = dict(planDigest=self.plan.digest, operationNonce='1'*64,
                        protectionDigest=self.protection, runtimeArchiveDigest='9'*64)
         operation = 'deploy'
         first = self.plan.create()
-        if parent is not None:
+        if stage is not None:
+            cutover['stage'] = stage
+        if stage in ('switch', 'rollback'):
+            candidate = candidate or self.candidate
+            cutover.update(candidateId=candidate, creationRequestHash=creation.digest(),
+                           creationWitnessDigest=creation_witness, observationDigest='6'*64,
+                           scopeGeneration=reviewed_generation)
+            if stage == 'switch':
+                first = self.plan.switch(candidate)[0]
+            else:
+                cutover['switchWitnessDigest'] = switch_witness
+        if parent is not None and stage != 'switch':
             operation = 'rollback'
             candidate = candidate or self.candidate
             cutover.update(candidateId=candidate, switchPrefix=prefix, candidateRunning=False,
@@ -61,15 +74,17 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         review = dict(self.private['publicReview'], retainedCutover=cutover)
         request = host.prepare_production_frontend_request(review, policy_hash=old.policy_hash,
                                                            expires_at=old.expires_at, operation=operation)
-        policy = host.ProductionFrontendApprovalPolicyV2(**dict(vars(policy), operation=operation,
+        policy_type = host.ProductionFrontendApprovalPolicyV3 if stage else host.ProductionFrontendApprovalPolicyV2
+        stage_fields = {'stage': stage} if stage else {}
+        policy = policy_type(**dict(vars(policy), operation=operation,
             snapshot_hash=request.before_hash, body_hash=request.after_hash, plan_hash=request.plan_hash,
             protected_inventory_hash=host._digest(list(request.protected_components)), request_hash=request.digest(),
-            observation_hash=request.observation_hash, history_hash=request.history_hash))
+            observation_hash=request.observation_hash, history_hash=request.history_hash, **stage_fields))
         approval, _, _ = approved(policy, request)
         consumption = approval.consume(approval.validate(request), request)
         receipt_hash = _digest(asdict(consumption))
         execution_digest = _digest(dict(plan=self.plan.digest, approvedReview=request.plan_hash,
-            protection=self.protection, scopeGeneration=1, writerOrigin=self.origin))
+            protection=self.protection, scopeGeneration=generation, writerOrigin=self.origin))
         desc = RetainedWriteV1.scope_descriptor(first, request_hash=request.digest(), receipt_hash=receipt_hash,
                                                 plan_digest=execution_digest, index=0)
         gate_policy = GatePolicy('retained-test', 'retained-key', '4'*64, self.cert, True, desc['scopeHash'],
@@ -80,7 +95,7 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         self.addCleanup(store.close)
         return dict(store=store, gate_policy=gate_policy, gate_key=self.key, witness_signer=self.signer,
                     witness_public_key=self.public, private_plan=self.private, review=review, request=request,
-                    approval=approval, consumption=consumption, scope_generation=1, writer_origin_digest=self.origin)
+                    approval=approval, consumption=consumption, scope_generation=generation, writer_origin_digest=self.origin)
 
     def _complete(self, broker, binding, operation, index, *, body=b'', status=204, definitive=True):
         desc = self._descriptor(broker, operation, index)
@@ -125,6 +140,70 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         self.assertEqual(restored.read()['phase'], 'closed')
         with self.assertRaises(ValueError):
             self._advance(broker, stopped, self.plan.switch(self.candidate)[1], 2)
+
+    def _check_lineage_file(self, registration, broker, parent=None):
+        raw = self._lineage_path(registration).read_bytes()
+        value = json.loads(raw)
+        payload = value['payload']
+        self.assertEqual(payload['requestHash'], registration['request'].digest())
+        self.assertEqual(payload['firstBinding'], broker.first_binding)
+        self.assertEqual(payload['parentBinding'], parent.first_binding if parent else None)
+        self.assertEqual(payload['parentLineageDigest'], parent._lineage_digest if parent else None)
+        allowed = self.root/'allowed-lineage'
+        allowed.write_bytes(b'fixture ' + key_material(self.public) + b'\n')
+        signature = self.root/'lineage.sig'
+        signature.write_bytes(base64.b64decode(value['signature'], validate=True))
+        subprocess.run(['ssh-keygen', '-Y', 'verify', '-f', str(allowed), '-I', 'fixture',
+                        '-n', _LINEAGE_NAMESPACE, '-s', str(signature)], input=canonical(payload),
+                       capture_output=True, check=True)
+
+    def _lineage_path(self, registration):
+        return self.root / (registration['request'].digest() + '.retained-lineage.json')
+
+    def test_staged_brokers_bind_closed_evidence_and_persist_signed_lineage(self):
+        creation = self._registration(stage='create')
+        create = RetainedWitnessAdmissionV1(**creation)
+        created = self._create(create)
+        candidate, witnesses = create.closed_chain()
+        self.assertEqual(candidate, self.candidate)
+        stop = self.plan.switch(candidate)[0]
+        with self.assertRaises(ValueError):
+            self._advance(create, created, stop, 1)
+        self._check_lineage_file(creation, create)
+        switch = self._registration(stage='switch', creation=creation['request'], creation_witness=witnesses[0])
+        cutover = RetainedWitnessAdmissionV1(**switch, parent=create)
+        self._check_lineage_file(switch, cutover, create)
+        self._complete(cutover, cutover.first_binding, stop, 0)
+        _, stopped = cutover.closed_chain()
+        invalid = self._registration(stage='rollback', parent=switch['request'], creation=creation['request'],
+                                     creation_witness=witnesses[0], switch_witness='0'*64)
+        with self.assertRaises(ValueError):
+            RetainedWitnessAdmissionV1(**invalid, parent=cutover)
+        rollback = self._registration(stage='rollback', parent=switch['request'], creation=creation['request'],
+                                      creation_witness=witnesses[0], switch_witness=_digest(stopped))
+        restore = RetainedWitnessAdmissionV1(**rollback, parent=cutover)
+        self._check_lineage_file(rollback, restore, cutover)
+        start = self.plan.restore(candidate, switch_prefix=1, candidate_running=False)[0]
+        client = self._complete(restore, restore.first_binding, start, 0)
+        self.assertEqual(client.read()['phase'], 'closed')
+
+    def test_staged_switch_rejects_wrong_candidate_witness_generation_and_lineage(self):
+        creation = self._registration(stage='create')
+        create = RetainedWitnessAdmissionV1(**creation)
+        self._create(create)
+        _, witnesses = create.closed_chain()
+        verified = dict(stage='switch', creation=creation['request'], creation_witness=witnesses[0])
+        for changes in (dict(candidate='d'*64), dict(creation_witness='0'*64),
+                        dict(generation=2, reviewed_generation=2), dict(reviewed_generation=3)):
+            with self.subTest(changes=changes):
+                invalid = self._registration(**(verified | changes))
+                with self.assertRaises(ValueError):
+                    RetainedWitnessAdmissionV1(**invalid, parent=create)
+                self.assertFalse(self._lineage_path(invalid).exists())
+        lineage = self._lineage_path(creation)
+        lineage.write_bytes(b'changed')
+        with self.assertRaises(ValueError):
+            RetainedWitnessAdmissionV1(**self._registration(**verified), parent=create)
 
     def test_successor_cannot_choose_candidate_or_skip_step(self):
         broker = RetainedWitnessAdmissionV1(**self.registration)
