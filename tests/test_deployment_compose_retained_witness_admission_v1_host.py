@@ -78,6 +78,7 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         policy_type = host.ProductionFrontendApprovalPolicyV3 if stage else host.ProductionFrontendApprovalPolicyV2
         stage_fields = {'stage': stage} if stage else {}
         policy = policy_type(**dict(vars(policy), operation=operation,
+            host_id=request.host_id, daemon_id=request.daemon_id,
             snapshot_hash=request.before_hash, body_hash=request.after_hash, plan_hash=request.plan_hash,
             protected_inventory_hash=host._digest(list(request.protected_components)), request_hash=request.digest(),
             observation_hash=request.observation_hash, history_hash=request.history_hash, **stage_fields))

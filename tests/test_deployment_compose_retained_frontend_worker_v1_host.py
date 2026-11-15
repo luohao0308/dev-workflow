@@ -304,7 +304,7 @@ class RetainedWorkerTests(unittest.TestCase):
         self.assertEqual(self.other_rows[self.candidate]['State']['Status'], 'created')
 
     @unittest.skipUnless(shutil.which('openssl') and shutil.which('ssh-keygen'), 'OpenSSL and OpenSSH required')
-    def _install_mtls_writer(self):
+    def _install_mtls_writer(self, register=None):
         self.write_patch.stop()
         GateFixture.setup_gate_fixture(self)
 
@@ -335,10 +335,14 @@ class RetainedWorkerTests(unittest.TestCase):
             root.mkdir(mode=0o700)
             self.store = signed.OperationWitnessStoreV3(root, key=b'w'*32)
             self.addCleanup(self.store.close)
-            self.store.register_once(binding)
+            transport = self.transport
+            if register is None:
+                self.store.register_once(binding)
+            else:
+                binding, transport = register(self.store, policy)
             return RetainedWriteV1(gate_policy=policy, gate_root=self.registration.root/('gate-'+request_hash),
                 gate_key=b'g'*32, witness_client_factory=lambda value: signed.OperationWitnessClientV3(
-                    value, self.public, self.transport), registered_binding=binding,
+                    value, self.public, transport), registered_binding=binding,
                 tls_server_context=server_tls, tls_client_context=client_tls,
                 server_certificate_sha256=pin('server'), observer=observer, timeout=30)
 
