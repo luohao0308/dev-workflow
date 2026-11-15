@@ -368,18 +368,24 @@ class GitHubActionsApproval:
     def validate(self, request):
         self._match(request)
         self._check_authority()
+        return self._grant_for_checked_authority(request)
+
+    def _grant_for_checked_authority(self, request):
         expires = datetime.fromtimestamp(self._grant_expiry(request), timezone.utc).isoformat()
         return self.grant_type(self.grant_namespace + ':' + str(self.policy.run_id) + ':' + request.operation, request.digest(), expires, 1)
 
     def _ledger_marker(self, request):
         return 'tags/' + self.ledger_namespace + '/' + str(self.policy.run_id) + '/' + self.bundle_hash + '/' + request.operation
 
+    def _consumption_grant(self, request):
+        return self.validate(request)
+
     def consume(self, grant, request, *, before_consume=None):
         """Consume once, optionally checking a trusted SDK guard at the CAS edge."""
         if before_consume is not None and not callable(before_consume):
             _deny('Consumption guard must be callable')
         with self._lock:
-            expected = self.validate(request)
+            expected = self._consumption_grant(request)
             if type(grant) is not self.grant_type or grant != expected or request.digest() in self._consumed:
                 _deny('Grant changed or already consumed')
             marker = 'refs/' + self._ledger_marker(request)
@@ -390,6 +396,8 @@ class GitHubActionsApproval:
                 nonlocal preflight_stage
                 preflight_stage = 'authority'
                 self._check_authority()
+                if self._grant_for_checked_authority(request) != grant:
+                    _deny('Grant changed before consumption')
                 if before_consume is not None:
                     preflight_stage = 'host-guard'
                     before_consume()

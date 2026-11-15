@@ -291,3 +291,15 @@ class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
 class GitHubProductionFrontendApprovalV3(GitHubProductionFrontendApprovalV2):
     policy_type = ProductionFrontendApprovalPolicyV3
     profile_version = '3'
+
+    def provisional_grant(self, request):
+        """Transfer an already checked grant into the live native validation path."""
+        self._match(request)
+        if self._expires is None or time.time() >= self._grant_expiry(request):
+            _deny('Production frontend handoff expired')
+        return self._grant_for_checked_authority(request)
+
+    def _consumption_grant(self, request):
+        # The SDK performs the live authority and exact grant check at the
+        # ledger's before_send edge.
+        return self.provisional_grant(request)

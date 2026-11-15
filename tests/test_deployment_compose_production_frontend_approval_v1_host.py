@@ -60,6 +60,33 @@ def approved(policy,req):
 
 
 class ProductionApprovalTests(unittest.TestCase):
+    def test_staged_grant_handoff_reads_authority_again_at_ledger_edge(self):
+        old, base, review = fixture()
+        review = retained_review(review, 'deploy')
+        review['retainedCutover']['stage'] = 'create'
+        request = host.prepare_production_frontend_request(
+            review, policy_hash=old.policy_hash, expires_at=old.expires_at)
+        policy = host.ProductionFrontendApprovalPolicyV3(**dict(
+            vars(base), stage='create', observation_hash=request.observation_hash,
+            request_hash=request.digest(), plan_hash=request.plan_hash))
+
+        for revoked in (False, True):
+            with self.subTest(revoked=revoked):
+                approval, client, _ = approved(policy, request)
+                with mock.patch.object(approval, '_check_authority', wraps=approval._check_authority) as authority:
+                    grant = approval.provisional_grant(request)
+                    authority.assert_not_called()
+                    if revoked:
+                        path = '/repos/' + host.RUNTIME + '/actions/runs/' + str(policy.run_id) + '/approvals'
+                        client.data[path][0]['comment'] = 'approval changed'
+                        with self.assertRaises(AuthorizationUnavailable):
+                            approval.consume(grant, request)
+                        self.assertFalse(client.markers)
+                    else:
+                        approval.consume(grant, request)
+                        self.assertEqual(len(client.markers), 1)
+                    authority.assert_called_once_with()
+
     def test_live_retained_approval_rechecks_fresh_batches_and_consumed_ledger(self):
         import deployment_compose_live_review_v3_host as live
 

@@ -212,7 +212,11 @@ class GitHubProductionFrontendReviewV1(GitHubLiveReviewV3):
                     if result.returncode or len(token)>32768 or not token.isascii() or token.count(b'.')!=2:raise LiveReviewBlocked('Invalid sealed consent')
                     approval_type=_APPROVAL_TYPES[request.profile_version]
                     approval=approval_type(self.client,token.decode('ascii'),[request],policy)
-                    grant=approval.validate(request);check()
+                    if request.profile_version == '3':
+                        grant = approval.provisional_grant(request)
+                    else:
+                        grant = approval.validate(request)
+                    check()
                     return approval,grant,dict(runId=run['id'],url=run['html_url'],requestHash=request.digest(),runtimePermit=False,consumed=False,**stage)
             time.sleep(min(5,max(0,deadline-time.time())))
         raise LiveReviewBlocked('Production review expired; do not retry dispatch')
