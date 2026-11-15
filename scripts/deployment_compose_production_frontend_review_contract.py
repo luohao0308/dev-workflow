@@ -99,6 +99,9 @@ def summary(raw,env):
                            f"Observation: `{request.observation_hash}`.\n\n")
             if stage=='rollback':
                 retained+=f"Switch witness: `{cutover['switchWitnessDigest']}`.\n\n"
+                if 'recoveryJournalDigest' in cutover:
+                    retained+=(f"Abandoned journal: `{cutover['recoveryJournalDigest']}`. "
+                               f"Recovered evidence: `{cutover['recoveryEvidenceDigest']}`.\n\n")
         if request.operation=='rollback':
             if request.profile_version=='2':
                 retained+=(f"Candidate: `{cutover['candidateId']}`. Observation: `{request.observation_hash}`. ")

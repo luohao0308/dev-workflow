@@ -276,6 +276,7 @@ class _Session:
     expected: bytes
     state: str = 'started'
     cleanup: weakref.finalize | None = None
+    takeover: tuple[str, bytes] | None = None
 
 
 def _session(lease):
@@ -292,6 +293,20 @@ def _check_started(value):
     try:
         if _read(value.registration, value.fd) != value.expected:
             _block('Production scope journal differs from owned attempt')
+        if value.takeover is not None:
+            name, expected = value.takeover
+            root_fd, identity = _directory(value.registration.root)
+            try:
+                if identity != value.registration.root_identity:
+                    _block('Production scope directory changed during recovery')
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root_fd)
+                try:
+                    if _file_info(fd).st_size != len(expected) or os.read(fd, len(expected) + 1) != expected:
+                        _block('Production recovery claim changed')
+                finally:
+                    os.close(fd)
+            finally:
+                os.close(root_fd)
     except BaseException:
         value.state = 'uncertain'
         raise
@@ -379,16 +394,68 @@ def acquire_scope(registration, request_digest):
         expected = raw + start
         if _read(registration, fd) != expected:
             _block('Production scope start could not be verified')
-        lease = object.__new__(ScopeLeaseV1)
-        pid = os.getpid()
-        value = _Session(fd, (pid, threading.current_thread()), registration,
-                         request_digest, generation, expected)
-        _LEASES[lease] = value
-        value.cleanup = weakref.finalize(lease, _close_owned_journal, pid, fd)
-        return lease
+        return _new_lease(fd, registration, request_digest, generation, expected)
     except BaseException:
         _close_journal(fd)
         raise
+
+
+def _new_lease(fd, registration, request, generation, expected, *, takeover=None):
+    lease = object.__new__(ScopeLeaseV1)
+    pid = os.getpid()
+    value = _Session(fd, (pid, threading.current_thread()), registration, request, generation, expected,
+                     takeover=takeover)
+    _LEASES[lease] = value
+    value.cleanup = weakref.finalize(lease, _close_owned_journal, pid, fd)
+    return lease
+
+
+def _claim_pending_scope(registration, pending, recovery_request, authorize):
+    """Retain a one-time recovery claim under the same journal lock."""
+    if (type(pending) is not dict or set(pending) != {'generation', 'requestHash', 'journalDigest'}
+            or type(pending['generation']) is not int or not hex_value(recovery_request)
+            or recovery_request == pending['requestHash'] or not callable(authorize)):
+        _block('Exact pending production recovery required')
+    with _locked_pending_scope(registration, pending['requestHash'], writable=True) as (fd, raw, actual):
+        if actual != pending:
+            _block('Production recovery journal differs from approval')
+        name = f"{_name(registration.project)}.takeover-{actual['generation']}.json"
+        directory, identity = _directory(registration.root)
+        try:
+            if identity != registration.root_identity:
+                _block('Production recovery scope changed')
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                _block('Production recovery already claimed for this generation')
+            terminal = _line(dict(state='verified', generation=actual['generation'],
+                                  request=actual['requestHash'], proof='0'*64))
+            if len(raw) + len(terminal) > MAX_BYTES:
+                _block('Production scope journal capacity exhausted')
+            proof = authorize()
+            if not hex_value(proof) or _read(registration, fd) != raw:
+                _block('Production recovery authorization could not be verified')
+            material = _line(dict(pending=actual, recoveryRequest=recovery_request, proof=proof))
+            marker = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+            try:
+                _append(marker, material)
+            finally:
+                os.close(marker)
+            os.fsync(directory)
+            with _FD_LOCK:
+                owned_fd = os.dup(fd)
+                _LOCK_FDS.add(owned_fd)
+            try:
+                return _new_lease(owned_fd, registration, actual['requestHash'], actual['generation'], raw,
+                                  takeover=(name, material))
+            except BaseException:
+                _close_journal(owned_fd)
+                raise
+        finally:
+            os.close(directory)
 
 
 def _close_owned_journal(pid, fd):

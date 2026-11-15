@@ -402,6 +402,8 @@ class RetainedWorkerTests(unittest.TestCase):
             self.assertEqual(next_scope.generation, generation + 1)
 
     def test_staged_expiry_after_stop_preserves_a_rollback_review(self):
+        from deployment_compose_retained_recovery_handoff_v1_host import observe_confirmed_stop
+
         approval, grant, create, _ = self._approval(self.worker.create_review(), 'deploy')
         self.worker.create(approval, grant, create)
         approval, grant, switch, _ = self._approval(self.worker.switch_review(), 'deploy')
@@ -421,6 +423,19 @@ class RetainedWorkerTests(unittest.TestCase):
         self.assertEqual(pins['switchPrefix'], 1)
         self.assertEqual(pins['parentRequestHash'], switch.digest())
         self.assertEqual(pins['creationRequestHash'], create.digest())
+        observer = self.observe()
+        endpoint = observer.descriptor()['endpointDigest']
+        protection = worker_module.ProductionFrontendProtectionV1
+        capture = protection._observe
+        # The basic fixture has no endpoint-specific firewall rules.
+        with patch.object(protection, '_observe', side_effect=lambda obs, limit, _: capture(obs, limit)):
+            observation = observe_confirmed_stop(observer, self.private, self.worker._baseline, pins,
+                                                 endpoint_digest=endpoint)
+            self.assertRegex(observation, r'^[0-9a-f]{64}$')
+            self.other_rows[self.candidate]['State']['Status'] = 'exited'
+            with self.assertRaises(ValueError):
+                observe_confirmed_stop(observer, self.private, self.worker._baseline, pins, endpoint_digest=endpoint)
+            self.other_rows[self.candidate]['State']['Status'] = 'created'
         approval, grant, rollback, _ = self._approval(review, 'rollback')
         self.worker.restore(approval, grant, rollback)
         self.assertEqual(self.writes, ['create', 'stop-original', 'start-original'])

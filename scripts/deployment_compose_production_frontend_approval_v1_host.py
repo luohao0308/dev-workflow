@@ -27,6 +27,7 @@ STAGED_CANDIDATE_FIELDS = {
     'candidateId', 'creationRequestHash', 'creationWitnessDigest', 'observationDigest', 'scopeGeneration',
 }
 STAGED_ROLLBACK_FIELDS = {'parentRequestHash', 'switchWitnessDigest', 'switchPrefix', 'candidateRunning'}
+STAGED_RECOVERY_FIELDS = {'recoveryJournalDigest', 'recoveryEvidenceDigest'}
 
 
 def _digest(value):
@@ -69,6 +70,8 @@ def _staged_pins(review, cutover, operation):
         fields |= STAGED_CANDIDATE_FIELDS
     if stage == 'rollback':
         fields |= STAGED_ROLLBACK_FIELDS
+        if STAGED_RECOVERY_FIELDS & cutover.keys():
+            fields |= STAGED_RECOVERY_FIELDS
     if set(cutover) != fields:
         _deny('Invalid staged frontend scope')
     for key in fields - {'stage', 'scopeGeneration', 'switchPrefix', 'candidateRunning'}:
