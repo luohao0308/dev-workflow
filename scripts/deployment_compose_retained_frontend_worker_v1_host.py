@@ -287,16 +287,20 @@ class RetainedFrontendWorkerV1:
             raise RetainedCutoverWindowTooShort('production-cutover-window-too-short')
 
     def _write(self, transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at):
-        def guard():
-            if self._observe() != self._observation:
-                raise RetainedWorkerBlocked('retained-production-write-drift')
+        def refresh_intent():
             checked = approval.check_consumed_intent(request)
             if type(approval) is RetainedIntentClientV1:
                 return checked
 
+        def guard():
+            if self._observe() != self._observation:
+                raise RetainedWorkerBlocked('retained-production-write-drift')
+            return refresh_intent()
+
         status, raw, witness = transport.write(
             operation, request_hash=request.digest(), receipt_hash=receipt_hash,
             plan_digest=execution_digest, index=index, before_dispatch=guard, expires_at=expires_at,
+            refresh_intent=refresh_intent,
         )
         if not hex_value(witness) or (operation.phase == 'create' and status != 201
                                      or operation.phase != 'create' and (status != 204 or raw != b'')):
