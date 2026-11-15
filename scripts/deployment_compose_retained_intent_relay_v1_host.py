@@ -225,6 +225,7 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._consume_transport = consume_transport
         self._attempted = False
         self._grant = self._receipt = self._scope = None
+        self._validation_expires_at = None
 
     @property
     def binding(self):
@@ -280,7 +281,7 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._match(request)
         if self._attempted:
             reject()
-        result, _, _ = self._call('validate')
+        result, _, validation_expiry = self._call('validate')
         grant = ProductionFrontendGrantV1(**result)
         expiry = timestamp(grant.expires_at).timestamp()
         if (grant.request_hash != self._pin[0] or type(grant.max_uses) is not int or grant.max_uses != 1
@@ -289,7 +290,17 @@ class RetainedIntentClientV1(_OriginalOwner):
                 or self._grant is not None and grant != self._grant):
             reject()
         self._grant = grant
+        self._validation_expires_at = min(validation_expiry, expiry)
         return grant
+
+    def validated_grant(self, request):
+        """Reuse the initial signed validation during the worker handoff."""
+        self._match(request)
+        if self._attempted:
+            reject()
+        if self._grant is not None and time.time() < self._validation_expires_at:
+            return self._grant
+        return self.validate(request)
 
     def consume(self, grant, request, *, before_consume, generation):
         self._match(request)

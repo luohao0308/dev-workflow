@@ -255,7 +255,10 @@ class RetainedFrontendWorkerV1:
         expected = prepare_production_frontend_request(
             review, policy_hash=self._policy_hash, expires_at=request.expires_at, operation=request.operation,
         )
-        if request != expected or approval.validate(request) != grant:
+        if request != expected:
+            raise RetainedWorkerBlocked('retained-production-request-mismatch')
+        validated = approval.validated_grant(request) if relayed else approval.validate(request)
+        if validated != grant:
             raise RetainedWorkerBlocked('retained-production-request-mismatch')
         expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         if request.operation == 'deploy':
