@@ -1,4 +1,4 @@
-"""Live native host embedding for V2 frontend replacement and restoration.
+"""Live native host embedding for retained frontend replacement and restoration.
 
 The installed host supplies its scope registration, runtime source pins,
 independent witness registrar and Caddy readiness probe. This module has no
@@ -18,7 +18,8 @@ from deployment_compose_host_snapshot_v3_host import (
 from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_origin
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV2, prepare_production_frontend_request,
+    GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3,
+    prepare_production_frontend_request,
 )
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1, acquire_scope
@@ -123,6 +124,7 @@ class RetainedFrontendWorkerV1:
         self._prefix = 0
         self._lease = None
         self._parent = None
+        self._creation = None
         self._deploy_witnesses = ()
         self._state = 'prepared'
         self._protection_digest = self._protection.verify()
@@ -215,13 +217,20 @@ class RetainedFrontendWorkerV1:
                 self._candidate_created_at = stamp
         return hashlib.sha256(raw).hexdigest()
 
-    def _review_for(self, *, rollback=False):
+    def _review_for(self, *, rollback=False, stage=None):
         retained = dict(planDigest=self._plan.digest, operationNonce=self._nonce,
                         protectionDigest=self._protection_digest, runtimeArchiveDigest=self._runtime[1])
         if rollback:
             retained.update(candidateId=self._candidate_id, switchPrefix=self._prefix,
                             candidateRunning=self._phase.candidate_running, parentRequestHash=self._parent,
                             observationDigest=self._observation)
+        if stage is not None:
+            retained['stage'] = stage
+            if stage != 'create':
+                retained.update(self._creation, candidateId=self._candidate_id,
+                                observationDigest=self._observation, scopeGeneration=self._lease.generation)
+            if stage == 'rollback':
+                retained['switchWitnessDigest'] = digest(list(self._deploy_witnesses))
         return dict(deepcopy(self._review), retainedCutover=retained)
 
     def deploy_review(self, *, recheck_review=False):
@@ -239,11 +248,31 @@ class RetainedFrontendWorkerV1:
         if self._state not in ('deployed', 'restoration-ready') or not 1 <= self._prefix <= 4:
             raise RetainedWorkerBlocked('production-restoration-prefix-unavailable')
         self._observation = self._observe(refresh_candidate=self._prefix == 4)
-        return self._review_for(rollback=True)
+        stage = 'rollback' if self._creation is not None else None
+        return self._review_for(rollback=True, stage=stage)
+
+    def create_review(self):
+        self.deploy_review(recheck_review=True)
+        return self._review_for(stage='create')
+
+    def switch_review(self):
+        self._check_owner()
+        if self._state != 'candidate-created' or self._lease is None or self._creation is None:
+            raise RetainedWorkerBlocked('production-switch-review-stale')
+        if self._observe(recheck_review=True) != self._observation:
+            raise RetainedObservationFailed('pre-write-container-check')
+        return self._review_for(stage='switch')
 
     def _authorize(self, approval, grant, request, review, first):
+        stage = review['retainedCutover'].get('stage')
         relayed = type(approval) is RetainedIntentClientV1
-        if relayed:
+        if stage is not None:
+            # The existing framed channel and witness broker only accept V2.
+            if (type(approval) is not GitHubProductionFrontendApprovalV3
+                    or approval.policy.workflow_sha != self._runtime[0] or approval.policy.stage != stage
+                    or stage != 'create' and self._lease is None):
+                raise RetainedWorkerBlocked('retained-production-staged-approval-required')
+        elif relayed:
             binding = approval.binding
             if (binding.runtime_sha, binding.archive_digest, binding.origin_digest, binding.protection_digest) != (
                     self._runtime[0], self._runtime[1], hashlib.sha256(self._origin).hexdigest(),
@@ -258,8 +287,10 @@ class RetainedFrontendWorkerV1:
         if request != expected or approval.validate(request) != grant:
             raise RetainedWorkerBlocked('retained-production-request-mismatch')
         expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
-        if request.operation == 'deploy':
+        if request.operation == 'deploy' and stage != 'create':
             self._require_cutover_window(expires_at)
+        if stage == 'switch':
+            self._state = 'blocked'
         if self._lease is None:
             self._lease = acquire_scope(self._registration, request.digest())
 
@@ -327,14 +358,40 @@ class RetainedFrontendWorkerV1:
         first = self._plan.create()
         transport, receipt_hash, execution_digest, expires_at = self._authorize(approval, grant, request, review, first)
         self._parent = request.digest()
-        raw, witness = self._write(transport, approval, request, first, 0, receipt_hash, execution_digest, expires_at)
+        proof = (receipt_hash, execution_digest, expires_at)
+        witness = self._create(transport, approval, request, first, proof)
+        return self._switch(transport, approval, request, proof, [witness], write_offset=1)
+
+    def create(self, approval, grant, request):
+        review = self.create_review()
+        self._state = 'blocked'
+        first = self._plan.create()
+        transport, *proof = self._authorize(approval, grant, request, review, first)
+        witness = self._create(transport, approval, request, first, proof)
+        self._creation = dict(creationRequestHash=request.digest(), creationWitnessDigest=witness)
+        self._state = 'candidate-created'
+        return self._result(request, [witness])
+
+    def _create(self, transport, approval, request, first, proof):
+        raw, witness = self._write(transport, approval, request, first, 0, *proof)
         response = json.loads(raw, object_pairs_hook=pairs)
         candidate = response['Id']
         self._plan._candidate(candidate)
         self._candidate_id = candidate
         self._phase = switched_phase(self._plan, 0)
         self._observation = self._observe(after_write=True)
-        witnesses = [witness]
+        return witness
+
+    def switch(self, approval, grant, request):
+        review = self.switch_review()
+        first = self._plan.switch(self._candidate_id)[0]
+        transport, *proof = self._authorize(approval, grant, request, review, first)
+        self._parent = request.digest()
+        return self._switch(transport, approval, request, proof, [], write_offset=0)
+
+    def _switch(self, transport, approval, request, proof, witnesses, *, write_offset):
+        candidate = self._candidate_id
+        _, _, expires_at = proof
         self._deploy_witnesses = tuple(witnesses)
         for index, operation in enumerate(self._plan.switch(candidate), start=1):
             try:
@@ -347,7 +404,7 @@ class RetainedFrontendWorkerV1:
                 raise
             if index == 1:
                 self._require_cutover_window(expires_at)
-            _, witness = self._write(transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at)
+            _, witness = self._write(transport, approval, request, operation, index - 1 + write_offset, *proof)
             witnesses.append(witness)
             self._prefix = index
             self._phase = switched_phase(self._plan, index)
@@ -373,7 +430,7 @@ class RetainedFrontendWorkerV1:
             self._observation = self._observe(refresh_candidate=True)
             self._state = 'restoration-ready'
             raise
-        result = self._finish(request, witnesses)
+        result = self._result(request, witnesses) if self._creation is not None else self._finish(request, witnesses)
         self._state = 'deployed'
         return result
 
@@ -394,12 +451,16 @@ class RetainedFrontendWorkerV1:
         self._state = 'restored'
         return result
 
-    def _finish(self, request, witnesses):
+    def _result(self, request, witnesses):
         result = dict(requestHash=request.digest(), observationDigest=self._observation,
                       protectionDigest=self._protection_digest, witnessDigests=witnesses,
                       originalId=self._plan.original_id, candidateId=self._candidate_id)
         if request.operation == 'rollback':
             result.update(parentRequestHash=self._parent, parentWitnessDigests=list(self._deploy_witnesses))
+        return result
+
+    def _finish(self, request, witnesses):
+        result = self._result(request, witnesses)
         self._lease.complete(digest(result))
         self._lease.close()
         self._lease = None

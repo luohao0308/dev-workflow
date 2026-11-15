@@ -20,7 +20,7 @@ from tests import test_deployment_runtime as tls_fixture
 from deployment_compose_retained_frontend_worker_v1_host import RetainedFrontendWorkerV1, RetainedWorkerBlocked
 import deployment_compose_retained_frontend_worker_v1_host as worker_module
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
-from deployment_compose_production_scope_v1_host import ScopeBlocked, acquire_scope, provision_scope
+from deployment_compose_production_scope_v1_host import ScopeBlocked, acquire_scope, inspect_pending_scope, provision_scope
 from release_execute import AuthorizationUnavailable
 from deployment_gateway import GatePolicy
 
@@ -76,7 +76,7 @@ class RetainedWorkerTests(unittest.TestCase):
             registration=self.registration, writer_source_sha='b'*40, writer_archive_digest='b'*64,
             policy_hash='f'*64, witness_transport_factory=self._transport,
             readiness=lambda active: self.ready or active == self.original, readiness_timeout=1)
-        self.addCleanup(self.worker.close)
+        self.addCleanup(lambda: self.worker.close() if self.worker._state != 'closed' else None)
 
     @staticmethod
     def _transport(observer, *_):
@@ -127,11 +127,14 @@ class RetainedWorkerTests(unittest.TestCase):
         old, policy, _ = fixture()
         request = host.prepare_production_frontend_request(review, policy_hash=old.policy_hash,
             expires_at=old.expires_at, operation=operation)
-        policy = host.ProductionFrontendApprovalPolicyV2(**dict(vars(policy), operation=operation,
+        stage = review['retainedCutover'].get('stage')
+        policy_type = host.ProductionFrontendApprovalPolicyV3 if stage else host.ProductionFrontendApprovalPolicyV2
+        stage_fields = {'stage': stage} if stage else {}
+        policy = policy_type(**dict(vars(policy), operation=operation,
             host_id=request.host_id, daemon_id=request.daemon_id,
             snapshot_hash=request.before_hash, body_hash=request.after_hash, plan_hash=request.plan_hash,
             protected_inventory_hash=host._digest(list(request.protected_components)), request_hash=request.digest(),
-            observation_hash=request.observation_hash, history_hash=request.history_hash))
+            observation_hash=request.observation_hash, history_hash=request.history_hash, **stage_fields))
         approval, client, _ = approved(policy, request)
         return approval, approval.validate(request), request, client
 
@@ -301,7 +304,7 @@ class RetainedWorkerTests(unittest.TestCase):
         self.assertEqual(self.other_rows[self.candidate]['State']['Status'], 'created')
 
     @unittest.skipUnless(shutil.which('openssl') and shutil.which('ssh-keygen'), 'OpenSSL and OpenSSH required')
-    def test_worker_uses_mtls_native_connection_and_signed_witnesses_for_both_requests(self):
+    def _install_mtls_writer(self):
         self.write_patch.stop()
         GateFixture.setup_gate_fixture(self)
 
@@ -333,7 +336,7 @@ class RetainedWorkerTests(unittest.TestCase):
             self.store = signed.OperationWitnessStoreV3(root, key=b'w'*32)
             self.addCleanup(self.store.close)
             self.store.register_once(binding)
-            return RetainedWriteV1(gate_policy=policy, gate_root=self.root/('gate-'+request_hash),
+            return RetainedWriteV1(gate_policy=policy, gate_root=self.registration.root/('gate-'+request_hash),
                 gate_key=b'g'*32, witness_client_factory=lambda value: signed.OperationWitnessClientV3(
                     value, self.public, self.transport), registered_binding=binding,
                 tls_server_context=server_tls, tls_client_context=client_tls,
@@ -352,8 +355,109 @@ class RetainedWorkerTests(unittest.TestCase):
 
         self.worker._factory = factory
         self.engine_post = engine_post
+        return operations
+
+    def test_worker_uses_mtls_native_connection_and_signed_witnesses_for_both_requests(self):
+        operations = self._install_mtls_writer()
         approval, grant, request, _ = self._approval(self.worker.deploy_review(), 'deploy')
         self.assertEqual(len(self.worker.deploy(approval, grant, request)['witnessDigests']), 5)
         approval, grant, request, _ = self._approval(self.worker.restore_review(), 'rollback')
         self.assertEqual(len(self.worker.restore(approval, grant, request)['witnessDigests']), 4)
         self.assertEqual(self.writes, [operation.phase for operation in operations])
+
+    def test_staged_worker_keeps_one_scope_through_create_switch_and_restore(self):
+        operations = self._install_mtls_writer()
+        approval, grant, create, ledger = self._approval(self.worker.create_review(), 'deploy')
+        prepared = self.worker.create(approval, grant, create)
+        self.assertEqual(self.writes, ['create'])
+        self.assertEqual(len(ledger.markers), 1)
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+        lease = self.worker._lease
+        generation = lease.generation
+        cutover = self.worker.switch_review()
+        pins = cutover['retainedCutover']
+        self.assertEqual(pins['creationRequestHash'], create.digest())
+        self.assertEqual(pins['creationWitnessDigest'], prepared['witnessDigests'][0])
+        self.assertEqual(pins['scopeGeneration'], lease.generation)
+
+        approval, grant, switch, ledger = self._approval(cutover, 'deploy')
+        deployed = self.worker.switch(approval, grant, switch)
+        self.assertIs(self.worker._lease, lease)
+        self.assertEqual(len(deployed['witnessDigests']), 4)
+        self.assertEqual(len(ledger.markers), 1)
+
+        review = self.worker.restore_review()
+        pins = review['retainedCutover']
+        self.assertEqual(pins['parentRequestHash'], switch.digest())
+        self.assertEqual(pins['switchWitnessDigest'], worker_module.digest(deployed['witnessDigests']))
+        self.assertEqual(pins['scopeGeneration'], lease.generation)
+        approval, grant, rollback, ledger = self._approval(review, 'rollback')
+        result = self.worker.restore(approval, grant, rollback)
+        self.assertEqual(len(result['witnessDigests']), 4)
+        self.assertIsNone(self.worker._lease)
+        self.assertEqual(self.writes, [operation.phase for operation in operations])
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+        self.assertEqual(len(ledger.markers), 1)
+        with acquire_scope(self.registration, 'a' * 64) as next_scope:
+            self.assertEqual(next_scope.generation, generation + 1)
+
+    def test_staged_expiry_after_stop_preserves_a_rollback_review(self):
+        approval, grant, create, _ = self._approval(self.worker.create_review(), 'deploy')
+        self.worker.create(approval, grant, create)
+        approval, grant, switch, _ = self._approval(self.worker.switch_review(), 'deploy')
+        check = approval.check_consumed_intent
+
+        def expire_after_stop(request):
+            if self.writes[-1:] == ['stop-original']:
+                raise AuthorizationUnavailable('fixture approval expired')
+            return check(request)
+
+        with patch.object(approval, 'check_consumed_intent', side_effect=expire_after_stop):
+            with self.assertRaises(AuthorizationUnavailable):
+                self.worker.switch(approval, grant, switch)
+        self.assertEqual(self.writes, ['create', 'stop-original'])
+        review = self.worker.restore_review()
+        pins = review['retainedCutover']
+        self.assertEqual(pins['switchPrefix'], 1)
+        self.assertEqual(pins['parentRequestHash'], switch.digest())
+        self.assertEqual(pins['creationRequestHash'], create.digest())
+        approval, grant, rollback, _ = self._approval(review, 'rollback')
+        self.worker.restore(approval, grant, rollback)
+        self.assertEqual(self.writes, ['create', 'stop-original', 'start-original'])
+
+    def test_staged_short_switch_window_leaves_candidate_ready_for_new_review(self):
+        approval, grant, create, _ = self._approval(self.worker.create_review(), 'deploy')
+        self.worker.create(approval, grant, create)
+        review = self.worker.switch_review()
+        approval, _, request, ledger = self._approval(review, 'deploy')
+        claims = approval.verifier('signed')
+        claims['exp'] = int(worker_module.time.time()) + 239
+        approval.verifier = lambda _: claims
+        grant = approval.validate(request)
+
+        with self.assertRaises(worker_module.RetainedCutoverWindowTooShort):
+            self.worker.switch(approval, grant, request)
+        self.assertEqual(self.worker.switch_review(), review)
+        self.assertFalse(ledger.markers)
+        self.assertEqual(self.writes, ['create'])
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+
+    def test_staged_owner_loss_keeps_creation_generation_pending(self):
+        from deployment_compose_frontend_reconciliation_v1_host import _closed_switch_prefix
+
+        self._install_mtls_writer()
+        approval, grant, request, _ = self._approval(self.worker.create_review(), 'deploy')
+        self.worker.create(approval, grant, request)
+        generation = self.worker._lease.generation
+        self.worker.close()
+        self.assertEqual(inspect_pending_scope(self.registration, request.digest())['generation'], generation)
+        with self.assertRaises(ScopeBlocked):
+            acquire_scope(self.registration, 'a' * 64)
+        self.assertTrue(self.other_rows[self.original]['State']['Running'])
+        gate = self.registration.root / ('gate-' + request.digest())
+        proof_scope, = (entry for entry in gate.iterdir() if entry.is_dir())
+        receipt = tuple(hashlib.sha256((proof_scope / f'{index:08}.json').read_bytes()).hexdigest()
+                        for index in range(6))
+        candidate, _ = _closed_switch_prefix(self.registration, request.digest(), self.worker._plan,
+                                             {proof_scope.name: receipt}, prefix=0)
+        self.assertEqual(candidate, self.candidate)
