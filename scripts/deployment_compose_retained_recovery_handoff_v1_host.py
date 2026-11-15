@@ -16,6 +16,7 @@ from deployment_compose_production_frontend_approval_v1_host import (
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import _claim_pending_scope
 from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
+from deployment_compose_retained_intent_relay_v1_host import RetainedIntentClientV1
 from deployment_compose_retained_phase_v1_host import FrontendNotReady, restored_phase, switched_phase, verify_phase
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_witness_store import canonical, hex_value
@@ -127,23 +128,44 @@ def claim_crash_rollback(registration, root, pending, *, public_key, expected_ke
     Call the returned guard at the final write admission, then verify restoration
     before completing the lease. This helper does not dispatch Docker requests.
     """
-    if (type(approval) is not GitHubProductionFrontendApprovalV3 or type(request) is not RequestV2
-            or request.operation != 'rollback' or approval.policy.stage != 'rollback'
-            or approval.policy.workflow_sha != runtime_sha or type(observer) is not HostSnapshotV3
-            or (request.host_id, request.target.namespace, request.daemon_id)
+    if (type(approval) is not GitHubProductionFrontendApprovalV3 or approval.policy.stage != 'rollback'
+            or approval.policy.workflow_sha != runtime_sha):
+        _reject()
+
+    def history(pending_now, plan, review_now):
+        verify_crash_rollback_evidence(root, pending_now, public_key=public_key,
+                                       expected_key_hash=expected_key_hash, private_plan=plan, review=review_now)
+
+    return _claim_crash_rollback(
+        registration, pending, private_plan=private_plan, original_baseline=original_baseline,
+        observer=observer, endpoint_digest=endpoint_digest, review=review, approval=approval,
+        grant=grant, request=request, policy_hash=approval.policy.policy_hash, verify_history=history,
+    )
+
+
+def _claim_crash_rollback(registration, pending, *, private_plan, original_baseline, observer, endpoint_digest,
+                          review, approval, grant, request, policy_hash, verify_history=None):
+    if (type(request) is not RequestV2 or request.operation != 'rollback' or request.profile_version != '3'
+            or type(observer) is not HostSnapshotV3 or (request.host_id, request.target.namespace, request.daemon_id)
             != (registration.host_id, registration.project, registration.daemon_id)):
         _reject()
     frozen_review = deepcopy(review)
     frozen_pending = deepcopy(pending)
     frozen_plan = deepcopy(private_plan)
     frozen_baseline = deepcopy(original_baseline)
-    expected = prepare_production_frontend_request(frozen_review, policy_hash=approval.policy.policy_hash,
+    expected = prepare_production_frontend_request(frozen_review, policy_hash=policy_hash,
                                                    expires_at=request.expires_at, operation='rollback')
     if request != expected:
         _reject()
     cutover = frozen_review['retainedCutover']
+    if (cutover.get('recoveryJournalDigest') != frozen_pending['journalDigest']
+            or cutover.get('creationRequestHash') != frozen_pending['requestHash']
+            or cutover.get('scopeGeneration') != frozen_pending['generation']
+            or cutover.get('switchPrefix') != 1 or cutover.get('candidateRunning') is not False):
+        _reject()
     receipt = None
     expires = None
+    relayed = type(approval) is RetainedIntentClientV1
 
     def check_live():
         observation = observe_confirmed_stop(observer, frozen_plan, frozen_baseline, cutover,
@@ -153,14 +175,17 @@ def claim_crash_rollback(registration, root, pending, *, public_key, expected_ke
 
     def authorize():
         nonlocal receipt, expires
-        verify_crash_rollback_evidence(root, frozen_pending, public_key=public_key,
-                                       expected_key_hash=expected_key_hash, private_plan=frozen_plan,
-                                       review=frozen_review)
+        if verify_history is not None:
+            verify_history(frozen_pending, frozen_plan, frozen_review)
         if approval.validate(request) != grant:
             _reject()
         expires = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         check_live()
-        receipt = approval.consume(grant, request, before_consume=check_live)
+        if relayed:
+            receipt = approval.consume(grant, request, before_consume=check_live,
+                                       generation=frozen_pending['generation'])
+        else:
+            receipt = approval.consume(grant, request, before_consume=check_live)
         check_live()
         if time.time() >= expires:
             _reject()
@@ -174,10 +199,10 @@ def claim_crash_rollback(registration, root, pending, *, public_key, expected_ke
     def guard():
         lease.check()
         check_live()
-        approval.check_consumed_intent(request)
+        checked = approval.check_consumed_intent(request)
         if time.time() >= expires:
             _reject()
-        return expires
+        return min(expires, checked) if relayed else expires
 
     return lease, receipt, operation, guard
 
@@ -186,6 +211,46 @@ def execute_crash_rollback(registration, root, pending, *, public_key, expected_
                            private_plan, original_baseline, observer, endpoint_digest, review, approval,
                            grant, request, runtime_sha, witness_writer_factory, caddy_id, readiness_timeout=60):
     """Restart the one retained original through the witnessed native writer."""
+    def claim(plan, baseline, review_now, origin):
+        return claim_crash_rollback(
+            registration, root, pending, public_key=public_key, expected_key_hash=expected_key_hash,
+            private_plan=plan, original_baseline=baseline, observer=observer, endpoint_digest=endpoint_digest,
+            review=review_now, approval=approval, grant=grant, request=request, runtime_sha=runtime_sha,
+        )
+
+    return _execute_crash_rollback(
+        private_plan, original_baseline, observer, endpoint_digest, review, grant, request, runtime_sha,
+        witness_writer_factory, caddy_id, readiness_timeout, claim,
+    )
+
+
+def execute_relayed_crash_rollback(registration, pending, *, private_plan, original_baseline, observer,
+                                   endpoint_digest, review, approval, grant, request, runtime_sha,
+                                   policy_hash, witness_writer_factory, caddy_id):
+    """Restart through an owned intent relay with independently verified history."""
+    def claim(plan, baseline, review_now, origin):
+        if type(approval) is not RetainedIntentClientV1:
+            _reject()
+        cutover = review_now['retainedCutover']
+        binding = approval.binding
+        if (binding.runtime_sha, binding.archive_digest, binding.origin_digest, binding.protection_digest) != (
+                runtime_sha, cutover['runtimeArchiveDigest'], hashlib.sha256(origin).hexdigest(),
+                cutover['protectionDigest']):
+            _reject()
+        return _claim_crash_rollback(
+            registration, pending, private_plan=plan, original_baseline=baseline, observer=observer,
+            endpoint_digest=endpoint_digest, review=review_now, approval=approval, grant=grant,
+            request=request, policy_hash=policy_hash,
+        )
+
+    return _execute_crash_rollback(
+        private_plan, original_baseline, observer, endpoint_digest, review, grant, request, runtime_sha,
+        witness_writer_factory, caddy_id, 60, claim,
+    )
+
+
+def _execute_crash_rollback(private_plan, original_baseline, observer, endpoint_digest, review, grant, request,
+                            runtime_sha, witness_writer_factory, caddy_id, readiness_timeout, claim):
     if (not callable(witness_writer_factory) or type(readiness_timeout) not in (int, float)
             or not 1 <= readiness_timeout <= 180):
         _reject()
@@ -198,11 +263,7 @@ def execute_crash_rollback(registration, root, pending, *, public_key, expected_
     probe = ProductionCaddyProbeV1(observer, caddy_id=caddy_id,
                                    network_id=networks['luohao-blog-prod_default']['NetworkID'])
     origin = _capture_current_origin(runtime_sha, cutover['runtimeArchiveDigest'])
-    lease, receipt, operation, verify = claim_crash_rollback(
-        registration, root, pending, public_key=public_key, expected_key_hash=expected_key_hash,
-        private_plan=frozen_plan, original_baseline=baseline, observer=observer, endpoint_digest=endpoint_digest,
-        review=frozen_review, approval=approval, grant=grant, request=request, runtime_sha=runtime_sha,
-    )
+    lease, receipt, operation, verify = claim(frozen_plan, baseline, frozen_review, origin)
     with lease:
         def guard():
             if _capture_current_origin(runtime_sha, cutover['runtimeArchiveDigest']) != origin:

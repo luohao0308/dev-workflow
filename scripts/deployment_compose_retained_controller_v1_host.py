@@ -27,6 +27,10 @@ from deployment_compose_production_frontend_approval_v1_host import (
 from deployment_compose_retained_intent_relay_v1_host import (
     IntentRelayRejected, RetainedIntentBindingV1, RetainedIntentIssuerV1,
 )
+from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
+from deployment_compose_retained_recovery_handoff_v1_host import (
+    prepare_crash_rollback_review, verify_crash_rollback_evidence,
+)
 from deployment_compose_retained_native_channel_v1_host import BLOCKED_FIELDS, FAILURE_STAGES
 from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _signer_pin
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
@@ -90,7 +94,7 @@ class RetainedControllerV1:
 
     def __init__(self, stdin, stdout, *, startup, expected_startup, private_plan, operation_nonce,
                  policy_hash, intent_signer, intent_public_key, witness_signer, witness_public_key,
-                 witness_root, witness_key, gate_key, caddy_id, network_id, timeout=1200, staged=False):
+                 witness_root, witness_key, gate_key, caddy_id, network_id, timeout=1200, staged=False, recovery=None):
         if type(self) is not RetainedControllerV1 or hasattr(self, '_owner'):
             reject()
         self._owner = (os.getpid(), threading.current_thread())
@@ -101,6 +105,7 @@ class RetainedControllerV1:
                 or type(gate_key) is not bytes or len(gate_key) != 32
                 or type(witness_key) is not bytes or not 32 <= len(witness_key) <= 4096
                 or type(staged) is not bool
+                or (recovery is not None and staged)
                 or type(timeout) not in (int, float) or not math.isfinite(timeout) or not 1 <= timeout <= 1800
                 or not isinstance(witness_root, Path) or not witness_root.is_absolute()
                 or witness_root.resolve(strict=True) != witness_root
@@ -131,22 +136,43 @@ class RetainedControllerV1:
             reject()
 
         self._staged = staged
+        self._recovery_source = None
+        recovery_fields = {}
+        configuration = 'configure-staged' if staged else 'configure'
+        if recovery is not None:
+            source_fields = {'root', 'pending', 'public_key', 'expected_key_hash'}
+            recovery = deepcopy(_closed(recovery, source_fields | {'original_baseline'}))
+            self._recovery_source = {key: recovery[key] for key in source_fields}
+            report = inspect_retained_crash_evidence(**self._recovery_source)
+            proposal = prepare_crash_rollback_review(report, self._private, observation_digest='0'*64)
+            pins = proposal['retainedCutover']
+            if (pins['runtimeArchiveDigest'] != self._source['archiveDigest']
+                    or pins['operationNonce'] != operation_nonce):
+                reject()
+            configuration = 'configure-crash-recovery'
+            recovery_fields = dict(recoveryReview=proposal, pendingScope=recovery['pending'],
+                                   originalBaseline=recovery['original_baseline'], endpointDigest=hello['endpointDigest'])
         self._creation_request = self._creation = None
         self._deploy_request = self._parent = None
         self._state = 'blocked'
         self._deadline = time.monotonic() + timeout
-        self._write('configure-staged' if staged else 'configure', privatePlan=self._private, operationNonce=operation_nonce,
+        self._write(configuration, privatePlan=self._private, operationNonce=operation_nonce,
                     policyHash=policy_hash, intentPublicKey=base64.b64encode(intent_key).decode('ascii'),
                     witnessPublicKey=base64.b64encode(witness_public).decode('ascii'),
-                    gateKey=base64.b64encode(gate_key).decode('ascii'), caddyId=caddy_id, networkId=network_id)
+                    gateKey=base64.b64encode(gate_key).decode('ascii'), caddyId=caddy_id, networkId=network_id,
+                    **recovery_fields)
         prepared = _closed(self._read(), {'kind', 'review', 'writerCertificateSha256'})
         if prepared['kind'] != 'prepared' or not hex_value(prepared['writerCertificateSha256']):
             reject()
         self._certificate = prepared['writerCertificateSha256']
         self._protection_digest = None
-        self._review = self._validate_review(prepared['review'], stage='create' if staged else None)
+        if self._recovery_source is not None:
+            self._review = deepcopy(prepared['review'])
+            self._verify_recovery_evidence()
+        else:
+            self._review = self._validate_review(prepared['review'], stage='create' if staged else None)
         self._protection_digest = self._review['retainedCutover']['protectionDigest']
-        self._state = 'create' if staged else 'deploy'
+        self._state = 'rollback' if self._recovery_source is not None else 'create' if staged else 'deploy'
 
     def __copy__(self):
         reject()
@@ -188,11 +214,19 @@ class RetainedControllerV1:
     def _consume_challenge(self, challenge):
         fields = {'nonce', 'requestHash', 'scopeGeneration'}
         _closed(challenge, fields)
+        if self._recovery_source is not None:
+            if challenge['scopeGeneration'] != self._recovery_source['pending']['generation']:
+                reject()
+            self._verify_recovery_evidence()
         self._write('consume-check', **challenge)
         reply = _closed(self._read(), fields | {'kind'})
         if reply.pop('kind') != 'consume-confirmed' or canonical(reply) != canonical(challenge):
             reject()
         return reply
+
+    def _verify_recovery_evidence(self):
+        return verify_crash_rollback_evidence(**self._recovery_source, private_plan=self._private,
+                                              review=self._review)
 
     def _validate_review(self, review, *, rollback=False, allow_restart_refresh=False, stage=None):
         review = deepcopy(_closed(review, set(self._base_review) | {'retainedCutover'}))
@@ -287,6 +321,7 @@ class RetainedControllerV1:
                 private_plan=self._private, review=self._review, request=request, approval=approval,
                 consumption=receipt, scope_generation=generation, writer_origin_digest=self._source['originDigest'],
                 parent=self._parent if request.operation == 'rollback' else self._creation if stage == 'switch' else None,
+                recovery_source=self._recovery_source,
             )
         except BaseException:
             store.close()
@@ -300,6 +335,20 @@ class RetainedControllerV1:
         return broker.closed_chain()
 
     def _reconcile(self, result, broker, request):
+        if self._recovery_source is not None:
+            fields = {'requestHash', 'scopeGeneration', 'creationRequestHash', 'originalId', 'candidateId',
+                      'witnessDigest', 'observationDigest'}
+            _closed(result, fields)
+            candidate, evidence = self._closed_chain(broker)
+            pins = self._review['retainedCutover']
+            if (result['requestHash'] != request.digest() or type(result['scopeGeneration']) is not int
+                    or result['scopeGeneration'] != self._recovery_source['pending']['generation']
+                    or result['creationRequestHash'] != pins['creationRequestHash']
+                    or result['originalId'] != self._plan.original_id or result['candidateId'] != candidate
+                    or candidate != pins['candidateId'] or evidence != [result['witnessDigest']]
+                    or not hex_value(result['observationDigest'])):
+                reject()
+            return deepcopy(result)
         fields = {'requestHash', 'observationDigest', 'protectionDigest', 'witnessDigests', 'originalId', 'candidateId'}
         rollback = request.operation == 'rollback'
         if rollback:
