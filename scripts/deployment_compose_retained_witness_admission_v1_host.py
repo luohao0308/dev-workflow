@@ -78,7 +78,7 @@ class RetainedWitnessAdmissionV1:
 
     def __init__(self, *, store, gate_policy, gate_key, witness_signer, witness_public_key,
                  private_plan, review, request, approval, consumption,
-                 scope_generation, writer_origin_digest, parent=None):
+                 scope_generation, writer_origin_digest, parent=None, recovery_source=None):
         if (type(store) is not OperationWitnessStoreV3 or type(gate_policy) is not GatePolicy
                 or gate_policy.operation_profile != 'compose-v3' or gate_policy.witness_required is not True
                 or type(gate_key) is not bytes or not 32 <= len(gate_key) <= 4096
@@ -141,7 +141,13 @@ class RetainedWitnessAdmissionV1:
         self._state = None
         self._lineage_digest = None
         self._consent(self._entry)
-        if self._stage is not None:
+        if 'recoveryEvidenceDigest' in cutover:
+            if parent is not None:
+                reject()
+            self._register_recovered(recovery_source, private_plan, review)
+        elif recovery_source is not None:
+            reject()
+        elif self._stage is not None:
             self._register_staged(parent)
         elif request.operation == 'deploy':
             if parent is not None:
@@ -158,6 +164,20 @@ class RetainedWitnessAdmissionV1:
         else:
             reject()
 
+    def _register_recovered(self, source, private_plan, review):
+        from deployment_compose_retained_recovery_handoff_v1_host import verify_crash_rollback_evidence
+
+        if (type(source) is not dict or set(source) != {'root', 'pending', 'public_key', 'expected_key_hash'}
+                or source['root'] == self._store.root.parent):
+            reject()
+        report = verify_crash_rollback_evidence(**source, private_plan=private_plan, review=review)
+        if report['pending']['generation'] != self._scope_generation:
+            reject()
+        switch = report['stages'][-1]
+        self._candidate = self._cutover['candidateId']
+        operation, = self._restore_operations()
+        self._register(operation, lineage=True, predecessor=(switch['firstBinding'], switch['lineageDigest']))
+
     def _register_staged(self, parent):
         if self._stage == 'create':
             if parent is not None:
@@ -171,7 +191,7 @@ class RetainedWitnessAdmissionV1:
             self._candidate = self._cutover['candidateId']
             operations = self._plan.switch(self._candidate) if self._stage == 'switch' else self._restore_operations()
             parent._frozen = True
-            self._register(operations[0], lineage=True, parent=parent)
+            self._register(operations[0], lineage=True, predecessor=(parent.first_binding, parent._lineage_digest))
 
     def __copy__(self):
         reject()
@@ -214,26 +234,25 @@ class RetainedWitnessAdmissionV1:
                        policyHash=self._policy.identity_hash())
         return dict(binding=binding, descriptor=desc, entry=self._entry, operation=operation)
 
-    def _register(self, first, *, lineage=False, parent=None):
+    def _register(self, first, *, lineage=False, predecessor=(None, None)):
         scope = self._descriptor(first, 0)
         if self._policy.witness_scope_hash != scope['binding']['scopeHash']:
             reject()
         if lineage:
-            self._persist_lineage(scope['binding'], parent)
+            self._persist_lineage(scope['binding'], predecessor)
         self._store.register_once(scope['binding'])
         self._state = self._state_pin()
         self._scopes.append(scope)
         if lineage:
             self._persist_checkpoint(None, [])
 
-    def _persist_lineage(self, binding, parent):
+    def _persist_lineage(self, binding, predecessor):
         request = self._entry['request']
         evidence = dict(
             schemaVersion=1, kind='retained-stage-lineage', stage=self._stage,
             requestHash=request.digest(), receiptHash=self.receipt_hash, reviewHash=request.plan_hash,
             scopeGeneration=self._scope_generation, writerOrigin=self._origin, cutover=self._cutover,
-            firstBinding=binding, parentBinding=parent.first_binding if parent is not None else None,
-            parentLineageDigest=parent._lineage_digest if parent is not None else None,
+            firstBinding=binding, parentBinding=predecessor[0], parentLineageDigest=predecessor[1],
         )
         name = self._lineage_name()
         self._lineage_digest = self._persist_signed(name, evidence, _LINEAGE_NAMESPACE)

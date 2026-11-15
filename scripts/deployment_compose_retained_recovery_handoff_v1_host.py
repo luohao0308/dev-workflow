@@ -7,6 +7,8 @@ import time
 from deployment_compose_host_snapshot_v3_host import (
     HostSnapshotV3, ProductionFrontendProtectionV1, _frontend_projection,
 )
+from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_origin
+from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
     GitHubProductionFrontendApprovalV3, prepare_production_frontend_request,
@@ -14,7 +16,8 @@ from deployment_compose_production_frontend_approval_v1_host import (
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import _claim_pending_scope
 from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
-from deployment_compose_retained_phase_v1_host import switched_phase, verify_phase
+from deployment_compose_retained_phase_v1_host import FrontendNotReady, restored_phase, switched_phase, verify_phase
+from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_witness_store import canonical, hex_value
 from deployment_contract_v2 import RequestV2
 from release_host import timestamp
@@ -51,6 +54,11 @@ def prepare_crash_rollback_review(report, private_plan, *, observation_digest):
 
 def observe_confirmed_stop(observer, private_plan, original_baseline, cutover, *, endpoint_digest):
     """Take a fresh, stable observation of the fixed first-stop recovery phase."""
+    return _observe_recovery_phase(observer, private_plan, original_baseline, cutover,
+                                   endpoint_digest=endpoint_digest)
+
+
+def _observe_recovery_phase(observer, private_plan, original_baseline, cutover, *, endpoint_digest, restored=False):
     identity = private_plan['publicReview']['identity']
     if (type(observer) is not HostSnapshotV3 or observer._info_id != identity['daemonId']
             or not hex_value(endpoint_digest) or observer.descriptor()['endpointDigest'] != endpoint_digest
@@ -61,6 +69,10 @@ def observe_confirmed_stop(observer, private_plan, original_baseline, cutover, *
         _reject()
     candidate = cutover['candidateId']
     plan._candidate(candidate)
+    phase = switched_phase(plan, 1)
+    if restored:
+        operation, = plan.restore(candidate, switch_prefix=1, candidate_running=False)
+        phase = restored_phase(plan, phase, operation)
 
     def read(path):
         return observer._get(path, time.monotonic() + 5, [2 * 1024 * 1024])
@@ -81,7 +93,8 @@ def observe_confirmed_stop(observer, private_plan, original_baseline, cutover, *
 
     def sample():
         rows = [read('/v1.45/containers/' + cid + '/json') for cid in (plan.original_id, candidate)]
-        return verify_phase(plan, original_baseline, *rows, candidate_id=candidate, phase=switched_phase(plan, 1))
+        return verify_phase(plan, original_baseline, *rows, candidate_id=candidate, phase=phase,
+                            require_ready=restored)
 
     before = sample()
     snapshot = ProductionFrontendProtectionV1._observe(observer, 20, (plan.original_id, candidate))
@@ -89,9 +102,21 @@ def observe_confirmed_stop(observer, private_plan, original_baseline, cutover, *
     protection = hashlib.sha256(projection).hexdigest()
     if protection != cutover['protectionDigest'] or sample() != before:
         _reject()
-    observer.verify_unchanged()
+    if not restored:
+        observer.verify_unchanged()
+    if observer.descriptor()['endpointDigest'] != endpoint_digest:
+        _reject()
     return _digest(dict(endpointDigest=endpoint_digest, protectionDigest=protection,
                         phaseDigest=hashlib.sha256(before).hexdigest()))
+
+
+def verify_crash_rollback_evidence(root, pending, *, public_key, expected_key_hash, private_plan, review):
+    report = inspect_retained_crash_evidence(root, pending, public_key=public_key, expected_key_hash=expected_key_hash)
+    rebuilt = prepare_crash_rollback_review(report, private_plan,
+                                            observation_digest=review['retainedCutover']['observationDigest'])
+    if canonical(rebuilt) != canonical(review):
+        _reject()
+    return report
 
 
 def claim_crash_rollback(registration, root, pending, *, public_key, expected_key_hash,
@@ -128,10 +153,10 @@ def claim_crash_rollback(registration, root, pending, *, public_key, expected_ke
 
     def authorize():
         nonlocal receipt, expires
-        report = inspect_retained_crash_evidence(root, frozen_pending, public_key=public_key,
-                                                 expected_key_hash=expected_key_hash)
-        rebuilt = prepare_crash_rollback_review(report, frozen_plan, observation_digest=cutover['observationDigest'])
-        if canonical(rebuilt) != canonical(frozen_review) or approval.validate(request) != grant:
+        verify_crash_rollback_evidence(root, frozen_pending, public_key=public_key,
+                                       expected_key_hash=expected_key_hash, private_plan=frozen_plan,
+                                       review=frozen_review)
+        if approval.validate(request) != grant:
             _reject()
         expires = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         check_live()
@@ -155,3 +180,65 @@ def claim_crash_rollback(registration, root, pending, *, public_key, expected_ke
         return expires
 
     return lease, receipt, operation, guard
+
+
+def execute_crash_rollback(registration, root, pending, *, public_key, expected_key_hash,
+                           private_plan, original_baseline, observer, endpoint_digest, review, approval,
+                           grant, request, runtime_sha, witness_writer_factory, caddy_id, readiness_timeout=60):
+    """Restart the one retained original through the witnessed native writer."""
+    if (not callable(witness_writer_factory) or type(readiness_timeout) not in (int, float)
+            or not 1 <= readiness_timeout <= 180):
+        _reject()
+    frozen_plan, baseline, frozen_review = deepcopy(private_plan), deepcopy(original_baseline), deepcopy(review)
+    cutover = frozen_review['retainedCutover']
+    plan = prepare_retained_frontend_cutover(frozen_plan, operation_nonce=cutover['operationNonce'])
+    networks = frozen_plan['privateBody']['NetworkingConfig']['EndpointsConfig']
+    if caddy_id not in plan.protected_ids or set(networks) != {'luohao-blog-prod_default'}:
+        _reject()
+    probe = ProductionCaddyProbeV1(observer, caddy_id=caddy_id,
+                                   network_id=networks['luohao-blog-prod_default']['NetworkID'])
+    origin = _capture_current_origin(runtime_sha, cutover['runtimeArchiveDigest'])
+    lease, receipt, operation, verify = claim_crash_rollback(
+        registration, root, pending, public_key=public_key, expected_key_hash=expected_key_hash,
+        private_plan=frozen_plan, original_baseline=baseline, observer=observer, endpoint_digest=endpoint_digest,
+        review=frozen_review, approval=approval, grant=grant, request=request, runtime_sha=runtime_sha,
+    )
+    with lease:
+        def guard():
+            if _capture_current_origin(runtime_sha, cutover['runtimeArchiveDigest']) != origin:
+                _reject()
+            return verify()
+
+        execution = _digest(dict(plan=plan.digest, approvedReview=request.plan_hash,
+                                 protection=cutover['protectionDigest'], scopeGeneration=lease.generation,
+                                 writerOrigin=hashlib.sha256(origin).hexdigest()))
+        writer = witness_writer_factory(observer, operation, receipt, execution, lease.generation)
+        if type(writer) is not RetainedWriteV1 or writer.observer is not observer:
+            _reject()
+        expires = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
+        status, raw, witness = writer.write(operation, request_hash=request.digest(), receipt_hash=_digest(asdict(receipt)),
+                                           plan_digest=execution, index=0, before_dispatch=guard, expires_at=expires)
+        if (status, raw) != (204, b'') or not hex_value(witness):
+            _reject()
+
+        def observe_restored():
+            return _observe_recovery_phase(observer, frozen_plan, baseline, cutover,
+                                           endpoint_digest=endpoint_digest, restored=True)
+
+        deadline = time.monotonic() + readiness_timeout
+        while time.monotonic() < deadline:
+            lease.check()
+            try:
+                before = observe_restored()
+                if probe(plan.original_id) is True and observe_restored() == before and time.monotonic() < deadline:
+                    if _capture_current_origin(runtime_sha, cutover['runtimeArchiveDigest']) != origin:
+                        _reject()
+                    result = dict(requestHash=request.digest(), scopeGeneration=lease.generation,
+                                  creationRequestHash=cutover['creationRequestHash'], originalId=plan.original_id,
+                                  candidateId=cutover['candidateId'], witnessDigest=witness, observationDigest=before)
+                    lease.complete(_digest(result))
+                    return result
+            except FrontendNotReady:
+                pass
+            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        _reject()

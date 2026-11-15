@@ -89,7 +89,7 @@ def _checkpoint(directory, entries, lineage, lineage_digest, public_key):
         os.close(state_dir)
     return dict(stage=lineage['stage'], requestHash=request, candidateId=candidate,
                 witnessDigests=evidence, stateDigest=actual, checkpointMatches=actual == payload['stateDigest'],
-                cutover=lineage['cutover'])
+                cutover=lineage['cutover'], firstBinding=lineage['firstBinding'], lineageDigest=lineage_digest)
 
 
 def inspect_retained_crash_evidence(root, pending, *, public_key, expected_key_hash):
