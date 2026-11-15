@@ -195,19 +195,24 @@ class _Relay:
         reply = self._controller({'reply': {'response'}}, limit=90)
         self._write(self.process.stdin, reply)
 
-    def _execute(self, *, rollback):
+    def _execute(self, phase):
+        rollback = phase == 'rollback'
         command = self._controller({'execute': {'request'}, 'finish': set()},
                                    limit=ROLLBACK_COMMAND_TIMEOUT if rollback else REVIEW_COMMAND_TIMEOUT)
         self._write(self.process.stdin, command)
         if command['kind'] == 'finish':
-            return False
+            return None
         executed = False
         for _ in range(4096):
             shapes = {'blocked': BLOCKED_FIELDS}
             if not executed:
                 shapes.update(rpc={'service', 'method', 'request'}, executed={'result'})
-            if not rollback:
+            if phase == 'create':
+                shapes['switch-prepared'] = {'review'}
+            elif not rollback:
                 shapes['restore-prepared'] = {'review'}
+                if phase == 'switch':
+                    shapes['switch-retry'] = {'review'}
             frame = self._worker(shapes, limit=180)
             kind = frame['kind']
             if kind == 'rpc':
@@ -215,26 +220,32 @@ class _Relay:
             elif kind == 'executed':
                 self._write(self.stdout, frame)
                 if rollback:
-                    return False
+                    return None
                 executed = True
             elif kind == 'blocked':
                 stage = frame['failureStage']
+                preparation = 'prepare-switch' if phase == 'create' else 'prepare-restore' if not rollback else None
                 if (frame['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
-                        or executed != (stage == 'prepare-restore')):
+                        or executed != (stage == preparation)
+                        or stage in ('prepare-switch', 'prepare-restore') and stage != preparation):
                     reject()
                 self._write(self.stdout, frame)
-                return False
+                return None
             else:
+                if (kind == 'switch-prepared' and not executed or kind == 'switch-retry' and executed):
+                    reject()
                 self._write(self.stdout, frame)
-                return True
+                return 'rollback' if kind == 'restore-prepared' else 'switch'
         reject()
 
     def run(self):
-        self._write(self.process.stdin, self._controller({'configure': CONFIGURE}))
+        configuration = self._controller({'configure': CONFIGURE, 'configure-staged': CONFIGURE})
+        self._write(self.process.stdin, configuration)
         prepared = self._worker({'prepared': {'review', 'writerCertificateSha256'}})
         self._write(self.stdout, prepared)
-        if self._execute(rollback=False):
-            self._execute(rollback=True)
+        phase = 'create' if configuration['kind'] == 'configure-staged' else 'deploy'
+        while phase is not None:
+            phase = self._execute(phase)
 
 
 def run_manager(config, archive, root):

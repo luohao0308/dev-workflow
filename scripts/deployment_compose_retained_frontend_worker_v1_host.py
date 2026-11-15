@@ -266,21 +266,19 @@ class RetainedFrontendWorkerV1:
     def _authorize(self, approval, grant, request, review, first):
         stage = review['retainedCutover'].get('stage')
         relayed = type(approval) is RetainedIntentClientV1
-        if stage is not None:
-            # The existing framed channel and witness broker only accept V2.
-            if (type(approval) is not GitHubProductionFrontendApprovalV3
-                    or approval.policy.workflow_sha != self._runtime[0] or approval.policy.stage != stage
-                    or stage != 'create' and self._lease is None):
-                raise RetainedWorkerBlocked('retained-production-staged-approval-required')
-        elif relayed:
+        if stage in ('switch', 'rollback') and self._lease is None:
+            raise RetainedWorkerBlocked('retained-production-staged-lease-required')
+        if relayed:
             binding = approval.binding
             if (binding.runtime_sha, binding.archive_digest, binding.origin_digest, binding.protection_digest) != (
                     self._runtime[0], self._runtime[1], hashlib.sha256(self._origin).hexdigest(),
                     self._protection_digest):
                 raise RetainedWorkerBlocked('retained-production-intent-binding-mismatch')
-        elif (type(approval) is not GitHubProductionFrontendApprovalV2
-              or approval.policy.workflow_sha != self._runtime[0]):
-            raise RetainedWorkerBlocked('retained-production-approval-required')
+        else:
+            approval_type = GitHubProductionFrontendApprovalV3 if stage else GitHubProductionFrontendApprovalV2
+            if (type(approval) is not approval_type or approval.policy.workflow_sha != self._runtime[0]
+                    or stage is not None and approval.policy.stage != stage):
+                raise RetainedWorkerBlocked('retained-production-approval-required')
         expected = prepare_production_frontend_request(
             review, policy_hash=self._policy_hash, expires_at=request.expires_at, operation=request.operation,
         )

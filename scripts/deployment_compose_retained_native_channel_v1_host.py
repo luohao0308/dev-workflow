@@ -30,7 +30,7 @@ CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
-    'cutover-window-too-short',
+    'cutover-window-too-short', 'prepare-switch',
 )) | ADMITTED_FAILURE_STAGES | POST_WRITE_OBSERVATION_STAGES | PRE_WRITE_OBSERVATION_STAGES
 # Leave time for the controller to close the session after the longest review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
@@ -94,7 +94,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
         reject()
     channel = _Channel(nonce, sys.stdin.buffer if stdin is None else stdin,
                        sys.stdout.buffer if stdout is None else stdout)
-    _, data = channel.receive(('configure', CONFIGURE))
+    configuration, data = channel.receive(('configure', CONFIGURE), ('configure-staged', CONFIGURE))
+    staged = configuration == 'configure-staged'
     if any(not hex_value(data[key]) for key in ('operationNonce', 'policyHash', 'caddyId', 'networkId')):
         reject()
     intent_public = key_material(_binary(data['intentPublicKey']))
@@ -129,14 +130,14 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
             policy_hash=data['policyHash'], witness_transport_factory=factory, readiness=readiness,
             loaded_source=receipt)
         try:
-            deploy_review = worker.deploy_review()
+            deploy_review = worker.create_review() if staged else worker.deploy_review()
             channel.emit('prepared', review=deploy_review, writerCertificateSha256=writer_pin)
 
-            def execute(frame, review, operation):
+            def execute(frame, review, operation, run):
                 stage = 'parse-request'
                 try:
                     request = RequestV2.from_json(encode(frame['request']).decode('ascii'))
-                    if request.operation != operation:
+                    if request.operation != operation or request.profile_version != ('3' if staged else '2'):
                         reject()
                     stage = 'validate-intent'
                     binding = RetainedIntentBindingV1(nonce, source['sourceSha'], source['archiveDigest'],
@@ -145,7 +146,7 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                         transport=lambda rpc: channel.rpc('intent', 'authorize', rpc), consume_transport=channel.consume)
                     grant = client.validate(request)
                     stage = 'execute-worker'
-                    result = worker.deploy(client, grant, request) if operation == 'deploy' else worker.restore(client, grant, request)
+                    result = run(client, grant, request)
                 except ConsumedReceiptRejected:
                     return 'verify-consumed-receipt'
                 except RetainedCutoverWindowTooShort:
@@ -163,7 +164,30 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                                           timeout=REVIEW_COMMAND_TIMEOUT)
             if kind == 'finish':
                 return
-            failure = execute(frame, deploy_review, 'deploy')
+            failure = execute(frame, deploy_review, 'deploy', worker.create if staged else worker.deploy)
+            if staged:
+                if failure is not None:
+                    channel.emit('blocked', knownPrefix=False, failureStage=failure)
+                    return
+                try:
+                    switch_review = worker.switch_review()
+                except Exception:
+                    channel.emit('blocked', knownPrefix=False, failureStage='prepare-switch')
+                    return
+                channel.emit('switch-prepared', review=switch_review)
+                while True:
+                    kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
+                                                  timeout=REVIEW_COMMAND_TIMEOUT)
+                    if kind == 'finish':
+                        return
+                    failure = execute(frame, switch_review, 'deploy', worker.switch)
+                    if failure != 'cutover-window-too-short':
+                        break
+                    try:
+                        switch_review = worker.switch_review()
+                    except Exception:
+                        break
+                    channel.emit('switch-retry', review=switch_review)
             # Only a worker-owned, exact closed prefix can yield a restore
             # review. An uncertain request leaves the scope journal pending.
             try:
@@ -175,7 +199,7 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
             kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
                                           timeout=ROLLBACK_COMMAND_TIMEOUT)
             if kind == 'execute':
-                failure = execute(frame, restore_review, 'rollback')
+                failure = execute(frame, restore_review, 'rollback', worker.restore)
                 if failure is not None:
                     channel.emit('blocked', knownPrefix=False, failureStage=failure)
         finally:

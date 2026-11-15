@@ -149,6 +149,20 @@ class RelayTests(unittest.TestCase):
         finish = frame('finish')
         self.assertEqual(self.exercise([configure, finish], [prepared]), ([prepared], [configure, finish]))
 
+    def test_staged_relay_forwards_three_phases_and_a_switch_retry(self):
+        configure = frame('configure-staged', **{field: None for field in ssh.CONFIGURE})
+        prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
+        execute = frame('execute', request={})
+        executed = frame('executed', result={})
+        switch = frame('switch-prepared', review={})
+        retry = frame('switch-retry', review={})
+        restore = frame('restore-prepared', review={})
+        controller = [configure, execute, execute, execute, execute]
+        worker = [prepared, executed, switch, retry, executed, restore, executed]
+        self.assertEqual(self.exercise(controller, worker), (worker, controller))
+        self.assertEqual(self.exercise(controller[:2], [prepared, switch], error=True),
+                         ([prepared], controller[:2]))
+
     def test_blocked_stage_is_forwarded_only_for_known_values(self):
         configure = frame('configure', **{field: None for field in ssh.CONFIGURE})
         prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
