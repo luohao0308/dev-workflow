@@ -46,6 +46,7 @@ _SSH_KEYGEN = '/usr/bin/ssh-keygen'
 _METHODS = frozenset(('read', 'chain_status', 'check', 'events_after', 'append_event', 'transition_successor'))
 _MAX_RPC = 4096
 _LINEAGE_NAMESPACE = NAMESPACE + '-retained-lineage'
+_CHECKPOINT_NAMESPACE = NAMESPACE + '-retained-checkpoint'
 _APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
 
 
@@ -222,6 +223,8 @@ class RetainedWitnessAdmissionV1:
         self._store.register_once(scope['binding'])
         self._state = self._state_pin()
         self._scopes.append(scope)
+        if lineage:
+            self._persist_checkpoint(None, [])
 
     def _persist_lineage(self, binding, parent):
         request = self._entry['request']
@@ -232,16 +235,34 @@ class RetainedWitnessAdmissionV1:
             firstBinding=binding, parentBinding=parent.first_binding if parent is not None else None,
             parentLineageDigest=parent._lineage_digest if parent is not None else None,
         )
-        signed = encode(self._sign(evidence, namespace=_LINEAGE_NAMESPACE))
+        name = self._lineage_name()
+        self._lineage_digest = self._persist_signed(name, evidence, _LINEAGE_NAMESPACE)
+
+    def _persist_signed(self, name, payload, namespace):
+        signed = encode(self._sign(payload, namespace=namespace))
         with self._lineage_directory() as directory:
-            fd = os.open(self._lineage_name(), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                          0o600, dir_fd=directory)
             with os.fdopen(fd, 'wb') as output:
                 output.write(signed)
                 output.flush()
                 os.fsync(output.fileno())
             os.fsync(directory)
-        self._lineage_digest = hashlib.sha256(signed).hexdigest()
+        return hashlib.sha256(signed).hexdigest()
+
+    def _persist_checkpoint(self, candidate, evidence):
+        with self._store._locked():
+            if self._state_pin() != self._state:
+                reject()
+            state_digest = hashlib.sha256(self._store._seal(self._store._read())).hexdigest()
+            if self._state_pin() != self._state:
+                reject()
+        request_hash = self._entry['request'].digest()
+        payload = dict(schemaVersion=1, kind='retained-stage-checkpoint', stage=self._stage,
+                       requestHash=request_hash, lineageDigest=self._lineage_digest, stateDigest=state_digest,
+                       candidateId=candidate, witnessDigests=evidence)
+        self._persist_signed(f'{request_hash}.retained-checkpoint-{len(evidence)}.json',
+                             payload, _CHECKPOINT_NAMESPACE)
 
     def _lineage_name(self):
         return self._entry['request'].digest() + '.retained-lineage.json'
@@ -447,6 +468,10 @@ class RetainedWitnessAdmissionV1:
                     else:
                         payload = self._transition(request, scope)
                     self._state = self._state_pin()
+                    if (self._stage is not None and method == 'append_event'
+                            and request['event']['kind'] == 'closed'):
+                        candidate, evidence = self.closed_chain()
+                        self._persist_checkpoint(candidate, evidence)
                 else:
                     payload = dispatch_request(self._store, method, request)
                 return self._sign(payload)
