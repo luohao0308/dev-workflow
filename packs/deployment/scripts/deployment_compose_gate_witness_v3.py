@@ -69,15 +69,18 @@ class GateOperationWitnessAdapterV3:
         except Exception:
             raise ValueError('gate-operation-witness-v3-rejected') from None
 
-    def check(self, generation, count, gate_head):
-        records, previous, _ = self._records()
+    def _records_at(self, generation, count, gate_head):
+        records, previous, attempt = self._records()
         if generation != self.binding['generation'] or len(records) != count or previous != gate_head:
             raise ValueError('gate-operation-witness-v3-rejected')
+        return records, attempt
+
+    def check(self, generation, count, gate_head):
+        records, _ = self._records_at(generation, count, gate_head)
         return self._client.check(expected_seq=count, expected_head=records[-1]['head'] if records else ZERO)
 
     def reserve_event(self, generation, count, gate_head, event, envelope_bytes):
-        self.check(generation, count, gate_head)
-        records, _, attempt = self._records()
+        records, attempt = self._records_at(generation, count, gate_head)
         if (type(envelope_bytes) is not bytes or canonical(json.loads(envelope_bytes)['payload']) != canonical(event)
                 or canonical(json.loads(envelope_bytes)) != envelope_bytes):
             raise ValueError('gate-operation-witness-v3-rejected')
@@ -90,6 +93,7 @@ class GateOperationWitnessAdapterV3:
         witness_event = dict(binding=self.binding, sequence=count + 1, previousHead=head,
                              kind=['open', 'prepared', 'admitted', 'response', 'completed', 'closed'][count],
                              data=self._data(event, attempt), materialDigest=hashlib.sha256(envelope_bytes).hexdigest())
+        # The store compares the cursor and active scope under the append lock.
         return self._client.append_event(expected_seq=count, expected_head=head, event=witness_event,
                                          external_material=envelope_bytes)
 

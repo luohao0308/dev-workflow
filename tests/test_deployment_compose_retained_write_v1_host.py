@@ -124,13 +124,20 @@ class RetainedWriteTests(GateFixture, unittest.TestCase):
         self.assertTrue(all(t is threading.current_thread() for t in self.guards))
 
     def test_guard_at_admission_failure_never_writes_and_blocks_retry(self):
+        observed = []
+
         def guard():
-            self._guard()
-            if len(self.guards) == 3:
+            observed.append('full')
+            if observed == ['full', 'refresh', 'full']:
                 raise ValueError('phase drift')
+
+        def refresh():
+            observed.append('refresh')
+            return time.time() + 30
+
         with self.assertRaises(ValueError):
-            self.writer.write(self.create, **self.pins, index=0, before_dispatch=guard)
-        self.assertEqual(len(self.guards), 3)
+            self.writer.write(self.create, **self.pins, index=0, before_dispatch=guard, refresh_intent=refresh)
+        self.assertEqual(observed, ['full', 'refresh', 'full'])
         self.assertFalse(self.calls_engine)
         with self.assertRaises(ValueError):
             self.writer.write(self.create, **self.pins, index=0, before_dispatch=self._guard)
@@ -207,6 +214,9 @@ class RetainedWriteTests(GateFixture, unittest.TestCase):
 
         def guard():
             self._guard()
+            return refresh()
+
+        def refresh():
             deadlines.append(now + 30)
             return deadlines[-1]
 
@@ -214,8 +224,9 @@ class RetainedWriteTests(GateFixture, unittest.TestCase):
               patch.object(WriterSession, 'prepare_attempt', delayed_prepare),
               patch.object(self.writer, '_relay', wraps=relay) as dispatch):
             status, _, _ = self.writer.write(self.create, **self.pins, index=0,
-                                            before_dispatch=guard, expires_at=expires_at)
+                                            before_dispatch=guard, refresh_intent=refresh, expires_at=expires_at)
         self.assertEqual(status, 201)
+        self.assertEqual(len(self.guards), 2)
         self.assertEqual(dispatch.call_args.args[-1], deadlines[1])
         self.assertLess(deadlines[0], now)
         self.assertEqual(self.calls_engine, [(self.create.path, b'{}')])

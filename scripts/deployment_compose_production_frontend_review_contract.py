@@ -37,9 +37,12 @@ def _values(payload,env,now):
     request.ensure_fresh(now,maximum_seconds=1800)
     policy_type=host.ProductionFrontendApprovalPolicyV1
     retained={}
-    if request.profile_version=='2':
+    if request.profile_version in ('2','3'):
         policy_type=host.ProductionFrontendApprovalPolicyV2
         retained=dict(operation=request.operation,observation_hash=request.observation_hash,history_hash=request.history_hash)
+        if request.profile_version=='3':
+            policy_type=host.ProductionFrontendApprovalPolicyV3
+            retained['stage']=payload['review']['retainedCutover']['stage']
     policy=policy_type(**identity,expires_at=request.expires_at,
         source_sha=request.source.source_sha,host_id=request.host_id,daemon_id=request.daemon_id,
         current_image_id='sha256:'+request.artifact_digest,snapshot_hash=request.before_hash,
@@ -81,16 +84,29 @@ def summary(raw,env):
     details='PRODUCTION frontend intent consent; production=true; deploy only.\n\n'
     retained=''
     limits='Rollback/recovery denied. '
-    if request.profile_version=='2':
+    if request.profile_version in ('2','3'):
         details=f'PRODUCTION frontend intent consent. production=true. Operation: `{request.operation}`.\n\n'
         cutover=review['retainedCutover']
         retained=(f"Retained cutover plan: `{cutover['planDigest']}`. Operation nonce: `{cutover['operationNonce']}`. "
                   f"Protection digest: `{cutover['protectionDigest']}`. "
                   f"Runtime archive digest: `{cutover['runtimeArchiveDigest']}`.\n\n")
+        if request.profile_version=='3':
+            stage=cutover['stage']
+            retained+=f"Stage: `{stage}`.\n\n"
+            if stage!='create':
+                retained+=(f"Candidate: `{cutover['candidateId']}`. Scope generation: `{cutover['scopeGeneration']}`. "
+                           f"Creation request: `{cutover['creationRequestHash']}`. Creation witness: `{cutover['creationWitnessDigest']}`. "
+                           f"Observation: `{request.observation_hash}`.\n\n")
+            if stage=='rollback':
+                retained+=f"Switch witness: `{cutover['switchWitnessDigest']}`.\n\n"
+                if 'recoveryJournalDigest' in cutover:
+                    retained+=(f"Abandoned journal: `{cutover['recoveryJournalDigest']}`. "
+                               f"Recovered evidence: `{cutover['recoveryEvidenceDigest']}`.\n\n")
         if request.operation=='rollback':
-            retained+=(f"Candidate: `{cutover['candidateId']}`. Switch prefix: `{cutover['switchPrefix']}`. "
-                       f"Candidate running: `{str(cutover['candidateRunning']).lower()}`. "
-                       f"Parent request: `{request.history_hash}`. Observation: `{request.observation_hash}`.\n\n")
+            if request.profile_version=='2':
+                retained+=(f"Candidate: `{cutover['candidateId']}`. Observation: `{request.observation_hash}`. ")
+            retained+=(f"Switch prefix: `{cutover['switchPrefix']}`. Candidate running: `{str(cutover['candidateRunning']).lower()}`. "
+                       f"Parent request: `{request.history_hash}`.\n\n")
         limits='Recovery denied. '
     return (details
         +'Repository: `'+host.BLOG+'`; business SHA: `'+request.source.source_sha+'`; runtime SHA: `'+env['GITHUB_SHA']+'`.\n\n'

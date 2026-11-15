@@ -36,6 +36,12 @@ class NativeChannelTests(unittest.TestCase):
     def test_relay_denial_at_closed_prefix_leaves_separately_approvable_restore(self):
         self._round_trip(deny_before_start=True)
 
+    def test_staged_channel_creates_switches_and_rolls_back_with_separate_approvals(self):
+        self._round_trip(deny_before_start=False, staged=True, short_switch=True)
+
+    def test_staged_channel_relays_partial_switch_for_separately_approved_rollback(self):
+        self._round_trip(deny_before_start=True, staged=True)
+
     def test_initial_intent_failure_reports_stage_without_consumption_or_error_text(self):
         self._round_trip(deny_before_start=False, fail_validation=True)
 
@@ -49,7 +55,7 @@ class NativeChannelTests(unittest.TestCase):
         self._round_trip(deny_before_start=False, ipv4_drift_after_stop=True, late_ipv4_drift=True)
 
     def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False,
-                    ipv4_drift_after_stop=False, late_ipv4_drift=False):
+                    ipv4_drift_after_stop=False, late_ipv4_drift=False, staged=False, short_switch=False):
         self.write_patch.stop()
         if ipv4_drift_after_stop:
             self.network['firewall4WithoutTransientBans'] = 'a' * 64
@@ -136,11 +142,30 @@ class NativeChannelTests(unittest.TestCase):
                     intent_signer=signers[0], intent_public_key=signers[0].with_suffix('.pub').read_bytes(),
                     witness_signer=signers[1], witness_public_key=signers[1].with_suffix('.pub').read_bytes(),
                     witness_root=directory, witness_key=b'w'*32, gate_key=b'g'*32,
-                    caddy_id=self.row['Id'], network_id=network['NetworkID'], timeout=120)
+                    caddy_id=self.row['Id'], network_id=network['NetworkID'], timeout=120, staged=staged)
                 stack.callback(controller.close)
                 deploy_review = controller.review
                 approval, grant, request, first_ledger = self._approval(deploy_review, 'deploy')
                 result = controller.execute(approval, grant, request)
+                expected_deploy_witnesses = 4 if staged else 5
+                if staged:
+                    self.assertEqual(len(result['result']['witnessDigests']), 1)
+                    self.assertEqual(self.writes, ['create'])
+                    self.assertTrue(self.other_rows[self.original]['State']['Running'])
+                    self.assertEqual(len(first_ledger.markers), 1)
+                    with self.assertRaises(ValueError):
+                        controller.execute(approval, grant, request)
+                    if short_switch:
+                        approval, _, request, short_ledger = self._approval(result['switchReview'], 'deploy')
+                        claims = approval.verifier('signed')
+                        claims['exp'] = int(fixture.worker_module.time.time()) + 239
+                        approval.verifier = lambda _: claims
+                        result = controller.execute(approval, approval.validate(request), request)
+                        self.assertEqual(result['failureStage'], 'cutover-window-too-short')
+                        self.assertFalse(short_ledger.markers)
+                        self.assertEqual(self.writes, ['create'])
+                    approval, grant, request, first_ledger = self._approval(result['switchReview'], 'deploy')
+                    result = controller.execute(approval, grant, request)
                 if fail_validation:
                     self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
                                                   failureStage='validate-intent'))
@@ -163,7 +188,7 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertIsNone(result['result'])
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
                 else:
-                    self.assertEqual(len(result['result']['witnessDigests']), 5)
+                    self.assertEqual(len(result['result']['witnessDigests']), expected_deploy_witnesses)
                 if not (fail_validation or fail_restore_preparation):
                     approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
                     if late_ipv4_drift:

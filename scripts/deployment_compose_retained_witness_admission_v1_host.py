@@ -9,6 +9,7 @@ registered witness root, and registration never resets an existing chain.
 The broker has no server, Engine access, or restart/adoption path.
 """
 import base64
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -24,13 +25,13 @@ import threading
 from deployment_compose_gate_witness_v3 import GateOperationWitnessAdapterV3
 from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3
 from deployment_compose_operation_witness_client_v3 import (
-    NAMESPACE, OperationWitnessClientV3, binding_value, decode_material,
+    NAMESPACE, OperationWitnessClientV3, decode_material,
     dispatch_request, encode, validate_request,
 )
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV2, ProductionFrontendReceiptV1,
+    GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3, ProductionFrontendReceiptV1,
     prepare_production_frontend_request,
 )
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
@@ -44,6 +45,9 @@ _ROOT = Path(__file__).resolve().parents[1]
 _SSH_KEYGEN = '/usr/bin/ssh-keygen'
 _METHODS = frozenset(('read', 'chain_status', 'check', 'events_after', 'append_event', 'transition_successor'))
 _MAX_RPC = 4096
+_LINEAGE_NAMESPACE = NAMESPACE + '-retained-lineage'
+_CHECKPOINT_NAMESPACE = NAMESPACE + '-retained-checkpoint'
+_APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
 
 
 def reject():
@@ -74,12 +78,11 @@ class RetainedWitnessAdmissionV1:
 
     def __init__(self, *, store, gate_policy, gate_key, witness_signer, witness_public_key,
                  private_plan, review, request, approval, consumption,
-                 scope_generation, writer_origin_digest, parent=None):
+                 scope_generation, writer_origin_digest, parent=None, recovery_source=None):
         if (type(store) is not OperationWitnessStoreV3 or type(gate_policy) is not GatePolicy
                 or gate_policy.operation_profile != 'compose-v3' or gate_policy.witness_required is not True
                 or type(gate_key) is not bytes or not 32 <= len(gate_key) <= 4096
-                or type(request) is not RequestV2 or request.profile_version != '2'
-                or type(approval) is not GitHubProductionFrontendApprovalV2
+                or type(request) is not RequestV2 or type(approval) is not _APPROVAL_TYPES.get(request.profile_version)
                 or type(consumption) is not ProductionFrontendReceiptV1
                 or type(scope_generation) is not int or not 1 <= scope_generation < 2**53
                 or not hex_value(writer_origin_digest)):
@@ -108,6 +111,7 @@ class RetainedWitnessAdmissionV1:
                 or stat.S_IMODE(private.stat().st_mode) != 0o700
                 or not isinstance(witness_signer, Path) or witness_signer.parent != private):
             reject()
+        self._lineage_parent_id = (private.stat().st_dev, private.stat().st_ino)
         self._signer = witness_signer
         self._signer_pin = _signer_pin(witness_signer)
         self._public = key_material(witness_public_key)
@@ -121,6 +125,8 @@ class RetainedWitnessAdmissionV1:
         self._lock = threading.RLock()
         self._store, self._policy, self._key = store, gate_policy, gate_key
         self._plan, self._cutover = plan, cutover
+        self._stage = cutover.get('stage')
+        self._scope_generation = scope_generation
         self._origin = writer_origin_digest
         self._entry = dict(request=request, approval=approval, receiptHash=_digest(asdict(consumption)))
         self._execution_digest = _digest(dict(
@@ -133,8 +139,17 @@ class RetainedWitnessAdmissionV1:
         self._frozen = False
         self._candidate = None
         self._state = None
+        self._lineage_digest = None
         self._consent(self._entry)
-        if request.operation == 'deploy':
+        if 'recoveryEvidenceDigest' in cutover:
+            if parent is not None:
+                reject()
+            self._register_recovered(recovery_source, private_plan, review)
+        elif recovery_source is not None:
+            reject()
+        elif self._stage is not None:
+            self._register_staged(parent)
+        elif request.operation == 'deploy':
             if parent is not None:
                 reject()
             self._register(plan.create())
@@ -148,6 +163,35 @@ class RetainedWitnessAdmissionV1:
                 self._register(self._restore_operations()[0])
         else:
             reject()
+
+    def _register_recovered(self, source, private_plan, review):
+        from deployment_compose_retained_recovery_handoff_v1_host import verify_crash_rollback_evidence
+
+        if (type(source) is not dict or set(source) != {'root', 'pending', 'public_key', 'expected_key_hash'}
+                or source['root'] == self._store.root.parent):
+            reject()
+        report = verify_crash_rollback_evidence(**source, private_plan=private_plan, review=review)
+        if report['pending']['generation'] != self._scope_generation:
+            reject()
+        switch = report['stages'][-1]
+        self._candidate = self._cutover['candidateId']
+        operation, = self._restore_operations()
+        self._register(operation, lineage=True, predecessor=(switch['firstBinding'], switch['lineageDigest']))
+
+    def _register_staged(self, parent):
+        if self._stage == 'create':
+            if parent is not None:
+                reject()
+            self._register(self._plan.create(), lineage=True)
+            return
+        if type(parent) is not RetainedWitnessAdmissionV1:
+            reject()
+        with parent._lock:
+            parent._check_staged_parent(self)
+            self._candidate = self._cutover['candidateId']
+            operations = self._plan.switch(self._candidate) if self._stage == 'switch' else self._restore_operations()
+            parent._frozen = True
+            self._register(operations[0], lineage=True, predecessor=(parent.first_binding, parent._lineage_digest))
 
     def __copy__(self):
         reject()
@@ -190,19 +234,87 @@ class RetainedWitnessAdmissionV1:
                        policyHash=self._policy.identity_hash())
         return dict(binding=binding, descriptor=desc, entry=self._entry, operation=operation)
 
-    def _register(self, first):
+    def _register(self, first, *, lineage=False, predecessor=(None, None)):
         scope = self._descriptor(first, 0)
         if self._policy.witness_scope_hash != scope['binding']['scopeHash']:
             reject()
+        if lineage:
+            self._persist_lineage(scope['binding'], predecessor)
         self._store.register_once(scope['binding'])
         self._state = self._state_pin()
         self._scopes.append(scope)
+        if lineage:
+            self._persist_checkpoint(None, [])
 
-    def _sign(self, payload):
+    def _persist_lineage(self, binding, predecessor):
+        request = self._entry['request']
+        evidence = dict(
+            schemaVersion=1, kind='retained-stage-lineage', stage=self._stage,
+            requestHash=request.digest(), receiptHash=self.receipt_hash, reviewHash=request.plan_hash,
+            scopeGeneration=self._scope_generation, writerOrigin=self._origin, cutover=self._cutover,
+            firstBinding=binding, parentBinding=predecessor[0], parentLineageDigest=predecessor[1],
+        )
+        name = self._lineage_name()
+        self._lineage_digest = self._persist_signed(name, evidence, _LINEAGE_NAMESPACE)
+
+    def _persist_signed(self, name, payload, namespace):
+        signed = encode(self._sign(payload, namespace=namespace))
+        with self._lineage_directory() as directory:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                         0o600, dir_fd=directory)
+            with os.fdopen(fd, 'wb') as output:
+                output.write(signed)
+                output.flush()
+                os.fsync(output.fileno())
+            os.fsync(directory)
+        return hashlib.sha256(signed).hexdigest()
+
+    def _persist_checkpoint(self, candidate, evidence):
+        with self._store._locked():
+            if self._state_pin() != self._state:
+                reject()
+            state_digest = hashlib.sha256(self._store._seal(self._store._read())).hexdigest()
+            if self._state_pin() != self._state:
+                reject()
+        request_hash = self._entry['request'].digest()
+        payload = dict(schemaVersion=1, kind='retained-stage-checkpoint', stage=self._stage,
+                       requestHash=request_hash, lineageDigest=self._lineage_digest, stateDigest=state_digest,
+                       candidateId=candidate, witnessDigests=evidence)
+        self._persist_signed(f'{request_hash}.retained-checkpoint-{len(evidence)}.json',
+                             payload, _CHECKPOINT_NAMESPACE)
+
+    def _lineage_name(self):
+        return self._entry['request'].digest() + '.retained-lineage.json'
+
+    @contextmanager
+    def _lineage_directory(self):
+        self._store._validate_paths()
+        fd = os.open('..', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=self._store._dir)
+        try:
+            if self._store._directory_id(fd) != self._lineage_parent_id:
+                reject()
+            yield fd
+        finally:
+            os.close(fd)
+
+    def _check_lineage(self):
+        with self._lineage_directory() as directory:
+            fd = os.open(self._lineage_name(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=directory)
+        with os.fdopen(fd, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1
+                    or not 0 < info.st_size <= 8192):
+                reject()
+            if hashlib.sha256(source.read(8193)).hexdigest() != self._lineage_digest:
+                reject()
+
+    def _sign(self, payload, *, namespace=NAMESPACE):
         if _signer_pin(self._signer) != self._signer_pin:
             reject()
         result = subprocess.run(
-            [_SSH_KEYGEN, '-Y', 'sign', '-f', str(self._signer), '-n', NAMESPACE],
+            [_SSH_KEYGEN, '-Y', 'sign', '-f', str(self._signer), '-n', namespace],
             input=encode(payload), capture_output=True, check=True, timeout=10,
             env={'PATH': '/usr/bin:/bin'},
         )
@@ -217,13 +329,14 @@ class RetainedWitnessAdmissionV1:
                 reject()
             return OperationWitnessClientV3(binding, self._public, self.authorize_rpc)
 
-    def _closed_response(self, scope):
+    def _closed_scope(self, scope):
         binding = scope['binding']
         records = self._store.events_after(binding, seq=0, head=ZERO)
         if len(records) != 6:
             reject()
         previous = ZERO
         directory = attempt = finish = None
+        events = []
         for index, record in enumerate(records):
             event, directory, attempt, finish = self._validate_event(
                 scope, decode_material(record['externalMaterialBase64']), index, previous, directory, attempt, finish,
@@ -231,6 +344,7 @@ class RetainedWitnessAdmissionV1:
             if record['event']['data'] != GateOperationWitnessAdapterV3._data(event, attempt):
                 reject()
             previous = _digest(event)
+            events.append(event)
         raw = base64.b64decode(finish['bodyBase64'], validate=True)
         if scope['operation'].phase == 'create' and finish['status'] == 201:
             value = json.loads(raw, object_pairs_hook=pairs)
@@ -238,10 +352,67 @@ class RetainedWitnessAdmissionV1:
                 reject()
             candidate = value['Id']
             self._plan._candidate(candidate)
-            return candidate
+            return candidate, events, records
         if scope['operation'].phase == 'create' or finish['status'] != 204 or raw:
             reject()
-        return None
+        return None, events, records
+
+    def _closed_response(self, scope):
+        candidate, _, _ = self._closed_scope(scope)
+        return candidate
+
+    def closed_chain(self):
+        self._check_owner()
+        with self._lock:
+            if self._state_pin() != self._state:
+                reject()
+            evidence = []
+            candidate = self._candidate if self._stage in ('switch', 'rollback') else None
+            for scope in self._scopes:
+                result, events, records = self._closed_scope(scope)
+                candidate = result or candidate
+                binding = scope['binding']
+                gate = dict(generation=binding['generation'], head=_digest(events[-1]),
+                            binding=events[0]['data'], events=[
+                                dict(kind=event['kind'], data=event['data']) for event in events[1:]
+                            ], closed=True, authorityGranted=False)
+                witness = dict(records=records, authorityGranted=False, productionReady=False)
+                material = encode(dict(closure=canonical(events[-1]['data']).decode('ascii'),
+                                       gate=gate, witness=witness, binding=binding))
+                evidence.append(hashlib.sha256(material).hexdigest())
+            if self._state_pin() != self._state:
+                reject()
+            return candidate, evidence
+
+    def _check_staged_parent(self, child):
+        self._check_owner()
+        cutover = child._cutover
+        request = self._entry['request']
+        expected_stage = 'create' if child._stage == 'switch' else 'switch'
+        parent_hash = cutover['creationRequestHash'] if expected_stage == 'create' else cutover['parentRequestHash']
+        if (self._frozen or self._stage != expected_stage or request.digest() != parent_hash
+                or self._scope_generation != child._scope_generation
+                or cutover['scopeGeneration'] != child._scope_generation
+                or self._plan.digest != child._plan.digest or self._origin != child._origin
+                or self._public != child._public or self._key != child._key
+                or self._policy.identity_hash() != child._policy.identity_hash()
+                or self._store.root.parent != child._store.root.parent
+                or request.policy_hash != child._entry['request'].policy_hash
+                or self._entry['approval'].policy.workflow_sha != child._entry['approval'].policy.workflow_sha
+                or any(self._cutover[key] != cutover[key] for key in ('planDigest', 'operationNonce', 'runtimeArchiveDigest'))
+                or (self._cutover['protectionDigest'] != cutover['protectionDigest']
+                    and (child._stage != 'rollback' or cutover['switchPrefix'] != 1 or cutover['candidateRunning']))):
+            reject()
+        self._check_lineage()
+        candidate, evidence = self.closed_chain()
+        if candidate != cutover['candidateId']:
+            reject()
+        if expected_stage == 'create':
+            if evidence != [cutover['creationWitnessDigest']]:
+                reject()
+        elif (len(evidence) != cutover['switchPrefix'] or _digest(evidence) != cutover['switchWitnessDigest']
+              or any(self._cutover[key] != cutover[key] for key in ('creationRequestHash', 'creationWitnessDigest'))):
+            reject()
 
     def _restore_operations(self):
         return self._plan.restore(self._candidate, switch_prefix=self._cutover['switchPrefix'],
@@ -274,7 +445,11 @@ class RetainedWitnessAdmissionV1:
             reject()
         candidate = self._closed_response(scope) or self._candidate
         index = len(self._scopes)
-        if self._entry['request'].operation == 'deploy':
+        if self._stage == 'create':
+            reject()
+        if self._stage == 'switch':
+            operations = self._plan.switch(candidate)
+        elif self._entry['request'].operation == 'deploy':
             operations = (self._plan.create(), *self._plan.switch(candidate))
         else:
             operations = self._restore_operations()
@@ -312,6 +487,10 @@ class RetainedWitnessAdmissionV1:
                     else:
                         payload = self._transition(request, scope)
                     self._state = self._state_pin()
+                    if (self._stage is not None and method == 'append_event'
+                            and request['event']['kind'] == 'closed'):
+                        candidate, evidence = self.closed_chain()
+                        self._persist_checkpoint(candidate, evidence)
                 else:
                     payload = dispatch_request(self._store, method, request)
                 return self._sign(payload)

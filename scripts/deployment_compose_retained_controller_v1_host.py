@@ -19,19 +19,23 @@ import threading
 import time
 
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
-from deployment_compose_operation_witness_client_v3 import decode_material, encode
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV2, prepare_production_frontend_request,
+    STAGED_CANDIDATE_FIELDS, STAGED_ROLLBACK_FIELDS,
+    prepare_production_frontend_request,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
     IntentRelayRejected, RetainedIntentBindingV1, RetainedIntentIssuerV1,
+)
+from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
+from deployment_compose_retained_recovery_handoff_v1_host import (
+    prepare_crash_rollback_review, verify_crash_rollback_evidence,
 )
 from deployment_compose_retained_native_channel_v1_host import BLOCKED_FIELDS, FAILURE_STAGES
 from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _signer_pin
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_v3_channel_worker import read_frame, write_frame
-from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
+from deployment_compose_witness_store import canonical, hex_value
 from deployment_contract_v2 import RequestV2
 from deployment_gate_witness import key_material
 from deployment_gateway import GatePolicy
@@ -86,11 +90,11 @@ def _startup(actual, expected):
 
 
 class RetainedControllerV1:
-    """One configure and deploy, then one separately approved restore or finish."""
+    """Dispatch separately approved requests on one owned native channel."""
 
     def __init__(self, stdin, stdout, *, startup, expected_startup, private_plan, operation_nonce,
                  policy_hash, intent_signer, intent_public_key, witness_signer, witness_public_key,
-                 witness_root, witness_key, gate_key, caddy_id, network_id, timeout=1200):
+                 witness_root, witness_key, gate_key, caddy_id, network_id, timeout=1200, staged=False, recovery=None):
         if type(self) is not RetainedControllerV1 or hasattr(self, '_owner'):
             reject()
         self._owner = (os.getpid(), threading.current_thread())
@@ -100,6 +104,8 @@ class RetainedControllerV1:
         if (not all(hex_value(v) for v in (operation_nonce, policy_hash, caddy_id, network_id))
                 or type(gate_key) is not bytes or len(gate_key) != 32
                 or type(witness_key) is not bytes or not 32 <= len(witness_key) <= 4096
+                or type(staged) is not bool
+                or (recovery is not None and staged)
                 or type(timeout) not in (int, float) or not math.isfinite(timeout) or not 1 <= timeout <= 1800
                 or not isinstance(witness_root, Path) or not witness_root.is_absolute()
                 or witness_root.resolve(strict=True) != witness_root
@@ -129,21 +135,44 @@ class RetainedControllerV1:
                 or networks['luohao-blog-prod_default']['NetworkID'] != network_id):
             reject()
 
+        self._staged = staged
+        self._recovery_source = None
+        recovery_fields = {}
+        configuration = 'configure-staged' if staged else 'configure'
+        if recovery is not None:
+            source_fields = {'root', 'pending', 'public_key', 'expected_key_hash'}
+            recovery = deepcopy(_closed(recovery, source_fields | {'original_baseline'}))
+            self._recovery_source = {key: recovery[key] for key in source_fields}
+            report = inspect_retained_crash_evidence(**self._recovery_source)
+            proposal = prepare_crash_rollback_review(report, self._private, observation_digest='0'*64)
+            pins = proposal['retainedCutover']
+            if (pins['runtimeArchiveDigest'] != self._source['archiveDigest']
+                    or pins['operationNonce'] != operation_nonce):
+                reject()
+            configuration = 'configure-crash-recovery'
+            recovery_fields = dict(recoveryReview=proposal, pendingScope=recovery['pending'],
+                                   originalBaseline=recovery['original_baseline'], endpointDigest=hello['endpointDigest'])
+        self._creation_request = self._creation = None
         self._deploy_request = self._parent = None
         self._state = 'blocked'
         self._deadline = time.monotonic() + timeout
-        self._write('configure', privatePlan=self._private, operationNonce=operation_nonce,
+        self._write(configuration, privatePlan=self._private, operationNonce=operation_nonce,
                     policyHash=policy_hash, intentPublicKey=base64.b64encode(intent_key).decode('ascii'),
                     witnessPublicKey=base64.b64encode(witness_public).decode('ascii'),
-                    gateKey=base64.b64encode(gate_key).decode('ascii'), caddyId=caddy_id, networkId=network_id)
+                    gateKey=base64.b64encode(gate_key).decode('ascii'), caddyId=caddy_id, networkId=network_id,
+                    **recovery_fields)
         prepared = _closed(self._read(), {'kind', 'review', 'writerCertificateSha256'})
         if prepared['kind'] != 'prepared' or not hex_value(prepared['writerCertificateSha256']):
             reject()
         self._certificate = prepared['writerCertificateSha256']
         self._protection_digest = None
-        self._review = self._validate_review(prepared['review'])
+        if self._recovery_source is not None:
+            self._review = deepcopy(prepared['review'])
+            self._verify_recovery_evidence()
+        else:
+            self._review = self._validate_review(prepared['review'], stage='create' if staged else None)
         self._protection_digest = self._review['retainedCutover']['protectionDigest']
-        self._state = 'deploy'
+        self._state = 'rollback' if self._recovery_source is not None else 'create' if staged else 'deploy'
 
     def __copy__(self):
         reject()
@@ -161,7 +190,7 @@ class RetainedControllerV1:
     @property
     def review(self):
         self._owned()
-        if self._state not in ('deploy', 'rollback'):
+        if self._state not in ('create', 'switch', 'deploy', 'rollback'):
             reject()
         return deepcopy(self._review)
 
@@ -185,20 +214,35 @@ class RetainedControllerV1:
     def _consume_challenge(self, challenge):
         fields = {'nonce', 'requestHash', 'scopeGeneration'}
         _closed(challenge, fields)
+        if self._recovery_source is not None:
+            if challenge['scopeGeneration'] != self._recovery_source['pending']['generation']:
+                reject()
+            self._verify_recovery_evidence()
         self._write('consume-check', **challenge)
         reply = _closed(self._read(), fields | {'kind'})
         if reply.pop('kind') != 'consume-confirmed' or canonical(reply) != canonical(challenge):
             reject()
         return reply
 
-    def _validate_review(self, review, *, rollback=False, allow_restart_refresh=False):
+    def _verify_recovery_evidence(self):
+        return verify_crash_rollback_evidence(**self._recovery_source, private_plan=self._private,
+                                              review=self._review)
+
+    def _validate_review(self, review, *, rollback=False, allow_restart_refresh=False, stage=None):
         review = deepcopy(_closed(review, set(self._base_review) | {'retainedCutover'}))
         cutover = review.pop('retainedCutover')
         fields = {'planDigest', 'operationNonce', 'protectionDigest', 'runtimeArchiveDigest'}
         if rollback:
             fields |= {'candidateId', 'switchPrefix', 'candidateRunning', 'parentRequestHash', 'observationDigest'}
+        if stage is not None:
+            fields.add('stage')
+            if stage != 'create':
+                fields |= STAGED_CANDIDATE_FIELDS
+            if stage == 'rollback':
+                fields |= STAGED_ROLLBACK_FIELDS
         _closed(cutover, fields)
-        if (canonical(review) != canonical(self._base_review) or cutover['planDigest'] != self._plan.digest
+        if (cutover.get('stage') != stage or canonical(review) != canonical(self._base_review)
+                or cutover['planDigest'] != self._plan.digest
                 or cutover['operationNonce'] != self._operation_nonce
                 or cutover['runtimeArchiveDigest'] != self._source['archiveDigest']
                 or not hex_value(cutover['protectionDigest'])
@@ -206,13 +250,23 @@ class RetainedControllerV1:
                 and not (rollback and allow_restart_refresh and cutover['switchPrefix'] == 1
                          and cutover['candidateRunning'] is False)):
             reject()
+        if stage in ('switch', 'rollback'):
+            candidate, creation_evidence = self._closed_chain(self._creation)
+            if (cutover['candidateId'] != candidate
+                    or cutover['creationRequestHash'] != self._creation_request.digest()
+                    or [cutover['creationWitnessDigest']] != creation_evidence
+                    or type(cutover['scopeGeneration']) is not int
+                    or cutover['scopeGeneration'] != self._creation._scope_generation
+                    or not hex_value(cutover['observationDigest'])):
+                reject()
         if rollback:
             if (not hex_value(cutover['observationDigest']) or cutover['parentRequestHash'] != self._deploy_request.digest()):
                 reject()
             self._plan.restore(cutover['candidateId'], switch_prefix=cutover['switchPrefix'],
                                candidate_running=cutover['candidateRunning'])
             candidate, evidence = self._closed_chain(self._parent)
-            if candidate != cutover['candidateId'] or len(evidence) != 1 + cutover['switchPrefix']:
+            if (candidate != cutover['candidateId'] or len(evidence) != cutover['switchPrefix'] + (stage is None)
+                    or stage == 'rollback' and cutover['switchWitnessDigest'] != _hash(canonical(evidence))):
                 reject()
         review['retainedCutover'] = cutover
         return review
@@ -230,10 +284,14 @@ class RetainedControllerV1:
         if wire['executionDigest'] != execution:
             reject()
         cutover = self._review['retainedCutover']
-        first = self._plan.create() if request.operation == 'deploy' else self._plan.restore(
-            cutover['candidateId'], switch_prefix=cutover['switchPrefix'],
-            candidate_running=cutover['candidateRunning'],
-        )[0]
+        stage = cutover.get('stage')
+        if stage == 'switch':
+            first = self._plan.switch(cutover['candidateId'])[0]
+        elif request.operation == 'rollback':
+            first = self._plan.restore(cutover['candidateId'], switch_prefix=cutover['switchPrefix'],
+                                       candidate_running=cutover['candidateRunning'])[0]
+        else:
+            first = self._plan.create()
         descriptor = RetainedWriteV1.scope_descriptor(
             first, request_hash=request.digest(), receipt_hash=wire['receiptHash'], plan_digest=execution, index=0,
         )
@@ -262,7 +320,8 @@ class RetainedControllerV1:
                 witness_signer=self._witness_signer, witness_public_key=self._witness_public,
                 private_plan=self._private, review=self._review, request=request, approval=approval,
                 consumption=receipt, scope_generation=generation, writer_origin_digest=self._source['originDigest'],
-                parent=self._parent if request.operation == 'rollback' else None,
+                parent=self._parent if request.operation == 'rollback' else self._creation if stage == 'switch' else None,
+                recovery_source=self._recovery_source,
             )
         except BaseException:
             store.close()
@@ -273,29 +332,23 @@ class RetainedControllerV1:
     def _closed_chain(broker):
         if type(broker) is not RetainedWitnessAdmissionV1:
             reject()
-        with broker._lock:
-            if broker._state_pin() != broker._state:
-                reject()
-            evidence = []
-            candidate = None
-            for scope in broker._scopes:
-                candidate = broker._closed_response(scope) or candidate
-                binding = scope['binding']
-                records = broker._store.events_after(binding, seq=0, head=ZERO)
-                events = [json.loads(decode_material(record['externalMaterialBase64']),
-                                     object_pairs_hook=pairs)['payload'] for record in records]
-                gate = dict(generation=binding['generation'], head=_hash(canonical(events[-1])),
-                            binding=events[0]['data'], events=[
-                                dict(kind=event['kind'], data=event['data']) for event in events[1:]
-                            ], closed=True, authorityGranted=False)
-                material = dict(records=records, authorityGranted=False, productionReady=False)
-                evidence.append(_hash(encode(dict(closure=canonical(events[-1]['data']).decode('ascii'),
-                                                   gate=gate, witness=material, binding=binding))))
-            if broker._state_pin() != broker._state:
-                reject()
-            return candidate, evidence
+        return broker.closed_chain()
 
     def _reconcile(self, result, broker, request):
+        if self._recovery_source is not None:
+            fields = {'requestHash', 'scopeGeneration', 'creationRequestHash', 'originalId', 'candidateId',
+                      'witnessDigest', 'observationDigest'}
+            _closed(result, fields)
+            candidate, evidence = self._closed_chain(broker)
+            pins = self._review['retainedCutover']
+            if (result['requestHash'] != request.digest() or type(result['scopeGeneration']) is not int
+                    or result['scopeGeneration'] != self._recovery_source['pending']['generation']
+                    or result['creationRequestHash'] != pins['creationRequestHash']
+                    or result['originalId'] != self._plan.original_id or result['candidateId'] != candidate
+                    or candidate != pins['candidateId'] or evidence != [result['witnessDigest']]
+                    or not hex_value(result['observationDigest'])):
+                reject()
+            return deepcopy(result)
         fields = {'requestHash', 'observationDigest', 'protectionDigest', 'witnessDigests', 'originalId', 'candidateId'}
         rollback = request.operation == 'rollback'
         if rollback:
@@ -311,7 +364,7 @@ class RetainedControllerV1:
                     or candidate != cutover['candidateId']):
                 reject()
         else:
-            expected_writes = 5
+            expected_writes = {'create': 1, 'switch': 4}.get(self._review['retainedCutover'].get('stage'), 5)
         if (result['requestHash'] != request.digest() or result['protectionDigest'] != self._protection_digest
                 or not hex_value(result['observationDigest']) or result['originalId'] != self._plan.original_id
                 or result['candidateId'] != candidate or result['witnessDigests'] != evidence
@@ -322,10 +375,12 @@ class RetainedControllerV1:
     def execute(self, approval, grant, request):
         """Run one approved request and return its reconciled result or recovery review."""
         self._owned()
-        if self._state not in ('deploy', 'rollback') or type(request) is not RequestV2:
+        phase = self._state
+        if phase not in ('create', 'switch', 'deploy', 'rollback') or type(request) is not RequestV2:
             reject()
+        operation = 'rollback' if phase == 'rollback' else 'deploy'
         expected = prepare_production_frontend_request(self._review, policy_hash=self._policy_hash,
-                                                       expires_at=request.expires_at, operation=self._state)
+                                                       expires_at=request.expires_at, operation=operation)
         if expected != request:
             reject()
         binding = RetainedIntentBindingV1(self._nonce, self._source['sourceSha'], self._source['archiveDigest'],
@@ -365,8 +420,10 @@ class RetainedControllerV1:
                 elif kind == 'blocked':
                     blocked = _closed(frame, {'kind'} | BLOCKED_FIELDS)
                     stage = blocked['failureStage']
+                    preparation = 'prepare-switch' if phase == 'create' else 'prepare-restore' if phase != 'rollback' else None
                     if (blocked['knownPrefix'] is not False or type(stage) is not str or stage not in FAILURE_STAGES
-                            or (result is not None) != (stage == 'prepare-restore')):
+                            or (result is not None) != (stage == preparation)
+                            or stage in ('prepare-switch', 'prepare-restore') and stage != preparation):
                         reject()
                     return {'result': result, 'restoreReview': None, 'blocked': True, 'failureStage': stage}
                 elif kind == 'executed':
@@ -376,10 +433,26 @@ class RetainedControllerV1:
                     if request.operation == 'rollback':
                         self._state = 'done'
                         return {'result': result, 'restoreReview': None, 'blocked': False}
-                elif kind == 'restore-prepared' and request.operation == 'deploy' and broker is not None:
+                elif kind == 'switch-prepared' and phase == 'create' and result is not None:
+                    self._creation_request, self._creation = request, broker
+                    review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], stage='switch')
+                    if review['retainedCutover']['observationDigest'] != result['observationDigest']:
+                        reject()
+                    self._review, self._state = review, 'switch'
+                    return {'result': result, 'switchReview': self.review, 'restoreReview': None, 'blocked': False}
+                elif (kind == 'switch-retry' and phase == 'switch' and result is None and broker is None
+                      and not issuer._attempted):
+                    review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], stage='switch')
+                    if review != self._review:
+                        reject()
+                    self._state = 'switch'
+                    return {'result': None, 'switchReview': self.review, 'restoreReview': None, 'blocked': True,
+                            'failureStage': 'cutover-window-too-short'}
+                elif kind == 'restore-prepared' and phase in ('deploy', 'switch') and broker is not None:
                     self._deploy_request, self._parent = request, broker
                     review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], rollback=True,
-                                                   allow_restart_refresh=result is None)
+                                                   allow_restart_refresh=result is None,
+                                                   stage='rollback' if self._staged else None)
                     if result is not None and review['retainedCutover']['switchPrefix'] != 4:
                         reject()
                     self._review = review
@@ -390,12 +463,12 @@ class RetainedControllerV1:
                     reject()
             reject()
         finally:
-            if broker is not None and broker is not self._parent:
+            if broker is not None and broker not in (self._parent, self._creation):
                 broker._store.close()
 
     def finish(self):
         self._owned()
-        if self._state not in ('deploy', 'rollback'):
+        if self._state not in ('create', 'switch', 'deploy', 'rollback'):
             reject()
         self._state = 'done'
         self._deadline = time.monotonic() + self._timeout
@@ -405,6 +478,7 @@ class RetainedControllerV1:
         """Release local witness resources. The enclosing owner closes the pipes."""
         self._owned()
         self._state = 'done'
-        if self._parent is not None:
-            self._parent._store.close()
-            self._parent = None
+        for broker in (self._parent, self._creation):
+            if broker is not None:
+                broker._store.close()
+        self._parent = self._creation = None

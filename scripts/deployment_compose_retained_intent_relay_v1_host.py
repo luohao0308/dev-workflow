@@ -19,7 +19,7 @@ import threading
 import time
 
 from deployment_compose_production_frontend_approval_v1_host import (
-    PROFILE, GitHubProductionFrontendApprovalV2, ProductionFrontendGrantV1,
+    PROFILE, GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3, ProductionFrontendGrantV1,
     ProductionFrontendReceiptV1,
 )
 from deployment_compose_witness_store import canonical, hex_value
@@ -33,6 +33,7 @@ RPC_FIELDS = {'method', 'requestHash', 'binding', 'nonce', 'generation', 'grantH
 RESPONSE_FIELDS = {'request', 'issuedAt', 'expiresAt', 'result', 'runtimePermit'}
 METHODS = frozenset(('validate', 'consume', 'check'))
 _MAX_CLOCK_SKEW = 2
+_APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
 
 
 class IntentRelayRejected(ValueError):
@@ -71,7 +72,7 @@ class RetainedIntentBindingV1:
 
 
 def _request_pin(request, binding):
-    if (type(request) is not RequestV2 or request.profile_id != PROFILE or request.profile_version != '2'
+    if (type(request) is not RequestV2 or request.profile_id != PROFILE or request.profile_version not in _APPROVAL_TYPES
             or request.production is not True or request.operation not in ('deploy', 'rollback')
             or type(binding) is not RetainedIntentBindingV1):
         reject()
@@ -113,7 +114,7 @@ class RetainedIntentIssuerV1(_OriginalOwner):
 
     def __init__(self, approval, request, grant, *, binding, signer, preflight_challenge=None):
         self._pin = _request_pin(request, binding)
-        if (type(approval) is not GitHubProductionFrontendApprovalV2
+        if (type(approval) is not _APPROVAL_TYPES[request.profile_version]
                 or type(grant) is not ProductionFrontendGrantV1
                 or approval.policy.workflow_sha != binding.runtime_sha or approval.validate(request) != grant
                 or preflight_challenge is not None and not callable(preflight_challenge)):
@@ -225,6 +226,7 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._consume_transport = consume_transport
         self._attempted = False
         self._grant = self._receipt = self._scope = None
+        self._validation_expires_at = None
 
     @property
     def binding(self):
@@ -280,7 +282,7 @@ class RetainedIntentClientV1(_OriginalOwner):
         self._match(request)
         if self._attempted:
             reject()
-        result, _, _ = self._call('validate')
+        result, _, validation_expiry = self._call('validate')
         grant = ProductionFrontendGrantV1(**result)
         expiry = timestamp(grant.expires_at).timestamp()
         if (grant.request_hash != self._pin[0] or type(grant.max_uses) is not int or grant.max_uses != 1
@@ -289,7 +291,17 @@ class RetainedIntentClientV1(_OriginalOwner):
                 or self._grant is not None and grant != self._grant):
             reject()
         self._grant = grant
+        self._validation_expires_at = min(validation_expiry, expiry)
         return grant
+
+    def validated_grant(self, request):
+        """Reuse the initial signed validation during the worker handoff."""
+        self._match(request)
+        if self._attempted:
+            reject()
+        if self._grant is not None and time.time() < self._validation_expires_at:
+            return self._grant
+        return self.validate(request)
 
     def consume(self, grant, request, *, before_consume, generation):
         self._match(request)

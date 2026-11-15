@@ -14,6 +14,66 @@ class ProductionReviewTests(unittest.TestCase):
         self.env=dict(GITHUB_REPOSITORY=contract.host.RUNTIME,GITHUB_REPOSITORY_ID='1327491026',GITHUB_REF='refs/heads/main',GITHUB_EVENT_NAME='workflow_dispatch',GITHUB_RUN_ATTEMPT='1',GITHUB_WORKFLOW_REF=contract.host.WORKFLOW,GITHUB_SHA=self.policy.workflow_sha,GITHUB_WORKFLOW_SHA=self.policy.workflow_sha,GITHUB_RUN_ID='123',DW_AUTH_REVIEWER_ID='42',DW_AUTH_LEDGER_REPOSITORY=contract.host.LEDGER,DW_AUTH_LEDGER_ID='1436718662',DW_AUTH_LEDGER_SHA=self.policy.ledger_sha,DW_PROD_FRONTEND_POLICY_HASH=self.req.policy_hash)
         self.payload=dict(request=asdict(self.req),review=self.review)
     def prepared(self):return contract.canonical(contract.prepare(contract.canonical(self.payload),self.env))
+
+    def test_staged_reviews_bind_their_predecessors_and_independent_expiries(self):
+        host=contract.host
+        now=datetime.now(timezone.utc).replace(microsecond=0)
+        create=retained_review(self.review,'deploy')
+        create['retainedCutover']['stage']='create'
+
+        def prepare(review,operation,seconds):
+            request=host.prepare_production_frontend_request(review,operation=operation,policy_hash=self.req.policy_hash,
+                expires_at=contract.common.stamp(now+timedelta(seconds=seconds)))
+            data=dict(request=asdict(request),review=review)
+            artifact=contract.prepare(contract.canonical(data),self.env,now)
+            return request,contract.canonical(artifact),artifact['bundleHash']
+
+        creation,create_raw,create_bundle=prepare(create,'deploy',120)
+        switch=deepcopy(create)
+        switch['retainedCutover'].update(stage='switch',candidateId='3'*64,creationRequestHash=creation.digest(),
+            creationWitnessDigest='4'*64,observationDigest='5'*64,scopeGeneration=10)
+        cutover,switch_raw,switch_bundle=prepare(switch,'deploy',30)
+        rollback=deepcopy(switch)
+        rollback['retainedCutover'].update(stage='rollback',parentRequestHash=cutover.digest(),switchWitnessDigest='6'*64,
+            switchPrefix=3,candidateRunning=False,observationDigest='7'*64)
+        restore,restore_raw,restore_bundle=prepare(rollback,'rollback',240)
+
+        for stage,req,review,raw in (('create',creation,create,create_raw),('switch',cutover,switch,switch_raw),
+                                    ('rollback',restore,rollback,restore_raw)):
+            verified,policy,_=contract.verify_prepared_review(raw,self.env,req,review,now)
+            self.assertEqual(verified.profile_version,'3')
+            self.assertIs(type(policy),host.ProductionFrontendApprovalPolicyV3)
+            self.assertEqual(policy.stage,stage)
+            self.assertIn(f'Stage: `{stage}`',contract.summary(raw,self.env))
+        self.assertEqual(len({create_bundle,switch_bundle,restore_bundle}),3)
+        self.assertEqual(cutover.plan_hash,host._digest(switch))
+        self.assertEqual(restore.history_hash,cutover.digest())
+        with self.assertRaises(ValueError):
+            contract.verify_prepared_review(create_raw,self.env,cutover,switch,now)
+        for key,value in (('candidateId','8'*64),('creationWitnessDigest','9'*64),
+                          ('scopeGeneration',11),('observationDigest','a'*64),('creationRequestHash','b'*64)):
+            tampered=deepcopy(switch)
+            tampered['retainedCutover'][key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):
+                contract.verify_prepared_review(switch_raw,self.env,cutover,tampered,now)
+        after_expiry=now+timedelta(seconds=31)
+        with self.assertRaises(ValueError):
+            contract.verify(switch_raw,self.env,after_expiry)
+        self.assertEqual(contract.verify(restore_raw,self.env,after_expiry)[0],restore)
+
+    def test_staged_review_rejects_invalid_scope_shapes(self):
+        host=contract.host
+        switch=retained_review(self.review,'deploy')
+        switch['retainedCutover'].update(stage='switch',candidateId='3'*64,creationRequestHash='4'*64,
+            creationWitnessDigest='5'*64,observationDigest='6'*64,scopeGeneration=10)
+        for patch_values in (dict(stage='rollback'),dict(stage='create'),dict(stage=[]),
+                             dict(scopeGeneration=True),dict(scopeGeneration=0),dict(scopeGeneration=2**53),
+                             dict(candidateId=self.review['identity']['containerId']),dict(switchPrefix=0)):
+            invalid=deepcopy(switch)
+            invalid['retainedCutover'].update(patch_values)
+            with self.subTest(patch_values=patch_values),self.assertRaises(ValueError):
+                host.prepare_production_frontend_request(invalid,policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
+
     def test_retained_rollback_artifact_binds_and_displays_scope(self):
         review=retained_review(self.review,'rollback')
         req=contract.host.prepare_production_frontend_request(

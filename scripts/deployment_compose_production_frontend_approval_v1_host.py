@@ -22,6 +22,12 @@ IDENTITY_FIELDS={'hostId','daemonId','project','service','containerId','containe
 HASH=re.compile('[0-9a-f]{64}\\Z')
 RETAINED_DEPLOY_FIELDS={'planDigest','operationNonce','protectionDigest','runtimeArchiveDigest'}
 RETAINED_ROLLBACK_FIELDS={'candidateId','switchPrefix','candidateRunning','parentRequestHash','observationDigest'}
+STAGED_OPERATIONS = {'create': 'deploy', 'switch': 'deploy', 'rollback': 'rollback'}
+STAGED_CANDIDATE_FIELDS = {
+    'candidateId', 'creationRequestHash', 'creationWitnessDigest', 'observationDigest', 'scopeGeneration',
+}
+STAGED_ROLLBACK_FIELDS = {'parentRequestHash', 'switchWitnessDigest', 'switchPrefix', 'candidateRunning'}
+STAGED_RECOVERY_FIELDS = {'recoveryJournalDigest', 'recoveryEvidenceDigest'}
 
 
 def _digest(value):
@@ -36,6 +42,8 @@ def _retained_pins(review, operation):
             _deny('V1 frontend intent supports deployment only')
         return '1',review['snapshotDigest'],None
     cutover=review['retainedCutover']
+    if type(cutover) is dict and 'stage' in cutover:
+        return _staged_pins(review, cutover, operation)
     fields=RETAINED_DEPLOY_FIELDS | (RETAINED_ROLLBACK_FIELDS if operation=='rollback' else set())
     if type(cutover) is not dict or set(cutover)!=fields:
         _deny('Invalid retained frontend operation shape')
@@ -51,6 +59,40 @@ def _retained_pins(review, operation):
             or candidate in review['protectedContainerIds']):
         _deny('Invalid retained frontend restoration scope')
     return '2',cutover['observationDigest'],cutover['parentRequestHash']
+
+
+def _staged_pins(review, cutover, operation):
+    stage = cutover['stage']
+    if type(stage) is not str or STAGED_OPERATIONS.get(stage) != operation:
+        _deny('Invalid staged frontend operation')
+    fields = RETAINED_DEPLOY_FIELDS | {'stage'}
+    if stage != 'create':
+        fields |= STAGED_CANDIDATE_FIELDS
+    if stage == 'rollback':
+        fields |= STAGED_ROLLBACK_FIELDS
+        if STAGED_RECOVERY_FIELDS & cutover.keys():
+            fields |= STAGED_RECOVERY_FIELDS
+    if set(cutover) != fields:
+        _deny('Invalid staged frontend scope')
+    for key in fields - {'stage', 'scopeGeneration', 'switchPrefix', 'candidateRunning'}:
+        if type(cutover[key]) is not str or not HASH.fullmatch(cutover[key]):
+            _deny('Invalid staged frontend digest')
+    if stage == 'create':
+        return '3', review['snapshotDigest'], None
+    candidate = cutover['candidateId']
+    generation = cutover['scopeGeneration']
+    if (candidate == review['identity']['containerId'] or candidate in review['protectedContainerIds']
+            or type(generation) is not int or not 1 <= generation < 2**53):
+        _deny('Invalid staged frontend candidate or scope generation')
+    if stage == 'rollback':
+        prefix, running = cutover['switchPrefix'], cutover['candidateRunning']
+        if (type(prefix) is not int or not 1 <= prefix <= 4 or type(running) is not bool
+                or running and prefix != 4 or cutover['parentRequestHash'] == cutover['creationRequestHash']):
+            _deny('Invalid staged frontend restoration scope')
+        return '3', cutover['observationDigest'], cutover['parentRequestHash']
+    # The deploy contract reserves history_hash for restoration. The signed
+    # plan_hash binds the creation request and witness for the switch.
+    return '3', cutover['observationDigest'], None
 
 
 def prepare_production_frontend_request(review,*,policy_hash,expires_at,operation='deploy'):
@@ -157,6 +199,23 @@ class ProductionFrontendApprovalPolicyV2(ProductionFrontendApprovalPolicyV1):
             _deny('Invalid retained production frontend policy')
 
 
+@dataclass(frozen=True,kw_only=True)
+class ProductionFrontendApprovalPolicyV3(ProductionFrontendApprovalPolicyV1):
+    supported_operations = ProductionFrontendApprovalPolicyV2.supported_operations
+    stage: str
+    observation_hash: str
+    history_hash: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if (type(self.stage) is not str or STAGED_OPERATIONS.get(self.stage) != self.operation
+                or type(self.observation_hash) is not str or not HASH.fullmatch(self.observation_hash)
+                or self.stage == 'create' and self.observation_hash != self.snapshot_hash
+                or self.stage != 'rollback' and self.history_hash is not None
+                or self.stage == 'rollback' and (type(self.history_hash) is not str or not HASH.fullmatch(self.history_hash))):
+            _deny('Invalid staged production frontend policy')
+
+
 class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
     profile_id=PROFILE
     audience=AUDIENCE
@@ -214,7 +273,7 @@ class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
     operations=ProductionFrontendApprovalPolicyV2.supported_operations
 
     def _prefetch_authority(self):
-        if type(self) is not GitHubProductionFrontendApprovalV2:
+        if type(self) not in (GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3):
             return None
         import deployment_compose_live_review_v3_host as live
 
@@ -227,3 +286,8 @@ class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
         if result is None:
             _deny('Invalid GitHub authority batch')
         return result
+
+
+class GitHubProductionFrontendApprovalV3(GitHubProductionFrontendApprovalV2):
+    policy_type = ProductionFrontendApprovalPolicyV3
+    profile_version = '3'

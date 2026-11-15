@@ -14,6 +14,7 @@ import deployment_compose_production_frontend_review_contract as contract
 from tests.test_deployment_compose_production_frontend_approval_v1_host import fixture,approved,host,release,retained_review
 from tests.test_deployment_compose_production_frontend_v3_host import material,adapter
 from tests.test_release_host import claims
+from release_execute import AuthorizationUnavailable
 
 
 @unittest.skipUnless(os.name=='posix' and Path('/usr/bin/openssl').exists(),'POSIX/OpenSSL required')
@@ -108,6 +109,31 @@ class BridgeTests(unittest.TestCase):
   self.assertFalse(metadata['consumed'])
   sent=json.loads(json.loads(self.dispatch_inputs[0])['inputs']['public_payload'])
   self.assertEqual(sent['review']['retainedCutover'],review['retainedCutover'])
+ def test_staged_switch_returns_v3_consent_and_reports_stage(self):
+  review=retained_review(self.plan['publicReview'],'deploy')
+  review['retainedCutover'].update(stage='switch',candidateId='3'*64,creationRequestHash='4'*64,
+      creationWitnessDigest='5'*64,observationDigest='6'*64,scopeGeneration=10)
+  self.plan['publicReview']=review
+  req=host.prepare_production_frontend_request(
+      review,policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
+  raw=contract.prepare(contract.canonical(dict(request=asdict(req),review=review)),self.b._env(self.run))
+  self.zips[1]=self.zipped('bundle.json',contract.canonical(raw).encode())
+  prefix='/repos/'+host.RUNTIME+'/actions/runs/123'
+  self.data[prefix+'/artifacts?per_page=100']['artifacts'][0]['size_in_bytes']=len(self.zips[1])
+  self.data[prefix+'/approvals'][0]['comment']='dev-workflow approve '+raw['bundleHash']
+  events=[]
+  approval,grant,metadata=self.b.request_prepared_review(self.plan,req,events.append)
+  self.assertIs(type(approval),host.GitHubProductionFrontendApprovalV3)
+  self.assertEqual(grant.request_hash,req.digest())
+  self.assertEqual(events[0]['stage'],'switch')
+  self.assertEqual(metadata['stage'],'switch')
+  self.assertFalse(metadata['consumed'])
+  creation=retained_review(self.plan['publicReview'],'deploy')
+  creation['retainedCutover']['stage']='create'
+  other=host.prepare_production_frontend_request(
+      creation,policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
+  with self.assertRaises(AuthorizationUnavailable):
+   approval.validate(other)
  def test_main_denied_before_post(self):
   self.data['/repos/'+host.RUNTIME+'/environments/compose-review/deployment-branch-policies?per_page=100']['branch_policies']=[]
   with self.assertRaises(bridge.LiveReviewBlocked):self.b.request_prepared_review(self.plan,self.req,lambda _:None)
