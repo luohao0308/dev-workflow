@@ -19,7 +19,7 @@ import threading
 import time
 
 from deployment_compose_production_frontend_approval_v1_host import (
-    PROFILE, GitHubProductionFrontendApprovalV2, ProductionFrontendGrantV1,
+    PROFILE, GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3, ProductionFrontendGrantV1,
     ProductionFrontendReceiptV1,
 )
 from deployment_compose_witness_store import canonical, hex_value
@@ -33,6 +33,7 @@ RPC_FIELDS = {'method', 'requestHash', 'binding', 'nonce', 'generation', 'grantH
 RESPONSE_FIELDS = {'request', 'issuedAt', 'expiresAt', 'result', 'runtimePermit'}
 METHODS = frozenset(('validate', 'consume', 'check'))
 _MAX_CLOCK_SKEW = 2
+_APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
 
 
 class IntentRelayRejected(ValueError):
@@ -71,7 +72,7 @@ class RetainedIntentBindingV1:
 
 
 def _request_pin(request, binding):
-    if (type(request) is not RequestV2 or request.profile_id != PROFILE or request.profile_version != '2'
+    if (type(request) is not RequestV2 or request.profile_id != PROFILE or request.profile_version not in _APPROVAL_TYPES
             or request.production is not True or request.operation not in ('deploy', 'rollback')
             or type(binding) is not RetainedIntentBindingV1):
         reject()
@@ -113,7 +114,7 @@ class RetainedIntentIssuerV1(_OriginalOwner):
 
     def __init__(self, approval, request, grant, *, binding, signer, preflight_challenge=None):
         self._pin = _request_pin(request, binding)
-        if (type(approval) is not GitHubProductionFrontendApprovalV2
+        if (type(approval) is not _APPROVAL_TYPES[request.profile_version]
                 or type(grant) is not ProductionFrontendGrantV1
                 or approval.policy.workflow_sha != binding.runtime_sha or approval.validate(request) != grant
                 or preflight_challenge is not None and not callable(preflight_challenge)):
