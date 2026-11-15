@@ -59,6 +59,9 @@ class FrontendRecoveryTests(unittest.TestCase):
     def test_restored_original_requires_exact_closed_create_and_stop(self):
         self._check_closed_restored_prefix(1)
 
+    def test_create_only_requires_one_closed_create_receipt(self):
+        self._check_closed_restored_prefix(0)
+
     def test_restored_original_requires_both_closed_renames_at_prefix_three(self):
         self._check_closed_restored_prefix(3)
 

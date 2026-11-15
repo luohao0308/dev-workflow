@@ -26,10 +26,11 @@ MAX_APPROVAL_SECONDS = 900
 LEDGER_UNCONSUMED = 'ledger-unconsumed'
 LEDGER_CONSUMED_BEFORE_GATE = 'ledger-consumed-before-gate'
 FIRST_CREATE_OUTCOME_UNKNOWN = 'first-create-outcome-unknown'
+CONFIRMED_CREATE_ONLY = 'confirmed-create-only'
 ORIGINAL_RESTORED_AFTER_STOP = 'original-restored-after-confirmed-stop'
 ORIGINAL_RESTORED_AFTER_RENAMES = 'original-restored-after-confirmed-renames'
 _CONSUMED_BASES = (LEDGER_CONSUMED_BEFORE_GATE, FIRST_CREATE_OUTCOME_UNKNOWN,
-                   ORIGINAL_RESTORED_AFTER_STOP, ORIGINAL_RESTORED_AFTER_RENAMES)
+                   CONFIRMED_CREATE_ONLY, ORIGINAL_RESTORED_AFTER_STOP, ORIGINAL_RESTORED_AFTER_RENAMES)
 
 
 def valid_ledger_sha(value):

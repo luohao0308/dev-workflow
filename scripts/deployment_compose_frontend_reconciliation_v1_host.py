@@ -24,12 +24,18 @@ from deployment_compose_production_scope_v1_host import ScopeBlocked, _directory
 from deployment_compose_retained_phase_v1_host import original_projection, restored_phase, switched_phase, verify_phase
 from deployment_compose_retained_write_v1_host import _operation_tuple
 from deployment_compose_scope_reconciliation_v1_host import (
-    FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED,
+    CONFIRMED_CREATE_ONLY, FIRST_CREATE_OUTCOME_UNKNOWN, LEDGER_CONSUMED_BEFORE_GATE, LEDGER_UNCONSUMED,
     ORIGINAL_RESTORED_AFTER_RENAMES, ORIGINAL_RESTORED_AFTER_STOP, reconcile_pending_scope,
     recovery_payload, valid_ledger_sha,
 )
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
 from deployment_gateway import FileWriterGate
+
+_CLOSED_SWITCH_PREFIXES = {
+    CONFIRMED_CREATE_ONLY: 0,
+    ORIGINAL_RESTORED_AFTER_STOP: 1,
+    ORIGINAL_RESTORED_AFTER_RENAMES: 3,
+}
 
 
 def _reject():
@@ -184,7 +190,7 @@ def _closed_create_and_stop(registration, request_digest, cutover, gate_evidence
 
 def _closed_switch_prefix(registration, request_digest, cutover, gate_evidence, *, prefix):
     """Match each operation in the required prefix to its exact closed receipt."""
-    if prefix not in (1, 3) or type(gate_evidence) is not dict or len(gate_evidence) != prefix + 1:
+    if prefix not in _CLOSED_SWITCH_PREFIXES.values() or type(gate_evidence) is not dict or len(gate_evidence) != prefix + 1:
         _reject()
     if any(not hex_value(generation) or type(digests) is not tuple or len(digests) != 6
            or not all(hex_value(digest) for digest in digests)
@@ -257,11 +263,12 @@ def _observe_restored(registration, request_digest, cutover, review, *, original
     if not callable(verify_ledger_consumed) or not valid_ledger_sha(ledger_target_sha):
         _reject()
     _require_quiescent()
-    prefix = 3 if recovery_basis == ORIGINAL_RESTORED_AFTER_RENAMES else 1
+    prefix = _CLOSED_SWITCH_PREFIXES[recovery_basis]
     candidate, markers = _closed_switch_prefix(registration, request_digest, cutover, closed_gate_evidence, prefix=prefix)
     phase = switched_phase(cutover, prefix)
-    for operation in cutover.restore(candidate, switch_prefix=prefix, candidate_running=False):
-        phase = restored_phase(cutover, phase, operation)
+    if prefix:
+        for operation in cutover.restore(candidate, switch_prefix=prefix, candidate_running=False):
+            phase = restored_phase(cutover, phase, operation)
     observer = HostSnapshotV3()
     try:
         if observer.descriptor()['endpointDigest'] != endpoint_digest:
@@ -314,7 +321,7 @@ def _observe(registration, request_digest, *, private_plan, operation_nonce,
     if (registration.project != 'luohao-blog-prod'
             or not all(hex_value(value) for value in (request_digest, caddy_id, network_id, endpoint_digest))):
         _reject()
-    if recovery_basis in (ORIGINAL_RESTORED_AFTER_STOP, ORIGINAL_RESTORED_AFTER_RENAMES):
+    if recovery_basis in _CLOSED_SWITCH_PREFIXES:
         if (gate_generation is not None or gate_event_digests is not None or verify_ledger_absent is not None
                 or type(original_baseline) is not dict):
             _reject()
