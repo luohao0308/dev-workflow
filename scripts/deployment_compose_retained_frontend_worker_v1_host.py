@@ -282,7 +282,10 @@ class RetainedFrontendWorkerV1:
         expected = prepare_production_frontend_request(
             review, policy_hash=self._policy_hash, expires_at=request.expires_at, operation=request.operation,
         )
-        if request != expected or approval.validate(request) != grant:
+        if request != expected:
+            raise RetainedWorkerBlocked('retained-production-request-mismatch')
+        validated = approval.validated_grant(request) if relayed else approval.validate(request)
+        if validated != grant:
             raise RetainedWorkerBlocked('retained-production-request-mismatch')
         expires_at = min(timestamp(request.expires_at).timestamp(), timestamp(grant.expires_at).timestamp())
         if request.operation == 'deploy' and stage != 'create':
@@ -316,16 +319,20 @@ class RetainedFrontendWorkerV1:
             raise RetainedCutoverWindowTooShort('production-cutover-window-too-short')
 
     def _write(self, transport, approval, request, operation, index, receipt_hash, execution_digest, expires_at):
-        def guard():
-            if self._observe() != self._observation:
-                raise RetainedWorkerBlocked('retained-production-write-drift')
+        def refresh_intent():
             checked = approval.check_consumed_intent(request)
             if type(approval) is RetainedIntentClientV1:
                 return checked
 
+        def guard():
+            if self._observe() != self._observation:
+                raise RetainedWorkerBlocked('retained-production-write-drift')
+            return refresh_intent()
+
         status, raw, witness = transport.write(
             operation, request_hash=request.digest(), receipt_hash=receipt_hash,
             plan_digest=execution_digest, index=index, before_dispatch=guard, expires_at=expires_at,
+            refresh_intent=refresh_intent,
         )
         if not hex_value(witness) or (operation.phase == 'create' and status != 201
                                      or operation.phase != 'create' and (status != 204 or raw != b'')):

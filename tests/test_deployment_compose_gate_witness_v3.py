@@ -84,6 +84,18 @@ class GateWitnessV3Tests(GateFixture,unittest.TestCase):
         gate.finish_response(ticket,definitive=True,status=201,body=b'{}')
         self.assertTrue(gate.validate_proof(gate.close_generation(self.gen)))
 
+    def test_reservation_rejects_history_advanced_after_the_read(self):
+        gate = self.gate()
+        self.opening(gate)
+        raw = (self.root / 'gate' / self.gen / '00000000.json').read_bytes()
+        event = json.loads(raw)['payload']
+
+        with patch.object(self.client, 'events_after', return_value=[]) as read_history:
+            with self.assertRaises(ValueError):
+                self.adapter.reserve_event(self.gen, 0, '0' * 64, event, raw)
+        read_history.assert_called_once_with(seq=0, head='0' * 64)
+        self.assertEqual(self.client.read()['seq'], 1)
+
     def test_unknown_blocks_close_and_transition(self):
         gate=self.gate();ticket=self.admitted(gate)
         gate.finish_response(ticket,definitive=False,status=0,body=b'')
