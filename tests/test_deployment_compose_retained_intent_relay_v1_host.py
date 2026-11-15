@@ -71,6 +71,26 @@ class RetainedRelayTests(unittest.TestCase):
             client.validate(self.request)
         self.assertFalse(self.ledger.markers)
 
+    def test_worker_handoff_reuses_validation_only_while_signed_reply_is_fresh(self):
+        methods = []
+
+        def transport(rpc):
+            methods.append(rpc['method'])
+            return self.issuer.authorize_rpc(rpc)
+
+        client = self.client(transport)
+        grant = client.validate(self.request)
+        self.assertEqual(client.validated_grant(self.request), grant)
+        self.assertEqual(methods, ['validate'])
+
+        with patch.object(client, '_validation_expires_at', time.time() - 1):
+            self.assertEqual(client.validated_grant(self.request), grant)
+        self.assertEqual(methods, ['validate', 'validate'])
+        client.consume(grant, self.request, before_consume=lambda: None, generation=7)
+        with self.assertRaises(IntentRelayRejected):
+            client.validated_grant(self.request)
+        self.assertEqual(methods, ['validate', 'validate', 'consume'])
+
     def test_tampered_receipt_is_rejected_without_second_consumption(self):
         def corrupt(rpc):
             result = self.issuer.authorize_rpc(rpc)
