@@ -136,7 +136,7 @@ def inspect_retained_crash_evidence(root, pending, *, public_key, expected_key_h
                 if (value['parentBinding'] != parent['firstBinding'] or value['parentLineageDigest'] != parent_digest
                         or value['writerOrigin'] != parent['writerOrigin'] or cutover.get('scopeGeneration') != pending['generation']
                         or any(cutover.get(key) != parent['cutover'].get(key)
-                               for key in ('planDigest', 'operationNonce', 'runtimeArchiveDigest'))):
+                               for key in ('planDigest', 'operationNonce', 'runtimeArchiveDigest', 'protectionMode'))):
                     _reject()
                 created = evidence[0]
                 if (not evidence[-1]['checkpointMatches'] or cutover.get('candidateId') != created['candidateId']

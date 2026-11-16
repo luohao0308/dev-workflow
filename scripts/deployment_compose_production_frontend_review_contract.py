@@ -93,6 +93,8 @@ def summary(raw,env):
         if request.profile_version=='3':
             stage=cutover['stage']
             retained+=f"Stage: `{stage}`.\n\n"
+            if 'protectionMode' in cutover:
+                retained+=f"Protection mode: `{cutover['protectionMode']}`.\n\n"
             if stage!='create':
                 retained+=(f"Candidate: `{cutover['candidateId']}`. Scope generation: `{cutover['scopeGeneration']}`. "
                            f"Creation request: `{cutover['creationRequestHash']}`. Creation witness: `{cutover['creationWitnessDigest']}`. "

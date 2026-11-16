@@ -210,7 +210,7 @@ class HostSnapshotV3:
         self._local()
         return value
 
-    def _scan(self,deadline,budget,*,include_definitions=False,frontend_ids=()):
+    def _scan(self,deadline,budget,*,include_definitions=False,frontend_ids=(),project_transient_bans=False):
         self._fresh(deadline)
         info=self._get('/v1.45/info',deadline,budget)
         if (type(info) is not dict or info.get('ID')!=self._info_id or info.get('DockerRootDir')!=self._data_root):reject()
@@ -261,14 +261,27 @@ class HostSnapshotV3:
             network['routes6'] = _without_frontend_link_routes(network['routes6'], veths)
         else:
             network=capture_network(deadline)
+        if project_transient_bans:
+            if (not frontend_ids or not isinstance(network.get('firewall4WithoutTransientBans'), str)
+                    or re.fullmatch('[0-9a-f]{64}', network['firewall4WithoutTransientBans']) is None
+                    or not isinstance(network.get('firewall4'), str)
+                    or re.fullmatch('[0-9a-f]{64}', network['firewall4']) is None):
+                reject()
+            # Compare the endpoint-bound policy before checking the two scans.
+            # Only the exact transient ban projection came from capture_network.
+            network = {key: value for key, value in network.items() if key != 'firewall4'}
         if network['netns']!=self._context['net'] or network['mountns']!=self._context['mnt']:reject()
         self._fresh(deadline)
         return encode(dict(profile=PROFILE,endpointDigest=hashlib.sha256(self._endpoint).hexdigest(),
             resources=resources,containers=containers,network=network))
 
-    def _capture(self,deadline,budget,*,include_definitions=False,frontend_ids=()):
-        first=self._scan(deadline,budget,include_definitions=include_definitions,frontend_ids=frontend_ids)
-        second=self._scan(deadline,budget,include_definitions=include_definitions,frontend_ids=frontend_ids)
+    def _capture(self,deadline,budget,*,include_definitions=False,frontend_ids=(),project_transient_bans=False):
+        if type(project_transient_bans) is not bool or project_transient_bans and not frontend_ids:
+            reject()
+        options = dict(include_definitions=include_definitions, frontend_ids=frontend_ids,
+                       project_transient_bans=project_transient_bans)
+        first=self._scan(deadline,budget,**options)
+        second=self._scan(deadline,budget,**options)
         if first!=second:reject()
         units._left(deadline)
         return first
@@ -479,27 +492,31 @@ class ProductionFrontendProtectionV1:
     """
     __slots__ = ('__weakref__',)
 
-    def __init__(self, observer, *, daemon_id, original_id, protected_ids, timeout=20, bind_endpoint_rules=False):
+    def __init__(self, observer, *, daemon_id, original_id, protected_ids, timeout=20, bind_endpoint_rules=False,
+                 project_transient_bans=False):
         if (type(self) is not ProductionFrontendProtectionV1 or type(observer) is not HostSnapshotV3
                 or self in _FRONTEND_PROTECTIONS
                 or type(daemon_id) is not str or daemon_id!=observer._info_id
                 or type(original_id) is not str or not re.fullmatch('[0-9a-f]{64}',original_id)
                 or type(protected_ids) is not tuple or not 1<=len(protected_ids)<=63
                 or any(type(item) is not str or not re.fullmatch('[0-9a-f]{64}',item) for item in protected_ids)
-                or tuple(sorted(set(protected_ids)))!=protected_ids or original_id in protected_ids):
+                or tuple(sorted(set(protected_ids)))!=protected_ids or original_id in protected_ids
+                or type(project_transient_bans) is not bool or project_transient_bans and bind_endpoint_rules is not True):
             reject()
-        baseline = _frontend_projection(self._observe(observer, timeout, (original_id,) if bind_endpoint_rules else ()),
+        options = {'project_transient_bans': True} if project_transient_bans else {}
+        baseline = _frontend_projection(self._observe(observer, timeout, (original_id,) if bind_endpoint_rules else (),
+                                                       **options),
                                         original_id, protected_ids, None)
         _FRONTEND_PROTECTIONS[self] = ((os.getpid(),threading.get_ident()),observer,original_id,protected_ids,
-                                       baseline,bind_endpoint_rules)
+                                       baseline,bind_endpoint_rules,project_transient_bans)
 
     @staticmethod
-    def _observe(observer,timeout,frontend_ids=()):
+    def _observe(observer,timeout,frontend_ids=(),*,project_transient_bans=False):
         observer._check()
         if type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0<timeout<=20:
             reject()
         return json.loads(observer._capture(time.monotonic()+timeout,[32*1024*1024],include_definitions=True,
-                                            frontend_ids=frontend_ids))
+                                            frontend_ids=frontend_ids,project_transient_bans=project_transient_bans))
 
     def verify(self, *, candidate_id=None, timeout=20):
         return self._compare(candidate_id, timeout, refresh_ipv4=False)
@@ -512,15 +529,16 @@ class ProductionFrontendProtectionV1:
         state = _FRONTEND_PROTECTIONS.get(self)
         if state is None or state[0]!=(os.getpid(),threading.get_ident()):
             reject()
-        _,observer,original,protected,baseline,bind_endpoint_rules=state
+        _,observer,original,protected,baseline,bind_endpoint_rules,project_transient_bans=state
         ids = (original,) if candidate_id is None else (original, candidate_id)
+        options = {'project_transient_bans': True} if project_transient_bans else {}
         try:
-            current=_frontend_projection(self._observe(observer,timeout,ids if bind_endpoint_rules else ()),
+            current=_frontend_projection(self._observe(observer,timeout,ids if bind_endpoint_rules else (),**options),
                                          original,protected,candidate_id)
         except (ValueError, OSError, KeyError, TypeError):
             raise FrontendProtectionMismatch('protection-capture') from None
         if current!=baseline:
-            if not refresh_ipv4:
+            if not refresh_ipv4 or project_transient_bans:
                 raise FrontendProtectionMismatch(_protection_difference(baseline, current))
             before, after = json.loads(baseline), json.loads(current)
             if 'firewall4WithoutTransientBans' not in before['network']:
@@ -528,5 +546,5 @@ class ProductionFrontendProtectionV1:
             before['network']['firewall4'] = after['network']['firewall4']
             if encode(before) != current:
                 raise FrontendProtectionMismatch(_protection_difference(baseline, current))
-            _FRONTEND_PROTECTIONS[self] = (*state[:4], current, bind_endpoint_rules)
+            _FRONTEND_PROTECTIONS[self] = (*state[:4], current, *state[5:])
         return hashlib.sha256(current).hexdigest()

@@ -42,6 +42,12 @@ class NativeChannelTests(unittest.TestCase):
     def test_staged_channel_relays_partial_switch_for_separately_approved_rollback(self):
         self._round_trip(deny_before_start=True, staged=True)
 
+    def test_staged_channel_allows_only_projected_transient_firewall_changes(self):
+        self._round_trip(deny_before_start=False, staged=True, transient_firewall_drift=True)
+
+    def test_staged_channel_rejects_non_transient_firewall_change_before_consumption(self):
+        self._round_trip(deny_before_start=False, staged=True, persistent_firewall_drift=True)
+
     def test_initial_intent_failure_reports_stage_without_consumption_or_error_text(self):
         self._round_trip(deny_before_start=False, fail_validation=True)
 
@@ -55,9 +61,10 @@ class NativeChannelTests(unittest.TestCase):
         self._round_trip(deny_before_start=False, ipv4_drift_after_stop=True, late_ipv4_drift=True)
 
     def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False,
-                    ipv4_drift_after_stop=False, late_ipv4_drift=False, staged=False, short_switch=False):
+                    ipv4_drift_after_stop=False, late_ipv4_drift=False, staged=False, short_switch=False,
+                    transient_firewall_drift=False, persistent_firewall_drift=False):
         self.write_patch.stop()
-        if ipv4_drift_after_stop:
+        if ipv4_drift_after_stop or staged:
             self.network['firewall4WithoutTransientBans'] = 'a' * 64
         original = self.worker._plan
         prefix = 1 if ipv4_drift_after_stop else 3 if deny_before_start else 4
@@ -69,12 +76,28 @@ class NativeChannelTests(unittest.TestCase):
             operation = by_path[path]
             self.assertEqual(raw, operation.body)
             status, body, _ = self._write(operation, before_dispatch=lambda: None)
+            if transient_firewall_drift and operation.phase in ('create', 'stop-original'):
+                self.network['firewall4'] = 'b' * 64 if operation.phase == 'create' else 'c' * 64
             if ipv4_drift_after_stop and operation.phase == 'stop-original':
                 self.network['firewall4'] = '9' * 64
             return status, body
 
         self.engine_post = engine_post
         with ExitStack() as stack:
+            if transient_firewall_drift:
+                capture = fixture.host_fixture.host.capture_network
+                scans = 0
+
+                def changing_bans(deadline, **kwargs):
+                    nonlocal scans
+                    network = capture(deadline, **kwargs)
+                    if 'expected_endpoint_rules' in kwargs:
+                        scans += 1
+                        network['firewall4'] = ('e' if scans % 2 else 'f') * 64
+                    return network
+
+                stack.enter_context(patch.object(fixture.host_fixture.host, 'capture_network',
+                                                 side_effect=changing_bans))
             if fail_validation:
                 stack.enter_context(patch.object(native.RetainedIntentClientV1, 'validate',
                     side_effect=IntentRelayRejected('private failure detail')))
@@ -165,12 +188,19 @@ class NativeChannelTests(unittest.TestCase):
                         self.assertFalse(short_ledger.markers)
                         self.assertEqual(self.writes, ['create'])
                     approval, grant, request, first_ledger = self._approval(result['switchReview'], 'deploy')
+                    if persistent_firewall_drift:
+                        self.network['firewall4'] = self.network['firewall4WithoutTransientBans'] = 'd' * 64
                     result = controller.execute(approval, grant, request)
                 if fail_validation:
                     self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
                                                   failureStage='validate-intent'))
                     self.assertEqual(self.writes, [])
                     self.assertEqual(len(first_ledger.markers), 0)
+                elif persistent_firewall_drift:
+                    self.assertEqual(result['failureStage'], 'pre-write-protection-network')
+                    self.assertFalse(first_ledger.markers)
+                    self.assertEqual(self.writes, ['create'])
+                    self.assertTrue(self.other_rows[self.original]['State']['Running'])
                 elif fail_restore_preparation:
                     self.assertEqual(result['failureStage'], 'prepare-restore')
                     self.assertTrue(result['blocked'])
@@ -189,7 +219,7 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
                 else:
                     self.assertEqual(len(result['result']['witnessDigests']), expected_deploy_witnesses)
-                if not (fail_validation or fail_restore_preparation):
+                if not (fail_validation or fail_restore_preparation or persistent_firewall_drift):
                     approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
                     if late_ipv4_drift:
                         self.network['firewall4'] = '8' * 64

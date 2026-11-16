@@ -197,7 +197,7 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
         worker = RetainedFrontendWorkerV1(plan, operation_nonce=data['operationNonce'], observer=observer,
             registration=registration, writer_source_sha=source['sourceSha'], writer_archive_digest=source['archiveDigest'],
             policy_hash=data['policyHash'], witness_transport_factory=factory, readiness=readiness,
-            loaded_source=receipt)
+            loaded_source=receipt, project_transient_bans=staged)
         try:
             deploy_review = worker.create_review() if staged else worker.deploy_review()
             channel.emit('prepared', review=deploy_review, writerCertificateSha256=writer_pin)

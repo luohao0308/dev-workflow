@@ -11,7 +11,7 @@ from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
-    GitHubProductionFrontendApprovalV3, prepare_production_frontend_request,
+    GitHubProductionFrontendApprovalV3, STAGED_PROTECTION_MODE, prepare_production_frontend_request,
 )
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import _claim_pending_scope
@@ -98,12 +98,16 @@ def _observe_recovery_phase(observer, private_plan, original_baseline, cutover, 
                             require_ready=restored)
 
     before = sample()
-    snapshot = ProductionFrontendProtectionV1._observe(observer, 20, (plan.original_id, candidate))
+    mode = cutover.get('protectionMode')
+    if mode is not None and mode != STAGED_PROTECTION_MODE:
+        _reject()
+    options = {'project_transient_bans': True} if mode == STAGED_PROTECTION_MODE else {}
+    snapshot = ProductionFrontendProtectionV1._observe(observer, 20, (plan.original_id, candidate), **options)
     projection = _frontend_projection(snapshot, plan.original_id, plan.protected_ids, candidate)
     protection = hashlib.sha256(projection).hexdigest()
     if protection != cutover['protectionDigest'] or sample() != before:
         _reject()
-    if not restored:
+    if not restored and not options:
         observer.verify_unchanged()
     if observer.descriptor()['endpointDigest'] != endpoint_digest:
         _reject()
