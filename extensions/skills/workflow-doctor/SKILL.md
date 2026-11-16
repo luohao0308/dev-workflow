@@ -12,6 +12,8 @@ Interpret findings against the user's task and project rules. Read only the mapp
 
 Separate deterministic findings from semantic judgments, and give evidence paths and confidence for the latter. Describe installed packages, configured capabilities and executable tools separately. Installed packages do not prove an intention to enable a capability.
 
+When available, use `onboarding.status` for the recorded local adoption phase and report any disagreement between the document and manifest. Use the distribution's strict audit result for adoption acceptance and for older Core versions without this field.
+
 Identify the current branch and the freshness of available local references. Old branch files are not proof of current main or production state. Do not fetch, checkout, scan secrets, change permissions or repair content. Remote and production facts remain unverified unless independently supplied evidence supports them.
 
 Return prioritized findings, their practical impact, and a bounded repair plan. If documents disagree, preserve the disagreement rather than choosing the most optimistic statement. No finding or Skill installation grants action permissions.

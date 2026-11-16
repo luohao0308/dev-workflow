@@ -210,6 +210,43 @@ class ConfigurationTests(unittest.TestCase):
         self.assertFalse((self.root / 'SHOULD_NOT_EXIST').exists())
         self.assertEqual(report['production'], 'unknown')
 
+    def test_doctor_reports_recorded_onboarding_and_drift(self):
+        adoption = self.root / 'docs' / 'WORKFLOW-ADOPTION.md'
+        adoption.parent.mkdir()
+        cases = (
+            ('pending', 'pending', 'pending', 'onboarding.pending'),
+            ('blocked', 'blocked', 'blocked', 'onboarding.blocked'),
+            ('ready', 'pending', 'unknown', 'onboarding.mismatch'),
+            ('ready', 'ready', 'ready', None),
+            ('ready', None, 'unknown', 'onboarding.unverified'),
+        )
+        for manifest_status, document_status, expected, warning in cases:
+            with self.subTest(manifest=manifest_status, document=document_status):
+                self.write(self.manifest, self.original | {'onboarding': {
+                    'status': manifest_status, 'lastAuditAt': '2026-11-16T00:00:00Z',
+                }})
+                if document_status is None:
+                    adoption.unlink(missing_ok=True)
+                else:
+                    adoption.write_bytes(f'---\r\nstatus: {document_status}\r\n---\r\n'.encode())
+                report = doctor.check(self.root)
+                self.assertEqual(report['onboarding'], {
+                    'status': expected, 'manifestStatus': manifest_status,
+                    'documentStatus': document_status or 'unknown',
+                })
+                codes = {item['code'] for item in report['issues'] if item['code'].startswith('onboarding.')}
+                self.assertEqual(codes, {warning} if warning else set())
+
+    def test_doctor_reports_missing_current_adoption_but_accepts_legacy_unknown(self):
+        report = doctor.check(self.root)
+        self.assertEqual(report['onboarding']['status'], 'unknown')
+        self.assertIn('onboarding.unverified', {item['code'] for item in report['issues']})
+
+        self.write(self.manifest, self.original | {'schemaVersion': 4})
+        report = doctor.check(self.root)
+        self.assertEqual(report['onboarding']['status'], 'unknown')
+        self.assertFalse(any(item['code'].startswith('onboarding.') for item in report['issues']))
+
     def test_doctor_detects_local_baseline_divergence(self):
         def git(*args):
             return subprocess.run(['git', '-C', str(self.root), *args], check=True, capture_output=True)

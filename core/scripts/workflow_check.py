@@ -12,6 +12,9 @@ import sys
 sys.dont_write_bytecode = True
 from workflow_config import CAPABILITY_PACKS, resolve_configuration, safe_path
 
+ADOPTION_DOCUMENT = 'docs/WORKFLOW-ADOPTION.md'
+ADOPTION_STATES = ('pending', 'blocked', 'ready')
+
 
 def git(root: Path, *arguments: str) -> str | None:
     try:
@@ -19,6 +22,20 @@ def git(root: Path, *arguments: str) -> str | None:
         return process.stdout.strip() if process.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
         return None
+
+
+def read_adoption_status(root: Path) -> str:
+    try:
+        path = safe_path(root, ADOPTION_DOCUMENT)
+        if path.is_file():
+            with path.open(encoding='utf-8-sig') as document:
+                header = document.read(16384)
+            match = re.search(r'^status:[ \t]*(\w+)[ \t]*$', header, re.MULTILINE)
+            if match and match[1] in ADOPTION_STATES:
+                return match[1]
+    except (OSError, ValueError):
+        pass
+    return 'unknown'
 
 
 def check(root: Path) -> dict:
@@ -33,6 +50,23 @@ def check(root: Path) -> dict:
         issues.append(item)
 
     manifest = resolved['manifest']
+    adoption = manifest.get('onboarding')
+    manifest_status = adoption.get('status') if isinstance(adoption, dict) else None
+    if manifest_status not in ADOPTION_STATES:
+        manifest_status = 'unknown'
+    document_status = read_adoption_status(root)
+    onboarding_status = 'unknown'
+    if manifest_status == document_status and manifest_status in ADOPTION_STATES:
+        onboarding_status = manifest_status
+        if onboarding_status == 'pending':
+            issue('onboarding.pending', 'Finish the project profile and run the adoption audit.', ADOPTION_DOCUMENT)
+        elif onboarding_status == 'blocked':
+            issue('onboarding.blocked', 'Review the recorded adoption blocker and run the audit after resolving it.', ADOPTION_DOCUMENT)
+    elif manifest_status in ADOPTION_STATES and document_status in ADOPTION_STATES:
+        issue('onboarding.mismatch', 'Installation metadata and the adoption record disagree; run the adoption audit.', ADOPTION_DOCUMENT)
+    elif manifest.get('schemaVersion') == 5 or 'onboarding' in manifest or document_status in ADOPTION_STATES:
+        issue('onboarding.unverified', 'One of the recorded adoption statuses is missing or invalid; run the adoption audit.', ADOPTION_DOCUMENT)
+
     installed = manifest.get('installedPacks', [])
     if not isinstance(installed, list) or any(not isinstance(p, str) for p in installed):
         installed = []
@@ -117,6 +151,7 @@ def check(root: Path) -> dict:
         issue('git.unverified', 'No committed Git HEAD could be verified locally.')
     state = 'invalid' if any(i['severity'] == 'error' for i in issues) else 'warning' if issues else 'ready'
     return dict(schemaVersion=1, result=state, configurationSource=resolved['source'],
+                onboarding=dict(status=onboarding_status, manifestStatus=manifest_status, documentStatus=document_status),
                 installedPacks=installed, capabilities=capabilities, issues=issues,
                 git=dict(head=head, branch=branch, baselineRef=baseline_ref, baselineSha=baseline, divergence=divergence),
                 remote='unknown', production='unknown', commandsExecuted=False)
@@ -134,6 +169,7 @@ def main() -> int:
     else:
         print('dev-workflow doctor: ' + report['result'])
         print('configuration: ' + report['configurationSource'])
+        print('onboarding: ' + report['onboarding']['status'])
         for item in report['issues']:
             print(f"[{item['severity']}] {item['code']}: {item['message']}")
         print('remote: unknown; production: unknown; declared commands were not executed')
