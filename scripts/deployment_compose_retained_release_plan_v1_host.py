@@ -8,7 +8,6 @@ import re
 from deployment_compose_production_frontend_approval_v1_host import (
     STAGED_OPERATIONS, STAGED_PROTECTION_MODE, prepare_production_frontend_request,
 )
-from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
 from deployment_compose_witness_store import canonical, hex_value
 from deployment_contract_v2 import RequestV2
 
@@ -95,6 +94,8 @@ def propose_release_stage(plan, *, reviewed_digest, runtime_sha, current_review,
             _reject()
         expected = approved['createReview']
     else:
+        from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_crash_evidence
+
         if (type(witness_source) is not dict
                 or set(witness_source) != {'root', 'pending', 'public_key', 'expected_key_hash'}):
             _reject()

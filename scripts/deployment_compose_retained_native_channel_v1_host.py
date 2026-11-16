@@ -13,7 +13,7 @@ from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyPro
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1, inspect_pending_scope
 from deployment_compose_retained_frontend_worker_v1_host import (
     POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedAcceptanceRejected, RetainedCutoverWindowTooShort,
-    RetainedFrontendWorkerV1, RetainedObservationFailed,
+    RetainedFrontendWorkerV1, RetainedObservationFailed, RetainedReadinessFailed,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
     ConsumedReceiptRejected, RetainedIntentBindingV1, RetainedIntentClientV1,
@@ -36,7 +36,7 @@ ACCEPT_DEPLOYMENT_FIELDS = {'requestHash', 'observationDigest'}
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
-    'cutover-window-too-short', 'prepare-switch',
+    'cutover-window-too-short', 'prepare-switch', 'candidate-readiness-failed',
 )) | ADMITTED_FAILURE_STAGES | POST_WRITE_OBSERVATION_STAGES | PRE_WRITE_OBSERVATION_STAGES
 # Leave time for the controller to close the session after the longest review wait.
 REVIEW_COMMAND_TIMEOUT = 1020
@@ -153,6 +153,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                 return error.stage
             except RetainedObservationFailed as error:
                 return error.stage
+            except RetainedReadinessFailed:
+                return 'candidate-readiness-failed' if staged and operation == 'deploy' else stage
             except Exception:
                 return stage
             channel.emit('executed', result=result)
@@ -239,7 +241,8 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
             except Exception:
                 channel.emit('blocked', knownPrefix=False, failureStage=failure or 'prepare-restore')
                 return
-            channel.emit('restore-prepared', review=restore_review)
+            disposition = 'restore-readiness-prepared' if failure == 'candidate-readiness-failed' else 'restore-prepared'
+            channel.emit(disposition, review=restore_review)
             commands = [('execute', {'request'}), ('finish', set())]
             if staged:
                 commands.append(('accept-deployment', ACCEPT_DEPLOYMENT_FIELDS))

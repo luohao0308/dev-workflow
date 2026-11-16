@@ -34,6 +34,7 @@ from deployment_compose_production_frontend_approval_v1_host import (
     GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3, ProductionFrontendReceiptV1,
     prepare_production_frontend_request,
 )
+from deployment_compose_retained_release_authority_v1_host import RetainedReleaseStageApprovalV1
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
 from deployment_compose_witness_store import ZERO, canonical, hex_value, pairs
 from deployment_contract_v2 import RequestV2
@@ -47,7 +48,8 @@ _METHODS = frozenset(('read', 'chain_status', 'check', 'events_after', 'append_e
 _MAX_RPC = 4096
 _LINEAGE_NAMESPACE = NAMESPACE + '-retained-lineage'
 _CHECKPOINT_NAMESPACE = NAMESPACE + '-retained-checkpoint'
-_APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
+_APPROVAL_TYPES = {'2': (GitHubProductionFrontendApprovalV2,),
+                   '3': (GitHubProductionFrontendApprovalV3, RetainedReleaseStageApprovalV1)}
 
 
 def reject():
@@ -82,7 +84,7 @@ class RetainedWitnessAdmissionV1:
         if (type(store) is not OperationWitnessStoreV3 or type(gate_policy) is not GatePolicy
                 or gate_policy.operation_profile != 'compose-v3' or gate_policy.witness_required is not True
                 or type(gate_key) is not bytes or not 32 <= len(gate_key) <= 4096
-                or type(request) is not RequestV2 or type(approval) is not _APPROVAL_TYPES.get(request.profile_version)
+                or type(request) is not RequestV2 or type(approval) not in _APPROVAL_TYPES.get(request.profile_version, ())
                 or type(consumption) is not ProductionFrontendReceiptV1
                 or type(scope_generation) is not int or not 1 <= scope_generation < 2**53
                 or not hex_value(writer_origin_digest)):
@@ -95,11 +97,12 @@ class RetainedWitnessAdmissionV1:
             reject()
 
         frozen_review = deepcopy(review)
+        release = type(approval) is RetainedReleaseStageApprovalV1
         expected = prepare_production_frontend_request(
-            frozen_review, policy_hash=approval.policy.policy_hash,
+            frozen_review, policy_hash=approval.request.policy_hash if release else approval.policy.policy_hash,
             expires_at=request.expires_at, operation=request.operation,
         )
-        if expected != request:
+        if expected != request or release and approval.request != request:
             reject()
         cutover = frozen_review.pop('retainedCutover')
         plan = prepare_retained_frontend_cutover(private_plan, operation_nonce=cutover['operationNonce'])
@@ -126,6 +129,9 @@ class RetainedWitnessAdmissionV1:
         self._store, self._policy, self._key = store, gate_policy, gate_key
         self._plan, self._cutover = plan, cutover
         self._stage = cutover.get('stage')
+        self._release_binding = approval.release_binding if release else None
+        if release and approval.stage != self._stage:
+            reject()
         self._scope_generation = scope_generation
         self._origin = writer_origin_digest
         self._entry = dict(request=request, approval=approval, receiptHash=_digest(asdict(consumption)))
@@ -391,6 +397,8 @@ class RetainedWitnessAdmissionV1:
         expected_stage = 'create' if child._stage == 'switch' else 'switch'
         parent_hash = cutover['creationRequestHash'] if expected_stage == 'create' else cutover['parentRequestHash']
         if (self._frozen or self._stage != expected_stage or request.digest() != parent_hash
+                or (child._stage == 'switch' or child._release_binding is not None)
+                and self._release_binding != child._release_binding
                 or self._scope_generation != child._scope_generation
                 or cutover['scopeGeneration'] != child._scope_generation
                 or self._plan.digest != child._plan.digest or self._origin != child._origin
