@@ -97,6 +97,10 @@ def prepare_frontend_plan(row,image,*,expected_identity,expected_snapshot_digest
         if type(protected) is not list or len(protected)>32 or protected!=sorted(set(protected)) or row['Id'] in protected or any(type(x) is not str or not HEX.fullmatch(x) for x in protected):reject()
         context={key:identity[key] for key in ('project','service','containerId','containerName','imageId')}
         validated_config=deepcopy(row['Config']);validated_host=deepcopy(row['HostConfig'])
+        if 'ArgsEscaped' in validated_config:
+            observed = validated_config.pop('ArgsEscaped')
+            if type(observed) is not bool or image['Config'].get('ArgsEscaped') is not observed:
+                reject()
         validated_config['Healthcheck'].setdefault('StartPeriod',0)
         validated_host.setdefault('Tmpfs',{})
         map_config(validated_config,context);map_host_config(validated_host,context)
