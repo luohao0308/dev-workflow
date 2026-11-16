@@ -25,6 +25,20 @@ def material():
 
 
 class FrontendPlanTests(unittest.TestCase):
+    def test_reprepare_retained_candidate_with_materialized_image_args_escaped(self):
+        row,image,options=material()
+        old=adapter.prepare_frontend_plan(row,image,**options)
+        row['Config'].update(ArgsEscaped=True,Image=row['Image'])
+        options['expected_snapshot_digest']=adapter.snapshot_digest(row,image,[])
+        plan=adapter.prepare_frontend_plan(row,image,**options)
+        self.assertEqual(plan['privateBody'],old['privateBody'])
+        self.assertNotEqual(plan['publicReview']['snapshotDigest'],old['publicReview']['snapshotDigest'])
+        for invalid in (False, 1, 'true'):
+            row['Config']['ArgsEscaped']=invalid
+            options['expected_snapshot_digest']=adapter.snapshot_digest(row,image,[])
+            with self.subTest(invalid=invalid),self.assertRaises(ValueError):
+                adapter.prepare_frontend_plan(row,image,**options)
+
     def test_exact_unlimited_resources_and_private_body_without_authority(self):
         row,image,args=material();before=deepcopy(row)
         result=adapter.prepare_frontend_plan(row,image,**args)
