@@ -4,7 +4,7 @@ import re
 import time
 
 from deployment_compose_production_frontend_approval_v1_host import (
-    ProductionFrontendGrantV1, ProductionFrontendReceiptV1,
+    ProductionFrontendGrantV1, ProductionFrontendReceiptV1, _production_authority_reads,
 )
 from deployment_compose_retained_release_plan_v1_host import propose_release_stage
 from deployment_compose_retained_release_review_v1_host import MAX_TOKEN_SECONDS, slot_audience, verify_release_review
@@ -35,6 +35,7 @@ class RetainedReleaseStageApprovalV1(GitHubActionsApproval):
         self._approval_hash = root['approvalHash']
         self._release_digest = reviewed_digest
         self._stage, self._stage_request, self._claim_key = stage, proposed.request, proposed.claim_key
+        self._readiness_failure = readiness_failure
         self._claim_object = None
         authenticate = verifier or verify_oidc
 
@@ -51,8 +52,31 @@ class RetainedReleaseStageApprovalV1(GitHubActionsApproval):
     def request(self):
         return self._stage_request
 
+    @property
+    def stage(self):
+        return self._stage
+
+    @property
+    def release_binding(self):
+        return self._release_digest, self._approval_hash, self.policy.run_id
+
+    @property
+    def readiness_failure(self):
+        return self._readiness_failure
+
+    def provisional_grant(self, request):
+        self._match(request)
+        if self._expires is None or time.time() >= self._grant_expiry(request):
+            _deny('Release stage handoff expired')
+        return self._grant_for_checked_authority(request)
+
     def _reviewed_bundle_hash(self):
         return self._approval_hash
+
+    def _prefetch_authority(self):
+        if type(self) is not RetainedReleaseStageApprovalV1:
+            return None
+        return _production_authority_reads(self.client, self._authority_queries())
 
     def _match(self, request):
         if type(request) is not RequestV2 or request != self._stage_request or not time.time() < timestamp(request.expires_at).timestamp():

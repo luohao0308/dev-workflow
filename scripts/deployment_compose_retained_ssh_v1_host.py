@@ -222,6 +222,7 @@ class _Relay:
                 shapes['restore-prepared'] = {'review'}
                 if phase == 'switch':
                     shapes['switch-retry'] = {'review'}
+                    shapes['restore-readiness-prepared'] = {'review'}
             frame = self._worker(shapes, limit=180)
             kind = frame['kind']
             if kind == 'rpc':
@@ -244,7 +245,7 @@ class _Relay:
                 if (kind == 'switch-prepared' and not executed or kind == 'switch-retry' and executed):
                     reject()
                 self._write(self.stdout, frame)
-                return 'rollback' if kind == 'restore-prepared' else 'switch'
+                return 'rollback' if kind in ('restore-prepared', 'restore-readiness-prepared') else 'switch'
         reject()
 
     def run(self):

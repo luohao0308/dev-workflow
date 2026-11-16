@@ -31,6 +31,8 @@ from deployment_compose_retained_crash_evidence_v1_host import inspect_retained_
 from deployment_compose_retained_recovery_handoff_v1_host import (
     prepare_crash_rollback_review, verify_crash_rollback_evidence,
 )
+from deployment_compose_retained_release_authority_v1_host import RetainedReleaseStageApprovalV1
+from deployment_compose_retained_release_plan_v1_host import VerifiedReadinessFailure
 from deployment_compose_retained_native_channel_v1_host import BLOCKED_FIELDS, FAILURE_STAGES
 from deployment_compose_retained_witness_admission_v1_host import RetainedWitnessAdmissionV1, _signer_pin
 from deployment_compose_retained_write_v1_host import RetainedWriteV1
@@ -155,6 +157,8 @@ class RetainedControllerV1:
         self._creation_request = self._creation = None
         self._deploy_request = self._parent = None
         self._deployment_result = None
+        self._release_binding = None
+        self._readiness_failure = None
         self._state = 'blocked'
         self._deadline = time.monotonic() + timeout
         self._write(configuration, privatePlan=self._private, operationNonce=operation_nonce,
@@ -391,10 +395,21 @@ class RetainedControllerV1:
                                                        expires_at=request.expires_at, operation=operation)
         if expected != request:
             reject()
+        release = type(approval) is RetainedReleaseStageApprovalV1
+        if release:
+            if (not self._staged or approval.request != request or approval.stage != phase
+                    or phase != 'create' and approval.release_binding != self._release_binding
+                    or phase == 'rollback' and (self._readiness_failure is None
+                                                 or self._readiness_failure != approval.readiness_failure)):
+                reject()
+        elif phase == 'switch' and self._release_binding is not None:
+            reject()
         binding = RetainedIntentBindingV1(self._nonce, self._source['sourceSha'], self._source['archiveDigest'],
                                           self._source['originDigest'], self._protection_digest)
         issuer = RetainedIntentIssuerV1(approval, request, grant, binding=binding, signer=self._intent_signer,
                                        preflight_challenge=self._consume_challenge)
+        if phase == 'create' and release:
+            self._release_binding = approval.release_binding
         self._deadline = time.monotonic() + self._timeout
         self._state = 'blocked'
         broker = None
@@ -456,22 +471,34 @@ class RetainedControllerV1:
                     self._state = 'switch'
                     return {'result': None, 'switchReview': self.review, 'restoreReview': None, 'blocked': True,
                             'failureStage': 'cutover-window-too-short'}
-                elif kind == 'restore-prepared' and phase in ('deploy', 'switch') and broker is not None:
+                elif (kind in ('restore-prepared', 'restore-readiness-prepared')
+                      and phase in ('deploy', 'switch') and broker is not None):
                     self._deploy_request, self._parent = request, broker
                     review = self._validate_review(_closed(frame, {'kind', 'review'})['review'], rollback=True,
                                                    allow_restart_refresh=result is None,
                                                    stage='rollback' if self._staged else None)
                     if result is not None and review['retainedCutover']['switchPrefix'] != 4:
                         reject()
+                    if kind == 'restore-readiness-prepared':
+                        pins = review['retainedCutover']
+                        if phase != 'switch' or result is not None or pins['switchPrefix'] != 4:
+                            reject()
+                        self._readiness_failure = VerifiedReadinessFailure(
+                            request.digest(), pins['scopeGeneration'], pins['observationDigest'],
+                            pins['candidateRunning'],
+                        )
                     self._review = review
                     self._protection_digest = review['retainedCutover']['protectionDigest']
                     self._state = 'rollback'
                     self._deployment_result = deepcopy(result) if phase == 'switch' else None
-                    if accept_success and result is not None:
+                    if (accept_success or release) and result is not None:
                         proof = self.accept_deployment()
                         if proof is not None:
                             return {'result': result, 'restoreReview': None, 'blocked': False, 'terminalProof': proof}
-                    return {'result': result, 'restoreReview': self.review, 'blocked': False}
+                    outcome = {'result': result, 'restoreReview': self.review, 'blocked': False}
+                    if self._readiness_failure is not None:
+                        outcome['readinessFailure'] = self._readiness_failure
+                    return outcome
                 else:
                     reject()
             reject()

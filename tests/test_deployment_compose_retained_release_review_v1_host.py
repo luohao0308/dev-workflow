@@ -20,9 +20,14 @@ from release_execute import AuthorizationUnavailable
 
 class ReleaseReviewTests(unittest.TestCase):
     def setUp(self):
+        self.configure()
+
+    def configure(self, review=None):
         initial, base, source = fixture()
-        self.review = retained_review(source, 'deploy')
-        self.review['retainedCutover'].update(stage='create', protectionMode=host.STAGED_PROTECTION_MODE)
+        if review is None:
+            review = retained_review(source, 'deploy')
+            review['retainedCutover'].update(stage='create', protectionMode=host.STAGED_PROTECTION_MODE)
+        self.review = deepcopy(review)
         self.plan = prepare_release_plan(self.review, policy_hash=initial.policy_hash,
                                          runtime_sha=base.workflow_sha, expires_at=initial.expires_at)
         self.digest = release_plan_digest(self.plan)
@@ -40,6 +45,9 @@ class ReleaseReviewTests(unittest.TestCase):
             self.review, policy_hash=initial.policy_hash, expires_at=initial.expires_at)
         staged = host.ProductionFrontendApprovalPolicyV3(**dict(
             vars(base), environment='compose-review', stage='create',
+            host_id=self.request.host_id, daemon_id=self.request.daemon_id,
+            snapshot_hash=self.request.before_hash, body_hash=self.request.after_hash,
+            protected_inventory_hash=host._digest(list(self.request.protected_components)),
             observation_hash=self.request.observation_hash, plan_hash=self.request.plan_hash,
             request_hash=self.request.digest(),
         ))
@@ -75,13 +83,15 @@ class ReleaseReviewTests(unittest.TestCase):
 
         self.client.request = transport
 
-    def authority(self, slot, *, token_slot=None, token_seconds=300):
+    def authority(self, slot, *, token_slot=None, token_seconds=300, stage='create',
+                  review=None, witness_source=None, readiness_failure=None):
         token = claims(self.policy)
         token['exp'] = token['iat'] + token_seconds
         token['aud'] = slot_audience(self.approval_hash, slot if token_slot is None else token_slot)
         return RetainedReleaseStageApprovalV1(
             self.client, 'signed', self.raw, self.env, reviewed_digest=self.digest, slot=slot,
-            stage='create', current_review=self.review, verifier=lambda _: deepcopy(token),
+            stage=stage, current_review=self.review if review is None else review, witness_source=witness_source,
+            readiness_failure=readiness_failure, verifier=lambda _: deepcopy(token),
         )
 
     def test_release_summary_and_slot_ciphertexts_are_bound_to_one_review(self):

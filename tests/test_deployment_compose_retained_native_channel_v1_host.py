@@ -13,11 +13,14 @@ import unittest
 from unittest.mock import patch
 
 from tests import test_deployment_compose_retained_frontend_worker_v1_host as fixture
+from tests import test_deployment_compose_retained_release_review_v1_host as release_fixture
 from deployment_compose_retained_controller_v1_host import RetainedControllerV1
 from deployment_compose_retained_intent_relay_v1_host import IntentRelayRejected, RetainedIntentIssuerV1
 from release_execute import AuthorizationUnavailable
 import deployment_compose_retained_native_channel_v1_host as native
 import deployment_compose_retained_source_v1_host as loader
+from deployment_compose_production_scope_v1_host import _name
+from deployment_gate_witness import key_material
 
 
 @unittest.skipUnless(os.name == 'posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),
@@ -52,6 +55,12 @@ class NativeChannelTests(unittest.TestCase):
     def test_healthy_staged_deployment_closes_without_rollback_or_extra_docker_write(self):
         self._round_trip(deny_before_start=False, staged=True, keep_candidate=True)
 
+    def test_one_review_keeps_healthy_candidate(self):
+        self._round_trip(deny_before_start=False, staged=True, keep_candidate=True, single_review=True)
+
+    def test_one_review_rolls_back_only_a_verified_readiness_failure(self):
+        self._round_trip(deny_before_start=False, staged=True, single_review=True, readiness_failed=True)
+
     def test_acceptance_drift_leaves_independently_approved_rollback_available(self):
         self._round_trip(deny_before_start=False, staged=True, acceptance_drift=True)
 
@@ -70,7 +79,7 @@ class NativeChannelTests(unittest.TestCase):
     def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False,
                     ipv4_drift_after_stop=False, late_ipv4_drift=False, staged=False, short_switch=False,
                     transient_firewall_drift=False, persistent_firewall_drift=False, keep_candidate=False,
-                    acceptance_drift=False):
+                    acceptance_drift=False, single_review=False, readiness_failed=False):
         self.write_patch.stop()
         if ipv4_drift_after_stop or staged:
             self.network['firewall4WithoutTransientBans'] = 'a' * 64
@@ -92,6 +101,16 @@ class NativeChannelTests(unittest.TestCase):
 
         self.engine_post = engine_post
         with ExitStack() as stack:
+            if readiness_failed:
+                ready = native.RetainedFrontendWorkerV1._verify_readiness
+
+                def check_readiness(worker, active_id):
+                    if active_id == self.candidate:
+                        raise native.RetainedReadinessFailed('fixture readiness check timed out')
+                    return ready(worker, active_id)
+
+                stack.enter_context(patch.object(native.RetainedFrontendWorkerV1, '_verify_readiness',
+                                                 check_readiness))
             if transient_firewall_drift:
                 capture = fixture.host_fixture.host.capture_network
                 scans = 0
@@ -176,14 +195,22 @@ class NativeChannelTests(unittest.TestCase):
                     caddy_id=self.row['Id'], network_id=network['NetworkID'], timeout=120, staged=staged)
                 stack.callback(controller.close)
                 deploy_review = controller.review
-                approval, grant, request, first_ledger = self._approval(deploy_review, 'deploy')
+                release = None
+                if single_review:
+                    release = release_fixture.ReleaseReviewTests()
+                    release.configure(deploy_review)
+                    approval = release.authority(1)
+                    request = approval.request
+                    grant = approval.validate(request)
+                else:
+                    approval, grant, request, first_ledger = self._approval(deploy_review, 'deploy')
                 result = controller.execute(approval, grant, request)
                 expected_deploy_witnesses = 4 if staged else 5
                 if staged:
                     self.assertEqual(len(result['result']['witnessDigests']), 1)
                     self.assertEqual(self.writes, ['create'])
                     self.assertTrue(self.other_rows[self.original]['State']['Running'])
-                    self.assertEqual(len(first_ledger.markers), 1)
+                    self.assertEqual(len(release.claims if release else first_ledger.markers), 1)
                     creation_hash = request.digest()
                     with self.assertRaises(ValueError):
                         controller.execute(approval, grant, request)
@@ -198,10 +225,27 @@ class NativeChannelTests(unittest.TestCase):
                         self.assertEqual(result['failureStage'], 'cutover-window-too-short')
                         self.assertFalse(short_ledger.markers)
                         self.assertEqual(self.writes, ['create'])
-                    approval, grant, request, first_ledger = self._approval(result['switchReview'], 'deploy')
+                    if release:
+                        ordinary, grant, request, _ = self._approval(result['switchReview'], 'deploy')
+                        with self.assertRaises(ValueError):
+                            controller.execute(ordinary, grant, request)
+                        journal = (registration.root / _name(registration.project)).read_bytes()
+                        started = json.loads(journal.splitlines()[-1])
+                        self.assertEqual(started['request'], creation_hash)
+                        public = signers[1].with_suffix('.pub').read_bytes()
+                        evidence = dict(root=directory, public_key=public,
+                                        expected_key_hash=hashlib.sha256(key_material(public)).hexdigest(),
+                                        pending=dict(requestHash=creation_hash, generation=started['generation'],
+                                                     journalDigest=hashlib.sha256(journal).hexdigest()))
+                        approval = release.authority(2, stage='switch', review=result['switchReview'],
+                                                     witness_source=evidence)
+                        request = approval.request
+                        grant = approval.validate(request)
+                    else:
+                        approval, grant, request, first_ledger = self._approval(result['switchReview'], 'deploy')
                     if persistent_firewall_drift:
                         self.network['firewall4'] = self.network['firewall4WithoutTransientBans'] = 'd' * 64
-                    result = controller.execute(approval, grant, request, accept_success=keep_candidate)
+                    result = controller.execute(approval, grant, request, accept_success=keep_candidate and not release)
                 if fail_validation:
                     self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
                                                   failureStage='validate-intent'))
@@ -228,6 +272,11 @@ class NativeChannelTests(unittest.TestCase):
                 elif deny_before_start:
                     self.assertIsNone(result['result'])
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
+                    self.assertNotIn('readinessFailure', result)
+                elif readiness_failed:
+                    self.assertIsNone(result['result'])
+                    self.assertEqual(result['readinessFailure'].request_hash, request.digest())
+                    self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 4)
                 else:
                     self.assertEqual(len(result['result']['witnessDigests']), expected_deploy_witnesses)
                 if keep_candidate:
@@ -242,6 +291,8 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
                     self.assertTrue(self.other_rows[self.candidate]['State']['Running'])
                     self.assertFalse(self.other_rows[self.original]['State']['Running'])
+                    if release:
+                        self.assertEqual(len(release.claims), 2)
                 if acceptance_drift:
                     old_firewall = self.network['firewall6']
                     self.network['firewall6'] = '0'*64
@@ -249,7 +300,14 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
                     self.network['firewall6'] = old_firewall
                 if not (fail_validation or fail_restore_preparation or persistent_firewall_drift or keep_candidate):
-                    approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
+                    if release:
+                        approval = release.authority(3, stage='rollback', review=result['restoreReview'],
+                                                     witness_source=evidence,
+                                                     readiness_failure=result['readinessFailure'])
+                        request = approval.request
+                        grant = approval.validate(request)
+                    else:
+                        approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
                     if late_ipv4_drift:
                         self.network['firewall4'] = '8' * 64
                     result = controller.execute(approval, grant, request)
@@ -260,7 +318,10 @@ class NativeChannelTests(unittest.TestCase):
                     else:
                         self.assertEqual(len(result['result']['witnessDigests']), prefix)
                         self.assertEqual(self.writes, [operation.phase for operation in expected])
-                        self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
+                        if release:
+                            self.assertEqual(len(release.claims), 3)
+                        else:
+                            self.assertEqual((len(first_ledger.markers), len(second_ledger.markers)), (1, 1))
             finally:
                 parent_out.close()
                 thread.join(8)

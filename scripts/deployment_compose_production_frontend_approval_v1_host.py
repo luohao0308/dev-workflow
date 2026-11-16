@@ -272,6 +272,20 @@ class GitHubProductionFrontendApprovalV1(GitHubActionsApproval):
         return GitHubActionsApproval.guard(self,request)
 
 
+def _production_authority_reads(client, queries):
+    import deployment_compose_live_review_v3_host as live
+
+    if Path(getattr(live, '__file__', '')).resolve() != Path(__file__).resolve().with_name(
+            'deployment_compose_live_review_v3_host.py'):
+        _deny('Live approval client must come from trusted distribution')
+    if type(client) is not live._ReadRetryGitHubClient:
+        return None
+    result = client.fetch_authority_reads(queries)
+    if result is None:
+        _deny('Invalid GitHub authority batch')
+    return result
+
+
 class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
     policy_type=ProductionFrontendApprovalPolicyV2
     profile_version='2'
@@ -280,17 +294,7 @@ class GitHubProductionFrontendApprovalV2(GitHubProductionFrontendApprovalV1):
     def _prefetch_authority(self):
         if type(self) not in (GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3):
             return None
-        import deployment_compose_live_review_v3_host as live
-
-        if Path(getattr(live, '__file__', '')).resolve() != Path(__file__).resolve().with_name(
-                'deployment_compose_live_review_v3_host.py'):
-            _deny('Live approval client must come from trusted distribution')
-        if type(self.client) is not live._ReadRetryGitHubClient:
-            return None
-        result = self.client.fetch_authority_reads(self._authority_queries())
-        if result is None:
-            _deny('Invalid GitHub authority batch')
-        return result
+        return _production_authority_reads(self.client, self._authority_queries())
 
 
 class GitHubProductionFrontendApprovalV3(GitHubProductionFrontendApprovalV2):

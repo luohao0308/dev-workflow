@@ -22,6 +22,7 @@ from deployment_compose_production_frontend_approval_v1_host import (
     PROFILE, GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3, ProductionFrontendGrantV1,
     ProductionFrontendReceiptV1,
 )
+from deployment_compose_retained_release_authority_v1_host import RetainedReleaseStageApprovalV1
 from deployment_compose_witness_store import canonical, hex_value
 from deployment_contract_v2 import RequestV2
 from deployment_gate_witness import key_material
@@ -33,7 +34,8 @@ RPC_FIELDS = {'method', 'requestHash', 'binding', 'nonce', 'generation', 'grantH
 RESPONSE_FIELDS = {'request', 'issuedAt', 'expiresAt', 'result', 'runtimePermit'}
 METHODS = frozenset(('validate', 'consume', 'check'))
 _MAX_CLOCK_SKEW = 2
-_APPROVAL_TYPES = {'2': GitHubProductionFrontendApprovalV2, '3': GitHubProductionFrontendApprovalV3}
+_APPROVAL_TYPES = {'2': (GitHubProductionFrontendApprovalV2,),
+                   '3': (GitHubProductionFrontendApprovalV3, RetainedReleaseStageApprovalV1)}
 
 
 class IntentRelayRejected(ValueError):
@@ -114,7 +116,7 @@ class RetainedIntentIssuerV1(_OriginalOwner):
 
     def __init__(self, approval, request, grant, *, binding, signer, preflight_challenge=None):
         self._pin = _request_pin(request, binding)
-        if (type(approval) is not _APPROVAL_TYPES[request.profile_version]
+        if (type(approval) not in _APPROVAL_TYPES[request.profile_version]
                 or type(grant) is not ProductionFrontendGrantV1
                 or approval.policy.workflow_sha != binding.runtime_sha
                 or preflight_challenge is not None and not callable(preflight_challenge)):
