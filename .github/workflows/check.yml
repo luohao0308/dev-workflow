@@ -2,9 +2,10 @@ name: Checks
 
 on:
   push:
+    branches: [main]
   pull_request:
 
-# Superseded commits release their runners; push and PR checks stay separate.
+# Cancel superseded PR checks. Keep the post-merge check on main independent.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
