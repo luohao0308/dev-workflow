@@ -2,7 +2,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime,timedelta,timezone
 from pathlib import Path
-import sys,unittest,tempfile
+import os,sys,unittest,tempfile
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 import deployment_compose_production_frontend_review_contract as contract
@@ -14,6 +14,28 @@ class ProductionReviewTests(unittest.TestCase):
         self.env=dict(GITHUB_REPOSITORY=contract.host.RUNTIME,GITHUB_REPOSITORY_ID='1327491026',GITHUB_REF='refs/heads/main',GITHUB_EVENT_NAME='workflow_dispatch',GITHUB_RUN_ATTEMPT='1',GITHUB_WORKFLOW_REF=contract.host.WORKFLOW,GITHUB_SHA=self.policy.workflow_sha,GITHUB_WORKFLOW_SHA=self.policy.workflow_sha,GITHUB_RUN_ID='123',DW_AUTH_REVIEWER_ID='42',DW_AUTH_LEDGER_REPOSITORY=contract.host.LEDGER,DW_AUTH_LEDGER_ID='1436718662',DW_AUTH_LEDGER_SHA=self.policy.ledger_sha,DW_PROD_FRONTEND_POLICY_HASH=self.req.policy_hash)
         self.payload=dict(request=asdict(self.req),review=self.review)
     def prepared(self):return contract.canonical(contract.prepare(contract.canonical(self.payload),self.env))
+
+    def test_release_plan_cli_keeps_stage_review_and_sealing_closed(self):
+        from deployment_compose_retained_release_plan_v1_host import release_plan_digest
+
+        create=retained_review(self.review,'deploy')
+        create['retainedCutover'].update(stage='create',protectionMode=contract.host.STAGED_PROTECTION_MODE)
+        private=dict(createReview=create,policyHash=self.req.policy_hash,runtimeSha=self.policy.workflow_sha,
+                     expiresAt=self.req.expires_at)
+        with tempfile.TemporaryDirectory() as directory:
+            output=Path(directory)/'release.json'
+            with (patch.object(sys,'argv',['contract','release-prepare','--bundle',str(output)]),
+                  patch.dict(os.environ,{'PUBLIC_PAYLOAD':contract.canonical(private)})):
+                self.assertEqual(contract.main(),0)
+            raw=output.read_text()
+            release=contract.common._parse(raw,32768)
+            digest=release_plan_digest(release)
+            with patch.object(sys,'argv',['contract','release-verify','--bundle',str(output),'--reviewed-digest',
+                                          digest,'--runtime-sha',self.policy.workflow_sha]):
+                self.assertEqual(contract.main(),0)
+            with patch.object(contract.common,'fetch_token') as mint,self.assertRaises(ValueError):
+                contract.seal(raw,self.env,'recipient',Path(directory)/'sealed')
+            mint.assert_not_called()
 
     def test_staged_reviews_bind_their_predecessors_and_independent_expiries(self):
         host=contract.host
