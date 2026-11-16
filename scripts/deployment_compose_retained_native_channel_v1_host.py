@@ -12,7 +12,7 @@ from deployment_compose_operation_witness_client_v3 import OperationWitnessClien
 from deployment_compose_production_caddy_probe_v1_host import ProductionCaddyProbeV1
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1, inspect_pending_scope
 from deployment_compose_retained_frontend_worker_v1_host import (
-    POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedCutoverWindowTooShort,
+    POST_WRITE_OBSERVATION_STAGES, PRE_WRITE_OBSERVATION_STAGES, RetainedAcceptanceRejected, RetainedCutoverWindowTooShort,
     RetainedFrontendWorkerV1, RetainedObservationFailed,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
@@ -32,6 +32,7 @@ from deployment_gateway import GatePolicy
 CONFIGURE = {'privatePlan', 'operationNonce', 'policyHash', 'intentPublicKey',
              'witnessPublicKey', 'gateKey', 'caddyId', 'networkId'}
 CONFIGURE_RECOVERY = CONFIGURE | {'recoveryReview', 'pendingScope', 'originalBaseline', 'endpointDigest'}
+ACCEPT_DEPLOYMENT_FIELDS = {'requestHash', 'observationDigest'}
 BLOCKED_FIELDS = {'knownPrefix', 'failureStage'}
 FAILURE_STAGES = frozenset((
     'parse-request', 'validate-intent', 'verify-consumed-receipt', 'execute-worker', 'prepare-restore',
@@ -239,8 +240,23 @@ def run_channel(config, receipt, observer, registration, *, stdin=None, stdout=N
                 channel.emit('blocked', knownPrefix=False, failureStage=failure or 'prepare-restore')
                 return
             channel.emit('restore-prepared', review=restore_review)
-            kind, frame = channel.receive(('execute', {'request'}), ('finish', set()),
-                                          timeout=ROLLBACK_COMMAND_TIMEOUT)
+            commands = [('execute', {'request'}), ('finish', set())]
+            if staged:
+                commands.append(('accept-deployment', ACCEPT_DEPLOYMENT_FIELDS))
+            while True:
+                kind, frame = channel.receive(*commands, timeout=ROLLBACK_COMMAND_TIMEOUT)
+                if kind != 'accept-deployment':
+                    break
+                try:
+                    proof = worker.accept_deployment(frame['requestHash'], frame['observationDigest'])
+                except RetainedAcceptanceRejected:
+                    channel.emit('acceptance-rejected')
+                    continue
+                except Exception:
+                    channel.emit('acceptance-uncertain')
+                    return
+                channel.emit('deployment-accepted', terminalProof=proof)
+                return
             if kind == 'execute':
                 failure = execute(frame, restore_review, 'rollback', worker.restore, profile)
                 if failure is not None:

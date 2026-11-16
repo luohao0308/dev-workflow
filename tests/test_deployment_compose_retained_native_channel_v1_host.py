@@ -1,6 +1,7 @@
 """Framed controller/native integration with real cryptography and a Unix Engine double."""
 from contextlib import ExitStack
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -48,6 +49,12 @@ class NativeChannelTests(unittest.TestCase):
     def test_staged_channel_rejects_non_transient_firewall_change_before_consumption(self):
         self._round_trip(deny_before_start=False, staged=True, persistent_firewall_drift=True)
 
+    def test_healthy_staged_deployment_closes_without_rollback_or_extra_docker_write(self):
+        self._round_trip(deny_before_start=False, staged=True, keep_candidate=True)
+
+    def test_acceptance_drift_leaves_independently_approved_rollback_available(self):
+        self._round_trip(deny_before_start=False, staged=True, acceptance_drift=True)
+
     def test_initial_intent_failure_reports_stage_without_consumption_or_error_text(self):
         self._round_trip(deny_before_start=False, fail_validation=True)
 
@@ -62,7 +69,8 @@ class NativeChannelTests(unittest.TestCase):
 
     def _round_trip(self, *, deny_before_start, fail_validation=False, fail_restore_preparation=False,
                     ipv4_drift_after_stop=False, late_ipv4_drift=False, staged=False, short_switch=False,
-                    transient_firewall_drift=False, persistent_firewall_drift=False):
+                    transient_firewall_drift=False, persistent_firewall_drift=False, keep_candidate=False,
+                    acceptance_drift=False):
         self.write_patch.stop()
         if ipv4_drift_after_stop or staged:
             self.network['firewall4WithoutTransientBans'] = 'a' * 64
@@ -176,8 +184,11 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(self.writes, ['create'])
                     self.assertTrue(self.other_rows[self.original]['State']['Running'])
                     self.assertEqual(len(first_ledger.markers), 1)
+                    creation_hash = request.digest()
                     with self.assertRaises(ValueError):
                         controller.execute(approval, grant, request)
+                    with self.assertRaises(ValueError):
+                        controller.accept_deployment()
                     if short_switch:
                         approval, _, request, short_ledger = self._approval(result['switchReview'], 'deploy')
                         claims = approval.verifier('signed')
@@ -190,7 +201,7 @@ class NativeChannelTests(unittest.TestCase):
                     approval, grant, request, first_ledger = self._approval(result['switchReview'], 'deploy')
                     if persistent_firewall_drift:
                         self.network['firewall4'] = self.network['firewall4WithoutTransientBans'] = 'd' * 64
-                    result = controller.execute(approval, grant, request)
+                    result = controller.execute(approval, grant, request, accept_success=keep_candidate)
                 if fail_validation:
                     self.assertEqual(result, dict(result=None, restoreReview=None, blocked=True,
                                                   failureStage='validate-intent'))
@@ -219,7 +230,25 @@ class NativeChannelTests(unittest.TestCase):
                     self.assertEqual(result['restoreReview']['retainedCutover']['switchPrefix'], 3)
                 else:
                     self.assertEqual(len(result['result']['witnessDigests']), expected_deploy_witnesses)
-                if not (fail_validation or fail_restore_preparation or persistent_firewall_drift):
+                if keep_candidate:
+                    from deployment_compose_retained_native_entry_v1_host import _inspect_registration
+
+                    proof = result['terminalProof']
+                    self.assertRegex(proof, r'^[0-9a-f]{64}$')
+                    self.assertIsNone(result['restoreReview'])
+                    terminal = json.loads(_inspect_registration(registration).splitlines()[-1])
+                    self.assertEqual(terminal, dict(state='verified', generation=1,
+                                                    request=creation_hash, proof=proof))
+                    self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
+                    self.assertTrue(self.other_rows[self.candidate]['State']['Running'])
+                    self.assertFalse(self.other_rows[self.original]['State']['Running'])
+                if acceptance_drift:
+                    old_firewall = self.network['firewall6']
+                    self.network['firewall6'] = '0'*64
+                    self.assertIsNone(controller.accept_deployment())
+                    self.assertEqual(self.writes, [operation.phase for operation in expected[:5]])
+                    self.network['firewall6'] = old_firewall
+                if not (fail_validation or fail_restore_preparation or persistent_firewall_drift or keep_candidate):
                     approval, grant, request, second_ledger = self._approval(result['restoreReview'], 'rollback')
                     if late_ipv4_drift:
                         self.network['firewall4'] = '8' * 64

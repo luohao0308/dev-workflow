@@ -225,13 +225,16 @@ class GitHubActionsApproval:
                 or len({item.operation for item in self.requests}) != len(self.requests)):
             _deny('Invalid frozen operation bundle')
         self._requests = {item.digest(): item for item in self.requests}
-        self.bundle_hash = bundle_digest(self.requests, policy.expires_at, policy.bundle_context())
+        self.bundle_hash = self._reviewed_bundle_hash()
         self.verifier = verifier or verify_oidc
         self._consumed = set()
         self._verified_consumptions = set()
         self._lock = threading.Lock()
         self._expires = None
         self._check_authority()
+
+    def _reviewed_bundle_hash(self):
+        return bundle_digest(self.requests, self.policy.expires_at, self.policy.bundle_context())
 
     def _get(self, path):
         result, _headers = self.client.request('GET', path)

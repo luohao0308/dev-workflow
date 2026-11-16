@@ -19,7 +19,7 @@ import threading
 import time
 
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
-from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
+from deployment_compose_production_cutover_v1_host import accepted_deployment_proof, prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
     STAGED_CANDIDATE_FIELDS, STAGED_PROTECTION_MODE, STAGED_ROLLBACK_FIELDS,
     prepare_production_frontend_request,
@@ -154,6 +154,7 @@ class RetainedControllerV1:
                                    originalBaseline=recovery['original_baseline'], endpointDigest=hello['endpointDigest'])
         self._creation_request = self._creation = None
         self._deploy_request = self._parent = None
+        self._deployment_result = None
         self._state = 'blocked'
         self._deadline = time.monotonic() + timeout
         self._write(configuration, privatePlan=self._private, operationNonce=operation_nonce,
@@ -378,11 +379,12 @@ class RetainedControllerV1:
             reject()
         return deepcopy(result)
 
-    def execute(self, approval, grant, request):
+    def execute(self, approval, grant, request, *, accept_success=False):
         """Run one approved request and return its reconciled result or recovery review."""
         self._owned()
         phase = self._state
-        if phase not in ('create', 'switch', 'deploy', 'rollback') or type(request) is not RequestV2:
+        if (phase not in ('create', 'switch', 'deploy', 'rollback') or type(request) is not RequestV2
+                or type(accept_success) is not bool or (accept_success and phase != 'switch')):
             reject()
         operation = 'rollback' if phase == 'rollback' else 'deploy'
         expected = prepare_production_frontend_request(self._review, policy_hash=self._policy_hash,
@@ -464,6 +466,11 @@ class RetainedControllerV1:
                     self._review = review
                     self._protection_digest = review['retainedCutover']['protectionDigest']
                     self._state = 'rollback'
+                    self._deployment_result = deepcopy(result) if phase == 'switch' else None
+                    if accept_success and result is not None:
+                        proof = self.accept_deployment()
+                        if proof is not None:
+                            return {'result': result, 'restoreReview': None, 'blocked': False, 'terminalProof': proof}
                     return {'result': result, 'restoreReview': self.review, 'blocked': False}
                 else:
                     reject()
@@ -479,6 +486,35 @@ class RetainedControllerV1:
         self._state = 'done'
         self._deadline = time.monotonic() + self._timeout
         self._write('finish')
+
+    def accept_deployment(self):
+        """Finalize a proven staged deployment without sending Docker writes."""
+        self._owned()
+        result = self._deployment_result
+        if not self._staged or self._state != 'rollback' or result is None:
+            reject()
+        candidate, switch = self._closed_chain(self._parent)
+        created, creation = self._closed_chain(self._creation)
+        if (candidate != result['candidateId'] or created != candidate or switch != result['witnessDigests']
+                or len(creation) != 1):
+            reject()
+        expected_proof = accepted_deployment_proof(
+            creation_request=self._creation_request.digest(), creation_witness=creation[0],
+            generation=self._creation._scope_generation, result=result,
+        )
+        self._state = 'blocked'
+        self._deployment_result = None
+        self._deadline = time.monotonic() + self._timeout
+        self._write('accept-deployment', requestHash=result['requestHash'],
+                    observationDigest=result['observationDigest'])
+        reply = self._read()
+        if reply == {'kind': 'acceptance-rejected'}:
+            self._state = 'rollback'
+            return None
+        if reply != {'kind': 'deployment-accepted', 'terminalProof': expected_proof}:
+            reject()
+        self._state = 'done'
+        return expected_proof
 
     def close(self):
         """Release local witness resources. The enclosing owner closes the pipes."""

@@ -12,6 +12,13 @@ HEX = re.compile(r'[0-9a-f]{64}\Z')
 IMAGE = re.compile(r'sha256:[0-9a-f]{64}\Z')
 
 
+def accepted_deployment_proof(*, creation_request, creation_witness, generation, result):
+    return hashlib.sha256(_encode(dict(
+        disposition='retained-candidate', creationRequestHash=creation_request,
+        creationWitnessDigest=creation_witness, scopeGeneration=generation, deployment=result,
+    ))).hexdigest()
+
+
 @dataclass(frozen=True)
 class ContainerOperation:
     phase: str

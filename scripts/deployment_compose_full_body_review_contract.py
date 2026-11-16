@@ -261,6 +261,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def fetch_token(env, *, audience=AUDIENCE):
     if audience not in (AUDIENCE, 'dev-workflow-production-frontend-intent-v1'):
         raise ValueError('Unsupported OIDC audience')
+    return _fetch_verified_audience(env, audience)
+
+
+def _fetch_verified_audience(env, audience):
     url = env['ACTIONS_ID_TOKEN_REQUEST_URL']
     parsed = urllib.parse.urlsplit(url)
     host = parsed.hostname or ''

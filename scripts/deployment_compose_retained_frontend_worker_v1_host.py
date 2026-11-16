@@ -16,7 +16,7 @@ from deployment_compose_host_snapshot_v3_host import (
     FRONTEND_PROTECTION_FAILURES, FrontendProtectionMismatch, HostSnapshotV3, ProductionFrontendProtectionV1,
 )
 from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_origin
-from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
+from deployment_compose_production_cutover_v1_host import accepted_deployment_proof, prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
     GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3,
     STAGED_PROTECTION_MODE, prepare_production_frontend_request,
@@ -42,6 +42,10 @@ class RetainedWorkerBlocked(ValueError):
 
 
 class RetainedReadinessFailed(RetainedWorkerBlocked):
+    pass
+
+
+class RetainedAcceptanceRejected(RetainedWorkerBlocked):
     pass
 
 
@@ -127,6 +131,7 @@ class RetainedFrontendWorkerV1:
         self._lease = None
         self._parent = None
         self._creation = None
+        self._deployment_result = None
         self._deploy_witnesses = ()
         self._state = 'prepared'
         self._protection_digest = self._protection.verify()
@@ -440,8 +445,35 @@ class RetainedFrontendWorkerV1:
             self._state = 'restoration-ready'
             raise
         result = self._result(request, witnesses) if self._creation is not None else self._finish(request, witnesses)
+        if self._creation is not None:
+            self._deployment_result = deepcopy(result)
         self._state = 'deployed'
         return result
+
+    def accept_deployment(self, request_hash, observation_digest):
+        """Close a witnessed staged deployment after fresh readiness checks."""
+        self._check_owner()
+        result = self._deployment_result
+        if (self._state != 'deployed' or self._prefix != 4 or self._lease is None
+                or self._creation is None or result is None
+                or (request_hash, observation_digest) != (result['requestHash'], result['observationDigest'])):
+            raise RetainedAcceptanceRejected('production-deployment-acceptance-stale')
+        try:
+            observation = self._verify_readiness(self._candidate_id)
+        except (ValueError, OSError, KeyError, TypeError):
+            raise RetainedAcceptanceRejected('production-deployment-acceptance-drift') from None
+        if observation != observation_digest:
+            raise RetainedAcceptanceRejected('production-deployment-acceptance-drift')
+        proof = accepted_deployment_proof(
+            creation_request=self._creation['creationRequestHash'],
+            creation_witness=self._creation['creationWitnessDigest'],
+            generation=self._lease.generation, result=result,
+        )
+        self._lease.complete(proof)
+        self._lease.close()
+        self._lease = None
+        self._state = 'accepted'
+        return proof
 
     def restore(self, approval, grant, request):
         review = self.restore_review()

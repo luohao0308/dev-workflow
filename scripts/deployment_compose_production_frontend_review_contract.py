@@ -140,11 +140,52 @@ def seal(raw,env,recipient,output):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('prepare','verify','summary','seal'))
+    parser.add_argument('command',choices=('prepare','verify','summary','seal','release-prepare','release-verify',
+                                          'release-review-prepare','release-review-verify',
+                                          'release-review-summary','release-review-seal'))
     parser.add_argument('--bundle',required=True,type=Path);parser.add_argument('--recipient',type=Path);parser.add_argument('--output',type=Path)
+    parser.add_argument('--reviewed-digest')
+    parser.add_argument('--runtime-sha')
+    parser.add_argument('--slot',type=int)
     args=parser.parse_args()
     try:
-        if args.command=='prepare':
+        if args.command=='release-prepare':
+            from deployment_compose_retained_release_plan_v1_host import prepare_release_plan, release_plan_digest
+
+            payload=common._parse(os.environ['PUBLIC_PAYLOAD'],32768)
+            common._closed(payload,{'createReview','policyHash','runtimeSha','expiresAt'})
+            release=prepare_release_plan(payload['createReview'],policy_hash=payload['policyHash'],
+                                         runtime_sha=payload['runtimeSha'],expires_at=payload['expiresAt'])
+            args.bundle.write_text(canonical(release),encoding='ascii')
+            print(release_plan_digest(release))
+        elif args.command=='release-verify':
+            from deployment_compose_retained_release_plan_v1_host import release_plan_digest, verify_release_plan
+
+            release=common._parse(args.bundle.read_text(encoding='ascii'),32768)
+            verified=verify_release_plan(release,reviewed_digest=args.reviewed_digest,runtime_sha=args.runtime_sha)
+            print(release_plan_digest(verified))
+        elif args.command.startswith('release-review-'):
+            from deployment_compose_retained_release_review_v1_host import (
+                prepare_release_review, release_summary, seal_release_slot, verify_release_review,
+            )
+
+            action = args.command.removeprefix('release-review-')
+            if action == 'prepare':
+                value = prepare_release_review(os.environ['PUBLIC_PAYLOAD'], os.environ)
+                args.bundle.write_text(canonical(value), encoding='ascii')
+                print(value['approvalHash'])
+            else:
+                raw = args.bundle.read_text(encoding='ascii')
+                if action == 'verify':
+                    print(verify_release_review(raw, os.environ)[0]['approvalHash'])
+                elif action == 'summary':
+                    print(release_summary(raw, os.environ), end='')
+                else:
+                    if not args.recipient or not args.output:
+                        raise ValueError('Missing release slot output')
+                    seal_release_slot(raw, os.environ, args.recipient, args.output, slot=args.slot)
+                    print('Encrypted release slot saved')
+        elif args.command=='prepare':
             value=prepare(os.environ['PUBLIC_PAYLOAD'],os.environ);args.bundle.write_text(canonical(value),encoding='ascii');print(value['bundleHash'])
         elif args.command=='verify':print(verify(args.bundle.read_text(encoding='ascii'),os.environ)[2])
         elif args.command=='summary':print(summary(args.bundle.read_text(encoding='ascii'),os.environ),end='')
