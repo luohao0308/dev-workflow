@@ -21,7 +21,7 @@ import time
 from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
-    STAGED_CANDIDATE_FIELDS, STAGED_ROLLBACK_FIELDS,
+    STAGED_CANDIDATE_FIELDS, STAGED_PROTECTION_MODE, STAGED_ROLLBACK_FIELDS,
     prepare_production_frontend_request,
 )
 from deployment_compose_retained_intent_relay_v1_host import (
@@ -236,6 +236,10 @@ class RetainedControllerV1:
             fields |= {'candidateId', 'switchPrefix', 'candidateRunning', 'parentRequestHash', 'observationDigest'}
         if stage is not None:
             fields.add('stage')
+            if 'protectionMode' in cutover:
+                fields.add('protectionMode')
+                if cutover['protectionMode'] != STAGED_PROTECTION_MODE:
+                    reject()
             if stage != 'create':
                 fields |= STAGED_CANDIDATE_FIELDS
             if stage == 'rollback':
@@ -248,7 +252,9 @@ class RetainedControllerV1:
                 or not hex_value(cutover['protectionDigest'])
                 or self._protection_digest is not None and cutover['protectionDigest'] != self._protection_digest
                 and not (rollback and allow_restart_refresh and cutover['switchPrefix'] == 1
-                         and cutover['candidateRunning'] is False)):
+                         and cutover['candidateRunning'] is False and 'protectionMode' not in cutover)):
+            reject()
+        if stage in ('switch', 'rollback') and cutover.get('protectionMode') != self._review['retainedCutover'].get('protectionMode'):
             reject()
         if stage in ('switch', 'rollback'):
             candidate, creation_evidence = self._closed_chain(self._creation)

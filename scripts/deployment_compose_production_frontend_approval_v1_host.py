@@ -28,6 +28,7 @@ STAGED_CANDIDATE_FIELDS = {
 }
 STAGED_ROLLBACK_FIELDS = {'parentRequestHash', 'switchWitnessDigest', 'switchPrefix', 'candidateRunning'}
 STAGED_RECOVERY_FIELDS = {'recoveryJournalDigest', 'recoveryEvidenceDigest'}
+STAGED_PROTECTION_MODE = 'transient-ssh-bans-v1'
 
 
 def _digest(value):
@@ -66,6 +67,10 @@ def _staged_pins(review, cutover, operation):
     if type(stage) is not str or STAGED_OPERATIONS.get(stage) != operation:
         _deny('Invalid staged frontend operation')
     fields = RETAINED_DEPLOY_FIELDS | {'stage'}
+    if 'protectionMode' in cutover:
+        fields.add('protectionMode')
+        if cutover['protectionMode'] != STAGED_PROTECTION_MODE:
+            _deny('Invalid staged frontend protection mode')
     if stage != 'create':
         fields |= STAGED_CANDIDATE_FIELDS
     if stage == 'rollback':
@@ -74,7 +79,7 @@ def _staged_pins(review, cutover, operation):
             fields |= STAGED_RECOVERY_FIELDS
     if set(cutover) != fields:
         _deny('Invalid staged frontend scope')
-    for key in fields - {'stage', 'scopeGeneration', 'switchPrefix', 'candidateRunning'}:
+    for key in fields - {'stage', 'scopeGeneration', 'switchPrefix', 'candidateRunning', 'protectionMode'}:
         if type(cutover[key]) is not str or not HASH.fullmatch(cutover[key]):
             _deny('Invalid staged frontend digest')
     if stage == 'create':

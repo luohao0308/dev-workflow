@@ -20,6 +20,7 @@ class ProductionReviewTests(unittest.TestCase):
         now=datetime.now(timezone.utc).replace(microsecond=0)
         create=retained_review(self.review,'deploy')
         create['retainedCutover']['stage']='create'
+        create['retainedCutover']['protectionMode']=host.STAGED_PROTECTION_MODE
 
         def prepare(review,operation,seconds):
             request=host.prepare_production_frontend_request(review,operation=operation,policy_hash=self.req.policy_hash,
@@ -45,6 +46,7 @@ class ProductionReviewTests(unittest.TestCase):
             self.assertIs(type(policy),host.ProductionFrontendApprovalPolicyV3)
             self.assertEqual(policy.stage,stage)
             self.assertIn(f'Stage: `{stage}`',contract.summary(raw,self.env))
+            self.assertIn(f'Protection mode: `{host.STAGED_PROTECTION_MODE}`',contract.summary(raw,self.env))
         self.assertEqual(len({create_bundle,switch_bundle,restore_bundle}),3)
         self.assertEqual(cutover.plan_hash,host._digest(switch))
         self.assertEqual(restore.history_hash,cutover.digest())
@@ -68,6 +70,7 @@ class ProductionReviewTests(unittest.TestCase):
             creationWitnessDigest='5'*64,observationDigest='6'*64,scopeGeneration=10)
         for patch_values in (dict(stage='rollback'),dict(stage='create'),dict(stage=[]),
                              dict(scopeGeneration=True),dict(scopeGeneration=0),dict(scopeGeneration=2**53),
+                             dict(protectionMode='ignore-network'),
                              dict(candidateId=self.review['identity']['containerId']),dict(switchPrefix=0)):
             invalid=deepcopy(switch)
             invalid['retainedCutover'].update(patch_values)

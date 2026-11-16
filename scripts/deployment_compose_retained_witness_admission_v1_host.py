@@ -400,8 +400,10 @@ class RetainedWitnessAdmissionV1:
                 or request.policy_hash != child._entry['request'].policy_hash
                 or self._entry['approval'].policy.workflow_sha != child._entry['approval'].policy.workflow_sha
                 or any(self._cutover[key] != cutover[key] for key in ('planDigest', 'operationNonce', 'runtimeArchiveDigest'))
+                or self._cutover.get('protectionMode') != cutover.get('protectionMode')
                 or (self._cutover['protectionDigest'] != cutover['protectionDigest']
-                    and (child._stage != 'rollback' or cutover['switchPrefix'] != 1 or cutover['candidateRunning']))):
+                    and (child._stage != 'rollback' or cutover['switchPrefix'] != 1 or cutover['candidateRunning']
+                         or 'protectionMode' in cutover))):
             reject()
         self._check_lineage()
         candidate, evidence = self.closed_chain()

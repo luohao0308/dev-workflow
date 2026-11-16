@@ -19,7 +19,7 @@ from deployment_compose_native_writer_lifecycle_v3_host import _capture_current_
 from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
 from deployment_compose_production_frontend_approval_v1_host import (
     GitHubProductionFrontendApprovalV2, GitHubProductionFrontendApprovalV3,
-    prepare_production_frontend_request,
+    STAGED_PROTECTION_MODE, prepare_production_frontend_request,
 )
 from deployment_compose_production_frontend_v3_host import prepare_frontend_plan
 from deployment_compose_production_scope_v1_host import ScopeRegistrationV1, acquire_scope
@@ -77,7 +77,7 @@ class RetainedPostWriteObservationFailed(RetainedObservationFailed):
 class RetainedFrontendWorkerV1:
     def __init__(self, private_plan, *, operation_nonce, observer, registration,
                  writer_source_sha, writer_archive_digest, policy_hash, witness_transport_factory,
-                 readiness, readiness_timeout=60, loaded_source=None):
+                 readiness, readiness_timeout=60, loaded_source=None, project_transient_bans=False):
         if (hasattr(self, '_owner') or type(observer) is not HostSnapshotV3 or type(registration) is not ScopeRegistrationV1
                 or not hex_value(policy_hash) or not callable(witness_transport_factory)
                 or not callable(readiness) or type(readiness_timeout) not in (int, float)
@@ -88,6 +88,7 @@ class RetainedFrontendWorkerV1:
         self._runtime = (writer_source_sha, writer_archive_digest)
         self._origin = _capture_current_origin(*self._runtime)
         self._loaded_source = loaded_source
+        self._project_transient_bans = project_transient_bans
         self._verify_source()
         self._policy_hash = policy_hash
         self._factory, self._readiness = witness_transport_factory, readiness
@@ -116,6 +117,7 @@ class RetainedFrontendWorkerV1:
         self._protection = ProductionFrontendProtectionV1(
             observer, daemon_id=registration.daemon_id, original_id=self._plan.original_id,
             protected_ids=self._plan.protected_ids, bind_endpoint_rules=loaded_source is not None,
+            project_transient_bans=project_transient_bans,
         )
         self._candidate_id = None
         self._candidate_created_at = None
@@ -226,6 +228,8 @@ class RetainedFrontendWorkerV1:
                             observationDigest=self._observation)
         if stage is not None:
             retained['stage'] = stage
+            if self._project_transient_bans:
+                retained['protectionMode'] = STAGED_PROTECTION_MODE
             if stage != 'create':
                 retained.update(self._creation, candidateId=self._candidate_id,
                                 observationDigest=self._observation, scopeGeneration=self._lease.generation)
