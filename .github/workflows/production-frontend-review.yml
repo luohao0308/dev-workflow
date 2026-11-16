@@ -6,11 +6,11 @@ on:
     inputs:
       mode:
         type: choice
-        options: [launch, review]
+        options: [launch, review, launch-release, review-release]
         default: launch
         required: true
       public_payload:
-        description: 'Closed production frontend replacement or retained rollback intent'
+        description: 'Closed production frontend stage or retained release plan'
         type: string
         required: true
 permissions:
@@ -27,7 +27,7 @@ jobs:
       - name: Validate public review contract
         run: python3 -m unittest tests.test_deployment_compose_production_frontend_review_contract
   launch:
-    if: github.run_attempt == 1 && inputs.mode == 'launch'
+    if: github.run_attempt == 1 && (inputs.mode == 'launch' || inputs.mode == 'launch-release')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,6 +36,7 @@ jobs:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PUBLIC_PAYLOAD: ${{ inputs.public_payload }}
+          REVIEW_MODE: ${{ inputs.mode == 'launch-release' && 'review-release' || 'review' }}
         with:
           script: |
             if (context.ref !== 'refs/heads/main') throw new Error('Unsupported full-body review ref');
@@ -43,10 +44,10 @@ jobs:
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner, repo: context.repo.repo,
               workflow_id: 'production-frontend-review.yml', ref: 'main',
-              inputs: {mode: 'review', public_payload: process.env.PUBLIC_PAYLOAD}
+              inputs: {mode: process.env.REVIEW_MODE, public_payload: process.env.PUBLIC_PAYLOAD}
             });
   prepare:
-    if: github.run_attempt == 1 && github.event_name == 'workflow_dispatch' && inputs.mode == 'review'
+    if: github.run_attempt == 1 && github.event_name == 'workflow_dispatch' && (inputs.mode == 'review' || inputs.mode == 'review-release')
     runs-on: ubuntu-latest
     outputs:
       artifact-id: ${{ steps.bundle.outputs.artifact-id }}
@@ -66,22 +67,25 @@ jobs:
         shell: bash
         env:
           PUBLIC_PAYLOAD: ${{ inputs.public_payload }}
+          REVIEW_MODE: ${{ inputs.mode }}
         run: |
           mkdir -p public-bundle
-          bundle_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py prepare --bundle public-bundle/bundle.json)
+          prefix=
+          if [[ "$REVIEW_MODE" == review-release ]]; then prefix=release-review-; fi
+          bundle_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py "${prefix}prepare" --bundle public-bundle/bundle.json)
           printf 'bundle-hash=%s\n' "$bundle_hash" >> "$GITHUB_OUTPUT"
-          python3 scripts/deployment_compose_production_frontend_review_contract.py summary --bundle public-bundle/bundle.json >> "$GITHUB_STEP_SUMMARY"
+          python3 scripts/deployment_compose_production_frontend_review_contract.py "${prefix}summary" --bundle public-bundle/bundle.json >> "$GITHUB_STEP_SUMMARY"
       - id: bundle
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: production-frontend-public-review
+          name: ${{ inputs.mode == 'review-release' && 'production-retained-release-review' || 'production-frontend-public-review' }}
           path: public-bundle/bundle.json
           if-no-files-found: error
           retention-days: 1
   protected-review:
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment: compose-review
     permissions:
       contents: read
@@ -104,6 +108,7 @@ jobs:
           path: reviewed-bundle
           merge-multiple: true
       - name: Verify public artifact and seal fresh production OIDC evidence
+        if: inputs.mode == 'review'
         shell: bash
         env:
           EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
@@ -113,11 +118,88 @@ jobs:
           mkdir -p sealed-evidence
           python3 scripts/deployment_compose_production_frontend_review_contract.py seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-evidence/oidc.cms.der
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.mode == 'review'
         with:
           name: production-frontend-sealed-oidc
           path: sealed-evidence/oidc.cms.der
           if-no-files-found: error
           retention-days: 1
       - name: Bounded host verification window (authorization only)
+        if: inputs.mode == 'review'
+        shell: bash
+        run: sleep 300
+      - name: Seal retained release credential 1
+        if: inputs.mode == 'review-release'
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
+        run: |
+          verified_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-verify --bundle reviewed-bundle/bundle.json)
+          test "$verified_hash" = "$EXPECTED_BUNDLE_HASH"
+          mkdir -p sealed-release-1
+          python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-release-1/oidc.cms.der --slot 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.mode == 'review-release'
+        with:
+          name: production-retained-release-slot-1
+          path: sealed-release-1/oidc.cms.der
+          if-no-files-found: error
+          retention-days: 1
+      - name: Seal retained release credential 2
+        if: inputs.mode == 'review-release'
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
+        run: |
+          sleep 150
+          verified_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-verify --bundle reviewed-bundle/bundle.json)
+          test "$verified_hash" = "$EXPECTED_BUNDLE_HASH"
+          mkdir -p sealed-release-2
+          python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-release-2/oidc.cms.der --slot 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.mode == 'review-release'
+        with:
+          name: production-retained-release-slot-2
+          path: sealed-release-2/oidc.cms.der
+          if-no-files-found: error
+          retention-days: 1
+      - name: Seal retained release credential 3
+        if: inputs.mode == 'review-release'
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
+        run: |
+          sleep 150
+          verified_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-verify --bundle reviewed-bundle/bundle.json)
+          test "$verified_hash" = "$EXPECTED_BUNDLE_HASH"
+          mkdir -p sealed-release-3
+          python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-release-3/oidc.cms.der --slot 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.mode == 'review-release'
+        with:
+          name: production-retained-release-slot-3
+          path: sealed-release-3/oidc.cms.der
+          if-no-files-found: error
+          retention-days: 1
+      - name: Seal retained release credential 4
+        if: inputs.mode == 'review-release'
+        shell: bash
+        env:
+          EXPECTED_BUNDLE_HASH: ${{ needs.prepare.outputs.bundle-hash }}
+        run: |
+          sleep 150
+          verified_hash=$(python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-verify --bundle reviewed-bundle/bundle.json)
+          test "$verified_hash" = "$EXPECTED_BUNDLE_HASH"
+          mkdir -p sealed-release-4
+          python3 scripts/deployment_compose_production_frontend_review_contract.py release-review-seal --bundle reviewed-bundle/bundle.json --recipient .github/compose-approval-recipient.pem --output sealed-release-4/oidc.cms.der --slot 4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.mode == 'review-release'
+        with:
+          name: production-retained-release-slot-4
+          path: sealed-release-4/oidc.cms.der
+          if-no-files-found: error
+          retention-days: 1
+      - name: Bounded final release slot window
+        if: inputs.mode == 'review-release'
         shell: bash
         run: sleep 300
