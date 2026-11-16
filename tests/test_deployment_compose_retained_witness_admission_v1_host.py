@@ -49,7 +49,8 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
             self.registration = self._registration()
 
     def _registration(self, *, parent=None, prefix=1, candidate=None, stage=None, creation=None,
-                      creation_witness=None, switch_witness=None, generation=1, reviewed_generation=1):
+                      creation_witness=None, switch_witness=None, generation=1, reviewed_generation=1,
+                      protection_mode=None, expires_at=None):
         old, policy, _ = fixture()
         cutover = dict(planDigest=self.plan.digest, operationNonce='1'*64,
                        protectionDigest=self.protection, runtimeArchiveDigest='9'*64)
@@ -57,6 +58,8 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
         first = self.plan.create()
         if stage is not None:
             cutover['stage'] = stage
+            if protection_mode is not None:
+                cutover['protectionMode'] = protection_mode
         if stage in ('switch', 'rollback'):
             candidate = candidate or self.candidate
             cutover.update(candidateId=candidate, creationRequestHash=creation.digest(),
@@ -74,7 +77,7 @@ class RetainedWitnessAdmissionTests(unittest.TestCase):
             first = self.plan.restore(candidate, switch_prefix=prefix, candidate_running=False)[0]
         review = dict(self.private['publicReview'], retainedCutover=cutover)
         request = host.prepare_production_frontend_request(review, policy_hash=old.policy_hash,
-                                                           expires_at=old.expires_at, operation=operation)
+                                                           expires_at=expires_at or old.expires_at, operation=operation)
         policy_type = host.ProductionFrontendApprovalPolicyV3 if stage else host.ProductionFrontendApprovalPolicyV2
         stage_fields = {'stage': stage} if stage else {}
         policy = policy_type(**dict(vars(policy), operation=operation,

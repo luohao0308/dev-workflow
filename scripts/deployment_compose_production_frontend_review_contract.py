@@ -140,11 +140,28 @@ def seal(raw,env,recipient,output):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',choices=('prepare','verify','summary','seal'))
+    parser.add_argument('command',choices=('prepare','verify','summary','seal','release-prepare','release-verify'))
     parser.add_argument('--bundle',required=True,type=Path);parser.add_argument('--recipient',type=Path);parser.add_argument('--output',type=Path)
+    parser.add_argument('--reviewed-digest')
+    parser.add_argument('--runtime-sha')
     args=parser.parse_args()
     try:
-        if args.command=='prepare':
+        if args.command=='release-prepare':
+            from deployment_compose_retained_release_plan_v1_host import prepare_release_plan, release_plan_digest
+
+            payload=common._parse(os.environ['PUBLIC_PAYLOAD'],32768)
+            common._closed(payload,{'createReview','policyHash','runtimeSha','expiresAt'})
+            release=prepare_release_plan(payload['createReview'],policy_hash=payload['policyHash'],
+                                         runtime_sha=payload['runtimeSha'],expires_at=payload['expiresAt'])
+            args.bundle.write_text(canonical(release),encoding='ascii')
+            print(release_plan_digest(release))
+        elif args.command=='release-verify':
+            from deployment_compose_retained_release_plan_v1_host import release_plan_digest, verify_release_plan
+
+            release=common._parse(args.bundle.read_text(encoding='ascii'),32768)
+            verified=verify_release_plan(release,reviewed_digest=args.reviewed_digest,runtime_sha=args.runtime_sha)
+            print(release_plan_digest(verified))
+        elif args.command=='prepare':
             value=prepare(os.environ['PUBLIC_PAYLOAD'],os.environ);args.bundle.write_text(canonical(value),encoding='ascii');print(value['bundleHash'])
         elif args.command=='verify':print(verify(args.bundle.read_text(encoding='ascii'),os.environ)[2])
         elif args.command=='summary':print(summary(args.bundle.read_text(encoding='ascii'),os.environ),end='')
