@@ -11,7 +11,8 @@ import sys
 import time
 
 from deployment_compose_retained_native_channel_v1_host import (
-    BLOCKED_FIELDS, CONFIGURE, CONFIGURE_RECOVERY, FAILURE_STAGES, REVIEW_COMMAND_TIMEOUT, ROLLBACK_COMMAND_TIMEOUT,
+    ACCEPT_DEPLOYMENT_FIELDS, BLOCKED_FIELDS, CONFIGURE, CONFIGURE_RECOVERY, FAILURE_STAGES,
+    REVIEW_COMMAND_TIMEOUT, ROLLBACK_COMMAND_TIMEOUT,
 )
 from deployment_compose_retained_native_entry_v1_host import scope_registration
 from deployment_compose_retained_production_unit_v1_host import RetainedProductionUnitV1
@@ -195,13 +196,21 @@ class _Relay:
         reply = self._controller({'reply': {'response'}}, limit=90)
         self._write(self.process.stdin, reply)
 
-    def _execute(self, phase):
+    def _execute(self, phase, *, staged=False):
         rollback = phase == 'rollback'
-        command = self._controller({'execute': {'request'}, 'finish': set()},
+        commands = {'execute': {'request'}, 'finish': set()}
+        if staged and rollback:
+            commands['accept-deployment'] = ACCEPT_DEPLOYMENT_FIELDS
+        command = self._controller(commands,
                                    limit=ROLLBACK_COMMAND_TIMEOUT if rollback else REVIEW_COMMAND_TIMEOUT)
         self._write(self.process.stdin, command)
         if command['kind'] == 'finish':
             return None
+        if command['kind'] == 'accept-deployment':
+            reply = self._worker({'deployment-accepted': {'terminalProof'}, 'acceptance-rejected': set(),
+                                  'acceptance-uncertain': set()}, limit=180)
+            self._write(self.stdout, reply)
+            return 'rollback' if reply['kind'] == 'acceptance-rejected' else None
         executed = False
         for _ in range(4096):
             shapes = {'blocked': BLOCKED_FIELDS}
@@ -247,7 +256,7 @@ class _Relay:
         phase = {'configure': 'deploy', 'configure-staged': 'create',
                  'configure-crash-recovery': 'rollback'}[configuration['kind']]
         while phase is not None:
-            phase = self._execute(phase)
+            phase = self._execute(phase, staged=configuration['kind'] == 'configure-staged')
 
 
 def run_manager(config, archive, root):

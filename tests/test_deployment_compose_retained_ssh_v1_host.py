@@ -163,6 +163,20 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(self.exercise(controller[:2], [prepared, switch], error=True),
                          ([prepared], controller[:2]))
 
+    def test_staged_relay_forwards_acceptance_with_no_docker_rpc(self):
+        configure = frame('configure-staged', **{field: None for field in ssh.CONFIGURE})
+        prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
+        execute = frame('execute', request={})
+        executed = frame('executed', result={})
+        switch = frame('switch-prepared', review={})
+        restore = frame('restore-prepared', review={})
+        accept = frame('accept-deployment', requestHash='a'*64, observationDigest='b'*64)
+        accepted = frame('deployment-accepted', terminalProof='c'*64)
+        controller = [configure, execute, execute, accept]
+        worker = [prepared, executed, switch, executed, restore, accepted]
+        self.assertEqual(self.exercise(controller, worker), (worker, controller))
+        self.assertEqual(self.exercise([configure, accept], [prepared], error=True), ([prepared], [configure]))
+
     def test_blocked_stage_is_forwarded_only_for_known_values(self):
         configure = frame('configure', **{field: None for field in ssh.CONFIGURE})
         prepared = frame('prepared', review={}, writerCertificateSha256='d'*64)
