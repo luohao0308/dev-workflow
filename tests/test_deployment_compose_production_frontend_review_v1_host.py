@@ -134,6 +134,58 @@ class BridgeTests(unittest.TestCase):
       creation,policy_hash=self.req.policy_hash,expires_at=self.req.expires_at)
   with self.assertRaises(AuthorizationUnavailable):
    approval.validate(other)
+ def test_single_release_review_dispatch_and_fresh_encrypted_slot(self):
+  from deployment_compose_production_cutover_v1_host import prepare_retained_frontend_cutover
+  from deployment_compose_retained_release_plan_v1_host import prepare_release_plan
+  from deployment_compose_retained_release_review_v1_host import prepare_release_review, slot_audience, verify_release_review
+
+  nonce='1'*64
+  cutover=prepare_retained_frontend_cutover(self.plan,operation_nonce=nonce)
+  review=dict(self.plan['publicReview'],retainedCutover=dict(
+      stage='create',protectionMode=host.STAGED_PROTECTION_MODE,planDigest=cutover.digest,operationNonce=nonce,
+      protectionDigest='2'*64,runtimeArchiveDigest='3'*64))
+  plan=prepare_release_plan(review,policy_hash=self.req.policy_hash,runtime_sha=self.run['head_sha'],
+                            expires_at=self.req.expires_at)
+  workflow_env=self.b._env(self.run)
+  artifact=prepare_release_review(contract.canonical(plan),workflow_env)
+  raw=contract.canonical(artifact)
+  _,policy=verify_release_review(raw,workflow_env)
+  c=claims(policy)
+  c.update(aud=slot_audience(artifact['approvalHash'],2),exp=c['iat']+300)
+  def encode(value):
+   return base64.urlsafe_b64encode(value).rstrip(b'=')
+  signed=encode(b'{"alg":"RS256","kid":"test"}')+b'.'+encode(json.dumps(c).encode())
+  signature=subprocess.run(['/usr/bin/openssl','dgst','-sha256','-sign',str(self.key)],input=signed,
+                           capture_output=True,check=True).stdout
+  cipher=subprocess.run(['/usr/bin/openssl','cms','-encrypt','-binary','-aes256','-outform','DER',str(self.cert)],
+                        input=signed+b'.'+encode(signature),capture_output=True,check=True).stdout
+  self.zips[1]=self.zipped('bundle.json',raw.encode())
+  self.zips[2]=self.zipped('oidc.cms.der',cipher)
+  prefix='/repos/'+host.RUNTIME+'/actions/runs/123'
+  self.run['head_branch']='main'
+  self.data[prefix+'/jobs']={'jobs':[dict(name='protected-review',status='waiting')]}
+  self.data[prefix+'/approvals'][0]['comment']='dev-workflow approve '+artifact['approvalHash']
+  self.data[prefix+'/artifacts?per_page=100']['artifacts']=[
+      dict(id=1,name=bridge.RELEASE_ARTIFACT,expired=False,size_in_bytes=len(self.zips[1])),
+      dict(id=2,name='production-retained-release-slot-2',expired=False,size_in_bytes=len(self.zips[2]))]
+  request=self.client.request.side_effect
+  def list_runs(method,path,*args,**kwargs):
+   if '/actions/workflows/production-frontend-review.yml/runs?' in path:
+    self.assertIn('head_sha='+self.run['head_sha'],path)
+    path='/repos/'+host.RUNTIME+'/actions/workflows/production-frontend-review.yml/runs?event=workflow_dispatch&per_page=100'
+   return request(method,path,*args,**kwargs)
+  self.client.request.side_effect=list_runs
+  notices=[]
+  self.b.request_release_review(self.plan,review,expires_at=self.req.expires_at,on_review=notices.append)
+  self.assertEqual(len(self.posts),1)
+  self.assertEqual(notices[0]['comment'],'dev-workflow approve '+artifact['approvalHash'])
+  self.assertEqual(json.loads(self.dispatch_inputs[0])['inputs']['mode'],'launch-release')
+  slot,approval,grant=self.b.release_stage_grant('create',review,after_slot=1)
+  self.assertEqual(slot,2)
+  self.assertEqual(grant.request_hash,approval.request.digest())
+  with self.assertRaises(bridge.LiveReviewBlocked):
+   self.b.request_release_review(self.plan,review,expires_at=self.req.expires_at,on_review=notices.append)
+  self.assertEqual(len(self.posts),1)
  def test_main_denied_before_post(self):
   self.data['/repos/'+host.RUNTIME+'/environments/compose-review/deployment-branch-policies?per_page=100']['branch_policies']=[]
   with self.assertRaises(bridge.LiveReviewBlocked):self.b.request_prepared_review(self.plan,self.req,lambda _:None)
