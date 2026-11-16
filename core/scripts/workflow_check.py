@@ -14,6 +14,7 @@ from workflow_config import CAPABILITY_PACKS, resolve_configuration, safe_path
 
 ADOPTION_DOCUMENT = 'docs/WORKFLOW-ADOPTION.md'
 ADOPTION_STATES = ('pending', 'blocked', 'ready')
+ADOPTION_STATUS_LINE = re.compile(r'^status:[ \t]*(' + '|'.join(ADOPTION_STATES) + r')[ \t]*$', re.MULTILINE)
 
 
 def git(root: Path, *arguments: str) -> str | None:
@@ -30,8 +31,8 @@ def read_adoption_status(root: Path) -> str:
         if path.is_file():
             with path.open(encoding='utf-8-sig') as document:
                 header = document.read(16384)
-            match = re.search(r'^status:[ \t]*(\w+)[ \t]*$', header, re.MULTILINE)
-            if match and match[1] in ADOPTION_STATES:
+            match = ADOPTION_STATUS_LINE.search(header)
+            if match:
                 return match[1]
     except (OSError, ValueError):
         pass

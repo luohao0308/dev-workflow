@@ -247,6 +247,13 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(report['onboarding']['status'], 'unknown')
         self.assertFalse(any(item['code'].startswith('onboarding.') for item in report['issues']))
 
+    def test_doctor_ignores_unrecognized_adoption_status_lines(self):
+        adoption = self.root / 'docs' / 'WORKFLOW-ADOPTION.md'
+        adoption.parent.mkdir()
+        adoption.write_text('status: draft\nstatus: pending\n', encoding='utf-8')
+        self.write(self.manifest, self.original | {'onboarding': {'status': 'pending'}})
+        self.assertEqual(doctor.check(self.root)['onboarding']['status'], 'pending')
+
     def test_doctor_detects_local_baseline_divergence(self):
         def git(*args):
             return subprocess.run(['git', '-C', str(self.root), *args], check=True, capture_output=True)
