@@ -25,8 +25,9 @@ from deployment_compose_bundle_v3 import ExecutionBundleV3, FIELDS
 from deployment_contract_v2 import RequestV2
 from deployment_compose_image_defaults import derive_defaults, ZERO_DEFAULTS
 from deployment_compose_artifacts import ComposeArtifacts
+from deployment_compose_image_catalog import verify_images
 from deployment_compose_private import commit, MOUNT
-from deployment_compose_phase_guard_v3_host import baseline_state_digest, protected_state_digest
+from deployment_compose_phase_guard_v3_host import PhaseGuardV3, baseline_state_digest, protected_state_digest
 from deployment_compose_collect import _snapshot, image_catalog_digest
 from deployment_compose_v3_channel_worker import read_frame, write_frame
 
@@ -196,12 +197,36 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
     Actual consent is read from GitHub, verified and consumed by the adapter.
     No connection, intent, witness mutation or ledger consumption is retried.
     """
+    return _run_live(private_root, ssh_alias, source_sha, on_review=on_review,
+                     recipient_private_key=recipient_private_key, batch_deploy=False, rollback=True)
+
+
+def run_live_batch_deploy(private_root, ssh_alias, source_sha, *, on_review, recipient_private_key):
+    """Own one isolated SSH batch deploy and verify cleanup after signed completion."""
+    return _run_live(private_root, ssh_alias, source_sha, on_review=on_review,
+                     recipient_private_key=recipient_private_key, batch_deploy=True, rollback=False)
+
+
+def run_live_batch_acceptance(private_root, ssh_alias, source_sha, *, on_review, recipient_private_key):
+    """Verify an isolated dual-service deploy and a separately reviewed rollback."""
+    return _run_live(private_root, ssh_alias, source_sha, on_review=on_review,
+                     recipient_private_key=recipient_private_key, batch_deploy=True, rollback=True)
+
+
+def _run_live(private_root, ssh_alias, source_sha, *, on_review, recipient_private_key, batch_deploy, rollback):
     from deployment_compose_profile3_prepare_ssh_probe import _private_root
     from deployment_compose_operation_witness_v3 import OperationWitnessStoreV3
     from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3, LiveAdmissionRejected
-    from deployment_contract_v2 import TargetIdentity
     from deployment_gateway import GatePolicy
     from deployment_gate_witness import key_material
+    intent_limit=2 if rollback else 1
+    if batch_deploy:
+        from deployment_compose_log_probe import IMAGE
+        from deployment_compose_namespaced_transition_probe import V2
+        from deployment_compose_registry_enrollment_probe import registry_settings
+        registries={operation:dict.fromkeys(('backend','frontend'),
+                        registry_settings('ecr-public',image_reference=ref)[0])
+                    for operation,ref in (('deploy',V2),('rollback',IMAGE))}
     if not callable(on_review):reject()
     root=_private_root(private_root)
     archive=published_live_archive(source_sha)
@@ -275,13 +300,15 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                 admission=MacLiveAdmissionV3(store=store,gate_policy=policy,gate_key=gate_key,
                     witness_signer=witness_signer,witness_public_key=witness_public,
                     intent_signer=status_signer,intent_public_key=status_public)
+                mode=({'batch':True} if batch_deploy else {})
+                if batch_deploy and rollback:mode['batchRollback']=True
                 send('configure',policy=asdict(policy),epoch=admission._epoch,
                     witnessPublicKey=base64.b64encode(witness_public).decode(),
                     statusPublicKey=base64.b64encode(status_public).decode(),
                     keys={k:base64.b64encode(v).decode() for k,v in keys.items()},
-                    gateKey=base64.b64encode(gate_key).decode())
+                    gateKey=base64.b64encode(gate_key).decode(),**mode)
             elif kind=='observer-facts':
-                if hello is None or facts is not None:reject()
+                if hello is None or facts is not None or intent_count>=intent_limit:reject()
                 expected='deploy' if intent_count==0 else 'rollback'
                 if (set(data)!={'operation','root','daemonId','sourceSha','archiveDigest','bootId','bindDigest'}
                         or data['operation']!=expected or data['root']!=hello['root']
@@ -289,13 +316,22 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                         or data['archiveDigest']!=archive_digest
                         or not re.fullmatch('[0-9a-f]{32}',data['bootId']) or data['bindDigest'] is not None):reject()
                 facts=data
-            elif kind in ('prepared-private','rollback-prepared-private'):
+            elif kind in ('prepared-private','rollback-prepared-private',
+                         'batch-prepared-private','batch-rollback-prepared-private'):
                 expected='deploy' if intent_count==0 else 'rollback'
-                if (facts is None or intent_count>=2 or kind!=('prepared-private' if expected=='deploy' else 'rollback-prepared-private')):reject()
+                expected_kind='prepared-private' if expected=='deploy' else 'rollback-prepared-private'
+                if batch_deploy:expected_kind='batch-'+expected_kind
+                if facts is None or intent_count>=intent_limit or kind!=expected_kind:reject()
                 supplied_history=data.pop('history',None)
-                bundle,request=verify_private_capsule(data,hello=hello,source_sha=source_sha,
-                    ssh_alias=ssh_alias,policy=policy,keys=keys,
+                options=dict(hello=hello,source_sha=source_sha,ssh_alias=ssh_alias,policy=policy,keys=keys,
                     trusted_boot_id=facts['bootId'],trusted_bind_digest=facts['bindDigest'])
+                if batch_deploy:
+                    if set(data)!={'capsule'}:reject()
+                    bundle,request=verify_batch_private_capsule(data['capsule'],**options,
+                        expected_target_registries=registries[expected])
+                    if request.components!=('backend','frontend') or request.protected_components!=('peer',):reject()
+                else:
+                    bundle,request=verify_private_capsule(data,**options)
                 if request.operation!=expected or process.poll() is not None:reject()
                 parent=None
                 if expected=='rollback':
@@ -304,6 +340,8 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                             or encode(supplied_history)!=parent.canonical
                             or parent.canonical!=deployed.canonical
                             or request.history_hash!=parent.digest):reject()
+                    if batch_deploy:
+                        admission._inverse(dict(bundle=bundle,request=request),admission._root,parent)
                 elif supplied_history is not None:reject()
                 approval,consumption,metadata=review.consume_prepared(bundle,request,on_review)
                 if process.poll() is not None:reject()
@@ -327,19 +365,31 @@ def run_live_acceptance(private_root, ssh_alias, source_sha, *, on_review, recip
                 reply=_authorize_rpc(admission,data['service'],data['method'],data['request'],case)
                 send('reply',rpcId=last_rpc,response=reply)
             elif kind=='deployed':
-                if intent_count!=1 or deployed is not None or set(data)!={'result','history'}:reject()
+                if not rollback or intent_count!=1 or deployed is not None or set(data)!={'result','history'}:reject()
                 deployed=_complete_history(admission,'deploy')
                 if encode(data['history'])!=deployed.canonical or deployed.snapshot['blocker'] is not None:reject()
             elif kind=='final':
-                if (intent_count!=2 or deployed is None or facts is not None
+                if (intent_count!=intent_limit or (rollback and deployed is None) or facts is not None
                         or set(data)!={'result','history','success','cleanupCompleted','daemonStopped','productionSnapshotUnchanged'}
                         or any(data[k] is not True for k in ('success','cleanupCompleted','daemonStopped','productionSnapshotUnchanged'))):reject()
-                latest=_complete_history(admission,'rollback',deployed)
+                latest=(_complete_history(admission,'rollback',deployed) if rollback else
+                        _complete_history(admission,'deploy'))
                 if encode(data['history'])!=latest.canonical or latest.snapshot['blocker'] is not None:reject()
-                final=dict(success=True,operationCount=2,requestCount=intent_count,
+                if batch_deploy:
+                    result=data['result']
+                    receipts=json.loads(latest.canonical)['receiptMap']
+                    operations=admission._current['bundle'].resolve_operations(receipts)
+                    if (type(result) is not dict or result.get('receipts')!=receipts
+                            or encode(result.get('completedOperations'))!=encode(operations)
+                            or type(result.get('initialWriteCount')) is not int or result['initialWriteCount']!=0
+                            or result.get('productionReady') is not False):reject()
+                final=dict(success=True,operationCount=intent_limit,requestCount=intent_count,
                     daemonStopped=True,productionSnapshotUnchanged=True,cleanupCompleted=True,
                     root=hello['root'],sourceSha=source_sha,productionReady=False,
                     witnessFinal=private_json_status(store.chain_status(admission._current['first'])))
+                if batch_deploy:
+                    final['writeCount']=len(latest.snapshot['knownPrefix'])
+                    if rollback:final['writeCount']+=len(deployed.snapshot['knownPrefix'])
                 process.stdin.close();process.wait(timeout=60)
                 thread.join(timeout=5)
                 if process.returncode or thread.is_alive() or errors:reject()
@@ -380,15 +430,50 @@ def scope_bind_paths(scope):
 
 def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, keys,
                            trusted_boot_id, trusted_bind_digest, historical=False):
-    """Reconstruct commitments before publishing any review.
+    """Verify the fixed single-service SSH acceptance capsule."""
+    return _verify_capsule(capsule, hello=hello, source_sha=source_sha, ssh_alias=ssh_alias,
+        policy=policy, keys=keys, trusted_boot_id=trusted_boot_id,
+        trusted_bind_digest=trusted_bind_digest, historical=historical, batch_registries=None)
 
-    Boot and bind pins must come from the controller's owned-host provenance
-    boundary, never copied out of this capsule by its caller. This function
-    validates captured material; Linux retains responsibility for live rechecks.
+
+def verify_batch_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, keys,
+                                 trusted_boot_id, trusted_bind_digest, expected_target_registries,
+                                 historical=False):
+    """Verify captured batch preparation before any review or write.
+
+    The caller obtains the boot/bind pins and target registry map from trusted
+    host context. Captured material alone cannot grant execution authority.
     """
+    if type(expected_target_registries) is not dict or not expected_target_registries:
+        reject()
+    return _verify_capsule(capsule, hello=hello, source_sha=source_sha, ssh_alias=ssh_alias,
+        policy=policy, keys=keys, trusted_boot_id=trusted_boot_id,
+        trusted_bind_digest=trusted_bind_digest, historical=historical,
+        batch_registries=expected_target_registries)
+
+
+_BATCH_FIELDS = {'kind', 'schemaVersion', 'bundle', 'request', 'publicReview', 'sourceModel',
+                 'rawRows', 'sourceFacts', 'targetInputs', 'baselineArtifacts', 'scopePolicy',
+                 'imageCatalog', 'phaseSnapshot', 'observationMaterial'}
+_TARGET_INPUT_FIELDS = {'image', 'commitment', 'expected_key_id', 'expected_image_id',
+                        'expected_registry_digest', 'expected_architecture'}
+
+
+def _verify_capsule(capsule, *, hello, source_sha, ssh_alias, policy, keys,
+                    trusted_boot_id, trusted_bind_digest, historical, batch_registries):
+    """Reconstruct commitments from the capsule using separately obtained boot and bind pins."""
     try:
         if (type(historical) is not bool or hello['sourceSha'] != source_sha or hello['hostId'] != ssh_alias
                 or not re.fullmatch('[0-9a-f]{32}', trusted_boot_id)):
+            reject()
+        batch = batch_registries is not None
+        if batch:
+            if (type(capsule) is not dict or set(capsule) != _BATCH_FIELDS
+                    or capsule['kind'] != 'compose-managed-batch-capsule'
+                    or type(capsule['schemaVersion']) is not int or capsule['schemaVersion'] != 1):
+                reject()
+            encode(capsule)  # Enforce the channel's JSON type and size limits for direct callers.
+        elif 'kind' in capsule or 'schemaVersion' in capsule:
             reject()
         value = capsule['bundle']
         request = RequestV2.from_json(encode(capsule['request']).decode('ascii'))
@@ -413,13 +498,27 @@ def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, key
         if value['identity'] != dict(hostId=ssh_alias, daemonId=hello['daemonId'],
                 project=project, sourceIdentity=encode(capsule['request']['source']).decode('ascii')):
             reject()
-        from deployment_compose_log_probe import IMAGE
-        from deployment_compose_namespaced_transition_probe import V2
-        fixed_target = 'public.ecr.aws/docker/library/' + (V2 if request.operation == 'deploy' else IMAGE)
+        services = {service['name']: service for service in value['services']}
+        if batch:
+            if (len(services) < 2 or len(services) != len(value['services'])
+                    or set(services) != set(request.components)
+                    or any(type(mapping) is not dict or set(mapping) != set(services)
+                           for mapping in (batch_registries, capsule['sourceFacts'], capsule['targetInputs']))
+                    or request.profile_id != value['profile'] or request.profile_version != value['profileVersion']
+                    or int(expires.timestamp()) != value['expiresAt']):
+                reject()
+            registries = batch_registries
+        else:
+            from deployment_compose_log_probe import IMAGE
+            from deployment_compose_namespaced_transition_probe import V2
+            fixed_target = 'public.ecr.aws/docker/library/' + (V2 if request.operation == 'deploy' else IMAGE)
+            registries = dict.fromkeys(services, fixed_target)
         defaults, manifests = {}, {}
         for service in value['services']:
             name = service['name']; ti = capsule['targetInputs'][name]
-            if ti['expected_registry_digest'] != fixed_target:
+            if (ti['expected_registry_digest'] != registries[name]
+                    or (batch and (type(ti) is not dict or set(ti) != _TARGET_INPUT_FIELDS
+                                   or ti['expected_image_id'] != service['targetImageId']))):
                 reject()
             derived = derive_defaults(ti['image'], ti['commitment'], keys['target'],
                 **{k:ti[k] for k in ('expected_image_id','expected_registry_digest','expected_architecture')})
@@ -440,13 +539,31 @@ def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, key
         rows = capsule['rawRows']; by_id = {row['Id']:row for row in rows.values()}
         if len(by_id) != len(rows) or baseline_state_digest(by_id) != value['baselineStateDigest']:
             reject()
-        if (request.components != ('backend',) or request.protected_components != ('peer',)
+        if batch:
+            protected = set(request.protected_components)
+            scope = capsule['scopePolicy']
+            pins = {rows[name]['Id']: protected_state_digest(rows[name]) for name in protected}
+            if (set(rows) != set(services) | protected or scope['project'] != project
+                    or scope['daemonId'] != request.daemon_id
+                    or tuple(scope['selectedServices']) != request.components
+                    or tuple(scope['protectedServices']) != request.protected_components
+                    or scope['selectedContainerIds'] != {name: rows[name]['Id'] for name in services}
+                    or scope.get('protectedContainerIds', {}) != {name: rows[name]['Id'] for name in protected}
+                    or {pin['containerId']: pin['staticConfigDigest'] for pin in value['protectedContainers']} != pins
+                    or tuple(artifact.service for artifact in artifacts.services) != request.components
+                    or scope['baselineSourceShas'] != {artifact.service: artifact.source_sha for artifact in artifacts.services}):
+                reject()
+        elif (request.components != ('backend',) or request.protected_components != ('peer',)
                 or value['protectedContainers'] != [dict(containerId=rows['peer']['Id'],
                     staticConfigDigest=protected_state_digest(rows['peer']))]):
             reject()
         private = {}
         for name, row in rows.items():
+            if batch:
+                PhaseGuardV3._healthy(row)
             private[row['Id']] = commit(project, name, _projection(row), 'profile3-config', keys['config'])['configHmac']
+        if batch and scope['protectedConfigHmacs'] != {name: private[rows[name]['Id']] for name in protected}:
+            reject()
         for artifact in artifacts.services:
             row = rows[artifact.service]
             if (artifact.source_sha != source_sha or artifact.image_id != row['Image']
@@ -455,20 +572,36 @@ def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, key
                 reject()
         if request.before_hash != artifacts.digest():
             reject()
-        from deployment_compose_restore_body_host import compile_restore_body
-        if digest(capsule['sourceModel']) != capsule['sourceFacts']['expected_source_model_digest']:
+        from deployment_compose_restore_body_host import compile_restore_body, retention_binding
+        if not batch and (list(services) != ['backend']
+                or tuple(artifact.service for artifact in artifacts.services) != ('backend',)):
             reject()
-        facts = dict(capsule['sourceFacts'])
-        facts.update(private_key=keys['config'], image_key=keys['image'], declaration_key=keys['declaration'])
-        # The fixed fixture selects exactly one backend service; source facts
-        # are the preparer's single authenticated retained-source input.
-        if len(value['services']) != 1 or value['services'][0]['name'] != 'backend':
-            reject()
-        raw = {k:rows['backend'][k] for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
-        raw['Mounts'] = _projection(rows['backend'])['Mounts']
-        candidate = compile_restore_body(raw=raw, artifact=artifacts.services[0],
-            operation_nonce=value['operationNonce'], **facts)
-        if encode(candidate['body']) != encode(value['services'][0]['baselineCreateBody']):
+        source_facts = capsule['sourceFacts'] if batch else {'backend': capsule['sourceFacts']}
+        source_model_digest = digest(capsule['sourceModel'])
+        snapshots, bindings = {}, {}
+        for artifact in artifacts.services:
+            name = artifact.service
+            row, service = rows[name], services[name]
+            facts = dict(source_facts[name])
+            if source_model_digest != facts['expected_source_model_digest']:
+                reject()
+            if batch and (row['Id'] != service['baselineContainerId'] or row['Image'] != service['baselineImageId']
+                    or row['Name'] != '/' + service['finalName']
+                    or any(facts['identity'][key] != expected for key, expected in {
+                        'project': project, 'service': name, 'hostId': request.host_id,
+                        'daemonId': request.daemon_id}.items())):
+                reject()
+            facts.update(private_key=keys['config'], image_key=keys['image'], declaration_key=keys['declaration'])
+            raw = {k:row[k] for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
+            raw['Mounts'] = _projection(row)['Mounts']
+            candidate = compile_restore_body(raw=raw, artifact=artifact, operation_nonce=value['operationNonce'], **facts)
+            if encode(candidate['body']) != encode(service['baselineCreateBody']):
+                reject()
+            if batch:
+                snapshots[name] = candidate['sourceSnapshotDigest']
+                bindings[name] = retention_binding(value['archiveReference'], candidate)
+        if batch and (digest(snapshots) != value['sourceSnapshotDigest']
+                or digest(bindings) != value['retentionBindingDigest']):
             reject()
         material = capsule['observationMaterial']
         if set(material) != {'boot','structure','private','instance','catalog','bind'}:
@@ -477,8 +610,17 @@ def verify_private_capsule(capsule, *, hello, source_sha, ssh_alias, policy, key
                 or material['boot'] != trusted_boot_id or material['bind'] is not None
                 or request.observation_hash != _batch(b'dev-workflow:compose-host-observation:v1\0', material)):
             reject()
-        resources = capsule['phaseSnapshot']['resources']
+        phase = capsule['phaseSnapshot']
+        resources = phase['resources']
         catalog = {item['Id']:item for item in capsule['imageCatalog']}
+        if batch and (set(phase) != {'rows', 'resources'}
+                or digest(phase['rows']) != value['baselineStateDigest']
+                or len(catalog) != len(capsule['imageCatalog'])):
+            reject()
+        if batch:
+            verify_images(artifacts, {artifact.service: {
+                field: catalog[artifact.image_id][field] for field in ('Id', 'Os', 'Architecture', 'RepoDigests')
+            } for artifact in artifacts.services})
         scope = capsule['scopePolicy']
         class CapturedReader:
             list_path = '/inventory'

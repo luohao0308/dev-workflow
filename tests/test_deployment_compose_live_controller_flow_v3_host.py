@@ -74,8 +74,9 @@ class OwnedLocalProcess:
 
 
 class LocalAcceptanceCase:
-    def __init__(self, testcase, attack=None):
+    def __init__(self, testcase, attack=None, *, batch=False, rollback=False):
         self.testcase=testcase;self.attack=attack;self.process=None;self.harness=None
+        self.batch=batch;self.rollback=rollback;self.readiness_calls=[]
         self.worker_frames=[];self.controller_frames=[];self.reviewed=[];self.notices=[]
         self.alias='host-one';self.source='b'*40;self.archive=b'fixed-test-published-source'
         self.temp=tempfile.TemporaryDirectory(prefix='live-controller-')
@@ -121,6 +122,10 @@ class LocalAcceptanceCase:
             def cleanup(self):pass
         original_temp=tempfile.TemporaryDirectory
         class Harness(preparation_tests.CurrentPreparationUnixTests):
+            if owner.batch:
+                fixture_services = (*preparation_tests.CurrentPreparationUnixTests.fixture_services,
+                                    ('frontend', '3'*64))
+
             def prepare_initial(self,bodies):
                 self.keys=settings['keys']
                 self.images[0]['RepoDigests']=['public.ecr.aws/docker/library/'+IMAGE]
@@ -129,7 +134,8 @@ class LocalAcceptanceCase:
                 def observed(*args,**kwargs):
                     kwargs['policy_hash']=settings['policy_hash']
                     return original(*args,**kwargs)
-                with patch.object(preparation,'_prepare_observed',side_effect=observed):super().prepare_initial(bodies)
+                with patch.object(preparation,'_prepare_observed',side_effect=observed):
+                    super().prepare_initial(bodies,batch=owner.batch)
         def temp_factory(*args,**kwargs):
             if kwargs.get('prefix')=='p3-':return ExistingRoot()
             return original_temp(*args,**kwargs)
@@ -147,7 +153,7 @@ class LocalAcceptanceCase:
             path=urllib.parse.urlsplit(handler.path);bits=path.path.split('/')
             body=handler.rfile.read(int(handler.headers.get('Content-Length','0')))
             if path.path=='/v1.45/containers/create':
-                value=json.loads(body);cid=('a' if not created else 'b')*64;created.append(cid)
+                value=json.loads(body);cid='abcd'[len(created)]*64;created.append(cid)
                 row=deepcopy(h.rows['2'*64]);row.update(Id=cid,Image=value['Image'],Name='/'+urllib.parse.parse_qs(path.query)['name'][0])
                 row['Config']={k:v for k,v in value.items() if k not in ('HostConfig','NetworkingConfig')}
                 row['HostConfig']=value['HostConfig'];row['State'].update(Pid=0,StartedAt='',Running=False,Status='created')
@@ -165,11 +171,11 @@ class LocalAcceptanceCase:
         handler.do_POST=post;handler.do_DELETE=delete
         target=object.__new__(PrivateDaemon)
         target.socket=str(h.root/'docker.sock');target.daemon_id='daemon-one';target.host='unix://'+target.socket
-        h.session.target=target;h.session.created_ids=['1'*64,'2'*64]
+        h.session.target=target;h.session.created_ids=list(h.rows)
         return h.session
 
     def outer_probe(self,workload):
-        workload(self.engine_root,{'ID':'daemon-one'})
+        workload(self.engine_spelling if self.batch else self.engine_root,{'ID':'daemon-one'})
         return dict(completed=True,stopped=True,productionSnapshotUnchanged=True)
 
     def worker_write(self,stream,value,timeout=30):
@@ -178,6 +184,9 @@ class LocalAcceptanceCase:
         if self.attack=='bad-nonce' and frame['kind']=='hello':frame['channelNonce']='0'*64
         if self.attack=='no-facts' and frame['kind']=='observer-facts':return
         if self.attack=='false-final' and frame['kind']=='final':frame['daemonStopped']=False
+        if self.attack=='wrong-batch-source' and frame['kind']=='batch-prepared-private':
+            facts=frame['capsule']['sourceFacts']
+            facts['backend'],facts['frontend']=facts['frontend'],facts['backend']
         self.worker_frames.append(frame)
         write_frame(stream,frame,timeout=timeout)
         if self.attack=='extra-rpc' and frame['kind']=='hello':
@@ -197,7 +206,19 @@ class LocalAcceptanceCase:
         self.controller_frames.append(deepcopy(value))
         return write_frame(stream,value,timeout=timeout)
 
+    def batch_ready(self,session,bundle,service,cid):
+        self.testcase.assertIs(session,self.harness.session)
+        self.testcase.assertEqual(self.harness.rows[cid]['Config']['Labels']['com.docker.compose.service'],service)
+        self.testcase.assertTrue(self.harness.rows[cid]['State']['Running'])
+        if service=='backend':
+            frontend=next(row for row in self.harness.rows.values()
+                if row['Config']['Labels']['com.docker.compose.service']=='frontend')
+            self.testcase.assertFalse(frontend['State']['Running'])
+        self.readiness_calls.append((service,cid))
+        return True
+
     def run(self):
+        rebind=worker.bind_prepared_guard
         with patch.object(controller,'published_live_archive',return_value=self.archive), \
              patch.object(controller,'_spawn_live',side_effect=self.spawn), \
              patch.object(controller,'_review_adapter',side_effect=self.review_adapter), \
@@ -205,9 +226,16 @@ class LocalAcceptanceCase:
              patch.object(probe_module,'_probe',side_effect=self.outer_probe), \
              patch.object(preparation,'prepare_profile3',side_effect=self.prepare), \
              patch.object(worker,'readiness',return_value=True), \
+             patch.object(worker,'batch_readiness',side_effect=self.batch_ready), \
+             patch.object(worker,'bind_prepared_guard',side_effect=lambda session,prepared,root:
+                 rebind(session,prepared,root.resolve())), \
              patch.object(worker,'write_frame',side_effect=self.worker_write):
-            return controller.run_live_acceptance(self.root,self.alias,self.source,
-                on_review=self.notices.append,recipient_private_key=self.recipient)
+            if self.batch:
+                run=controller.run_live_batch_acceptance if self.rollback else controller.run_live_batch_deploy
+            else:
+                run=controller.run_live_acceptance
+            return run(self.root,self.alias,self.source,on_review=self.notices.append,
+                recipient_private_key=self.recipient)
 
 
 @unittest.skipUnless(os.name=='posix' and shutil.which('openssl') and shutil.which('ssh-keygen'),'local pipes/OpenSSL/OpenSSH required')
@@ -246,6 +274,72 @@ class ControllerFlowTests(unittest.TestCase):
         self.assertNotIn('archiveBase64',case.initial)
         encoded=json.dumps(case.controller_frames)
         for credential in ('GITHUB_TOKEN','GH_TOKEN','oidcToken','githubToken'):self.assertNotIn(credential,encoded)
+
+    def test_real_owned_pipe_batch_deploy_and_cleanup(self):
+        case=LocalAcceptanceCase(self,batch=True);self.addCleanup(case.close)
+        result=case.run()
+        self.assertTrue(result['success'])
+        self.assertEqual(result['requestCount'],1)
+        self.assertTrue(result['daemonStopped']);self.assertTrue(result['productionSnapshotUnchanged'])
+        self.assertEqual([(request.operation,request.components) for request in case.reviewed],
+                         [('deploy',('backend','frontend'))])
+        self.assertEqual(len(case.notices),1)
+        self.assertEqual(case.readiness_calls,[('backend','a'*64),('frontend','b'*64)])
+        self.assertEqual(case.harness.rows,{})
+        phases=[('delete' if method=='DELETE' else urllib.parse.urlsplit(path).path.split('/')[-1])
+                for method,path in case.harness.calls if method!='GET']
+        self.assertEqual(phases[:10],['create','create','stop','stop','delete','delete','rename','rename','start','start'])
+        self.assertEqual(phases[10:],['stop','delete']*3)
+        kinds=[frame['kind'] for frame in case.worker_frames if frame['kind']!='rpc']
+        self.assertEqual(kinds,['hello','observer-facts','batch-prepared-private','final'])
+        self.assertEqual(result['witnessFinal']['activePhase'],'closed')
+        self.assertEqual(result['witnessFinal']['activeSeq'],6)
+        self.assertEqual(len(result['witnessFinal']['lineage']),9)
+        self.assertEqual(case.process.returncode,0)
+
+    def test_real_owned_pipe_batch_deploy_and_separate_rollback(self):
+        case=LocalAcceptanceCase(self,batch=True,rollback=True);self.addCleanup(case.close)
+        try:
+            result=case.run()
+        except ValueError as error:
+            if case.process is not None and case.process.failure is not None:
+                raise error from case.process.failure
+            raise
+        self.assertTrue(result['success'])
+        self.assertEqual(result['requestCount'],2)
+        self.assertTrue(result['daemonStopped']);self.assertTrue(result['cleanupCompleted'])
+        deploy,rollback=case.reviewed
+        self.assertEqual((deploy.operation,rollback.operation),('deploy','rollback'))
+        self.assertEqual(deploy.components,('backend','frontend'))
+        self.assertEqual(rollback.components,deploy.components)
+        self.assertIsNone(deploy.history_hash)
+        self.assertIsNotNone(rollback.history_hash)
+        self.assertNotEqual(deploy.digest(),rollback.digest())
+        approvals=[f for f in case.controller_frames if f.get('kind')=='consume-intent']
+        self.assertEqual([f['requestHash'] for f in approvals],[deploy.digest(),rollback.digest()])
+        self.assertNotEqual(approvals[0]['receiptHash'],approvals[1]['receiptHash'])
+        self.assertEqual(case.readiness_calls,[
+            ('backend','a'*64),('frontend','b'*64),('backend','c'*64),('frontend','d'*64)])
+        self.assertEqual(case.harness.rows,{})
+        phases=[('delete' if method=='DELETE' else urllib.parse.urlsplit(path).path.split('/')[-1])
+                for method,path in case.harness.calls if method!='GET']
+        self.assertEqual(phases[:20],
+            ['create','create','stop','stop','delete','delete','rename','rename','start','start']*2)
+        self.assertEqual(phases[20:],['stop','delete']*3)
+        self.assertEqual(len(result['witnessFinal']['lineage']),19)
+        self.assertEqual(result['witnessFinal']['activePhase'],'closed')
+        self.assertEqual(result['witnessFinal']['activeSeq'],6)
+        self.assertEqual(case.process.returncode,0)
+
+    def test_misbound_batch_capsule_never_reaches_review_or_consumption(self):
+        case=LocalAcceptanceCase(self,'wrong-batch-source',batch=True);self.addCleanup(case.close)
+        with self.assertRaises(ValueError):case.run()
+        self.assertEqual(case.reviewed,[])
+        self.assertFalse(any(frame.get('kind')=='consume-intent' for frame in case.controller_frames))
+        self.assertFalse(any(method=='POST' and urllib.parse.urlsplit(path).path=='/v1.45/containers/create'
+                             for method,path in case.harness.calls))
+        self.assertFalse(any(case.root.glob('live-*/witness/state.json')))
+        self.assertFalse(any(case.root.glob('live-*/result.private.json')))
 
     def test_bad_nonce_and_extra_rpc_rejected_before_review(self):
         for attack in ('bad-nonce','extra-rpc'):

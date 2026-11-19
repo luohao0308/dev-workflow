@@ -16,8 +16,8 @@ import weakref
 from deployment_compose_scene_service_v3_host import SceneClientV3
 from deployment_compose_scene_control_ssh_v3_host import SceneSSHClientV3
 from deployment_compose_live_admission_v3_host import MacLiveAdmissionV3
-from deployment_compose_live_ssh_v3_host import verify_private_capsule
-from deployment_compose_operation_witness_client_v3 import encode
+from deployment_compose_live_ssh_v3_host import verify_batch_private_capsule, verify_private_capsule
+from deployment_compose_operation_witness_client_v3 import encode,hex_value
 from deployment_compose_recovery_phase_capsule_v3_host import decode
 from deployment_compose_witness_store import canonical
 from deployment_compose_scene_create_certificate_v3_host import issue_create_closure
@@ -40,6 +40,60 @@ def reject():raise ValueError('compose-scene-create-controller-v3-rejected') fro
 
 
 def digest(raw):return hashlib.sha256(raw).hexdigest()
+
+
+def review_batch_preparation(client, *, hello, metadata, policy, integrity_keys, expected_target_registries):
+    """Read an authenticated scene's immutable batch capsule and return its public review."""
+    try:
+        if type(client) not in (SceneClientV3,SceneSSHClientV3):reject()
+        hello=decode(canonical(hello))
+        metadata=decode(canonical(metadata))
+        expected_target_registries=dict(expected_target_registries)
+        integrity_keys=dict(integrity_keys)
+        prep,capsule_digest,total=(metadata[k] for k in ('preparationId','capsuleDigest','totalBytes'))
+        facts=metadata['observerFacts']
+        if (not hex_value(prep) or not hex_value(capsule_digest) or type(total) is not int
+                or not 0<total<=MAX_MESSAGE or facts['operation']!='deploy'
+                or facts['bindDigest'] is not None or any(facts[k]!=hello[k]
+                    for k in ('root','daemonId','sourceSha','archiveDigest'))):reject()
+
+        end=time.monotonic()+90
+        def check_scene():
+            status=client.status()
+            if (time.monotonic()>=end or status['sceneId']!=client._handle.sceneId
+                    or status['preparationState']!='prepared' or status['preparationIdentity']!=hello
+                    or status['preparation']!=metadata or status['daemonId']!=hello['daemonId']):reject()
+
+        check_scene()
+        raw=bytearray()
+        check_due=time.monotonic()+5
+        while len(raw)<total:
+            if time.monotonic()>=check_due:
+                check_scene()
+                check_due=time.monotonic()+5
+            offset=len(raw)
+            size=min(4096,total-offset)
+            chunk=client.preparation_chunk(prep,capsule_digest,offset,size)['preparationChunk']
+            if (chunk['preparationId']!=prep or chunk['capsuleDigest']!=capsule_digest
+                    or type(chunk['totalBytes']) is not int or chunk['totalBytes']!=total
+                    or type(chunk['offset']) is not int or chunk['offset']!=offset):reject()
+            encoded=chunk['dataBase64']
+            if type(encoded) is not str or len(encoded)!=4*((size+2)//3):reject()
+            data=base64.b64decode(encoded,validate=True)
+            if len(data)!=size or base64.b64encode(data).decode('ascii')!=encoded:reject()
+            raw.extend(data)
+        if digest(raw)!=capsule_digest:reject()
+        bundle,request=verify_batch_private_capsule(decode(bytes(raw)),hello=hello,
+            source_sha=hello['sourceSha'],ssh_alias=hello['hostId'],policy=policy,keys=integrity_keys,
+            trusted_boot_id=facts['bootId'],trusted_bind_digest=facts['bindDigest'],
+            expected_target_registries=expected_target_registries)
+        if (request.operation!='deploy' or request.components!=('backend','frontend')
+                or request.protected_components!=('peer',) or request.digest()!=metadata['requestDigest']
+                or request.expires_at!=metadata['expiresAt']):reject()
+        check_scene()
+        request.ensure_fresh(datetime.now(timezone.utc))
+        return decode(canonical(dict(request=asdict(request),review=bundle.public_review())))
+    except Exception:reject()
 
 
 class SceneCreateControllerV3:

@@ -45,8 +45,9 @@ if sys.argv[1]=='serve':
                 self.hello=dict(root=self.observer.binding()['root'],daemonId=self.observer.daemon_id,sourceSha=self.source,archiveDigest=self.archive,
                     hostId=host,serverCertificateSha256='a'*64,writerCertificateSha256='b'*64);self.state='identity'
             return self.hello
-        def prepare(self,policy,keys):
+        def prepare(self,policy,keys,*,batch=False):
             if self.state!='identity':raise ValueError('once')
+            if batch:self.raw=b'{"kind":"compose-managed-batch-capsule","schemaVersion":1}'
             if len(sys.argv)>9:time.sleep(float(sys.argv[9]))
             self.state='prepared';self.meta=dict(preparationId='d'*64,capsuleDigest=hashlib.sha256(self.raw).hexdigest(),totalBytes=len(self.raw),
                 requestDigest='e'*64,expiresAt='2030-01-01T00:00:00Z',observerFacts={'bootId':'f'*32},approvalReady=False)

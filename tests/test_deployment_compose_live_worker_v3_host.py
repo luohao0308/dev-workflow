@@ -2,6 +2,7 @@
 import base64
 from dataclasses import asdict
 import hashlib
+import json
 import os
 from pathlib import Path
 import ssl
@@ -235,6 +236,64 @@ class WorkerTests(unittest.TestCase):
              patch.object(worker,'subprocess',fake_subprocess):
             with self.assertRaises(ValueError):worker.readiness(session,backend['Id'])
         fake_subprocess.run.assert_not_called();stop.assert_not_called();fake_os.close.assert_called_once_with(55)
+
+    def test_batch_readiness_binds_receipt_image_and_does_not_probe_other_service(self):
+        from copy import deepcopy
+        project='dw-restore-'+'a'*24
+        network_id='e'*64
+        images=[dict(Id='sha256:'+digit*64,Config={'Env':['PYTHON_VERSION=3.13.2']})
+                for digit in 'abc']
+        def row(name, cid, image):
+            return dict(Id=cid,Name='/'+project+'-'+name,Image=image['Id'],
+                Config={'Labels':{'com.docker.compose.project':project,'com.docker.compose.service':name}},
+                State=dict(Pid=123,StartedAt='pinned',Running=True,Health={'Status':'healthy'}),
+                NetworkSettings={'Networks':{'private':{'NetworkID':network_id,
+                    'Aliases':[name],'IPAddress':{'peer':'172.20.0.4','backend':'172.20.0.2','frontend':'172.20.0.3'}[name]}}})
+        rows={name:row(name,digit*64,image) for name,digit,image in
+              zip(('peer','backend','frontend'),'234',images)}
+        peer=rows['peer']
+        services=[dict(name=name,baselineContainerId=digit*64,finalName=project+'-'+name,
+                   targetImageId=rows[name]['Image'],targetCreateBody={'NetworkingConfig':{
+                       'EndpointsConfig':{'private':dict(NetworkID=network_id,Aliases=[name])}}})
+                  for name,digit in (('backend','7'),('frontend','8'))]
+        bundle=Mock()
+        bundle.to_dict.return_value=dict(identity={'project':project},services=services,
+            protectedContainers=[dict(containerId=peer['Id'],staticConfigDigest=worker.canonical(peer))])
+        session=Mock(raw_rows={'peer':peer},project=project,enrolled_images=images)
+        fake_os=SimpleNamespace(**vars(os))
+        fake_os.open=Mock(return_value=55);fake_os.stat=Mock(return_value=Mock(st_ino=9))
+        fake_os.fstat=Mock(return_value=Mock(st_ino=9));fake_os.close=Mock()
+        fake_subprocess=SimpleNamespace(**vars(worker.subprocess))
+        fake_subprocess.run=Mock(return_value=Mock(stdout=b'{"success":true}'))
+        for service in ('backend','frontend'):
+            with self.subTest(service=service):
+                selected=deepcopy(rows[service])
+                def inspect(path):
+                    if '/images/' in path:
+                        return deepcopy(next(image for image in images if image['Id'] in path))
+                    if peer['Id'] in path:return deepcopy(peer)
+                    self.assertIn(selected['Id'],path)
+                    return deepcopy(selected)
+                session.producer._get.side_effect=inspect
+                with patch('deployment_compose_phase_guard_v3_host.protected_state_digest',side_effect=worker.canonical), \
+                     patch.object(worker,'os',fake_os),patch.object(worker,'stop_probe_unit'), \
+                     patch.object(worker,'subprocess',fake_subprocess):
+                    self.assertTrue(worker.batch_readiness(session,bundle,service,selected['Id']))
+                    args=fake_subprocess.run.call_args.args[0]
+                    self.assertEqual(set(json.loads(args[-1])['addresses']),{service,'peer'})
+                    fake_subprocess.run.reset_mock()
+                    selected['Image']=images[0]['Id']
+                    with self.assertRaises(ValueError):
+                        worker.batch_readiness(session,bundle,service,selected['Id'])
+                    fake_subprocess.run.assert_not_called()
+                    selected['Image']=rows[service]['Image']
+                    def change_after_probe(*args, **kwargs):
+                        selected['State']['StartedAt']='replaced'
+                        return Mock(stdout=b'{"success":true}')
+                    fake_subprocess.run.side_effect=change_after_probe
+                    with self.assertRaises(ValueError):
+                        worker.batch_readiness(session,bundle,service,selected['Id'])
+                    fake_subprocess.run.side_effect=None
 
     def test_final_requires_outer_probe_shutdown_and_production_verification(self):
         payload=dict(result={'private':'result'},history={'private':'history'},success=True,cleanupCompleted=True)

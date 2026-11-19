@@ -12,20 +12,39 @@ from tests.test_deployment_compose_snapshot import KEY
 from deployment_compose_private import commit
 from deployment_compose_recovery_host import ComposeRecoveryHost
 from deployment_compose_image_defaults import commit_image_config
+from deployment_compose_network_declaration import commit_network_declaration
 from deployment_contract_v2 import SourceIdentity, TargetIdentity
 import deployment_compose_prepare_v3_host as host
 
 
-def fixture():
+def fixture(*, batch=False, source=None, target=None, source_model_digest=None,
+            config_key_id='inspect-key', target_registries=None):
     args, options, _, _, observer, _, store = retained_fixture()
-    project = 'dw-test'
+    baseline_source_sha = args['artifact'].source_sha if source is None else source.source_sha
+    source = source or SourceIdentity('github.com','https://github.com/o/r.git',1,'o/r','a'*40)
+    target = target or TargetIdentity('compose','dw-test','test')
+    project = target.namespace
+
+    def seal_source(inputs):
+        seal(inputs)
+        if source_model_digest is not None:
+            inputs['expected_source_model_digest'] = source_model_digest
+            declaration = inputs['declaration']
+            declaration['sourceModelDigest'] = source_model_digest
+            proof = commit_network_declaration(declaration, 'declaration-key', inputs['declaration_key'])
+            inputs.update(declaration_proof=proof, expected_declaration_hmac=proof['declarationHmac'])
+
     observer._policy['project'] = project
     args['identity']['project'] = project
     args['raw']['Config']['Labels']['com.docker.compose.project'] = project
     args['raw']['Config']['Image'] = args['identity']['imageId']
+    if batch:
+        for endpoint in args['raw']['NetworkSettings']['Networks'].values():
+            endpoint['Aliases'] = ['web']
     projection = {k:deepcopy(args['raw'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
-    digest = commit(project,'web',projection,'inspect-key',KEY)['configHmac']
-    artifact = replace(args['artifact'],config_hmac=digest)
+    digest = commit(project,'web',projection,config_key_id,KEY)['configHmac']
+    artifact = replace(args['artifact'], source_sha=baseline_source_sha, config_hmac=digest,
+                       config_key_id=config_key_id)
     args['artifact'] = artifact
     observer._baseline_artifacts = replace(observer._baseline_artifacts,services=(artifact,))
     # The observation test seam reads the mutable observed fixture dictionary.
@@ -36,13 +55,16 @@ def fixture():
     observer._collect = collect
     baseline = (host.BaselineContainer('web',args['identity']['containerId'],args['identity']['containerName'],artifact.image_id),)
     recovery = ComposeRecoveryHost(store=store,observer=observer,baseline=baseline,
-        projections={'web':projection},private_keys={'inspect-key':KEY})
-    seal(args)
+        projections={'web':projection},private_keys={config_key_id:KEY})
+    seal_source(args)
     inputs = {k:v for k,v in args.items() if k not in ('raw','artifact','operation_nonce')}
     image = deepcopy(args['image']);image['Id']='sha256:'+'9'*64;image['Config']={}
+    if target_registries is not None:
+        image['RepoDigests'] = [target_registries['web']]
     targets = {'web':dict(image=image,commitment=commit_image_config(image,'target-key',KEY),key=KEY,
         expected_key_id='target-key',expected_image_id=image['Id'],expected_registry_digest=image['RepoDigests'][0],expected_architecture=image['Architecture'])}
     scope=observer._policy
+    scope['baselineSourceShas']['web'] = baseline_source_sha
     scope['protectedContainerIds']={'db':'2'*64}
     scope['containerNames']['db']='dw-db-1'
     # Explicit unit-only trusted reader seam; this does not exercise real TLS.
@@ -51,14 +73,56 @@ def fixture():
         Paused=False,Restarting=False,Dead=False,Status='running',Health={'Status':'healthy'}))
     protected=deepcopy(row);protected.update(Id='2'*64,Name='/dw-db-1',Image=scope['imageIds']['db'])
     protected['Config']['Labels']['com.docker.compose.service']='db'
+    if batch:
+        for endpoint in protected['NetworkSettings']['Networks'].values():
+            endpoint['Aliases'] = ['db']
     rows={row['Id']:row,protected['Id']:protected}
     projection_db={k:protected[k] for k in ('Config','HostConfig','Mounts','NetworkSettings')}
-    db_hmac=commit(project,'db',projection_db,'protected-key',KEY)['configHmac']
+    protected_key_id = config_key_id if batch else 'protected-key'
+    db_hmac=commit(project,'db',projection_db,protected_key_id,KEY)['configHmac']
     scope['protectedConfigHmacs']['db']=db_hmac
+    sources = {'web': inputs}
+    dependencies = {'web': ()}
+    if batch:
+        api = deepcopy(args)
+        api['identity'].update(service='api', containerId='7'*64, containerName='dw-api-1')
+        api_row = deepcopy(row)
+        api_row.update(Id='7'*64, Name='/dw-api-1')
+        api_row['Config']['Labels']['com.docker.compose.service'] = 'api'
+        for endpoint in api_row['NetworkSettings']['Networks'].values():
+            endpoint['Aliases'] = ['api']
+        api_projection = {key: deepcopy(api_row[key]) for key in projection}
+        api_digest = commit(project, 'api', api_projection, config_key_id, KEY)['configHmac']
+        api_artifact = replace(artifact, service='api', config_hmac=api_digest)
+        api.update(raw={key: deepcopy(api_row[key]) for key in args['raw']}, artifact=api_artifact)
+        seal_source(api)
+        sources['api'] = {key: api[key] for key in inputs}
+        api_image = dict(image, Id='sha256:'+'8'*64)
+        if target_registries is not None:
+            api_image['RepoDigests'] = [target_registries['api']]
+        targets['api'] = dict(targets['web'], image=api_image, expected_image_id=api_image['Id'],
+                              expected_registry_digest=api_image['RepoDigests'][0],
+                              commitment=commit_image_config(api_image, 'target-key', KEY))
+        baseline = (host.BaselineContainer('api', api_row['Id'], 'dw-api-1', api_artifact.image_id),) + baseline
+        dependencies.update(api=(), web=('api',))
+        scope['baselineSourceShas']['api'] = baseline_source_sha
+        scope['selectedServices'] = ['api', 'web']
+        scope['selectedContainerIds']['api'] = api_row['Id']
+        scope['containerNames']['api'] = 'dw-api-1'
+        scope['imageIds']['api'] = api_artifact.image_id
+        rows[api_row['Id']] = api_row
+        observer._baseline_artifacts = replace(observer._baseline_artifacts, services=(api_artifact, artifact))
+        recovery = ComposeRecoveryHost(store=store, observer=observer, baseline=baseline,
+            projections={'api':api_projection, 'web':projection}, private_keys={config_key_id:KEY})
     base_collector=observer._collect
     def collect_complete(*a,**k):
         value=base_collector(*a,**k)
         value['serviceConfigHmacs']['db']=db_hmac
+        if batch:
+            value['serviceConfigHmacs']['api'] = api_digest
+            value['serviceContainerIds']['api'] = api_row['Id']
+            value['serviceImages']['api'] = api_artifact.image_id
+            value['serviceState']['api'] = deepcopy(value['serviceState']['web'])
         instances={cid:(r['State']['Pid'],r['State']['StartedAt'],r['RestartCount']) for cid,r in rows.items()}
         value['instanceDigest']=hashlib.sha256(b'dev-workflow:compose-instance-batch:v1\0'+json.dumps(instances,sort_keys=True,separators=(',',':')).encode('ascii')).hexdigest()
         return value
@@ -76,15 +140,36 @@ def fixture():
     observer._unit_rows=rows
     observation=observer.issue();reference=recovery.retain(observation)
     kwargs=dict(whole_observer=observer,retention_observer=observer,recovery=recovery,baseline=baseline,
-        source_inputs={'web':inputs},target_inputs=targets,
-        source=SourceIdentity('github.com','https://github.com/o/r.git',1,'o/r','a'*40),
-        target=TargetIdentity('compose',project,'test'),host_id=args['identity']['hostId'],daemon_id=scope['daemonId'],
-        environment='test',policy_hash='e'*64,dependencies={'web':()},protected_names={'db':'dw-db-1'},protected_ids={'db':'2'*64},protected_hashes=scope['protectedConfigHmacs'],archive_reference=reference,phase_state_producer=producer,protected_private_keys={'db':('protected-key',KEY)})
+        source_inputs=sources,target_inputs=targets,
+        source=source, target=target, host_id=args['identity']['hostId'], daemon_id=scope['daemonId'],
+        environment=target.target_id,policy_hash='e'*64,dependencies=dependencies,protected_names={'db':'dw-db-1'},protected_ids={'db':'2'*64},protected_hashes=scope['protectedConfigHmacs'],archive_reference=reference,phase_state_producer=producer,protected_private_keys={'db':(protected_key_id,KEY)})
     return kwargs, observation
 
 
 @unittest.skipUnless(os.name == 'posix', 'private recovery store requires POSIX semantics')
 class PreparationTests(unittest.TestCase):
+    def test_batch_preparation_authenticates_each_service_before_creating_intent(self):
+        kwargs, observation = fixture(batch=True)
+        self.addCleanup(kwargs['recovery']._store.close)
+        expires = (datetime.now(timezone.utc) + timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        options = dict(operation_nonce='f'*64, expires_at=expires)
+        preparer = host.ComposePreparationHostV3(**kwargs)
+        prepared = preparer.prepare_intent(observation, observation, **options)
+        request, bundle, review = (prepared[key] for key in ('request', 'bundle', 'review'))
+        self.assertEqual(request.components, ('api', 'web'))
+        self.assertEqual(request.protected_components, ('db',))
+        self.assertEqual(request.plan_hash, bundle.digest)
+        services = {item['name']: item for item in bundle.to_dict()['services']}
+        self.assertEqual(services['web']['dependsOn'], ['api'])
+        self.assertNotEqual(services['api']['targetImageId'], services['web']['targetImageId'])
+        self.assertFalse(review['authorityGranted'])
+        self.assertNotIn('Env', json.dumps(review))
+        preparer.verify_intent(prepared, observation, observation, **options)
+
+        kwargs['source_inputs']['api'] = kwargs['source_inputs']['web']
+        with self.assertRaisesRegex(ValueError, 'compose-preparation-v3-rejected'):
+            host.ComposePreparationHostV3(**kwargs)
+
     def test_health_log_progress_does_not_rebase_stable_lifecycle(self):
         kw, observation=fixture()
         producer=kw['phase_state_producer'];original=producer.capture;calls=[]

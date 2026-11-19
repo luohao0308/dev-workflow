@@ -68,6 +68,19 @@ class WriterPhaseRelayTests(unittest.TestCase):
  cleanup_service=service_fixture.SceneTests.cleanup_service
  connect=RelayTests.connect
 
+ def test_batch_preparation_round_trips_through_authenticated_relay(self):
+  import base64,json
+  with self.connect() as client:
+   client.prepare_identity('host-one')
+   keys={key:b'k'*32 for key in ('config','image','declaration','archive','target')}
+   meta=client.prepare_batch_staging('c'*64,keys)['preparation']
+   chunk=client.preparation_chunk(meta['preparationId'],meta['capsuleDigest'],0,4096)['preparationChunk']
+   capsule=json.loads(base64.b64decode(chunk['dataBase64'],validate=True))
+   self.assertEqual(capsule,{'kind':'compose-managed-batch-capsule','schemaVersion':1})
+   self.assertFalse(client.status()['runtimePermit'])
+   client.close_scene()
+  self.assertEqual(self.process.wait(timeout=5),0)
+
  def test_writer_phase_command_round_trips_through_relay_and_authenticated_service(self):
   with self.connect() as client:
    client.prepare_identity('host-one')

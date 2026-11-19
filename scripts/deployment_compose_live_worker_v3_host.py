@@ -3,6 +3,8 @@
 Private length-prefixed canonical JSON protocol (existing 4 MiB frame limit):
 hello -> configure -> observer-facts -> prepared-private -> consume-intent -> rpc/reply* ->
 deployed -> observer-facts -> rollback-prepared-private -> consume-intent -> rpc/reply* -> final.
+Batch mode nests its capsule under an explicit batch frame and can use one
+deployment or a separately reviewed rollback.
 Every frame pins channelNonce. configure carries GatePolicy.public dataclass
 fields, epoch, witnessPublicKey, statusPublicKey, keys (five base64 HMAC keys),
 and gateKey. consume-intent carries exactly requestHash, receiptHash,
@@ -154,13 +156,15 @@ def writer_tls(root):
 PROBE_CODE = r'''
 import sys,json,socket,struct,http.client,pathlib,secrets
 args=json.loads(sys.argv[1]); assert set(args)=={'addresses','versions','token'}
+names=set(args['addresses'])
+assert names in ({'backend','peer'},{'frontend','peer'}) and set(args['versions'])==names
 cg=[x.split(':',2)[2] for x in pathlib.Path('/proc/self/cgroup').read_text().splitlines() if x.startswith('0::')]; assert len(cg)==1
 root=pathlib.Path('/sys/fs/cgroup')/cg[0].lstrip('/')
 assert (root/'memory.max').read_text().strip()=='67108864'
 assert (root/'memory.swap.max').read_text().strip()=='0'
 assert (root/'pids.max').read_text().strip()=='16'
 quota,period=map(int,(root/'cpu.max').read_text().split()); assert 0<quota<=period//4
-for name in ('backend','peer'):
+for name in sorted(names):
     ident=secrets.randbelow(65536); q=name.encode(); packet=struct.pack('!HHHHHH',ident,256,1,0,0,0)+bytes([len(q)])+q+b'\0'+struct.pack('!HH',1,1)
     s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3)
     try:
@@ -200,10 +204,11 @@ print('{"success":true}')
 '''
 
 
-def probe_command(unit, namespace_fd, addresses, versions, token):
+def probe_command(unit, namespace_fd, addresses, versions, token, *, service='backend'):
     if (not re.fullmatch('dw-live-probe-[0-9a-f]{32}\\.service',unit)
             or type(namespace_fd) is not int or namespace_fd<3
-            or set(addresses) != {'backend','peer'} or set(versions) != {'backend','peer'}
+            or service not in ('backend','frontend')
+            or set(addresses) != {service,'peer'} or set(versions) != {service,'peer'}
             or not re.fullmatch('dw-restore-[0-9a-f]{24}',token)): reject()
     for ip in addresses.values():
         if str(ipaddress.IPv4Address(ip)) != ip or ipaddress.IPv4Address(ip).is_unspecified or ipaddress.IPv4Address(ip).is_loopback: reject()
@@ -241,13 +246,45 @@ def stop_probe_unit(unit):
 
 
 def readiness(session, cid):
+    return _readiness(session, 'backend', cid)
+
+
+def batch_readiness(session, bundle, service, cid):
+    """Check the exact approved service receipt from the protected peer namespace."""
+    from deployment_compose_phase_guard_v3_host import protected_state_digest
+    if service not in ('backend','frontend') or not hex_value(cid): reject()
+    value=bundle.to_dict()
+    services={item['name']:item for item in value['services']}
+    peer=session.raw_rows['peer']
+    if (set(services)!={'backend','frontend'} or len(value['services'])!=2
+            or value['identity']['project']!=session.project
+            or value['protectedContainers']!=[dict(containerId=peer['Id'],staticConfigDigest=protected_state_digest(peer))]
+            or cid in {peer['Id'],*(item['baselineContainerId'] for item in services.values())}): reject()
+    target=services[service]
+    endpoints=target['targetCreateBody']['NetworkingConfig']['EndpointsConfig']
+    if len(endpoints)!=1: reject()
+    network,endpoint=next(iter(endpoints.items()))
+    if service not in endpoint['Aliases']: reject()
+    return _readiness(session,service,cid,target=target,network=network,endpoint=endpoint)
+
+
+def _readiness(session, service, cid, *, target=None, network=None, endpoint=None):
     from deployment_compose_phase_guard_v3_host import protected_state_digest
     protected=session.raw_rows['peer']
     peer_id=protected['Id']
     deadline=time.monotonic()+90
+    def inspect(identity):
+        return session.producer._get('/v1.45/containers/'+identity+'/json')
+    def check_target(row):
+        labels=row['Config']['Labels']
+        networks=row['NetworkSettings']['Networks']
+        if (row['Id']!=cid or row['Name']!='/'+target['finalName'] or row['Image']!=target['targetImageId']
+                or labels.get('com.docker.compose.project')!=session.project
+                or labels.get('com.docker.compose.service')!=service or set(networks)!={network}
+                or any(networks[network][key]!=endpoint[key] for key in ('NetworkID','Aliases'))): reject()
     while True:
-        rows={name:session.producer._get('/v1.45/containers/'+identity+'/json') for name,identity in
-              (('backend',cid),('peer',peer_id))}
+        rows={name:inspect(identity) for name,identity in ((service,cid),('peer',peer_id))}
+        if target is not None: check_target(rows[service])
         if protected_state_digest(rows['peer'])!=protected_state_digest(protected): reject()
         if all(row['State']['Running'] is True and row['State']['Health']['Status']=='healthy' for row in rows.values()): break
         if any(row['State']['Health']['Status'] not in ('starting','healthy') for row in rows.values()): reject()
@@ -265,6 +302,7 @@ def readiness(session, cid):
         env=[x.split('=',1)[1] for x in enrolled['Config']['Env'] if x.startswith('PYTHON_VERSION=')]
         if len(env)!=1: reject()
         versions[name]=env[0]
+    target_digest=protected_state_digest(rows[service]) if target is not None else None
     pid=rows['peer']['State']['Pid']
     if type(pid) is not int or pid<=1: reject()
     fd=os.open('/proc/'+str(pid)+'/ns/net',os.O_RDONLY|os.O_CLOEXEC)
@@ -275,11 +313,16 @@ def readiness(session, cid):
         if (protected_state_digest(fresh)!=protected_state_digest(protected)
                 or fresh['State']['Pid']!=pid or fresh['State']['StartedAt']!=rows['peer']['State']['StartedAt']
                 or os.stat('/proc/'+str(pid)+'/ns/net').st_ino!=os.fstat(fd).st_ino): reject()
-        command=probe_command(unit,fd,addresses,versions,session.project)
+        if target is not None and protected_state_digest(inspect(cid))!=target_digest: reject()
+        if target is None:
+            command=probe_command(unit,fd,addresses,versions,session.project)
+        else:
+            command=probe_command(unit,fd,addresses,versions,session.project,service=service)
         attempted=True
         result=subprocess.run(command,capture_output=True,check=True,timeout=40)
         if result.stdout.strip()!=b'{"success":true}': reject()
-        if protected_state_digest(session.producer._get('/v1.45/containers/'+peer_id+'/json'))!=protected_state_digest(protected): reject()
+        if protected_state_digest(inspect(peer_id))!=protected_state_digest(protected): reject()
+        if target is not None and protected_state_digest(inspect(cid))!=target_digest: reject()
         return True
     finally:
         original=sys.exc_info()[1]
@@ -356,13 +399,20 @@ def private_capsule(session, prepared):
     operation=prepared['bundle'].creation_operations()[0]
     phase=session.guard.capture_phase(dict(phase_index=0,operation=operation,receipts={},completed_operations=[]))
     target=session.preparer._target_inputs
-    return dict(bundle=prepared['bundle'].to_dict(),request=asdict(prepared['request']),
+    capsule = dict(bundle=prepared['bundle'].to_dict(),request=asdict(prepared['request']),
         publicReview=prepared['bundle'].public_review(),sourceModel=session.source_model,rawRows=session.raw_rows,
-        sourceFacts={k:v for k,v in session.source_inputs.items() if type(v) is not bytes},
         targetInputs={name:{k:v for k,v in values.items() if type(v) is not bytes} for name,values in target.items()},
         baselineArtifacts=asdict(session.preparer._artifacts),scopePolicy=session.whole_observer._policy,
         imageCatalog=session.enrolled_images,phaseSnapshot=private_json(phase),
         observationMaterial={name:getattr(observation,'_'+name) for name in ('boot','structure','private','instance','catalog','bind')})
+
+    if len(prepared['request'].components) > 1:
+        capsule.update(kind='compose-managed-batch-capsule', schemaVersion=1,
+            sourceFacts={name: {key: value for key, value in inputs.items() if type(value) is not bytes}
+                         for name, inputs in session.preparer._source_inputs.items()})
+    else:
+        capsule['sourceFacts'] = {k:v for k,v in session.source_inputs.items() if type(v) is not bytes}
+    return capsule
 
 
 def bind_prepared_guard(session, prepared, root):
@@ -416,10 +466,16 @@ def run(config, stdin, stdout):
         session=None
         try:
             tls=writer_tls(root)
-            channel.emit('hello',root=str(root),daemonId=info['ID'],writerCertificateSha256=tls[3],
+            hello=dict(root=str(root),daemonId=info['ID'],writerCertificateSha256=tls[3],
                 serverCertificateSha256=tls[2],sourceSha=config['sourceSha'],archiveDigest=config['archiveDigest'],hostId=config['hostId'])
+            channel.emit('hello',**hello)
             setup=channel.receive('configure')
-            if set(setup)!={'policy','epoch','witnessPublicKey','statusPublicKey','keys','gateKey'}: reject()
+            batch='batch' in setup
+            batch_rollback='batchRollback' in setup
+            required={'policy','epoch','witnessPublicKey','statusPublicKey','keys','gateKey'}
+            if ((set(setup)-{'batch','batchRollback'})!=required
+                    or (batch and setup['batch'] is not True)
+                    or (batch_rollback and (not batch or setup['batchRollback'] is not True))):reject()
             policy=GatePolicy(**setup['policy'])
             public=base64.b64decode(setup['witnessPublicKey'],validate=True)
             status=base64.b64decode(setup['statusPublicKey'],validate=True)
@@ -430,16 +486,32 @@ def run(config, stdin, stdout):
                     or not hex_value(setup['epoch']) or policy.writer_certificate_sha256!=tls[3]
                     or policy.operation_profile!='compose-v3' or policy.witness_scope_hash!='0'*64
                     or policy.witness_key_sha256!=hashlib.sha256(key_material(public)).hexdigest()): reject()
+            if batch and (policy.scope_hash!=hashlib.sha256(canonical(hello)).hexdigest()
+                    or policy.witness_required is not True or key_material(public)==key_material(status)):reject()
             session=prepare_profile3(root,info,source_sha=config['sourceSha'],host_id=config['hostId'],
-                expected_daemon_id=info['ID'],keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=900)
+                expected_daemon_id=info['ID'],keys=keys,policy_hash=policy.identity_hash(),environment='staging',expiry_seconds=900,
+                **({'batch':True} if batch else {}))
             bundle=session.prepared['bundle']; request=session.prepared['request']
             tracker=FixtureOwnershipTrackerV3(project=session.project,daemon_id=info['ID'],policy_hash=policy.identity_hash(),
                 witness_pub_hash=policy.witness_key_sha256,epoch=setup['epoch'],initial_confirmed_ids=session.created_ids,
                 protected_ids=[x['containerId'] for x in bundle.to_dict()['protectedContainers']])
             emit_observer_facts(channel,session,session.prepared,root)
-            channel.emit('prepared-private',**private_capsule(session,session.prepared))
-            result,history=execute_operation(channel,session,session.prepared,policy,gate_key,public,status,tls,tracker)
+            if batch:
+                capsule=private_capsule(session,session.prepared)
+                if (request.components!=('backend','frontend') or request.protected_components!=('peer',)
+                        or capsule.get('kind')!='compose-managed-batch-capsule'):reject()
+                channel.emit('batch-prepared-private',capsule=capsule)
+                result,history=execute_operation(channel,session,session.prepared,policy,gate_key,public,status,tls,tracker,
+                    readiness_probe=lambda service,cid:batch_readiness(session,bundle,service,cid))
+            else:
+                channel.emit('prepared-private',**private_capsule(session,session.prepared))
+                result,history=execute_operation(channel,session,session.prepared,policy,gate_key,public,status,tls,tracker)
             snapshot=history.capture()
+            if batch and not batch_rollback:
+                session.cleanup()
+                session=None
+                final_payload=dict(result=result,history=json.loads(snapshot.canonical),success=True,cleanupCompleted=True)
+                return dict(success=True)
             channel.emit('deployed',result=result,history=json.loads(snapshot.canonical))
             current=prepare_current_profile3(session,original_bundle=bundle,original_request=request,authenticated_history=history,
                 keys=keys,source_sha=config['sourceSha'],host_id=config['hostId'],policy_hash=policy.identity_hash(),expiry_seconds=900)
@@ -450,7 +522,11 @@ def run(config, stdin, stdout):
             current['private_session'].enrolled_images=session.enrolled_images
             current['guard']=bind_prepared_guard(current['private_session'],prepared,root)
             emit_observer_facts(channel,current['private_session'],prepared,root)
-            channel.emit('rollback-prepared-private',**private_capsule(current['private_session'],prepared),history=json.loads(snapshot.canonical))
+            capsule=private_capsule(current['private_session'],prepared)
+            if batch:
+                channel.emit('batch-rollback-prepared-private',capsule=capsule,history=json.loads(snapshot.canonical))
+            else:
+                channel.emit('rollback-prepared-private',**capsule,history=json.loads(snapshot.canonical))
             def quiesce():
                 # StepExecutor closes each owned gateway before returning. A fresh
                 # authenticated closed tail proves no active writer remains.
@@ -458,8 +534,9 @@ def run(config, stdin, stdout):
             fence=Profile3StartupFenceV3(original_history=history,reviewed_history=snapshot,quiesce_writer=quiesce)
             session.guard=current['guard']
             session.producer=current['private_session'].producer
+            readiness_probe=(lambda service,cid:batch_readiness(session,prepared['bundle'],service,cid)) if batch else None
             result,child=execute_operation(channel,session,prepared,policy,gate_key,public,status,tls,tracker,
-                parent=history,reviewed=snapshot,fence=fence)
+                parent=history,reviewed=snapshot,fence=fence,readiness_probe=readiness_probe)
             final_history=json.loads(child.capture().canonical)
             session.cleanup()
             session=None

@@ -4,6 +4,7 @@ Fixture provisioning is not product dispatch or approval. Partial sessions are
 retained before their first write, including through BaseException unwinding.
 """
 import base64
+from datetime import datetime, timezone
 import hashlib
 import os
 from pathlib import Path
@@ -66,7 +67,7 @@ class PreparationOwnerV3:
         binding=canonical(observer.binding())
         _RECORDS[self]=dict(owner=(os.getpid(),threading.get_ident()),observer=observer,binding=binding,
             root=Path(observer.root),daemon=observer.daemon_id,source=source_sha,archive=archive_digest,
-            state='new',identity=None,tls=None,session=None,raw=None,metadata=None,fileIdentity=None,host=None,keys=None,product_pending=False)
+            state='new',identity=None,tls=None,session=None,raw=None,metadata=None,fileIdentity=None,host=None,keys=None,product_pending=False,batch=False,batch_attempted=False)
 
     def __copy__(self):reject()
     def __deepcopy__(self,memo):reject()
@@ -96,9 +97,9 @@ class PreparationOwnerV3:
         except BaseException:
             record['state']='failed';raise
 
-    def prepare(self,policy_hash,keys):
+    def prepare(self,policy_hash,keys,*,batch=False):
         record=_record(self)
-        if (record['state']!='identity' or not hex_value(policy_hash) or type(keys) is not dict
+        if (type(batch) is not bool or record['state']!='identity' or not hex_value(policy_hash) or type(keys) is not dict
                 or set(keys)!={'config','image','declaration','archive','target'}
                 or any(type(value) is not bytes or len(value)!=32 for value in keys.values())):reject()
         record['state']='preparing';frozen_keys=dict(keys);record['keys']=frozen_keys
@@ -112,9 +113,16 @@ class PreparationOwnerV3:
                         or session.target.daemon_id!=record['daemon']):reject()
             session=prepare_profile3(record['root'],actual_info,source_sha=record['source'],
                 host_id=record['host'],expected_daemon_id=record['daemon'],keys=frozen_keys,policy_hash=policy_hash,
-                environment='staging',expiry_seconds=900,on_session_created=created)
+                environment='staging',expiry_seconds=900,on_session_created=created,
+                **({'batch':True} if batch else {}))
             if session is not record['session']:reject()
-            raw=encode(live.private_json(live.private_capsule(session,session.prepared)))
+            capsule=live.private_json(live.private_capsule(session,session.prepared))
+            if batch and (session.prepared['request'].components!=('backend','frontend')
+                    or session.prepared['request'].protected_components!=('peer',)
+                    or capsule.get('kind')!='compose-managed-batch-capsule'
+                    or type(capsule.get('schemaVersion')) is not int or capsule['schemaVersion']!=1):reject()
+            if not batch and 'kind' in capsule:reject()
+            raw=encode(capsule)
             if not 0<len(raw)<=4*1024*1024:reject()
             facts=[]
             class Capture:
@@ -135,7 +143,7 @@ class PreparationOwnerV3:
             meta=dict(preparationId=__import__('secrets').token_hex(32),capsuleDigest=digest(raw),totalBytes=len(raw),
                 requestDigest=session.prepared['request'].digest(),expiresAt=session.prepared['request'].expires_at,
                 observerFacts=facts[0],**{key:False for key in _FALSE})
-            record.update(state='prepared',raw=raw,metadata=meta,fileIdentity=(identity,file_id))
+            record.update(state='prepared',raw=raw,metadata=meta,fileIdentity=(identity,file_id),batch=batch)
             return decode(canonical(meta))
         except BaseException:
             record['state']='failed';raise
@@ -156,11 +164,67 @@ class PreparationOwnerV3:
     def business_inputs(self):
         """Borrow native private inputs inside the owning service thread only."""
         record=_record(self)
-        if record['state']!='prepared' or record['raw'] is None or record['session'] is None:reject()
+        if record['state']!='prepared' or record['batch'] or record['raw'] is None or record['session'] is None:reject()
         self.chunk(record['metadata']['preparationId'],record['metadata']['capsuleDigest'],0,1)
         _fresh(record)
         return dict(session=record['session'],capsule=record['raw'],tls=record['tls'],
             hello=decode(record['identity']),daemonBinding=decode(record['binding']),keys=dict(record['keys']),metadata=decode(canonical(record['metadata'])))
+
+    def execute_batch(self, preparation_id, capsule_digest, *, channel, policy, gate_key,
+                      witness_public_key, intent_public_key, epoch, readiness_probe):
+        """Run the held staging batch with an approved intent on a trusted host channel."""
+        from compose_profile3_ownership_fixture import FixtureOwnershipTrackerV3
+        from deployment_gate_witness import key_material
+        from deployment_gateway import GatePolicy
+
+        record=_record(self)
+        session=record['session']
+        if (record['state']!='prepared' or not record['batch'] or record['batch_attempted']
+                or record['product_pending'] or session.unknown_write_result
+                or type(policy) is not GatePolicy or type(gate_key) is not bytes
+                or not 32<=len(gate_key)<=4096 or not hex_value(epoch)
+                or not callable(readiness_probe)):reject()
+        metadata=record['metadata']
+        self.chunk(preparation_id,capsule_digest,0,1)
+        prepared=session.prepared
+        request,bundle=prepared['request'],prepared['bundle']
+        hello=decode(record['identity'])
+        witness,intent=key_material(witness_public_key),key_material(intent_public_key)
+        if (request.operation!='deploy' or request.production is not False
+                or request.components!=('backend','frontend') or request.protected_components!=('peer',)
+                or request.digest()!=metadata['requestDigest'] or request.plan_hash!=bundle.digest
+                or request.policy_hash!=policy.identity_hash()
+                or policy.operation_profile!='compose-v3' or policy.witness_required is not True
+                or policy.scope_hash!=digest(canonical(hello))
+                or policy.writer_certificate_sha256!=hello['writerCertificateSha256']
+                or policy.witness_scope_hash!='0'*64 or policy.witness_key_sha256!=digest(witness)
+                or witness==intent):reject()
+        value=bundle.to_dict()
+        protected_ids=[item['containerId'] for item in value['protectedContainers']]
+        baseline_ids={item['baselineContainerId'] for item in value['services']}
+        if (baseline_ids|set(protected_ids)!=set(session.created_ids)
+                or session.root!=record['root'] or session.project!=request.target.namespace
+                or request.daemon_id!=record['daemon']
+                or session.target.daemon_id!=record['daemon']
+                or session.target.socket!=str(record['root']/'docker.sock')):reject()
+        tracker=FixtureOwnershipTrackerV3(project=session.project,daemon_id=record['daemon'],
+            policy_hash=request.policy_hash,witness_pub_hash=policy.witness_key_sha256,epoch=epoch,
+            initial_confirmed_ids=session.created_ids,protected_ids=protected_ids)
+        request.ensure_fresh(datetime.now(timezone.utc),maximum_seconds=900)
+        _fresh(record)
+        session.guard.capture_phase(dict(phase_index=0,operation=bundle.creation_operations()[0],
+                                         receipts={},completed_operations=[]))
+        _fresh(record)
+        request.ensure_fresh(datetime.now(timezone.utc),maximum_seconds=900)
+        record['batch_attempted']=True
+        result=live.execute_operation(channel,session,prepared,policy,gate_key,witness,intent,
+            record['tls'],tracker,readiness_probe=readiness_probe)
+        try:
+            _fresh(record)
+        except BaseException:
+            session.unknown_write_result=True
+            raise
+        return result
 
     def mark_product_pending(self):
         record=_record(self)

@@ -94,6 +94,13 @@ def compile_restore_body(raw, identity, artifact, private_key, network_ids, expe
 RETENTION_DOMAIN = b'dev-workflow:compose-retained-restore-body:v1\0'
 
 
+def retention_binding(reference, candidate):
+    binding = {'archiveReference': reference, 'compositionDigest': candidate['compositionDigest'],
+               'bodySha256': candidate['bodySha256']}
+    binding['bindingDigest'] = hashlib.sha256(RETENTION_DOMAIN + _encode(binding)).hexdigest()
+    return binding
+
+
 def compile_retained_restore_body(recovery, reference, observer, observation, *, service, identity,
                                   private_key, network_ids, expected_mounts, image, image_commitment,
                                   image_key, declaration, declaration_proof, declaration_key,
@@ -121,9 +128,6 @@ def compile_retained_restore_body(recovery, reference, observer, observation, *,
                                                     service=service, identity=identity)
         if _encode(again) != _encode(raw) or again_artifact != artifact:
             raise ValueError()
-        binding = {'archiveReference': reference, 'compositionDigest': candidate['compositionDigest'],
-                   'bodySha256': candidate['bodySha256']}
-        binding['bindingDigest'] = hashlib.sha256(RETENTION_DOMAIN + _encode(binding)).hexdigest()
-        return {'candidate': candidate, 'retentionBinding': binding}
+        return {'candidate': candidate, 'retentionBinding': retention_binding(reference, candidate)}
     except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, OverflowError):
         raise ValueError('retained-restore-body-rejected') from None

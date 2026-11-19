@@ -187,7 +187,8 @@ def _observers(root, session, scope, artifacts, key, *, purpose='initial'):
     observers=[]
     for source_view in (False, True):
         policy=ComposeReaderHostPolicy(scope['project'], scope['daemonId'], fingerprint('reader'),
-            ('backend','peer'), ids, tuple(sorted(set(scope['imageIds'].values()))),
+            tuple(sorted(scope['selectedServices'] + scope['protectedServices'])), ids,
+            tuple(sorted(set(scope['imageIds'].values()))),
             tuple(sorted(scope['networks'].values())), tuple(sorted(scope['volumes'])),
             private_key_id='profile3-config', source_view=source_view)
         server=create_gateway(policy,tls_context=context,docker_socket=Path(session.target.socket),private_hmac_key=key)
@@ -203,58 +204,127 @@ def _observers(root, session, scope, artifacts, key, *, purpose='initial'):
 
 def _prepare_observed(session, *, root, rows, images, references, bodies, network_name,
                       network, volume, bind, source_sha, host_id, expected_daemon_id,
-                      fresh, keys, policy_hash, environment, expiry_seconds, purpose):
+                      fresh, keys, policy_hash, environment, expiry_seconds, purpose, batch=False):
     """Shared host-only preparation; fixture provisioning has already ended."""
     target, project = session.target, session.project
-    raw={k:deepcopy(rows['backend'][k]) for k in ('Id','Name','Image','Config','HostConfig','NetworkSettings','Mounts')}
-    raw['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in raw['Mounts']]
-    projection={k:raw[k] for k in ('Config','HostConfig','NetworkSettings','Mounts')}
-    networks={network_name:network}
-    mounts={'/sample-data':dict(type='volume',source=volume,readOnly=False),'/sample-config':dict(type='bind',source=str(bind),readOnly=True)}
-    identity=dict(project=project,service='backend',containerId=raw['Id'],containerName=project+'-backend',imageId=images[0]['Id'],hostId=host_id,daemonId=expected_daemon_id,requestedApiVersion='1.45',engineVersion=fresh['ServerVersion'])
-    artifact=ServiceArtifact('backend',source_sha,references[0],images[0]['Id'],'linux',images[0]['Architecture'],'profile3-config',commit(project,'backend',projection,'profile3-config',keys['config'])['configHmac'],hashlib.sha256(b'').hexdigest(),'none')
-    peer_projection={k:deepcopy(rows['peer'][k]) for k in ('Config','HostConfig','NetworkSettings','Mounts')}
-    peer_projection['Mounts']=[{**dict.fromkeys(MOUNT),**m} for m in peer_projection['Mounts']]
-    peer_hash=commit(project,'peer',peer_projection,'profile3-config',keys['config'])['configHmac']
-    scope=dict(project=project,daemonId=expected_daemon_id,selectedServices=['backend'],protectedServices=['peer'],protectedContainerIds={'peer':rows['peer']['Id']},protectedConfigHmacs={'peer':peer_hash},selectedContainerIds={'backend':raw['Id']},containerNames={s:project+'-'+s for s in rows},imageIds={s:rows[s]['Image'] for s in rows},baselineSourceShas={'backend':source_sha},networks=networks,volumes={volume:dict(driver='local',options={})},mounts={s:[dict(type=m['type'],source=m['source'],target=p,readOnly=m['readOnly']) for p,m in mounts.items()] for s in rows},networkAttachments={s:{network_name:rows[s]['NetworkSettings']['Networks'][network_name]['Aliases']} for s in rows})
-    session.whole_observer,session.retention_observer=_observers(root,session,scope,ComposeArtifacts(1,(artifact,)),keys['config'],purpose=purpose)
-    session.whole_observation=session.whole_observer.issue(); session.retention_observation=session.retention_observer.issue()
-    if session.whole_observation is None or session.retention_observation is None: raise ValueError('profile3-live-observation-not-issued')
+    selected = ('backend', 'frontend') if batch else ('backend',)
+    if set(rows) != set(bodies) or set(rows) != {*selected, 'peer'}:
+        raise ValueError('profile3-observed-service-scope-rejected')
+    networks = {network_name: network}
+    mounts = {'/sample-data': dict(type='volume', source=volume, readOnly=False),
+              '/sample-config': dict(type='bind', source=str(bind), readOnly=True)}
+    names = {name: project+'-'+name for name in rows}
+    raw_sources, projections, identities, artifacts = {}, {}, {}, {}
+    baseline = []
+    for name in selected:
+        row = rows[name]
+        raw = {key: deepcopy(row[key]) for key in ('Id', 'Name', 'Image', 'Config', 'HostConfig', 'NetworkSettings', 'Mounts')}
+        raw['Mounts'] = [{**dict.fromkeys(MOUNT), **mount} for mount in raw['Mounts']]
+        projection = {key: raw[key] for key in ('Config', 'HostConfig', 'NetworkSettings', 'Mounts')}
+        identity = dict(project=project, service=name, containerId=raw['Id'], containerName=names[name],
+                        imageId=images[0]['Id'], hostId=host_id, daemonId=expected_daemon_id,
+                        requestedApiVersion='1.45', engineVersion=fresh['ServerVersion'])
+        config_hmac = commit(project, name, projection, 'profile3-config', keys['config'])['configHmac']
+        artifacts[name] = ServiceArtifact(name, source_sha, references[0], images[0]['Id'], 'linux',
+            images[0]['Architecture'], 'profile3-config', config_hmac, hashlib.sha256(b'').hexdigest(), 'none')
+        baseline.append(BaselineContainer(name, raw['Id'], names[name], images[0]['Id']))
+        raw_sources[name], projections[name], identities[name] = raw, projection, identity
+
+    peer_projection = {key: deepcopy(rows['peer'][key]) for key in ('Config', 'HostConfig', 'NetworkSettings', 'Mounts')}
+    peer_projection['Mounts'] = [{**dict.fromkeys(MOUNT), **mount} for mount in peer_projection['Mounts']]
+    peer_hash = commit(project, 'peer', peer_projection, 'profile3-config', keys['config'])['configHmac']
+    protected_ids = {'peer': rows['peer']['Id']}
+    protected_hashes = {'peer': peer_hash}
+    scope = dict(project=project, daemonId=expected_daemon_id, selectedServices=list(selected),
+        protectedServices=['peer'], protectedContainerIds=protected_ids, protectedConfigHmacs=protected_hashes,
+        selectedContainerIds={name: rows[name]['Id'] for name in selected}, containerNames=names,
+        imageIds={name: row['Image'] for name, row in rows.items()}, baselineSourceShas=dict.fromkeys(selected, source_sha),
+        networks=networks, volumes={volume: dict(driver='local', options={})},
+        mounts={name: [dict(type=mount['type'], source=mount['source'], target=path, readOnly=mount['readOnly'])
+                       for path, mount in mounts.items()] for name in rows},
+        networkAttachments={name: {network_name: row['NetworkSettings']['Networks'][network_name]['Aliases']}
+                            for name, row in rows.items()})
+    session.whole_observer, session.retention_observer = _observers(
+        root, session, scope, ComposeArtifacts(1, tuple(artifacts.values())), keys['config'], purpose=purpose)
+    session.whole_observation = session.whole_observer.issue()
+    session.retention_observation = session.retention_observer.issue()
+    if session.whole_observation is None or session.retention_observation is None:
+        raise ValueError('profile3-live-observation-not-issued')
     if session.store is None:
-        archive=root/'profile3-archive'; archive.mkdir(mode=0o700)
-        session.store=ComposeRecoveryStore(archive,key=keys['archive'])
-    baseline=(BaselineContainer('backend',raw['Id'],identity['containerName'],images[0]['Id']),)
-    session.recovery=ComposeRecoveryHost(store=session.store,observer=session.retention_observer,baseline=baseline,projections={'backend':projection},private_keys={'profile3-config':keys['config']})
-    reference=session.recovery.retain(session.retention_observation)
-    snapshot=prepare_snapshot(raw,identity,artifact,keys['config'],networks,mounts)
-    model=dict(sourceSha=source_sha,command=fixture_command(project),createBodies=bodies)
-    model_digest=hashlib.sha256(_encode(model)).hexdigest()
-    declaration=dict(schemaVersion=1,identity=identity,sourceSha=source_sha,sourceModelDigest=model_digest,sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),networks={network_name:dict(id=network,aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],addressPolicy='dynamic-no-requested-addresses',requestedMac=None,ipamConfig=None,links=None,driverOpts=None)})
-    proof=commit_network_declaration(declaration,'profile3-declaration',keys['declaration'])
-    inputs=dict(identity=identity,private_key=keys['config'],network_ids=networks,expected_mounts=mounts,image=images[0],image_commitment=commit_image_config(images[0],'profile3-image',keys['image']),image_key=keys['image'],declaration=declaration,declaration_proof=proof,declaration_key=keys['declaration'],expected_image_key_id='profile3-image',expected_declaration_key_id='profile3-declaration',expected_declaration_hmac=proof['declarationHmac'],expected_source_model_digest=model_digest,host_config_policy=SOURCE_HOST_POLICY,metadata_policy=RUNNING_METADATA_POLICY)
-    targets=dict(image=images[1],commitment=commit_image_config(images[1],'profile3-target',keys['target']),key=keys['target'],expected_key_id='profile3-target',expected_image_id=images[1]['Id'],expected_registry_digest=references[1],expected_architecture=images[1]['Architecture'])
-    session.producer=TrustedPhaseStateProducerV3(socket_path=target.socket,project=project,daemon_id=expected_daemon_id,container_ids=tuple(sorted(r['Id'] for r in rows.values())))
-    session.preparer=ComposePreparationHostV3(whole_observer=session.whole_observer,retention_observer=session.retention_observer,recovery=session.recovery,baseline=baseline,source_inputs={'backend':inputs},target_inputs={'backend':targets},source=SourceIdentity('github.com','https://github.com/'+REPOSITORY+'.git',REPOSITORY_ID,REPOSITORY,source_sha),target=TargetIdentity('compose',project,environment),host_id=host_id,daemon_id=expected_daemon_id,environment=environment,policy_hash=policy_hash,dependencies={'backend':()},protected_names={'peer':project+'-peer'},protected_ids={'peer':rows['peer']['Id']},protected_hashes={'peer':peer_hash},archive_reference=reference,phase_state_producer=session.producer,protected_private_keys={'peer':('profile3-config',keys['config'])})
-    expires=(datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
-    operation_nonce=uuid.uuid4().hex+uuid.uuid4().hex
-    audit=dict(rawSource=raw,rawRows=rows,identity=identity,artifact=asdict(artifact),
-        sourceInputs={k:v for k,v in inputs.items() if type(v) is not bytes},
-        targetInputs={k:v for k,v in targets.items() if type(v) is not bytes},
-        scope=scope,sourceModel=model,operationNonce=operation_nonce,expiresAt=expires)
-    fd=os.open(root/('profile3-inputs.private.json' if purpose == 'initial' else 'profile3-rollback-inputs.private.json'),os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-    with os.fdopen(fd,'wb') as stream:stream.write(_encode(audit))
-    session.prepared=session.preparer.prepare_intent(session.whole_observation,session.retention_observation,operation_nonce=operation_nonce,expires_at=expires)
-    version=session.producer._get('/v1.45/version')
-    version={k:version[k] for k in ('Version','GitCommit')}
-    pinned_rows=TrustedPhaseStateProducerV3.reload(session.store,session.prepared['bundle'],read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
-    session.guard=PhaseGuardV3(session.prepared['bundle'],pinned_rows,read_json=session.producer._get,daemon_version=version,expected_docker_root=str(root/'data'))
-    session.raw_source,session.raw_rows,session.source_inputs,session.source_model=raw,rows,inputs,model
-    session.public=public_payload(session.prepared)
+        archive = root/'profile3-archive'
+        archive.mkdir(mode=0o700)
+        session.store = ComposeRecoveryStore(archive, key=keys['archive'])
+    session.recovery = ComposeRecoveryHost(store=session.store, observer=session.retention_observer,
+        baseline=tuple(baseline), projections=projections, private_keys={'profile3-config': keys['config']})
+    reference = session.recovery.retain(session.retention_observation)
+
+    model = dict(sourceSha=source_sha, command=fixture_command(project), createBodies=bodies)
+    model_digest = hashlib.sha256(_encode(model)).hexdigest()
+    source_inputs = {}
+    for name in selected:
+        raw, identity = raw_sources[name], identities[name]
+        snapshot = prepare_snapshot(raw, identity, artifacts[name], keys['config'], networks, mounts)
+        declaration = dict(schemaVersion=1, identity=identity, sourceSha=source_sha, sourceModelDigest=model_digest,
+            sourceSnapshotDigest=hashlib.sha256(_encode(snapshot)).hexdigest(),
+            networks={network_name: dict(id=network, aliases=raw['NetworkSettings']['Networks'][network_name]['Aliases'],
+                addressPolicy='dynamic-no-requested-addresses', requestedMac=None, ipamConfig=None, links=None, driverOpts=None)})
+        proof = commit_network_declaration(declaration, 'profile3-declaration', keys['declaration'])
+        source_inputs[name] = dict(identity=identity, private_key=keys['config'], network_ids=networks,
+            expected_mounts=mounts, image=images[0], image_commitment=commit_image_config(images[0], 'profile3-image', keys['image']),
+            image_key=keys['image'], declaration=declaration, declaration_proof=proof, declaration_key=keys['declaration'],
+            expected_image_key_id='profile3-image', expected_declaration_key_id='profile3-declaration',
+            expected_declaration_hmac=proof['declarationHmac'], expected_source_model_digest=model_digest,
+            host_config_policy=SOURCE_HOST_POLICY, metadata_policy=RUNNING_METADATA_POLICY)
+    target_input = dict(image=images[1], commitment=commit_image_config(images[1], 'profile3-target', keys['target']),
+        key=keys['target'], expected_key_id='profile3-target', expected_image_id=images[1]['Id'],
+        expected_registry_digest=references[1], expected_architecture=images[1]['Architecture'])
+    target_inputs = {name: deepcopy(target_input) for name in selected}
+    session.producer = TrustedPhaseStateProducerV3(socket_path=target.socket, project=project, daemon_id=expected_daemon_id,
+        container_ids=tuple(sorted(row['Id'] for row in rows.values())))
+    dependencies = {'backend': (), 'frontend': ('backend',)} if batch else {'backend': ()}
+    session.preparer = ComposePreparationHostV3(whole_observer=session.whole_observer,
+        retention_observer=session.retention_observer, recovery=session.recovery, baseline=tuple(baseline),
+        source_inputs=source_inputs, target_inputs=target_inputs,
+        source=SourceIdentity('github.com', 'https://github.com/'+REPOSITORY+'.git', REPOSITORY_ID, REPOSITORY, source_sha),
+        target=TargetIdentity('compose', project, environment), host_id=host_id, daemon_id=expected_daemon_id,
+        environment=environment, policy_hash=policy_hash, dependencies=dependencies, protected_names={'peer': names['peer']},
+        protected_ids=protected_ids, protected_hashes=protected_hashes, archive_reference=reference,
+        phase_state_producer=session.producer, protected_private_keys={'peer': ('profile3-config', keys['config'])})
+    expires = (datetime.now(timezone.utc)+timedelta(seconds=expiry_seconds)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    operation_nonce = uuid.uuid4().hex+uuid.uuid4().hex
+    def without_keys(values):
+        return {key: value for key, value in values.items() if type(value) is not bytes}
+    audit = dict(rawRows=rows, scope=scope, sourceModel=model, operationNonce=operation_nonce, expiresAt=expires)
+    if batch:
+        audit.update(rawSources=raw_sources, identities=identities, artifacts={key: asdict(value) for key, value in artifacts.items()},
+                     sourceInputs={key: without_keys(value) for key, value in source_inputs.items()},
+                     targetInputs={key: without_keys(value) for key, value in target_inputs.items()})
+    else:
+        audit.update(rawSource=raw_sources['backend'], identity=identities['backend'], artifact=asdict(artifacts['backend']),
+                     sourceInputs=without_keys(source_inputs['backend']), targetInputs=without_keys(target_input))
+    fd = os.open(root/('profile3-inputs.private.json' if purpose == 'initial' else 'profile3-rollback-inputs.private.json'),
+                 os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(_encode(audit))
+    session.prepared = session.preparer.prepare_intent(session.whole_observation, session.retention_observation,
+        operation_nonce=operation_nonce, expires_at=expires)
+    version = session.producer._get('/v1.45/version')
+    version = {key: version[key] for key in ('Version', 'GitCommit')}
+    pinned_rows = TrustedPhaseStateProducerV3.reload(session.store, session.prepared['bundle'],
+        read_json=session.producer._get, daemon_version=version, expected_docker_root=str(root/'data'))
+    session.guard = PhaseGuardV3(session.prepared['bundle'], pinned_rows, read_json=session.producer._get,
+        daemon_version=version, expected_docker_root=str(root/'data'))
+    session.raw_source = raw_sources if batch else raw_sources['backend']
+    session.source_inputs = source_inputs if batch else source_inputs['backend']
+    session.raw_rows, session.source_model = rows, model
+    session.public = public_payload(session.prepared)
     return session
 
 
 def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, keys, policy_hash,
-                     environment='test', expiry_seconds=600, registry='ecr-public', on_session_created=None):
+                     environment='test', expiry_seconds=600, registry='ecr-public', on_session_created=None, batch=False):
+    if type(batch) is not bool:
+        raise ValueError('profile3-batch-selector-rejected')
     if on_session_created is not None and not callable(on_session_created):
         raise ValueError('profile3-session-callback-rejected')
     target=validate_controller(root,info,source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
@@ -293,7 +363,8 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
             HostConfig=host,NetworkingConfig={'EndpointsConfig':{network_name:dict(NetworkID=network,Aliases=['backend'])}})
         rows={}
         bodies={}
-        for service in ('backend','peer'):
+        services = ('backend', 'frontend', 'peer') if batch else ('backend', 'peer')
+        for service in services:
             own=deepcopy(body); own['Labels']={'com.docker.compose.project':project,'com.docker.compose.service':service}
             own['NetworkingConfig']['EndpointsConfig'][network_name]['Aliases']=[service]
             bodies[service]=deepcopy(own)
@@ -314,7 +385,7 @@ def prepare_profile3(root, info, *, source_sha, host_id, expected_daemon_id, key
             bodies=bodies,network_name=network_name,network=network,volume=volume,bind=bind,
             source_sha=source_sha,host_id=host_id,expected_daemon_id=expected_daemon_id,
             fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
-            expiry_seconds=expiry_seconds,purpose='initial')
+            expiry_seconds=expiry_seconds,purpose='initial',batch=batch)
         session.deployment_context=dict(preparer=session.preparer,prepared=session.prepared,
             bundle=session.prepared['bundle'],request=session.prepared['request'],
             whole_observer=session.whole_observer,retention_observer=session.retention_observer,
@@ -356,6 +427,8 @@ def prepare_current_profile3(session, *, original_bundle, original_request,
             or type(original_request) is not RequestV2
             or type(authenticated_history) is not AuthenticatedHistoryV3
             or original_request.operation != 'deploy'
+            or original_request.components not in (('backend',), ('backend', 'frontend'))
+            or original_request.protected_components != ('peer',)
             or original_request.plan_hash != original_bundle.digest
             or authenticated_history._bundle.canonical_bytes != original_bundle.canonical_bytes
             or authenticated_history._request.digest() != original_request.digest()
@@ -366,10 +439,14 @@ def prepare_current_profile3(session, *, original_bundle, original_request,
             or any(type(k) is not bytes or not 32 <= len(k) <= 4096 for k in keys.values())
             or session.unknown_write_result):
         raise ValueError('profile3-current-input-rejected')
+    selected=original_request.components
+    batch=len(selected)==2
     context=session.deployment_context
+    source_inputs=context['source_inputs'] if batch else {'backend':context['source_inputs']}
     if (session.target.socket != context['producer']._socket_path
             or session.target.socket != str(session.root/'docker.sock')
-            or keys['config'] != context['source_inputs']['private_key']):
+            or set(source_inputs) != set(selected)
+            or any(keys['config'] != inputs['private_key'] for inputs in source_inputs.values())):
         raise ValueError('profile3-current-private-boundary-rejected')
     if (context['prepared']['bundle'].canonical_bytes != original_bundle.canonical_bytes
             or context['prepared']['request'].digest() != original_request.digest()):
@@ -378,15 +455,18 @@ def prepare_current_profile3(session, *, original_bundle, original_request,
     value=json.loads(signed.canonical)
     original=original_bundle.to_dict()
     receipts=value['receiptMap']
+    if (type(receipts) is not dict or set(receipts) != set(selected)
+            or len(set(receipts.values())) != len(selected)):
+        raise ValueError('profile3-current-history-rejected')
     expected=[op for op in original_bundle.resolve_operations(receipts) if op['method'] != 'GET']
+    expected_count=5*len(selected)
     if (value['bundleDigest'] != original_bundle.digest
             or value['originalRequestHash'] != original_request.digest()
             or value['sourceArchiveRef'] != original['archiveReference']
             or value['blocker'] is not None or value['pending'] is not None
-            or value['closedTail'] is None or len(expected) != 5
-            or set(receipts) != {'backend'}
+            or value['closedTail'] is None or len(expected) != expected_count
             or canonical(value['knownPrefix']) != canonical(expected)
-            or len(value['scopes']) != 5):
+            or len(value['scopes']) != expected_count):
         raise ValueError('profile3-current-history-rejected')
     # Validate the approved target and unchanged protected pin against fresh GETs.
     # The original guard reads its immutable CAS baseline, never old observers.
@@ -397,29 +477,35 @@ def prepare_current_profile3(session, *, original_bundle, original_request,
         raise ValueError('profile3-current-drift')
     producer=TrustedPhaseStateProducerV3(socket_path=session.target.socket,project=session.project,
         daemon_id=original['identity']['daemonId'],
-        container_ids=tuple(sorted([receipts['backend']]+[p['containerId'] for p in original['protectedContainers']])))
+        container_ids=tuple(sorted([*receipts.values(), *(p['containerId'] for p in original['protectedContainers'])])))
     current=producer.capture()
     peer=original['protectedContainers']
     if (len(peer) != 1 or peer[0]['containerId'] != context['raw_rows']['peer']['Id']):
         raise ValueError('profile3-current-peer-rejected')
     if protected_state_digest(current[peer[0]['containerId']]) != peer[0]['staticConfigDigest']:
         raise ValueError('profile3-current-peer-rejected')
-    rows={'backend':current[receipts['backend']],'peer':current[peer[0]['containerId']]}
+    rows={service:current[receipts[service]] for service in selected}
+    rows['peer']=current[peer[0]['containerId']]
     images=deepcopy(session.enrolled_images[::-1])
     for image in images:
         fresh_image=producer._get('/v1.45/images/'+image['Id']+'/json')
         if canonical(fresh_image) != canonical(image):
             raise ValueError('profile3-current-image-drift')
-    service=original['services'][0]
-    if (len(original['services']) != 1 or service['name'] != 'backend'
-            or images[0]['Id'] != service['targetImageId']
-            or images[1]['Id'] != service['baselineImageId']):
+    services={item['name']:item for item in original['services']}
+    if (len(original['services']) != len(selected) or set(services) != set(selected)
+            or any(images[0]['Id'] != item['targetImageId'] or images[1]['Id'] != item['baselineImageId']
+                   for item in services.values())):
         raise ValueError('profile3-current-image-rejected')
-    bodies={'backend':deepcopy(service['targetCreateBody']),
-            'peer':deepcopy(context['source_model']['createBodies']['peer'])}
-    inputs=context['source_inputs']
-    network_name,network=next(iter(inputs['network_ids'].items()))
+    bodies={name:deepcopy(item['targetCreateBody']) for name,item in services.items()}
+    bodies['peer']=deepcopy(context['source_model']['createBodies']['peer'])
+    inputs=source_inputs['backend']
+    networks=inputs['network_ids']
     mounts=inputs['expected_mounts']
+    if (len(networks) != 1
+            or any(other['network_ids'] != networks or other['expected_mounts'] != mounts
+                   for other in source_inputs.values())):
+        raise ValueError('profile3-current-topology-rejected')
+    network_name,network=next(iter(networks.items()))
     child=PreparationSession(session.target,session.project)
     child.listeners=session.listeners
     child.store=session.store
@@ -430,7 +516,7 @@ def prepare_current_profile3(session, *, original_bundle, original_request,
         volume=mounts['/sample-data']['source'],bind=Path(mounts['/sample-config']['source']),
         source_sha=source_sha,host_id=host_id,expected_daemon_id=original['identity']['daemonId'],
         fresh=fresh,keys=keys,policy_hash=policy_hash,environment=environment,
-        expiry_seconds=expiry_seconds,purpose='rollback')
+        expiry_seconds=expiry_seconds,purpose='rollback',batch=batch)
     for old,new in zip(original['services'],child.prepared['bundle'].to_dict()['services']):
         if (canonical(new['baselineCreateBody']) != canonical(old['targetCreateBody'])
                 or canonical(new['targetCreateBody']) != canonical(old['baselineCreateBody'])):

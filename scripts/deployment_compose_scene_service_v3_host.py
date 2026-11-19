@@ -187,7 +187,7 @@ class SceneClientV3:
             elif command=='drain_writer':end=time.monotonic()+DRAIN_RESPONSE_SECONDS
             elif command=='inspect_attached_worker':end=time.monotonic()+INSPECT_RESPONSE_SECONDS
             elif command=='prepare_identity':end=time.monotonic()+IDENTITY_RESPONSE_SECONDS
-            elif command=='prepare_staging':end=time.monotonic()+PREPARATION_RESPONSE_SECONDS
+            elif command in ('prepare_staging','prepare_batch_staging'):end=time.monotonic()+PREPARATION_RESPONSE_SECONDS
             reply=_verify(self._handle.controlKey,_read(self._socket,end))
             expected=dict(kind='scene-result-v3',**self._lease,seq=self._seq,command=command)
             if set(reply)!=set(expected)|{'result'} or any(canonical(reply[k])!=canonical(v) for k,v in expected.items()):reject()
@@ -227,8 +227,12 @@ class SceneClientV3:
 
     def prepare_identity(self,host_id):return self._call('prepare_identity',{'hostId':host_id})
     def prepare_staging(self,policy_hash,keys):
+        return self._prepare('prepare_staging',policy_hash,keys)
+    def prepare_batch_staging(self,policy_hash,keys):
+        return self._prepare('prepare_batch_staging',policy_hash,keys)
+    def _prepare(self,command,policy_hash,keys):
         if type(keys) is not dict or set(keys)!={'config','image','declaration','archive','target'} or any(type(v) is not bytes or len(v)!=32 for v in keys.values()):reject()
-        return self._call('prepare_staging',{'policyHash':policy_hash,'keys':{k:base64.b64encode(v).decode('ascii') for k,v in keys.items()}})
+        return self._call(command,{'policyHash':policy_hash,'keys':{k:base64.b64encode(v).decode('ascii') for k,v in keys.items()}})
     def preparation_chunk(self,preparation_id,capsule_digest,offset,length):
         return self._call('preparation_chunk',dict(preparationId=preparation_id,capsuleDigest=capsule_digest,offset=offset,length=length))
     def inspect_attached_worker(self,expected_slot_generation):
@@ -538,14 +542,14 @@ def serve(scene_id):
                                     reply=dict(kind='scene-lease-v3',**state['lease'],seq=0)
                                 else:
                                     lease=state['lease']
-                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase','observe_stopped_writer_phase','confirm_recovery_worker','capture_closed_phase_snapshot','read_closed_phase_chunk')
+                                    extended=value.get('command') in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','prepare_batch_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase','observe_stopped_writer_phase','confirm_recovery_worker','capture_closed_phase_snapshot','read_closed_phase_chunk')
                                     if (set(value)!=({'kind',*lease,'seq','command'}|({'args'} if extended else set())) or value['kind']!='scene-command-v3'
                                             or any(canonical(value[k])!=canonical(v) for k,v in lease.items()) or type(value['seq']) is not int
-                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase','observe_stopped_writer_phase','confirm_recovery_worker','capture_closed_phase_snapshot','read_closed_phase_chunk')):reject()
+                                            or value['seq']!=state['seq']+1 or value['command'] not in ('status','detach','closeScene','reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','prepare_batch_staging','preparation_chunk','start_first_create','poll_worker','read_worker_chunk','begin_worker_reply','worker_reply_chunk','commit_worker_reply','finish_worker','reconcile_closure','observe_closed_phase','observe_stopped_writer_phase','confirm_recovery_worker','capture_closed_phase_snapshot','read_closed_phase_chunk')):reject()
                                     if time.monotonic()>=state['lease_deadline']:reject()
                                     if extended:
                                         args=value['args'];command=value['command']
-                                        expected_args={'prepare_identity':{'hostId'},'prepare_staging':{'policyHash','keys'},
+                                        expected_args={'prepare_identity':{'hostId'},'prepare_staging':{'policyHash','keys'},'prepare_batch_staging':{'policyHash','keys'},
                                             'preparation_chunk':{'preparationId','capsuleDigest','offset','length'},
                                             'start_first_create':{'preparationId','capsuleDigest','slotGeneration','policy','gateKeyBase64','requestHash','receiptHash','firstBinding'},
                                             'poll_worker':set(),'read_worker_chunk':{'attemptId','messageDigest','offset','length'},
@@ -575,7 +579,7 @@ def serve(scene_id):
                                         if set(args)!=expected_args:reject()
                                         if 'slotGeneration' in expected_args and (type(args['slotGeneration']) is not int
                                                 or not 0<=args['slotGeneration']<2**53 or slot is None):reject()
-                                        if command in ('prepare_identity','prepare_staging') and (source is None or attached_archive is None or slot is not None
+                                        if command in ('prepare_identity','prepare_staging','prepare_batch_staging') and (source is None or attached_archive is None or slot is not None
                                                 and slot.status()['slotState'] not in ('empty','drained')):reject()
                                     state['seq']=value['seq'];command=value['command']
                                     lease_seconds=(BUSINESS_LEASE_SECONDS if broker is not None and broker.status()['businessState']
@@ -585,7 +589,7 @@ def serve(scene_id):
                                         daemonBinding=owner.observer.binding(),
                                         generation=generation,**{k:False for k in _FALSE})
                                     metadata=slot.status() if slot is not None else dict(slotGeneration=0,slotState='disabled')
-                                    if broker is not None and command in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging'):reject()
+                                    if broker is not None and command in ('reserve_writer','drain_writer','inspect_attached_worker','prepare_identity','prepare_staging','prepare_batch_staging'):reject()
                                     if command=='reserve_writer':metadata=slot.reserve(value['args']['slotGeneration'])
                                     if command=='drain_writer':metadata=slot.drain(value['args']['slotGeneration'])
                                     if command=='inspect_attached_worker':
@@ -595,7 +599,7 @@ def serve(scene_id):
                                     if command=='prepare_identity':
                                         if preparation is None:preparation=PreparationOwnerV3(owner.observer,source['sourceSha'],source['archiveDigest'])
                                         result['hello']=preparation.identity(args['hostId'])
-                                    if command=='prepare_staging':
+                                    if command in ('prepare_staging','prepare_batch_staging'):
                                         if service_end-time.monotonic()<PREPARATION_RESPONSE_SECONDS:reject()
                                         if preparation is None or type(args['keys']) is not dict or set(args['keys'])!={'config','image','declaration','archive','target'}:reject()
                                         keys={}
@@ -604,7 +608,10 @@ def serve(scene_id):
                                             decoded_key=base64.b64decode(encoded,validate=True)
                                             if len(decoded_key)!=32 or base64.b64encode(decoded_key).decode('ascii')!=encoded:reject()
                                             keys[name]=decoded_key
-                                        result['preparation']=preparation.prepare(args['policyHash'],keys)
+                                        if command=='prepare_batch_staging':
+                                            result['preparation']=preparation.prepare(args['policyHash'],keys,batch=True)
+                                        else:
+                                            result['preparation']=preparation.prepare(args['policyHash'],keys)
                                     if preparation is not None:
                                         prep_status=preparation.status()
                                         result['preparationState']=prep_status['preparationState']

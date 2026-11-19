@@ -1,8 +1,12 @@
 """Private synthetic captures; no SSH, Docker or GitHub operations."""
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import time
 import hashlib
 import json
 import os
+import socket
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -163,8 +167,189 @@ class CapsuleTests(CurrentPreparationUnixTests):
         with self.assertRaises(ValueError):live.verify_private_capsule(changed,**kw)
 
 
+
+@unittest.skipUnless(os.name == 'posix', 'private recovery store requires POSIX semantics')
+class BatchCapsuleTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_deployment_compose_prepare_v3_host import fixture
+        from deployment_compose_prepare_v3_host import ComposePreparationHostV3
+        from deployment_compose_phase_guard_v3_host import baseline_state_bytes
+        from deployment_contract_v2 import SourceIdentity, TargetIdentity
+        from deployment_compose_private import commit
+
+        source_sha = 'b' * 40
+        project = 'dw-restore-' + '3' * 24
+        repo = live.REPOSITORY
+        source = SourceIdentity('github.com', f'https://github.com/{repo}.git',
+                                live.REPOSITORY_ID, repo, source_sha)
+        source_model = {'sourceSha': source_sha}
+        registries = {name: f'example.com/{name}@sha256:' + char * 64
+                      for name, char in (('api', '3'), ('web', '4'))}
+        kw, _ = fixture(batch=True, source=source, target=TargetIdentity('compose', project, 'staging'),
+                        source_model_digest=live.digest(source_model), config_key_id='profile3-config',
+                        target_registries=registries)
+        store = kw['recovery']._store
+        self.addCleanup(store.close)
+        observer = kw['whole_observer']
+        by_id = observer._unit_rows
+        label = 'com.docker.compose.service'
+        rows = {row['Config']['Labels'][label]: row for row in by_id.values()}
+        keys = {name: kw['source_inputs']['web'][field]
+                for name, field in (('config', 'private_key'), ('image', 'image_key'),
+                                    ('declaration', 'declaration_key'))}
+        keys['target'] = kw['target_inputs']['web']['key']
+        scope = observer._policy
+        scope['networks'] = kw['source_inputs']['web']['network_ids']
+        scope['networkAttachments'] = {service: {name: endpoint['Aliases']
+                for name, endpoint in row['NetworkSettings']['Networks'].items()}
+            for service, row in rows.items()}
+        scope['mounts'] = {service: [dict(type=mount['Type'],
+                source=mount['Name'] if mount['Type'] == 'volume' else mount['Source'],
+                target=mount['Destination'], readOnly=not mount['RW']) for mount in row['Mounts']]
+            for service, row in rows.items()}
+        scope['volumes'] = {mount['source']: {'driver': 'local', 'options': {}}
+                            for mounts in scope['mounts'].values() for mount in mounts
+                            if mount['type'] == 'volume'}
+        labels = {'com.docker.compose.project': project}
+        resources = {f'network:{name}': dict(Name=name, Id=ident, Labels=labels)
+                     for name, ident in scope['networks'].items()}
+        resources.update({f'volume:{name}': dict(Name=name, Driver='local', Options={}, Labels=labels)
+                          for name in scope['volumes']})
+        responses = {'/v1.45/info': {'ID': kw['daemon_id']}, '/inventory': [
+            dict(Id=row['Id'], Labels=row['Config']['Labels']) for row in rows.values()]}
+        for service, row in rows.items():
+            cid = row['Id']
+            responses[f'/v1.45/containers/{cid}/json'] = row
+            responses[f'/v1.45/workflow/private/{cid}'] = commit(
+                project, service, live._projection(row), 'profile3-config', keys['config'])
+        for name, ident in scope['networks'].items():
+            responses[f'/v1.45/networks/{ident}'] = resources[f'network:{name}']
+        for name in scope['volumes']:
+            responses[f'/v1.45/volumes/{name}'] = resources[f'volume:{name}']
+        catalog = [observer._reader.get(f'/v1.45/images/{ident}/json', deadline=time.monotonic()+10)
+                   for ident in sorted(set(scope['imageIds'].values()))]
+        for image in catalog:
+            image['Config'] = {'Env': ['IMAGE_DEFAULT=fixture']}
+            responses[f"/v1.45/images/{image['Id']}/json"] = image
+        reader = SimpleNamespace(list_path='/inventory', policy=SimpleNamespace(
+            private_key_id='profile3-config', bind_count=0), get=lambda path, **kw: responses[path])
+        assessment, private, instances, images, _ = live._snapshot(reader, scope, time.monotonic()+10)
+        self.assertEqual(assessment['reasons'], [])
+        collect = observer._collect
+        observer._collect = lambda *args, **kw: dict(collect(*args, **kw),
+            structureDigest=assessment['structureDigest'],
+            privateDigest=live._batch(b'dev-workflow:compose-private-batch:v1\0', private),
+            instanceDigest=live._batch(b'dev-workflow:compose-instance-batch:v1\0', instances),
+            imageCatalogDigest=live.image_catalog_digest(images))
+        observation = observer.issue()
+        kw['archive_reference'] = kw['recovery'].retain(observation)
+        preparer = ComposePreparationHostV3(**kw)
+        expires = (datetime.now(timezone.utc)+timedelta(minutes=10)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        self.prepared = preparer.prepare_intent(observation, observation,
+                                               operation_nonce='f'*64, expires_at=expires)
+        phase = dict(rows=json.loads(baseline_state_bytes(by_id)), resources=resources)
+        self.session = SimpleNamespace(preparer=preparer, whole_observation=observation,
+            whole_observer=observer, raw_rows=rows, source_model=source_model,
+            enrolled_images=catalog, guard=SimpleNamespace(capture_phase=lambda snapshot: phase))
+        self.kwargs = dict(hello=dict(sourceSha=source_sha, hostId=kw['host_id'], daemonId=kw['daemon_id']),
+            source_sha=source_sha, ssh_alias=kw['host_id'], policy=SimpleNamespace(identity_hash=lambda:kw['policy_hash']),
+            keys=keys, trusted_boot_id=observation._boot, trusted_bind_digest=None)
+        self.registries = registries
+
+    def capsule(self):
+        return private_json(private_capsule(self.session, self.prepared))
+
+    def verify(self, capsule, *, registries=None):
+        return live.verify_batch_private_capsule(capsule, **self.kwargs,
+            expected_target_registries=self.registries if registries is None else registries)
+
+    def test_batch_round_trip_is_explicit(self):
+        sent = self.capsule()
+        reader, writer = socket.socketpair()
+        with reader, writer, ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(live.write_frame, writer, sent, timeout=5)
+            capsule = live.read_frame(reader, timeout=5)
+            pending.result()
+        self.assertEqual(capsule, sent)
+        self.assertIn('Config', capsule['imageCatalog'][0])
+        self.assertEqual(capsule['kind'], 'compose-managed-batch-capsule')
+        self.assertEqual(capsule['schemaVersion'], 1)
+        self.assertEqual(set(capsule['sourceFacts']), {'api', 'web'})
+        bundle, request = self.verify(capsule)
+        self.assertEqual(bundle.digest, self.prepared['bundle'].digest)
+        self.assertEqual(request, self.prepared['request'])
+        with self.assertRaises(ValueError):
+            live.verify_private_capsule(capsule, **self.kwargs)
+
+    def test_batch_requires_exact_service_material_and_target_pins(self):
+        for field in ('sourceFacts', 'rawRows', 'targetInputs'):
+            for mutation in ('missing', 'extra', 'swapped'):
+                with self.subTest(field=field, mutation=mutation):
+                    capsule = self.capsule()
+                    inputs = capsule[field]
+                    if mutation == 'missing':
+                        inputs.pop('api')
+                    elif mutation == 'extra':
+                        inputs['unexpected'] = inputs['api']
+                    else:
+                        inputs['api'], inputs['web'] = inputs['web'], inputs['api']
+                    with self.assertRaises(ValueError):
+                        self.verify(capsule)
+        for registries in ({'web': self.registries['web']},
+                           dict(self.registries, unexpected=self.registries['api']),
+                           {'api': self.registries['web'], 'web': self.registries['api']}):
+            with self.subTest(registries=registries), self.assertRaises(ValueError):
+                self.verify(self.capsule(), registries=registries)
+
+    def test_batch_rejects_detached_phase_scope_and_format(self):
+        for path, changed in (
+            (('schemaVersion',), True),
+            (('kind',), 'compose-managed-batch-capsule-v2'),
+            (('phaseSnapshot', 'rows', '7'*64, 'State', 'Pid'), 456),
+            (('scopePolicy', 'baselineSourceShas', 'api'), 'c'*40),
+            (('scopePolicy', 'protectedConfigHmacs', 'db'), 'e'*64),
+        ):
+            with self.subTest(path=path):
+                capsule = self.capsule()
+                obj = capsule
+                for key in path[:-1]:
+                    obj = obj[key]
+                obj[path[-1]] = changed
+                with self.assertRaises(ValueError):
+                    self.verify(capsule)
+
+    def rebind_bundle(self, capsule):
+        from deployment_compose_bundle_v3 import ExecutionBundleV3, FIELDS
+        from deployment_compose_image_defaults import ZERO_DEFAULTS
+        value = capsule['bundle']
+        bundle = ExecutionBundleV3({key: value[key] for key in FIELDS},
+            authenticated_image_defaults={service: ZERO_DEFAULTS for service in self.registries})
+        capsule['bundle'] = bundle.to_dict()
+        capsule['publicReview'] = bundle.public_review()
+        capsule['request']['plan_hash'] = bundle.digest
+
+    def test_batch_recomputes_retention_binding_after_request_rehash(self):
+        capsule = self.capsule()
+        capsule['bundle']['retentionBindingDigest'] = 'd'*64
+        self.rebind_bundle(capsule)
+        with self.assertRaises(ValueError):
+            self.verify(capsule)
+
+    def test_batch_rejects_rehashed_unhealthy_baseline(self):
+        from deployment_compose_phase_guard_v3_host import baseline_state_bytes
+        capsule = self.capsule()
+        capsule['rawRows']['api']['State']['Health']['Status'] = 'unhealthy'
+        rows = {row['Id']: row for row in capsule['rawRows'].values()}
+        baseline = baseline_state_bytes(rows)
+        capsule['phaseSnapshot']['rows'] = json.loads(baseline)
+        capsule['bundle']['baselineStateDigest'] = hashlib.sha256(baseline).hexdigest()
+        self.rebind_bundle(capsule)
+        with self.assertRaises(ValueError):
+            self.verify(capsule)
+
+
 def load_tests(loader, tests, pattern):
     # The inherited class supplies setup/cleanup and Engine responses, while its
     # own tests remain owned and run by their original module.
-    return unittest.TestSuite(cls(name) for cls in (LoaderTests, RpcDiagnosticTests, CapsuleTests)
+    return unittest.TestSuite(cls(name) for cls in (LoaderTests, RpcDiagnosticTests, CapsuleTests, BatchCapsuleTests)
         for name in cls.__dict__ if name.startswith('test_'))

@@ -201,6 +201,8 @@ class CurrentPreparationUnixTests(unittest.TestCase):
     The daemon responses are synthetic. No Docker process or external service is
     involved, and this does not prove actual Engine reconstruction equivalence.
     """
+    fixture_services = (('backend', '1'*64), ('peer', '2'*64))
+
     def setUp(self):
         import socketserver
         import threading
@@ -226,7 +228,7 @@ class CurrentPreparationUnixTests(unittest.TestCase):
         self.network_name='sample_default'
         self.volume='sample-data'
         self.rows={}
-        for service,cid in (('backend','1'*64),('peer','2'*64)):
+        for service,cid in self.fixture_services:
             row=deepcopy(args['raw'])
             row.update(Id=cid,Name='/'+self.project+'-'+service,RestartCount=0,
                 State=dict(Pid=123,StartedAt='initial',Running=True,Paused=False,
@@ -281,23 +283,25 @@ class CurrentPreparationUnixTests(unittest.TestCase):
         self.session=fixture.PreparationSession(target,self.project)
         self.addCleanup(self.session.cleanup)
         bodies={}
-        for service,cid in (('backend','1'*64),('peer','2'*64)):
+        for service,cid in self.fixture_services:
             row=self.rows[cid]
             bodies[service]=dict(deepcopy(row['Config']),HostConfig=deepcopy(row['HostConfig']),
                 NetworkingConfig={'EndpointsConfig':{self.network_name:dict(NetworkID=self.network,Aliases=[service])}})
         before=deepcopy(self.rows)
         self.prepare_initial(bodies)
         self.assertEqual(self.rows,before)
-        self.assertIsNone(self.session.raw_source['HostConfig']['OomKillDisable'])
+        raw = self.session.raw_source
+        self.assertIsNone(raw.get('backend', raw)['HostConfig']['OomKillDisable'])
 
-    def prepare_initial(self,bodies):
+    def prepare_initial(self,bodies,*,batch=False):
+        rows = {row['Config']['Labels']['com.docker.compose.service']: row for row in self.rows.values()}
         fixture._prepare_observed(self.session,root=self.root,
-            rows={'backend':self.rows['1'*64],'peer':self.rows['2'*64]},images=self.images,
+            rows=rows,images=self.images,
             references=[i['RepoDigests'][0] for i in self.images],bodies=bodies,
             network_name=self.network_name,network=self.network,volume=self.volume,
             bind=Path('/sample/config'),source_sha='b'*40,host_id='host-one',
             expected_daemon_id='daemon-one',fresh={'ServerVersion':'29.8.2'},keys=self.keys,
-            policy_hash='c'*64,environment='staging',expiry_seconds=600,purpose='initial')
+            policy_hash='c'*64,environment='staging',expiry_seconds=600,purpose='initial',batch=batch)
         session=self.session
         session.root=self.root
         session.enrolled_images=deepcopy(self.images)
@@ -306,7 +310,7 @@ class CurrentPreparationUnixTests(unittest.TestCase):
             bundle=session.prepared['bundle'],request=session.prepared['request'],
             whole_observer=session.whole_observer,retention_observer=session.retention_observer,
             guard=session.guard,producer=session.producer,
-            raw_rows={'backend':deepcopy(self.rows['1'*64]),'peer':deepcopy(self.rows['2'*64])},
+            raw_rows=deepcopy(rows),
             source_model=deepcopy(session.source_model),source_inputs=session.source_inputs)
 
     def deploy(self, *, receipt_id=None, unknown=False):
@@ -406,6 +410,110 @@ class CurrentPreparationUnixTests(unittest.TestCase):
         self.rows['1'*64]['Id']='1'*64
         self.assert_denied_without_new_observers()
 
+
+@unittest.skipUnless(os.name == 'posix' and hasattr(socket, 'AF_UNIX') and shutil.which('openssl'),
+                     'POSIX Unix sockets and OpenSSL required')
+class BatchPreparationUnixTests(unittest.TestCase):
+    fixture_services = (*CurrentPreparationUnixTests.fixture_services, ('frontend', '3'*64))
+    setUp = CurrentPreparationUnixTests.setUp
+
+    def prepare_initial(self, bodies):
+        CurrentPreparationUnixTests.prepare_initial(self, bodies, batch=True)
+
+    def test_prepare_and_capture_batch_over_real_reader(self):
+        from deployment_compose_live_ssh_v3_host import verify_batch_private_capsule
+        from deployment_compose_live_worker_v3_host import private_capsule, private_json
+
+        session = self.session
+        prepared = session.prepared
+        capsule = private_json(private_capsule(session, prepared))
+        request = prepared['request']
+        self.assertEqual(request.components, ('backend', 'frontend'))
+        self.assertEqual(request.protected_components, ('peer',))
+        self.assertEqual(tuple(capsule['sourceFacts']), request.components)
+        self.assertEqual(capsule['sourceFacts']['frontend']['identity']['containerId'], '3'*64)
+        self.assertEqual(prepared['bundle'].to_dict()['services'][1]['dependsOn'], ['backend'])
+        self.assertFalse(prepared['review']['authorityGranted'])
+        bundle, verified = verify_batch_private_capsule(capsule,
+            hello=dict(sourceSha='b'*40, hostId='host-one', daemonId='daemon-one'),
+            source_sha='b'*40, ssh_alias='host-one', policy=Mock(identity_hash=lambda: 'c'*64), keys=self.keys,
+            trusted_boot_id=session.whole_observation._boot, trusted_bind_digest=None,
+            expected_target_registries=dict.fromkeys(request.components, self.images[1]['RepoDigests'][0]))
+        self.assertEqual(bundle.canonical_bytes, prepared['bundle'].canonical_bytes)
+        self.assertEqual(verified, request)
+        self.assertTrue(all(method == 'GET' for method, _ in self.calls))
+
+
+    def completed_deploy(self, count=10):
+        """Build authenticated closed scopes against the prepared batch."""
+        from tests.test_deployment_compose_batch_restart_material_v3_host import BatchFixture
+        from tests.test_deployment_compose_history_v3_host import HistoryTests
+
+        history = HistoryTests('test_two_scopes_and_no_local_files')
+        history.setup_gate_fixture()
+        self.addCleanup(history.doCleanups)
+        history.bundle = self.session.prepared['bundle']
+        history.req = self.session.prepared['request']
+        receipt_ids = {'backend': 'a'*64, 'frontend': 'b'*64}
+        history.receipts = {}
+        history.writes = [op for op in history.bundle.resolve_operations(receipt_ids) if op['method'] != 'GET']
+        for index, operation in enumerate(history.writes[:count]):
+            history.index = index
+            BatchFixture.open_scope(history)
+            create = operation['phase'] == 'create'
+            cid = receipt_ids[operation['service']]
+            history.finish(status=201 if create else 204, body=json.dumps({'Id': cid}).encode() if create else b'')
+            if create:
+                history.receipts[operation['service']] = cid
+
+        if count == 10:
+            for service in history.bundle.to_dict()['services']:
+                row = self.rows.pop(service['baselineContainerId'])
+                cid = receipt_ids[service['name']]
+                body = self.deepcopy(service['targetCreateBody'])
+                row.update(Id=cid, Image=service['targetImageId'], HostConfig=body.pop('HostConfig'))
+                body.pop('NetworkingConfig')
+                row['Config'] = body
+                self.rows[cid] = row
+        self.history = history.history(witness_client=history.factory(history.first_binding))
+
+    current = CurrentPreparationUnixTests.current
+
+    @unittest.skipUnless(shutil.which('ssh-keygen'), 'OpenSSH signatures required')
+    def test_prepare_inverse_batch_from_complete_signed_deployment(self):
+        self.completed_deploy()
+        original = self.session.prepared['bundle'].to_dict()
+        current = self.current()
+        inverse = current['prepared']['bundle'].to_dict()
+        self.assertEqual([service['baselineContainerId'] for service in inverse['services']],
+                         ['a'*64, 'b'*64])
+        for old, new in zip(original['services'], inverse['services']):
+            self.assertEqual(new['name'], old['name'])
+            self.assertEqual(new['baselineCreateBody'], old['targetCreateBody'])
+            self.assertEqual(new['targetCreateBody'], old['baselineCreateBody'])
+        self.assertEqual(inverse['protectedContainers'], original['protectedContainers'])
+
+        from deployment_compose_rollback_prepare_v3_host import RollbackPreparationHostV3
+        deployed = self.session.prepared
+        rollback = RollbackPreparationHostV3(original_bundle=deployed['bundle'],
+            original_request=deployed['request'], original_history=self.history,
+            original_archive_store=self.session.store, original_private_keys={'profile3-config':self.keys['config']},
+            current_preparation=current['preparer'])
+        prepared = rollback.prepare_intent(current['whole_observation'], current['retention_observation'],
+            operation_nonce='e'*64, expires_at=current['prepared']['request'].expires_at)
+        self.assertEqual(prepared['request'].operation, 'rollback')
+        self.assertEqual(prepared['request'].history_hash, current['authenticated_history_snapshot'].digest)
+        self.assertNotEqual(prepared['request'].digest(), deployed['request'].digest())
+        self.assertFalse(prepared['review']['runtimePermit'])
+        self.assertEqual({method for method, _ in self.calls}, {'GET'})
+
+    @unittest.skipUnless(shutil.which('ssh-keygen'), 'OpenSSH signatures required')
+    def test_reject_partial_batch_history_before_current_engine_reads(self):
+        self.completed_deploy(count=9)
+        before = list(self.calls)
+        with self.assertRaisesRegex(ValueError, 'profile3-current-history-rejected'):
+            self.current()
+        self.assertEqual(self.calls, before)
 
 if __name__=='__main__': unittest.main()
 
